@@ -1,0 +1,15 @@
+[package]
+name = "php-ast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# NOTE: php-ast must NOT depend on php-lexer. The AST is the stable contract that
+# name-resolution, the type system, and the rules engine consume; it references
+# source only via Span and names via Symbol.
+[dependencies]
+php-span.workspace = true
+php-intern.workspace = true
+
+[dev-dependencies]
+insta.workspace = true

@@ -1,0 +1,346 @@
+//! `xtask` — project automation. Run as `cargo run -p xtask -- <command>`.
+//!
+//! Commands:
+//!   corpus [DIR]        Parse every `.phpt` under DIR (default: php-src/Zend/tests)
+//!                       and report counts. The TDD Tier-C smoke check.
+//!   phpt-extract FILE   Print the `--FILE--` body of a single `.phpt`.
+//!   gen-tokens          (M1) Generate golden token fixtures via PHP. Requires PHP.
+
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode, Stdio};
+
+use php_lexer::golden::{self, DEFAULT_IGNORED};
+use walkdir::WalkDir;
+use xtask::phpt;
+
+fn workspace_root() -> PathBuf {
+    // crates/xtask -> crates -> <root>
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("corpus") => cmd_corpus(args.get(1).map(PathBuf::from)),
+        Some("difftokens") => cmd_difftokens(&args[1..]),
+        Some("phpt-extract") => cmd_phpt_extract(args.get(1).map(PathBuf::from)),
+        Some("gen-tokens") => cmd_gen_tokens(),
+        Some(other) => {
+            eprintln!("unknown command: {other}");
+            usage();
+            ExitCode::FAILURE
+        }
+        None => {
+            usage();
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn usage() {
+    eprintln!(
+        "usage: cargo run -p xtask -- <command>\n\
+         \n\
+         commands:\n\
+         \x20 corpus [DIR]        parse every .phpt under DIR (default php-src/Zend/tests)\n\
+         \x20 difftokens [DIR] [--limit N]\n\
+         \x20                     diff our tokens vs PHP token_get_all over the corpus (requires PHP)\n\
+         \x20 phpt-extract FILE   print the --FILE-- body of a .phpt\n\
+         \x20 gen-tokens          generate golden token fixtures (requires PHP; M1)"
+    );
+}
+
+/// Differential token check: lex every corpus `--FILE--` with both our lexer and
+/// PHP's `token_get_all()` and report the first divergence per file, tallied by
+/// the oracle token name that we got wrong. A dev oracle (needs PHP); surfaces
+/// the remaining lexer worklist. Trivia PHP emits but we drop is filtered out.
+fn cmd_difftokens(args: &[String]) -> ExitCode {
+    let mut dir: Option<PathBuf> = None;
+    let mut limit = usize::MAX;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--limit" => limit = it.next().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX),
+            _ => dir = Some(PathBuf::from(a)),
+        }
+    }
+    let root = workspace_root();
+    let dir = dir.unwrap_or_else(|| root.join("php-src/Zend/tests"));
+    let helper = root.join("crates/xtask/php/gen_golden.php");
+    if Command::new("php").arg("--version").output().is_err() {
+        eprintln!("`php` not found on PATH (brew install php)");
+        return ExitCode::FAILURE;
+    }
+
+    let mut files: Vec<PathBuf> = WalkDir::new(&dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|e| e.into_path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("phpt"))
+        .collect();
+    files.sort();
+
+    let (mut checked, mut matched) = (0usize, 0usize);
+    let mut by_oracle: BTreeMap<String, usize> = BTreeMap::new();
+    let mut examples: Vec<String> = Vec::new();
+
+    for path in files.into_iter().take(limit) {
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let Some(source) = phpt::extract_file_section(&text) else { continue };
+        let Some(golden_text) = run_php_tokens(&helper, &source) else { continue };
+        let Ok(oracle) = golden::parse(&golden_text) else { continue };
+        let oracle = golden::filter_ignored(&oracle, DEFAULT_IGNORED);
+
+        let ours = match catch_unwind(AssertUnwindSafe(|| {
+            let (toks, _) = php_lexer::tokenize(&source);
+            golden::from_tokens(&toks, &source)
+        })) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        checked += 1;
+        match first_divergence(&ours, &oracle) {
+            None => matched += 1,
+            Some((o, u)) => {
+                *by_oracle.entry(format!("{o} (we said {u})")).or_default() += 1;
+                // Skip the known-deferred categories so examples surface real bugs.
+                let deferred = o.starts_with("T_AMPERSAND")
+                    || o.ends_with("_CAST")
+                    || o.ends_with("_SET")
+                    || o == "T_YIELD_FROM"
+                    || (o == "T_STRING" && u == "T_ENUM");
+                if !deferred && examples.len() < 20 {
+                    examples.push(format!("  {}: oracle={o} ours={u}", path.file_name().unwrap().to_string_lossy()));
+                }
+            }
+        }
+    }
+
+    println!("\ndifftokens: {matched}/{checked} files match exactly");
+    if matched != checked {
+        println!("\nmismatches by oracle token (first divergence per file):");
+        let mut rows: Vec<_> = by_oracle.into_iter().collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.1));
+        for (name, count) in rows.iter().take(25) {
+            println!("  {count:>5}  {name}");
+        }
+        println!("\nexamples:");
+        for e in &examples {
+            println!("{e}");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Return (oracle_name, our_name) at the first differing token, or `None` if the
+/// streams are identical.
+fn first_divergence(
+    ours: &[golden::GoldenToken],
+    oracle: &[golden::GoldenToken],
+) -> Option<(String, String)> {
+    let n = ours.len().min(oracle.len());
+    for i in 0..n {
+        if ours[i] != oracle[i] {
+            return Some((oracle[i].name.clone(), ours[i].name.clone()));
+        }
+    }
+    if ours.len() != oracle.len() {
+        let o = oracle.get(n).map(|t| t.name.clone()).unwrap_or_else(|| "<eof>".into());
+        let u = ours.get(n).map(|t| t.name.clone()).unwrap_or_else(|| "<eof>".into());
+        return Some((o, u));
+    }
+    None
+}
+
+fn run_php_tokens(helper: &Path, source: &str) -> Option<String> {
+    let mut child = Command::new("php")
+        .arg(helper)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(source.as_bytes()).ok()?;
+    let out = child.wait_with_output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[derive(Default)]
+struct CorpusStats {
+    total: usize,
+    no_file: usize,
+    parsed_clean: usize,
+    parsed_with_errors: usize,
+    panicked: usize,
+    lex_panicked: usize,
+    expects_error: usize,
+}
+
+fn cmd_corpus(dir: Option<PathBuf>) -> ExitCode {
+    let dir = dir.unwrap_or_else(|| workspace_root().join("php-src/Zend/tests"));
+    if !dir.is_dir() {
+        eprintln!("corpus dir not found: {}", dir.display());
+        return ExitCode::FAILURE;
+    }
+    println!("scanning {}", dir.display());
+
+    let mut s = CorpusStats::default();
+    for entry in WalkDir::new(&dir).into_iter().filter_map(Result::ok) {
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("phpt") {
+            continue;
+        }
+        s.total += 1;
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Some(source) = phpt::extract_file_section(&text) else {
+            s.no_file += 1;
+            continue;
+        };
+        if phpt::expects_parse_error(&text) {
+            s.expects_error += 1;
+        }
+        // Lexer stress: M1 lexing may produce wrong tokens for not-yet-supported
+        // constructs (heredoc, interpolation), but it must never panic.
+        match catch_unwind(AssertUnwindSafe(|| php_lexer::tokenize(&source))) {
+            Ok(_) => {}
+            Err(_) => {
+                s.lex_panicked += 1;
+                eprintln!("LEX PANIC on {}", entry.path().display());
+            }
+        }
+        match catch_unwind(AssertUnwindSafe(|| php_parser::parse(&source))) {
+            Ok(result) => {
+                if result.has_errors() {
+                    s.parsed_with_errors += 1;
+                } else {
+                    s.parsed_clean += 1;
+                }
+            }
+            Err(_) => {
+                s.panicked += 1;
+                eprintln!("PANIC parsing {}", entry.path().display());
+            }
+        }
+    }
+
+    println!("\ncorpus results:");
+    println!("  .phpt files scanned : {}", s.total);
+    println!("  with --FILE--       : {}", s.total - s.no_file);
+    println!("  lexed ok            : {}", (s.total - s.no_file) - s.lex_panicked);
+    println!("  LEX PANICKED        : {}", s.lex_panicked);
+    println!("  parsed (no errors)  : {}", s.parsed_clean);
+    println!("  parsed (w/ errors)  : {}", s.parsed_with_errors);
+    println!("  PARSE PANICKED      : {}", s.panicked);
+    println!("  assert parse error  : {} (error-recovery subset)", s.expects_error);
+
+    // The hard invariant: neither lexer nor parser may ever panic.
+    if s.panicked == 0 && s.lex_panicked == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn cmd_phpt_extract(path: Option<PathBuf>) -> ExitCode {
+    let Some(path) = path else {
+        eprintln!("usage: xtask phpt-extract FILE");
+        return ExitCode::FAILURE;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        eprintln!("cannot read {}", path.display());
+        return ExitCode::FAILURE;
+    };
+    match phpt::extract_file_section(&text) {
+        Some(body) => {
+            print!("{body}");
+            ExitCode::SUCCESS
+        }
+        None => {
+            eprintln!("no --FILE-- section in {}", path.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Generate golden token fixtures: for every `test-fixtures/tokens/*.php`, run
+/// the PHP oracle and (over)write the paired `*.tokens`. Requires `php` on PATH.
+fn cmd_gen_tokens() -> ExitCode {
+    let root = workspace_root();
+    let tokens_dir = root.join("test-fixtures/tokens");
+    let helper = root.join("crates/xtask/php/gen_golden.php");
+    if !helper.is_file() {
+        eprintln!("missing PHP helper: {}", helper.display());
+        return ExitCode::FAILURE;
+    }
+    match Command::new("php").arg("--version").output() {
+        Ok(out) if out.status.success() => {
+            let v = String::from_utf8_lossy(&out.stdout);
+            println!("oracle: {}", v.lines().next().unwrap_or("php"));
+        }
+        _ => {
+            eprintln!("`php` not found on PATH (brew install php)");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let mut sources: Vec<PathBuf> = WalkDir::new(&tokens_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|e| e.into_path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("php"))
+        .collect();
+    sources.sort();
+
+    if sources.is_empty() {
+        eprintln!("no *.php fixtures under {}", tokens_dir.display());
+        return ExitCode::FAILURE;
+    }
+
+    let mut failures = 0;
+    for php in &sources {
+        let out = match Command::new("php").arg(&helper).arg(php).output() {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("php invocation failed for {}: {e}", php.display());
+                failures += 1;
+                continue;
+            }
+        };
+        if !out.status.success() {
+            eprintln!(
+                "php errored on {}:\n{}",
+                php.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            failures += 1;
+            continue;
+        }
+        let dest = php.with_extension("tokens");
+        if let Err(e) = std::fs::write(&dest, &out.stdout) {
+            eprintln!("write failed {}: {e}", dest.display());
+            failures += 1;
+            continue;
+        }
+        println!("  {}", dest.strip_prefix(&root).unwrap_or(&dest).display());
+    }
+
+    println!("generated {} fixture(s), {failures} failure(s)", sources.len() - failures);
+    if failures == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}

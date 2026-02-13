@@ -1,0 +1,12 @@
+---
+source: crates/php-parser/tests/expr_snapshots.rs
+expression: "prog(\"<?php\\n\\\n        try { risky(); } catch (\\\\E1 | E2 $e) { handle($e); } finally { cleanup(); }\\n\\\n        try { x(); } catch (E) {}\\n\\\n        break;\\n\\\n        break 2;\\n\\\n        continue;\\n\\\n        goto target;\\n\\\n        target:\\n\\\n        throw new E('x');\\n\\\n    \")"
+---
+(try [(expr (call risky []))] (catch \E1|E2 $e [(expr (call handle [$e]))]) (finally [(expr (call cleanup []))]))
+(try [(expr (call x []))] (catch E []))
+(break)
+(break 2)
+(continue)
+(goto target)
+(label target)
+(expr (throw (new E ["x"])))

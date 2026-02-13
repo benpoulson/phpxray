@@ -1,0 +1,19 @@
+---
+source: crates/php-ast/src/lib.rs
+expression: program
+---
+Program {
+    stmts: [
+        Stmt {
+            span: 0..4,
+            kind: Expr(
+                Expr {
+                    span: 0..3,
+                    kind: Int(
+                        123,
+                    ),
+                },
+            ),
+        },
+    ],
+}

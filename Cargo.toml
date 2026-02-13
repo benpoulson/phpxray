@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/php-span",
+    "crates/php-intern",
+    "crates/php-diagnostics",
+    "crates/php-lexer",
+    "crates/php-ast",
+    "crates/php-parser",
+    "crates/xtask",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nexelity/php-analyzer"
+
+[workspace.dependencies]
+# Internal crates (dependency edges enforced per-crate; see plan).
+php-span = { path = "crates/php-span" }
+php-intern = { path = "crates/php-intern" }
+php-diagnostics = { path = "crates/php-diagnostics" }
+php-lexer = { path = "crates/php-lexer" }
+php-ast = { path = "crates/php-ast" }
+php-parser = { path = "crates/php-parser" }
+
+# Third-party
+insta = "1"
+walkdir = "2"
+
+[profile.release]
+# The whole point of the project is speed; optimise the corpus runner & lexer hard.
+lto = "thin"
+codegen-units = 1

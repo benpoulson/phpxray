@@ -1,0 +1,15 @@
+[package]
+name = "php-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+php-span.workspace = true
+php-intern.workspace = true
+php-diagnostics.workspace = true
+php-lexer.workspace = true
+php-ast.workspace = true
+
+[dev-dependencies]
+insta.workspace = true

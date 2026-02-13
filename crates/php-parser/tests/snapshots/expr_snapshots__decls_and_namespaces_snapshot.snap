@@ -1,0 +1,14 @@
+---
+source: crates/php-parser/tests/expr_snapshots.rs
+expression: "prog(\"<?php\\n\\\n        namespace App\\\\Models;\\n\\\n        use App\\\\Support\\\\Str;\\n\\\n        use function App\\\\helpers\\\\tap;\\n\\\n        use App\\\\{A, B as C, function d};\\n\\\n        global $a, $b;\\n\\\n        static $x = 1, $y;\\n\\\n        unset($a, $b['k']);\\n\\\n        declare(strict_types=1);\\n\\\n        $v = include 'f.php';\\n\\\n        require_once __DIR__ . '/x.php';\\n\\\n    \")"
+---
+(namespace App\Models)
+(use Class:App\Support\Str)
+(use Function:App\helpers\tap)
+(use Class:App\A Class:App\B as C Function:App\d)
+(global $a $b)
+(static $x=1 $y)
+(unset $a (idx $b "k"))
+(declare [strict_types=1])
+(expr (= $v (Include "f.php")))
+(expr (RequireOnce (. __DIR__ "/x.php")))

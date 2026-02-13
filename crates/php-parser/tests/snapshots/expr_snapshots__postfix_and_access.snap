@@ -1,0 +1,20 @@
+---
+source: crates/php-parser/tests/expr_snapshots.rs
+expression: "matrix(&[\"$a->b->c\", \"$a?->b->c\", \"foo()\", \"$a->m(1, 2)\", \"Foo::BAR\",\n\"Foo::method($x)\", \"Foo::$prop\", \"Foo::class\", \"$a[0][1]\", \"$obj->arr[1]\",\n\"new Foo(1)\", \"new $cls\", \"$a++ + ++$b\", \"f(...$xs)\", \"g(name: 1, ...$rest)\",\n\"-$a->b\",])"
+---
+$a->b->c                       => (-> (-> $a b) c)
+$a?->b->c                      => (-> (?-> $a b) c)
+foo()                          => (call foo [])
+$a->m(1, 2)                    => (->call $a m [1 2])
+Foo::BAR                       => (:: Foo BAR)
+Foo::method($x)                => (::call Foo method [$x])
+Foo::$prop                     => (::$ Foo $prop)
+Foo::class                     => (:: Foo class)
+$a[0][1]                       => (idx (idx $a 0) 1)
+$obj->arr[1]                   => (idx (-> $obj arr) 1)
+new Foo(1)                     => (new Foo [1])
+new $cls                       => (new $cls [])
+$a++ + ++$b                    => (+ ($a ++) (++ $b))
+f(...$xs)                      => (call f [...$xs])
+g(name: 1, ...$rest)           => (call g [name:1 ...$rest])
+-$a->b                         => (u- (-> $a b))

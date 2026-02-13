@@ -1,0 +1,6 @@
+---
+source: crates/php-parser/tests/expr_snapshots.rs
+expression: "prog(\"<?php\\n\\\n        $r = match ($x) { 1, 2 => 'a', 3 => 'b', default => 'c' };\\n\\\n        $r = match (true) { $x > 0 => 'pos', default => 'np', };\\n\\\n    \")"
+---
+(expr (= $r (match $x (1,2 => "a") (3 => "b") (default => "c"))))
+(expr (= $r (match true ((> $x 0) => "pos") (default => "np"))))

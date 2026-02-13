@@ -1,0 +1,10 @@
+---
+source: crates/php-parser/tests/expr_snapshots.rs
+expression: "prog(\"<?php\\n\\\n        /** doc */\\n\\\n        function add(int $a, int $b = 0): int { return $a + $b; }\\n\\\n        function &refgen(&$x, ...$rest) { yield $x; }\\n\\\n        function nullable(?string $s, A|B $u, X&Y $i): void {}\\n\\\n        $f = function ($x) use ($y, &$z): int { return $x; };\\n\\\n        $g = static fn (int $n) => $n * 2;\\n\\\n        const PI = 3.14, E = 2.71;\\n\\\n    \")"
+---
+"/** doc */" (function add (int $a, int $b=0): int [(return (+ $a $b))])
+(function &refgen (&$x, ...$rest) [(expr (yield $x))])
+(function nullable (?string $s, A|B $u, (X&Y) $i): void [])
+(expr (= $f (closure ($x) use(y,&z): int [(return $x)])))
+(expr (= $g (static fn (int $n) => (* $n 2))))
+(const PI=3.14 E=2.71)

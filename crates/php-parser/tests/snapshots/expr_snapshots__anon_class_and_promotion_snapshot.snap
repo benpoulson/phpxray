@@ -1,0 +1,7 @@
+---
+source: crates/php-parser/tests/expr_snapshots.rs
+expression: "prog(\"<?php\\n\\\n        $o = new class(1) extends Base implements I {\\n\\\n            public function __construct(public int $v) {}\\n\\\n        };\\n\\\n        $p = new Point(1, 2);\\n\\\n        $h = new $cls();\\n\\\n    \")"
+---
+(expr (= $o (new-anon (Class <anon> extends Base implements I [(method public __construct (public int $v) [])]) [1])))
+(expr (= $p (new Point [1 2])))
+(expr (= $h (new $cls [])))

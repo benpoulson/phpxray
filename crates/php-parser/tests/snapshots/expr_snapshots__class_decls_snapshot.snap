@@ -1,0 +1,8 @@
+---
+source: crates/php-parser/tests/expr_snapshots.rs
+expression: "prog(\"<?php\\n\\\n        abstract class Base extends Root implements I1, I2 {\\n\\\n            public const int MAX = 10;\\n\\\n            protected static ?int $count = 0;\\n\\\n            public readonly string $name;\\n\\\n            private int $a = 1, $b = 2;\\n\\\n            public function __construct(public int $x, private readonly string $y) {}\\n\\\n            abstract public function area(): float;\\n\\\n            final protected function tag(): string { return 'x'; }\\n\\\n            use T1, T2;\\n\\\n        }\\n\\\n        interface Shape extends Drawable { public function draw(): void; }\\n\\\n        trait Greet { public function hi() {} }\\n\\\n        enum Suit: string implements HasColor {\\n\\\n            case Hearts = 'H';\\n\\\n            case Spades = 'S';\\n\\\n            public function color(): string { return 'red'; }\\n\\\n        }\\n\\\n    \")"
+---
+(abstract Class Base extends Root implements I1,I2 [(const public MAX=10) (prop protected static ?int $count=0) (prop public readonly string $name) (prop private int $a=1 $b=2) (method public __construct (public int $x, private readonly string $y) []) (method public abstract area (): float ;) (method protected final tag (): string [(return "x")]) (use-trait T1,T2)])
+(Interface Shape extends Drawable [(method public draw (): void ;)])
+(Trait Greet [(method public hi () [])])
+(Enum Suit:string implements HasColor [(case Hearts="H") (case Spades="S") (method public color (): string [(return "red")])])

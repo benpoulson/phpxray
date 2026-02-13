@@ -1,0 +1,15 @@
+---
+source: crates/php-parser/tests/expr_snapshots.rs
+expression: "prog(\"<?php\\n\\\n        if ($a) { foo(); } elseif ($b) bar(); else baz();\\n\\\n        if ($a): echo 1; elseif ($b): echo 2; else: echo 3; endif;\\n\\\n        while ($a) { $i++; }\\n\\\n        while ($a): $i++; endwhile;\\n\\\n        do { $i++; } while ($a);\\n\\\n        for ($i = 0; $i < 10; $i++) loop();\\n\\\n        for (;;) {}\\n\\\n        foreach ($xs as $x) use_it($x);\\n\\\n        foreach ($xs as $k => &$v) {}\\n\\\n        foreach ($xs as [$a, $b]) {}\\n\\\n        switch ($x) { case 1: a(); break; case 2: case 3: b(); default: c(); }\\n\\\n    \")"
+---
+(if $a (block (expr (call foo []))) (elseif $b (expr (call bar []))) (else (expr (call baz []))))
+(if $a (block (echo 1)) (elseif $b (block (echo 2))) (else (block (echo 3))))
+(while $a (block (expr ($i ++))))
+(while $a (block (expr ($i ++))))
+(do-while (block (expr ($i ++))) $a)
+(for [(= $i 0)] [(< $i 10)] [($i ++)] (expr (call loop [])))
+(for [] [] [] (block ))
+(foreach $xs as $x (expr (call use_it [$x])))
+(foreach $xs as $k => &$v (block ))
+(foreach $xs as (array $a $b) (block ))
+(switch $x (case 1 (expr (call a [])) (break)) (case 2 ) (case 3 (expr (call b []))) (case default (expr (call c []))))

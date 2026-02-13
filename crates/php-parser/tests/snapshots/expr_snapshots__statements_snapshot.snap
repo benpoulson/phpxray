@@ -1,0 +1,10 @@
+---
+source: crates/php-parser/tests/expr_snapshots.rs
+expression: out
+---
+(echo 1 2)
+(expr (= $x (+ (call foo [$y]) 3)))
+(return $x)
+(block (expr $a) (expr $b))
+(nop)
+(expr if_marker_not_yet)

@@ -1,0 +1,10 @@
+[package]
+name = "php-lexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+php-span.workspace = true
+php-intern.workspace = true
+php-diagnostics.workspace = true

@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target
+
+# insta pending snapshots (review + accept, don't commit the .new files)
+*.snap.new
+
+# Reference PHP source / parse corpus (~870 MB, a checkout of php/php-src).
+# Not vendored into this repo — obtain separately and place at ./php-src.
+# Used only by dev tooling (`xtask corpus`/`difftokens`/`gen-tokens`); the
+# committed golden fixtures under test-fixtures/ make the test suite self-contained.
+/php-src
+
+# JetBrains IDE
+/.idea
