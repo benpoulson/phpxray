@@ -521,6 +521,10 @@ pub enum ExprKind {
     },
     /// `eval(expr)`
     Eval(Box<Expr>),
+    /// `isset($a, $b)`
+    Isset(Vec<Expr>),
+    /// `empty($x)`
+    Empty(Box<Expr>),
     /// `function (...) use (...) { ... }`
     Closure(Box<ClosureExpr>),
     /// `fn (...) => expr`

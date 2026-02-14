@@ -904,6 +904,12 @@ impl<'a> Lexer<'a> {
             }
         }
 
+        // `enum` is contextual: a keyword only when it starts a declaration
+        // (`enum Foo`), otherwise an identifier (`enum()`, `enum;`, `enum::X`).
+        if first.eq_ignore_ascii_case("enum") && !self.enum_is_declaration() {
+            return TokenKind::Identifier;
+        }
+
         match Kw::lookup(&first.to_ascii_lowercase()) {
             Some(kw) => {
                 // Asymmetric visibility: `private(set)` etc. is one token (no
@@ -931,6 +937,22 @@ impl<'a> Lexer<'a> {
         } else {
             None
         }
+    }
+
+    /// Whether the just-lexed `enum` begins an enum declaration: followed by
+    /// whitespace/comments then an identifier that is not `extends`/`implements`.
+    fn enum_is_declaration(&self) -> bool {
+        let b = self.bytes;
+        let i = self.skip_ws_and_comments(self.pos);
+        if i >= b.len() || !is_label_start(b[i]) {
+            return false;
+        }
+        let mut j = i;
+        while j < b.len() && is_label_cont(b[j]) {
+            j += 1;
+        }
+        let word = &self.text[i..j];
+        !word.eq_ignore_ascii_case("extends") && !word.eq_ignore_ascii_case("implements")
     }
 
     /// If `yield` is followed by whitespace/comments then the word `from`, return

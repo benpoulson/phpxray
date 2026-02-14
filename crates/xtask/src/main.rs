@@ -29,6 +29,8 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("corpus") => cmd_corpus(args.get(1).map(PathBuf::from)),
+        Some("triage") => cmd_triage(args.get(1).map(PathBuf::from)),
+        Some("diag") => cmd_diag(args.get(1).map(PathBuf::from)),
         Some("difftokens") => cmd_difftokens(&args[1..]),
         Some("phpt-extract") => cmd_phpt_extract(args.get(1).map(PathBuf::from)),
         Some("gen-tokens") => cmd_gen_tokens(),
@@ -252,6 +254,74 @@ fn cmd_corpus(dir: Option<PathBuf>) -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Triage: list corpus files that parse *with errors* but are NOT intentional
+/// parse-error tests — the M8 worklist. Tally by first diagnostic message.
+fn cmd_triage(dir: Option<PathBuf>) -> ExitCode {
+    let dir = dir.unwrap_or_else(|| workspace_root().join("php-src/Zend/tests"));
+    let mut by_msg: BTreeMap<String, (usize, Vec<String>)> = BTreeMap::new();
+    let mut total = 0usize;
+
+    for entry in WalkDir::new(&dir).into_iter().filter_map(Result::ok) {
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("phpt") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
+        if phpt::expects_parse_error(&text) {
+            continue; // intentional error — not our worklist
+        }
+        let Some(source) = phpt::extract_file_section(&text) else { continue };
+        let Ok(result) = catch_unwind(AssertUnwindSafe(|| php_parser::parse(&source))) else {
+            continue;
+        };
+        let Some(first) = result.diagnostics.iter().find(|d| d.is_error()) else {
+            continue;
+        };
+        total += 1;
+        let name = entry.path().file_name().unwrap().to_string_lossy().into_owned();
+        let bucket = by_msg.entry(first.message.clone()).or_default();
+        bucket.0 += 1;
+        if bucket.1.len() < 3 {
+            bucket.1.push(name);
+        }
+    }
+
+    println!("{total} non-intentional files parse with errors. By first diagnostic:\n");
+    let mut rows: Vec<_> = by_msg.into_iter().collect();
+    rows.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+    for (msg, (n, examples)) in rows {
+        println!("{n:>5}  {msg}");
+        println!("       e.g. {}", examples.join(", "));
+    }
+    ExitCode::SUCCESS
+}
+
+/// Parse one `.phpt`'s `--FILE--` and print each diagnostic with its source
+/// slice and 1-based line — pinpoints where the parser trips.
+fn cmd_diag(path: Option<PathBuf>) -> ExitCode {
+    let Some(path) = path else {
+        eprintln!("usage: xtask diag FILE.phpt");
+        return ExitCode::FAILURE;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        eprintln!("cannot read {}", path.display());
+        return ExitCode::FAILURE;
+    };
+    let Some(source) = phpt::extract_file_section(&text) else {
+        eprintln!("no --FILE-- section");
+        return ExitCode::FAILURE;
+    };
+    let r = php_parser::parse(&source);
+    println!("{} diagnostic(s):", r.diagnostics.len());
+    for d in &r.diagnostics {
+        let s = d.primary.start as usize;
+        let e = (d.primary.end as usize).min(source.len());
+        let line = source[..s.min(source.len())].bytes().filter(|&b| b == b'\n').count() + 1;
+        let slice = source.get(s..e).unwrap_or("");
+        println!("  line {line}: {} — {:?}", d.message, slice);
+    }
+    ExitCode::SUCCESS
 }
 
 fn cmd_phpt_extract(path: Option<PathBuf>) -> ExitCode {

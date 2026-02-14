@@ -114,6 +114,8 @@ fn render(e: &Expr, i: &Interner) -> String {
         }
         Include { kind, expr } => format!("({kind:?} {})", render(expr, i)),
         Eval(e) => format!("(eval {})", render(e, i)),
+        Isset(vs) => format!("(isset {})", vs.iter().map(|v| render(v, i)).collect::<Vec<_>>().join(" ")),
+        Empty(e) => format!("(empty {})", render(e, i)),
         Closure(c) => {
             let st = if c.is_static { "static " } else { "" };
             let uses = if c.uses.is_empty() {
@@ -518,6 +520,22 @@ fn anon_class_and_promotion_snapshot() {
         };\n\
         $p = new Point(1, 2);\n\
         $h = new $cls();\n\
+    "));
+}
+
+#[test]
+fn modern_syntax_snapshot() {
+    insta::assert_snapshot!(prog("<?php\n\
+        $x = isset($a, $b['k']);\n\
+        $y = empty($v);\n\
+        $c = clone $a;\n\
+        $d = clone($a);\n\
+        $e = clone($a, ['p' => 1]);\n\
+        $f = strlen(...);\n\
+        $g = $obj->method(...);\n\
+        $h = new readonly class extends B implements I {};\n\
+        $r = readonly();\n\
+        enum_func();\n\
     "));
 }
 

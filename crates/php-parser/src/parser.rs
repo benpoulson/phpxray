@@ -23,25 +23,37 @@ pub struct Parser<'a> {
     interner: Interner,
     diags: Vec<Diagnostic>,
     depth: u32,
-    /// The most recent doc-comment, awaiting attachment to a declaration.
-    pending_doc: Option<String>,
+    /// Doc-comments are kept out of the parse stream (so they never disrupt
+    /// parsing) and attached to declarations by source position. `(end, text)`,
+    /// in source order.
+    docs: Vec<(u32, String)>,
 }
 
 impl<'a> Parser<'a> {
     pub fn new(source: &'a str) -> Parser<'a> {
-        let (tokens, diags) = php_lexer::tokenize(source);
-        Parser { src: source, tokens, pos: 0, interner: Interner::new(), diags, depth: 0, pending_doc: None }
+        let (lexed, diags) = php_lexer::tokenize(source);
+        let mut docs = Vec::new();
+        let mut tokens = Vec::with_capacity(lexed.len());
+        for t in lexed {
+            if t.kind == T::DocComment {
+                docs.push((t.span.end, t.span.text(source).to_string()));
+            } else {
+                tokens.push(t);
+            }
+        }
+        Parser { src: source, tokens, pos: 0, interner: Interner::new(), diags, depth: 0, docs }
     }
 
-    /// Consume any doc-comment tokens, remembering the last as pending.
-    fn skip_docs(&mut self) {
-        while self.at(T::DocComment) {
-            let t = self.bump();
-            self.pending_doc = Some(self.text(t).to_string());
+    /// The doc-comment immediately preceding `offset` (only whitespace between),
+    /// if any — used to attach docs to the following declaration.
+    fn doc_before(&self, offset: u32) -> Option<String> {
+        for (end, text) in self.docs.iter().rev() {
+            if *end <= offset {
+                let gap = &self.src[*end as usize..offset as usize];
+                return gap.bytes().all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n')).then(|| text.clone());
+            }
         }
-    }
-    fn take_doc(&mut self) -> Option<String> {
-        self.pending_doc.take()
+        None
     }
 
     pub fn parse(mut self) -> ParseResult {
@@ -182,9 +194,8 @@ impl<'a> Parser<'a> {
             self.synchronize();
             return Stmt::new(self.span_to(s), StmtKind::Error);
         }
-        self.skip_docs();
-        let doc = self.take_doc();
         let start = self.cur_start();
+        let doc = self.doc_before(start);
         let kind = match self.peek() {
             T::Semicolon => {
                 self.bump();
@@ -263,6 +274,15 @@ impl<'a> Parser<'a> {
                 let elems = self.parse_const_elems();
                 self.eat_stmt_end();
                 StmtKind::ConstDecl(elems)
+            }
+            T::Keyword(Kw::HaltCompiler) => {
+                // `__halt_compiler();` — the lexer already turned the trailing
+                // bytes into one T_INLINE_HTML, handled by the statement loop.
+                self.bump();
+                self.eat(T::LParen);
+                self.eat(T::RParen);
+                self.eat_stmt_end();
+                StmtKind::Nop
             }
 
             // A label: `name:` (but not `name::` or `name ? :`).
@@ -619,9 +639,10 @@ impl<'a> Parser<'a> {
 
     fn parse_namespace(&mut self) -> StmtKind {
         self.bump();
+        // A reserved word may be a namespace-name segment (`namespace enum;`).
         let name = if matches!(
             self.peek(),
-            T::Identifier | T::NameQualified | T::NameFullyQualified | T::NameRelative
+            T::Identifier | T::NameQualified | T::NameFullyQualified | T::NameRelative | T::Keyword(_)
         ) {
             Some(self.parse_name())
         } else {
@@ -766,7 +787,6 @@ impl<'a> Parser<'a> {
 
     fn parse_attributed_decl(&mut self, doc: Option<String>) -> StmtKind {
         let attrs = self.parse_attributes();
-        self.skip_docs();
         match self.peek() {
             T::Keyword(Kw::Function) if self.is_function_decl() => {
                 StmtKind::Function(self.parse_function_decl(attrs, doc))
@@ -858,6 +878,10 @@ impl<'a> Parser<'a> {
             self.interner.intern("")
         };
         let default = if self.eat(T::Eq) { Some(self.parse_expr(0)) } else { None };
+        // Promoted property with hooks: `public $x { get {} set {} }` — bodies M-later.
+        if self.at(T::LBrace) {
+            self.skip_balanced_braces();
+        }
         Param { attrs, modifiers, ty, by_ref, variadic, name, default }
     }
 
@@ -936,11 +960,8 @@ impl<'a> Parser<'a> {
         let mut members = Vec::new();
         while !self.at(T::RBrace) && !self.at_eof() {
             let before = self.pos;
-            self.skip_docs();
-            if self.at(T::RBrace) {
-                break;
-            }
-            let doc = self.take_doc();
+            let mstart = self.cur_start();
+            let doc = self.doc_before(mstart);
             let attrs = self.parse_attributes();
             members.push(self.parse_member(attrs, doc));
             self.ensure_progress(before);
@@ -1204,7 +1225,16 @@ impl<'a> Parser<'a> {
         )
     }
 
-    fn parse_anon_class(&mut self, start: u32) -> Expr {
+    /// Lookahead: optional class modifiers followed by `class`.
+    fn is_anon_class_ahead(&self) -> bool {
+        let mut k = 0;
+        while matches!(self.nth(k), T::Keyword(Kw::Readonly | Kw::Abstract | Kw::Final)) {
+            k += 1;
+        }
+        self.nth(k) == T::Keyword(Kw::Class)
+    }
+
+    fn parse_anon_class(&mut self, start: u32, attrs: Vec<AttributeGroup>, modifiers: Modifiers) -> Expr {
         self.bump(); // class
         let args = if self.at(T::LParen) { self.parse_args() } else { Vec::new() };
         let extends = if self.eat(T::Keyword(Kw::Extends)) { vec![self.parse_name()] } else { Vec::new() };
@@ -1212,11 +1242,11 @@ impl<'a> Parser<'a> {
             if self.eat(T::Keyword(Kw::Implements)) { self.name_list() } else { Vec::new() };
         let members = self.parse_class_body();
         let class = ClassDecl {
-            attrs: Vec::new(),
+            attrs,
             doc: None,
             kind: ClassKind::Class,
             name: None,
-            modifiers: Modifiers::default(),
+            modifiers,
             extends,
             implements,
             backing: None,
@@ -1418,6 +1448,23 @@ impl<'a> Parser<'a> {
                 self.node(start, ExprKind::Cast { kind: cast_kind(k).unwrap(), expr: Box::new(e) })
             }
             T::Keyword(kw) => return self.parse_keyword_prefix(kw, start),
+            // Attributes in expression position decorate a closure / arrow fn.
+            T::Attribute => {
+                let attrs = self.parse_attributes();
+                match self.peek() {
+                    T::Keyword(Kw::Function) => self.parse_closure(start, false, attrs),
+                    T::Keyword(Kw::Fn) => self.parse_arrow(start, false, attrs),
+                    T::Keyword(Kw::Static) if self.nth(1) == T::Keyword(Kw::Function) => {
+                        self.bump();
+                        self.parse_closure(start, true, attrs)
+                    }
+                    T::Keyword(Kw::Static) if self.nth(1) == T::Keyword(Kw::Fn) => {
+                        self.bump();
+                        self.parse_arrow(start, true, attrs)
+                    }
+                    _ => self.parse_prefix(),
+                }
+            }
             _ => {
                 self.error_here("unexpected token in expression");
                 self.bump();
@@ -1441,8 +1488,23 @@ impl<'a> Parser<'a> {
             Kw::New => self.parse_new(start),
             Kw::Clone => {
                 self.bump();
-                let e = self.parse_expr(BP_CLONE);
-                self.node(start, ExprKind::Clone(Box::new(e)))
+                // PHP 8.5 clone-with-args: `clone($obj, [...])`. A single plain
+                // `clone($x)` is the ordinary clone construct; multiple/named/
+                // spread args make it a call (matching PHP's own AST).
+                if self.at(T::LParen) {
+                    let mut args = self.parse_args();
+                    if args.len() == 1 && !args[0].spread && args[0].name.is_none() {
+                        let only = args.pop().unwrap();
+                        self.node(start, ExprKind::Clone(Box::new(only.value)))
+                    } else {
+                        let callee =
+                            Expr::new(Span::at(start), ExprKind::Name(Name { fq: NameFq::NotFq, text: "clone".into() }));
+                        self.node(start, ExprKind::Call { callee: Box::new(callee), args })
+                    }
+                } else {
+                    let e = self.parse_expr(BP_CLONE);
+                    self.node(start, ExprKind::Clone(Box::new(e)))
+                }
             }
             Kw::Print => {
                 self.bump();
@@ -1468,6 +1530,20 @@ impl<'a> Parser<'a> {
                 self.expect(T::RParen, "`)`");
                 self.node(start, ExprKind::Eval(Box::new(e)))
             }
+            Kw::Isset => {
+                self.bump();
+                self.expect(T::LParen, "`(`");
+                let vars = self.parse_call_like_exprs();
+                self.expect(T::RParen, "`)`");
+                self.node(start, ExprKind::Isset(vars))
+            }
+            Kw::Empty => {
+                self.bump();
+                self.expect(T::LParen, "`(`");
+                let e = self.parse_expr(0);
+                self.expect(T::RParen, "`)`");
+                self.node(start, ExprKind::Empty(Box::new(e)))
+            }
             Kw::Function => self.parse_closure(start, false, Vec::new()),
             Kw::Fn => self.parse_arrow(start, false, Vec::new()),
             Kw::Static if self.nth(1) == T::Keyword(Kw::Function) => {
@@ -1479,6 +1555,12 @@ impl<'a> Parser<'a> {
                 self.parse_arrow(start, true, Vec::new())
             }
             Kw::Static => {
+                let t = self.bump();
+                self.node(start, ExprKind::Name(Name { fq: NameFq::NotFq, text: self.text(t).to_string() }))
+            }
+            // `readonly` is usable as a function/constant name (PHP grammar's
+            // `function_name: T_STRING | T_READONLY`).
+            Kw::Readonly => {
                 let t = self.bump();
                 self.node(start, ExprKind::Name(Name { fq: NameFq::NotFq, text: self.text(t).to_string() }))
             }
@@ -1543,7 +1625,13 @@ impl<'a> Parser<'a> {
     fn parse_exit(&mut self, start: u32) -> Expr {
         self.bump(); // exit / die
         let arg = if self.eat(T::LParen) {
-            let a = if self.at(T::RParen) { None } else { Some(Box::new(self.parse_expr(0))) };
+            // `exit(...)` first-class-callable form has no argument.
+            let a = if self.at(T::RParen) || (self.at(T::Ellipsis) && self.nth(1) == T::RParen) {
+                self.eat(T::Ellipsis);
+                None
+            } else {
+                Some(Box::new(self.parse_expr(0)))
+            };
             self.expect(T::RParen, "`)`");
             a
         } else {
@@ -1554,8 +1642,14 @@ impl<'a> Parser<'a> {
 
     fn parse_yield(&mut self, start: u32) -> Expr {
         self.bump(); // yield
-        // `yield` with no operand (followed by a terminator/closer).
-        if matches!(self.peek(), T::Semicolon | T::RParen | T::RBracket | T::CloseTag | T::Eof | T::Comma) {
+        // `yield` has no operand when followed by a terminator, or by an infix
+        // operator that cannot also start an expression (so `yield * -1` parses
+        // as `(yield) * -1`, while `yield +1` yields `+1`).
+        let no_operand = matches!(
+            self.peek(),
+            T::Semicolon | T::RParen | T::RBracket | T::RBrace | T::CloseTag | T::Eof | T::Comma
+        ) || (infix_power(self.peek()).is_some() && !matches!(self.peek(), T::Plus | T::Minus));
+        if no_operand {
             return self.node(start, ExprKind::Yield { key: None, value: None });
         }
         let first = self.parse_expr(BP_YIELD);
@@ -1654,6 +1748,17 @@ impl<'a> Parser<'a> {
             T::Variable => {
                 let t = self.bump();
                 let name = MemberName::Var(self.intern_var(t));
+                if self.at(T::LParen) {
+                    let args = self.parse_args();
+                    self.node(start, ExprKind::StaticCall { class: Box::new(class), method: name, args })
+                } else {
+                    self.node(start, ExprKind::StaticProp { class: Box::new(class), name })
+                }
+            }
+            // `Foo::$$var` — a variable-variable static member.
+            T::Dollar => {
+                let var = self.parse_variable_variable();
+                let name = MemberName::Expr(Box::new(var));
                 if self.at(T::LParen) {
                     let args = self.parse_args();
                     self.node(start, ExprKind::StaticCall { class: Box::new(class), method: name, args })
@@ -1836,8 +1941,15 @@ impl<'a> Parser<'a> {
 
     fn parse_new(&mut self, start: u32) -> Expr {
         self.bump(); // new
-        if self.at(T::Keyword(Kw::Class)) {
-            return self.parse_anon_class(start);
+        // `new #[Attr] readonly class {...}` — attributes/modifiers on an
+        // anonymous class.
+        let attrs = self.parse_attributes();
+        // `new [modifiers] class { … }` — anonymous class. Modifiers like
+        // `final`/duplicate `readonly` are accepted syntactically; their
+        // validity is a later semantic check (matching PHP).
+        if self.is_anon_class_ahead() {
+            let modifiers = self.parse_modifiers();
+            return self.parse_anon_class(start, attrs, modifiers);
         }
         let class = self.parse_class_ref();
         let args = if self.at(T::LParen) { self.parse_args() } else { Vec::new() };

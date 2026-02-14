@@ -1,0 +1,14 @@
+---
+source: crates/php-parser/tests/expr_snapshots.rs
+expression: "prog(\"<?php\\n\\\n        $x = isset($a, $b['k']);\\n\\\n        $y = empty($v);\\n\\\n        $c = clone $a;\\n\\\n        $d = clone($a);\\n\\\n        $e = clone($a, ['p' => 1]);\\n\\\n        $f = strlen(...);\\n\\\n        $g = $obj->method(...);\\n\\\n        $h = new readonly class extends B implements I {};\\n\\\n        $r = readonly();\\n\\\n        enum_func();\\n\\\n    \")"
+---
+(expr (= $x (isset $a (idx $b "k"))))
+(expr (= $y (empty $v)))
+(expr (= $c (clone $a)))
+(expr (= $d (clone $a)))
+(expr (= $e (call clone [$a (array "p"=>1)])))
+(expr (= $f (call strlen [])))
+(expr (= $g (->call $obj method [])))
+(expr (= $h (new-anon (readonly Class <anon> extends B implements I []) [])))
+(expr (= $r (call readonly [])))
+(expr (call enum_func []))
