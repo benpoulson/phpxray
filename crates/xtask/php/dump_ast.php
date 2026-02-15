@@ -19,6 +19,11 @@ if ($argc < 2) {
 }
 $src = $argv[1] === '-' ? stream_get_contents(STDIN) : file_get_contents($argv[1]);
 
+// Suppress compile-time warnings/notices (e.g. octal-overflow, declare-encoding)
+// so they don't pollute the AST dump on stdout. We only care about structure.
+error_reporting(0);
+ini_set('display_errors', '0');
+
 // Children keys that are metadata, not structural AST.
 const SKIP = ['docComment' => 1, '__declId' => 1];
 

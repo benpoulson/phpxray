@@ -1129,22 +1129,16 @@ impl<'a> Parser<'a> {
                 let class = class.unwrap_or(Name { fq: NameFq::NotFq, text: String::new() });
                 out.push(TraitAdaptation::Precedence { class, method, insteadof });
             } else if self.eat(T::Keyword(Kw::As)) {
-                let visibility = match self.peek() {
-                    T::Keyword(Kw::Public) => Some(Visibility::Public),
-                    T::Keyword(Kw::Protected) => Some(Visibility::Protected),
-                    T::Keyword(Kw::Private) => Some(Visibility::Private),
-                    _ => None,
-                };
-                if visibility.is_some() {
-                    self.bump();
-                }
+                // `as` may be followed by member modifiers (visibility, `final`,
+                // …) and/or a new name.
+                let modifiers = self.parse_modifiers();
                 let alias = if matches!(self.peek(), T::Identifier | T::Keyword(_)) {
                     let t = self.bump();
                     Some(self.intern_tok(t))
                 } else {
                     None
                 };
-                out.push(TraitAdaptation::Alias { class, method, visibility, alias });
+                out.push(TraitAdaptation::Alias { class, method, modifiers, alias });
             } else {
                 self.error_here("expected `insteadof` or `as`");
             }
@@ -2251,7 +2245,7 @@ const BP_YIELD: u8 = 10;
 const BP_NOT: u8 = 42; // `!`
 const BP_UNARY2: u8 = 46; // `~`, casts, `@`, unary `+`/`-`
 const BP_CLONE: u8 = 50;
-const BP_TERNARY_RHS: u8 = 13;
+const BP_TERNARY_RHS: u8 = 14; // `?:`/`?:` is left-associative (matches `%left '?' ':'`)
 
 fn infix_power(k: T) -> Option<(u8, u8)> {
     Some(match k {

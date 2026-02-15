@@ -298,9 +298,10 @@ fn render_member(m: &Member, i: &Interner) -> String {
                         let io: Vec<_> = insteadof.iter().map(|n| n.text.clone()).collect();
                         format!("{}::{} insteadof {}", class.text, i.resolve(*method), io.join(","))
                     }
-                    TraitAdaptation::Alias { class, method, visibility, alias } => {
+                    TraitAdaptation::Alias { class, method, modifiers, alias } => {
                         let c = class.as_ref().map(|c| format!("{}::", c.text)).unwrap_or_default();
-                        let v = visibility.map(|v| format!(" {v:?}").to_lowercase()).unwrap_or_default();
+                        let v = mods(modifiers);
+                        let v = if v.is_empty() { String::new() } else { format!(" {v}") };
                         let a = alias.map(|a| format!(" {}", i.resolve(a))).unwrap_or_default();
                         format!("{c}{} as{v}{a}", i.resolve(*method))
                     }

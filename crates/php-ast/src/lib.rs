@@ -268,11 +268,13 @@ pub enum TraitAdaptation {
         method: Symbol,
         insteadof: Vec<Name>,
     },
-    /// `A::foo as protected bar;` / `foo as bar;` / `foo as protected;`
+    /// `A::foo as protected bar;` / `foo as bar;` / `foo as final;`
     Alias {
         class: Option<Name>,
         method: Symbol,
-        visibility: Option<Visibility>,
+        /// Modifiers applied by the alias (`public`/`protected`/`private`,
+        /// `final`, …); empty for a plain rename.
+        modifiers: Modifiers,
         alias: Option<Symbol>,
     },
 }

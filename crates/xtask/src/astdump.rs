@@ -453,15 +453,10 @@ impl<'a> Dumper<'a> {
                 let names: Vec<_> = insteadof.iter().map(|n| ("", self.name_ref(n))).collect();
                 node("TRAIT_PRECEDENCE", vec![("method", mr), ("insteadof", C::N("NAME_LIST".into(), names))])
             }
-            TraitAdaptation::Alias { class, method, visibility, alias } => {
+            TraitAdaptation::Alias { class, method, modifiers, alias } => {
                 let cls = class.as_ref().map(|c| self.name_ref(c)).unwrap_or(C::Null);
                 let mr = node("METHOD_REFERENCE", vec![("class", cls), ("method", C::Str(self.sym(*method)))]);
-                let flag = match visibility {
-                    Some(Visibility::Public) => 1,
-                    Some(Visibility::Protected) => 2,
-                    Some(Visibility::Private) => 4,
-                    None => 0,
-                };
+                let flag = modifiers_flag(modifiers, false);
                 C::N(
                     head("TRAIT_ALIAS", flag),
                     vec![("method", mr), ("alias", alias.map(|a| C::Str(self.sym(a))).unwrap_or(C::Null))],
@@ -586,12 +581,14 @@ impl<'a> Dumper<'a> {
             ExprKind::ErrorSuppress(e) => C::N(head("UNARY_OP", 260), vec![("expr", self.expr(e))]),
             ExprKind::Empty(e) => node("EMPTY", vec![("expr", self.expr(e))]),
             ExprKind::Isset(vs) => {
-                // `isset($a, $b)` => AST_ISSET nested via AND in Zend; single => ISSET.
-                let mut it = vs.iter().rev();
-                let last = it.next().expect("isset has >=1 arg");
-                let mut acc = node("ISSET", vec![("var", self.expr(last))]);
+                // `isset($a, $b, ...)` folds left into BINARY_OP#259 (boolean and)
+                // over per-arg ISSET nodes; a single arg is a bare ISSET.
+                let mut it = vs.iter();
+                let first = it.next().expect("isset has >=1 arg");
+                let mut acc = node("ISSET", vec![("var", self.expr(first))]);
                 for v in it {
-                    acc = node("AND", vec![("left", node("ISSET", vec![("var", self.expr(v))])), ("right", acc)]);
+                    let right = node("ISSET", vec![("var", self.expr(v))]);
+                    acc = C::N(head("BINARY_OP", 259), vec![("left", acc), ("right", right)]);
                 }
                 acc
             }
@@ -759,6 +756,14 @@ impl<'a> Dumper<'a> {
     }
 
     fn binary(&self, op: BinOp, lhs: &Expr, rhs: &Expr) -> C {
+        // PHP folds constant `.` concatenation at AST-build time
+        // (zend_ast_create_concat_op): two scalar operands collapse to one
+        // string. No other operator is folded into the AST.
+        if op == BinOp::Concat {
+            if let (Some(a), Some(b)) = (fold_zval_str(lhs), fold_zval_str(rhs)) {
+                return C::Str(format!("{a}{b}"));
+            }
+        }
         // php-ast represents every binary operator as BINARY_OP#flag.
         C::N(head("BINARY_OP", binop_flag(op)), vec![("left", self.expr(lhs)), ("right", self.expr(rhs))])
     }
@@ -911,6 +916,70 @@ fn modifiers_flag(m: &Modifiers, default_public: bool) -> u32 {
         f |= 128;
     }
     f
+}
+
+/// Fold a constant-expression operand of `.` to its PHP string value, recursing
+/// through nested constant concatenations. Returns `None` for anything that is
+/// not a literal scalar (variables, named constants, `true`/`false`/`null`,
+/// other operators), which PHP leaves un-folded.
+fn fold_zval_str(e: &Expr) -> Option<String> {
+    match &e.kind {
+        ExprKind::Str(s) => Some(s.clone()),
+        ExprKind::Int(i) => Some(i.to_string()),
+        ExprKind::Float(f) => Some(php_runtime_float(*f)),
+        ExprKind::Binary { op: BinOp::Concat, lhs, rhs } => {
+            Some(format!("{}{}", fold_zval_str(lhs)?, fold_zval_str(rhs)?))
+        }
+        _ => None,
+    }
+}
+
+/// PHP's runtime float→string conversion (precision 14, `%G`-style), used when a
+/// float operand is folded into a constant concatenation. Distinct from the
+/// `var_export` form used for float *leaves*.
+fn php_runtime_float(f: f64) -> String {
+    if f.is_nan() {
+        return "NAN".into();
+    }
+    if f.is_infinite() {
+        return if f > 0.0 { "INF".into() } else { "-INF".into() };
+    }
+    if f == 0.0 {
+        return if f.is_sign_negative() { "-0".into() } else { "0".into() };
+    }
+    const P: i32 = 14;
+    // Read the true decimal exponent from a scientific rendering.
+    let sci = format!("{:.*E}", (P - 1) as usize, f);
+    let epos = sci.find('E').unwrap();
+    let exp: i32 = sci[epos + 1..].parse().unwrap();
+    if (-4..P).contains(&exp) {
+        let prec = (P - 1 - exp).max(0) as usize;
+        let mut s = format!("{f:.prec$}");
+        if s.contains('.') {
+            while s.ends_with('0') {
+                s.pop();
+            }
+            if s.ends_with('.') {
+                s.pop();
+            }
+        }
+        s
+    } else {
+        let mut mant = sci[..epos].to_string();
+        if mant.contains('.') {
+            while mant.ends_with('0') {
+                mant.pop();
+            }
+            if mant.ends_with('.') {
+                mant.pop();
+            }
+        }
+        if !mant.contains('.') {
+            mant.push_str(".0");
+        }
+        let sign = if exp < 0 { "-" } else { "+" };
+        format!("{mant}E{sign}{}", exp.abs())
+    }
 }
 
 /// php-ast `ast\flags\BINARY_*` values — note php-ast normalizes `&&`/`||`/`>`/
