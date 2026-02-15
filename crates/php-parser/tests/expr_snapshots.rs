@@ -145,6 +145,7 @@ fn render(e: &Expr, i: &Interner) -> String {
             format!("({st}fn ({}){} => {})", params(&a.params, i), ret(&a.return_type), render(&a.body, i))
         }
         NewAnon { class, args } => format!("(new-anon {} {})", render_class(class, i), render_args(args, i)),
+        Paren(inner) => render(inner, i),
         Error => "<error>".into(),
         _ => "<unknown>".into(),
     }
@@ -262,13 +263,20 @@ fn render_member(m: &Member, i: &Interner) -> String {
             let ps: Vec<_> = d
                 .props
                 .iter()
-                .map(|p| match &p.default {
-                    Some(v) => format!("${}={}", i.resolve(p.name), render(v, i)),
-                    None => format!("${}", i.resolve(p.name)),
+                .map(|p| {
+                    let base = match &p.default {
+                        Some(v) => format!("${}={}", i.resolve(p.name), render(v, i)),
+                        None => format!("${}", i.resolve(p.name)),
+                    };
+                    if p.hooks.is_empty() {
+                        base
+                    } else {
+                        let hs: Vec<_> = p.hooks.iter().map(|h| render_hook(h, i)).collect();
+                        format!("{base} {{{}}}", hs.join(" "))
+                    }
                 })
                 .collect();
-            let hook = if d.hooked { " {hooks}" } else { "" };
-            format!("(prop {md}{t}{}{hook})", ps.join(" "))
+            format!("(prop {md}{t}{})", ps.join(" "))
         }
         Member::ClassConst(d) => {
             let md = mods(&d.modifiers);
@@ -282,7 +290,24 @@ fn render_member(m: &Member, i: &Interner) -> String {
         },
         Member::TraitUse(d) => {
             let ts: Vec<_> = d.traits.iter().map(|n| n.text.clone()).collect();
-            format!("(use-trait {}{})", ts.join(","), if d.has_adaptations { " {..}" } else { "" })
+            let ad: Vec<_> = d
+                .adaptations
+                .iter()
+                .map(|a| match a {
+                    TraitAdaptation::Precedence { class, method, insteadof } => {
+                        let io: Vec<_> = insteadof.iter().map(|n| n.text.clone()).collect();
+                        format!("{}::{} insteadof {}", class.text, i.resolve(*method), io.join(","))
+                    }
+                    TraitAdaptation::Alias { class, method, visibility, alias } => {
+                        let c = class.as_ref().map(|c| format!("{}::", c.text)).unwrap_or_default();
+                        let v = visibility.map(|v| format!(" {v:?}").to_lowercase()).unwrap_or_default();
+                        let a = alias.map(|a| format!(" {}", i.resolve(a))).unwrap_or_default();
+                        format!("{c}{} as{v}{a}", i.resolve(*method))
+                    }
+                })
+                .collect();
+            let adapt = if ad.is_empty() { String::new() } else { format!(" {{{}}}", ad.join("; ")) };
+            format!("(use-trait {}{adapt})", ts.join(","))
         }
     }
 }
@@ -688,6 +713,18 @@ fn render_stmt(s: &Stmt, i: &Interner) -> String {
         }
         _ => "(unknown)".into(),
     }
+}
+
+fn render_hook(h: &PropertyHook, i: &Interner) -> String {
+    let r = if h.by_ref { "&" } else { "" };
+    let body = match &h.body {
+        HookBody::Abstract => ";".to_string(),
+        HookBody::Short(e) => format!("=> {}", render(e, i)),
+        HookBody::Block(b) => {
+            format!("[{}]", b.iter().map(|s| render_stmt(s, i)).collect::<Vec<_>>().join(" "))
+        }
+    };
+    format!("{r}{} {body}", i.resolve(h.name))
 }
 
 fn exprs(es: &[Expr], i: &Interner) -> String {

@@ -362,7 +362,7 @@ impl<'a> Dumper<'a> {
                             node("PROP_ELEM", vec![
                                 ("name", C::Str(self.sym(p.name))),
                                 ("default", p.default.as_ref().map(|e| self.expr(e)).unwrap_or(C::Null)),
-                                ("hooks", C::Null),
+                                ("hooks", self.hooks(&p.hooks)),
                             ]),
                         )
                     })
@@ -401,7 +401,18 @@ impl<'a> Dumper<'a> {
             ),
             Member::TraitUse(d) => {
                 let names: Vec<_> = d.traits.iter().map(|n| ("", self.name_ref(n))).collect();
-                node("USE_TRAIT", vec![("traits", C::N("NAME_LIST".into(), names)), ("adaptations", C::Null)])
+                let adaptations = if d.adaptations.is_empty() {
+                    C::Null
+                } else {
+                    C::N(
+                        "TRAIT_ADAPTATIONS".into(),
+                        d.adaptations.iter().map(|a| ("", self.trait_adaptation(a))).collect(),
+                    )
+                };
+                node(
+                    "USE_TRAIT",
+                    vec![("traits", C::N("NAME_LIST".into(), names)), ("adaptations", adaptations)],
+                )
             }
         }
     }
@@ -426,13 +437,62 @@ impl<'a> Dumper<'a> {
                             ("name", C::Str(self.sym(p.name))),
                             ("default", p.default.as_ref().map(|e| self.expr(e)).unwrap_or(C::Null)),
                             ("attributes", self.attrs(&p.attrs)),
-                            ("hooks", C::Null),
+                            ("hooks", self.hooks(&p.hooks)),
                         ],
                     ),
                 )
             })
             .collect();
         C::N("PARAM_LIST".into(), kids)
+    }
+
+    fn trait_adaptation(&self, a: &TraitAdaptation) -> C {
+        match a {
+            TraitAdaptation::Precedence { class, method, insteadof } => {
+                let mr = node("METHOD_REFERENCE", vec![("class", self.name_ref(class)), ("method", C::Str(self.sym(*method)))]);
+                let names: Vec<_> = insteadof.iter().map(|n| ("", self.name_ref(n))).collect();
+                node("TRAIT_PRECEDENCE", vec![("method", mr), ("insteadof", C::N("NAME_LIST".into(), names))])
+            }
+            TraitAdaptation::Alias { class, method, visibility, alias } => {
+                let cls = class.as_ref().map(|c| self.name_ref(c)).unwrap_or(C::Null);
+                let mr = node("METHOD_REFERENCE", vec![("class", cls), ("method", C::Str(self.sym(*method)))]);
+                let flag = match visibility {
+                    Some(Visibility::Public) => 1,
+                    Some(Visibility::Protected) => 2,
+                    Some(Visibility::Private) => 4,
+                    None => 0,
+                };
+                C::N(
+                    head("TRAIT_ALIAS", flag),
+                    vec![("method", mr), ("alias", alias.map(|a| C::Str(self.sym(a))).unwrap_or(C::Null))],
+                )
+            }
+        }
+    }
+
+    fn hooks(&self, hooks: &[PropertyHook]) -> C {
+        if hooks.is_empty() {
+            return C::Null;
+        }
+        C::N("STMT_LIST".into(), hooks.iter().map(|h| ("", self.property_hook(h))).collect())
+    }
+
+    fn property_hook(&self, h: &PropertyHook) -> C {
+        let flag = modifiers_flag(&h.modifiers, false) | if h.by_ref { 4096 } else { 0 };
+        let stmts = match &h.body {
+            HookBody::Abstract => C::Null,
+            HookBody::Block(b) => C::N("STMT_LIST".into(), self.stmt_list(b)),
+            HookBody::Short(e) => node("PROPERTY_HOOK_SHORT_BODY", vec![("expr", self.expr(e))]),
+        };
+        C::N(
+            head("PROPERTY_HOOK", flag),
+            vec![
+                ("name", C::Str(self.sym(h.name))),
+                ("params", h.params.as_ref().map(|p| self.params(p)).unwrap_or(C::Null)),
+                ("stmts", stmts),
+                ("attributes", self.attrs(&h.attrs)),
+            ],
+        )
     }
 
     fn attrs(&self, groups: &[AttributeGroup]) -> C {
@@ -490,16 +550,16 @@ impl<'a> Dumper<'a> {
             ExprKind::Call { callee, args } => node("CALL", vec![("expr", self.class_or_name(callee)), ("args", self.args(args))]),
             ExprKind::MethodCall { recv, nullsafe, method, args } => node(
                 if *nullsafe { "NULLSAFE_METHOD_CALL" } else { "METHOD_CALL" },
-                vec![("expr", self.expr(recv)), ("method", self.member(method)), ("args", self.args(args))],
+                vec![("expr", self.deref(recv)), ("method", self.member(method)), ("args", self.args(args))],
             ),
             ExprKind::StaticCall { class, method, args } => node(
                 "STATIC_CALL",
-                vec![("class", self.class_or_name(class)), ("method", self.member(method)), ("args", self.args(args))],
+                vec![("class", self.deref_class(class)), ("method", self.member(method)), ("args", self.args(args))],
             ),
-            ExprKind::Index { base, index } => node("DIM", vec![("expr", self.expr(base)), ("dim", self.opt(index.as_deref()))]),
+            ExprKind::Index { base, index } => node("DIM", vec![("expr", self.deref(base)), ("dim", self.opt(index.as_deref()))]),
             ExprKind::Prop { base, nullsafe, name } => node(
                 if *nullsafe { "NULLSAFE_PROP" } else { "PROP" },
-                vec![("expr", self.expr(base)), ("prop", self.member(name))],
+                vec![("expr", self.deref(base)), ("prop", self.member(name))],
             ),
             ExprKind::StaticProp { class, name } => {
                 // php-ast represents `Foo::$bar`'s property as the bare name string.
@@ -507,15 +567,15 @@ impl<'a> Dumper<'a> {
                     MemberName::Var(s) | MemberName::Ident(s) => C::Str(self.sym(*s)),
                     MemberName::Expr(e) => self.expr(e),
                 };
-                node("STATIC_PROP", vec![("class", self.class_or_name(class)), ("prop", prop)])
+                node("STATIC_PROP", vec![("class", self.deref_class(class)), ("prop", prop)])
             }
             ExprKind::ClassConst { class, name } => {
                 if let MemberName::Ident(s) = name {
                     if self.i.resolve(*s).eq_ignore_ascii_case("class") {
-                        return node("CLASS_NAME", vec![("class", self.class_or_name(class))]);
+                        return node("CLASS_NAME", vec![("class", self.deref_class(class))]);
                     }
                 }
-                node("CLASS_CONST", vec![("class", self.class_or_name(class)), ("const", self.member(name))])
+                node("CLASS_CONST", vec![("class", self.deref_class(class)), ("const", self.member(name))])
             }
             ExprKind::New { class, args } => node("NEW", vec![("class", self.class_or_name(class)), ("args", self.args(args))]),
             ExprKind::NewAnon { class, args } => node("NEW", vec![("class", self.class_decl(class)), ("args", self.args(args))]),
@@ -601,15 +661,70 @@ impl<'a> Dumper<'a> {
                 C::N(head("INCLUDE_OR_EVAL", f), vec![("expr", self.expr(expr))])
             }
             ExprKind::Eval(e) => C::N(head("INCLUDE_OR_EVAL", 1), vec![("expr", self.expr(e))]),
-            ExprKind::Exit(a) => node("EXIT", vec![("expr", self.opt(a.as_deref()))]),
+            // PHP 8.4+: `exit`/`die` with no argument is a plain call to the
+            // (unqualified, flag 0) function `exit`; only a parenthesized argument
+            // produces an EXIT node.
+            ExprKind::Exit(a) => match a {
+                Some(arg) => node("EXIT", vec![("expr", self.expr(arg))]),
+                None => node(
+                    "CALL",
+                    vec![
+                        ("expr", node("NAME", vec![("name", C::Str("exit".into()))])),
+                        ("args", C::N("ARG_LIST".into(), vec![])),
+                    ],
+                ),
+            },
             ExprKind::Yield { key, value } => node(
                 "YIELD",
                 vec![("value", self.opt(value.as_deref())), ("key", self.opt(key.as_deref()))],
             ),
             ExprKind::YieldFrom(e) => node("YIELD_FROM", vec![("expr", self.expr(e))]),
+            ExprKind::Paren(inner) => self.paren(inner),
             ExprKind::Error => C::N("ERROR".into(), vec![]),
             _ => C::N("UNMAPPED_EXPR".into(), vec![]),
         }
+    }
+
+    /// A parenthesized expression: transparent, except PHP records it on
+    /// conditionals (`#1`), static props (`#1`), and treats a parenthesized name
+    /// as a constant fetch.
+    fn paren(&self, inner: &Expr) -> C {
+        match &inner.kind {
+            ExprKind::Ternary { cond, then, els } => C::N(
+                head("CONDITIONAL", 1),
+                vec![("cond", self.expr(cond)), ("true", self.opt(then.as_deref())), ("false", self.expr(els))],
+            ),
+            ExprKind::Name(n) => self.const_or_magic(n),
+            _ => self.expr(inner),
+        }
+    }
+
+    /// Render an expression in dereference position (the base of `->`, `[]`, or
+    /// the class of `::`). A parenthesized static-prop being dereferenced carries
+    /// the PARENTHESIZED_STATIC_PROP flag (#1); a plain call `(A::$b)()` or `new`
+    /// does not.
+    fn deref(&self, e: &Expr) -> C {
+        if let ExprKind::Paren(inner) = &e.kind {
+            if let ExprKind::StaticProp { class, name } = &inner.kind {
+                let prop = match name {
+                    MemberName::Var(s) | MemberName::Ident(s) => C::Str(self.sym(*s)),
+                    MemberName::Expr(ex) => self.expr(ex),
+                };
+                return C::N(head("STATIC_PROP", 1), vec![("class", self.class_or_name(class)), ("prop", prop)]);
+            }
+        }
+        self.expr(e)
+    }
+
+    /// Like [`deref`], but for class-name positions (`::`), falling back to
+    /// [`class_or_name`] rather than [`expr`].
+    fn deref_class(&self, e: &Expr) -> C {
+        if let ExprKind::Paren(inner) = &e.kind {
+            if matches!(&inner.kind, ExprKind::StaticProp { .. }) {
+                return self.deref(e);
+            }
+        }
+        self.class_or_name(e)
     }
 
     /// A bare name in expression position is a constant fetch — unless it is a
@@ -918,6 +1033,7 @@ fn expr_yields(e: &Expr) -> bool {
         ExprKind::Interpolated(parts) => parts.iter().any(expr_yields),
         ExprKind::Exit(a) => a.as_deref().is_some_and(expr_yields),
         ExprKind::Include { expr, .. } | ExprKind::Eval(expr) => expr_yields(expr),
+        ExprKind::Paren(inner) => expr_yields(inner),
         // Closures / arrow fns / anonymous classes are separate scopes.
         _ => false,
     }

@@ -880,11 +880,9 @@ impl<'a> Parser<'a> {
             self.interner.intern("")
         };
         let default = if self.eat(T::Eq) { Some(self.parse_expr(0)) } else { None };
-        // Promoted property with hooks: `public $x { get {} set {} }` — bodies M-later.
-        if self.at(T::LBrace) {
-            self.skip_balanced_braces();
-        }
-        Param { attrs, modifiers, ty, by_ref, variadic, name, default }
+        // Promoted property with hooks: `public $x { get => …; }`.
+        let hooks = if self.at(T::LBrace) { self.parse_property_hooks() } else { Vec::new() };
+        Param { attrs, modifiers, ty, by_ref, variadic, name, default, hooks }
     }
 
     fn parse_modifiers(&mut self) -> Modifiers {
@@ -1037,14 +1035,13 @@ impl<'a> Parser<'a> {
             T::Keyword(Kw::Use) => {
                 self.bump();
                 let traits = self.name_list();
-                let has_adaptations = if self.at(T::LBrace) {
-                    self.skip_balanced_braces();
-                    true
+                let adaptations = if self.at(T::LBrace) {
+                    self.parse_trait_adaptations()
                 } else {
                     self.eat_stmt_end();
-                    false
+                    Vec::new()
                 };
-                Member::TraitUse(TraitUseDecl { traits, has_adaptations })
+                Member::TraitUse(TraitUseDecl { traits, adaptations })
             }
             _ => Member::Property(self.parse_property(attrs, doc, modifiers)),
         }
@@ -1068,36 +1065,94 @@ impl<'a> Parser<'a> {
                 self.interner.intern("")
             };
             let default = if self.eat(T::Eq) { Some(self.parse_expr(0)) } else { None };
-            props.push(PropElem { name, default });
-            // Property hooks `{ get; set; }` — bodies parsed in M8; skip the block.
-            if self.at(T::LBrace) {
+            let hooks = if self.at(T::LBrace) { self.parse_property_hooks() } else { Vec::new() };
+            if !hooks.is_empty() {
                 hooked = true;
-                self.skip_balanced_braces();
-                break;
             }
-            if !self.eat(T::Comma) {
+            props.push(PropElem { name, default, hooks });
+            // A hooked property is a single declaration (no comma list).
+            if hooked || !self.eat(T::Comma) {
                 break;
             }
         }
         if !hooked {
             self.eat_stmt_end();
         }
-        PropertyDecl { attrs, doc, modifiers, ty, props, hooked }
+        PropertyDecl { attrs, doc, modifiers, ty, props }
     }
 
-    /// Skip a balanced `{ ... }` block (used for trait adaptations and property
-    /// hook bodies, which are not yet modelled).
-    fn skip_balanced_braces(&mut self) {
+    /// `{ get …; set …; }` — property hooks.
+    fn parse_property_hooks(&mut self) -> Vec<PropertyHook> {
         self.expect(T::LBrace, "`{`");
-        let mut depth = 1;
-        while depth > 0 && !self.at_eof() {
-            match self.peek() {
-                T::LBrace => depth += 1,
-                T::RBrace => depth -= 1,
-                _ => {}
-            }
-            self.bump();
+        let mut hooks = Vec::new();
+        while !self.at(T::RBrace) && !self.at_eof() {
+            let before = self.pos;
+            let attrs = self.parse_attributes();
+            let modifiers = self.parse_modifiers();
+            let by_ref = self.eat_amp();
+            let name = self.member_ident();
+            let params = if self.at(T::LParen) { Some(self.parse_param_list()) } else { None };
+            let body = if self.eat(T::Semicolon) {
+                HookBody::Abstract
+            } else if self.eat(T::DoubleArrow) {
+                let e = self.parse_expr(0);
+                self.eat_stmt_end();
+                HookBody::Short(e)
+            } else if self.at(T::LBrace) {
+                HookBody::Block(self.parse_brace_block())
+            } else {
+                self.error_here("expected hook body");
+                HookBody::Abstract
+            };
+            hooks.push(PropertyHook { attrs, modifiers, by_ref, name, params, body });
+            self.ensure_progress(before);
         }
+        self.expect(T::RBrace, "`}`");
+        hooks
+    }
+
+    /// `{ A::foo insteadof B; bar as baz; }` — trait adaptations.
+    fn parse_trait_adaptations(&mut self) -> Vec<TraitAdaptation> {
+        self.expect(T::LBrace, "`{`");
+        let mut out = Vec::new();
+        while !self.at(T::RBrace) && !self.at_eof() {
+            let before = self.pos;
+            // A method reference: `Class::method` or a bare `method`.
+            let first = self.parse_name();
+            let (class, method) = if self.eat(T::DoubleColon) {
+                (Some(first), self.member_ident())
+            } else {
+                (None, self.interner.intern(&first.text))
+            };
+            if self.eat(T::Keyword(Kw::Insteadof)) {
+                let insteadof = self.name_list();
+                let class = class.unwrap_or(Name { fq: NameFq::NotFq, text: String::new() });
+                out.push(TraitAdaptation::Precedence { class, method, insteadof });
+            } else if self.eat(T::Keyword(Kw::As)) {
+                let visibility = match self.peek() {
+                    T::Keyword(Kw::Public) => Some(Visibility::Public),
+                    T::Keyword(Kw::Protected) => Some(Visibility::Protected),
+                    T::Keyword(Kw::Private) => Some(Visibility::Private),
+                    _ => None,
+                };
+                if visibility.is_some() {
+                    self.bump();
+                }
+                let alias = if matches!(self.peek(), T::Identifier | T::Keyword(_)) {
+                    let t = self.bump();
+                    Some(self.intern_tok(t))
+                } else {
+                    None
+                };
+                out.push(TraitAdaptation::Alias { class, method, visibility, alias });
+            } else {
+                self.error_here("expected `insteadof` or `as`");
+            }
+            self.eat(T::Semicolon);
+            self.ensure_progress(before);
+        }
+        self.expect(T::RBrace, "`}`");
+        out
     }
 
     // --- types ------------------------------------------------------------
@@ -1417,7 +1472,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 let inner = self.parse_expr(0);
                 self.expect(T::RParen, "`)`");
-                Expr::new(self.span_to(start), inner.kind)
+                Expr::new(self.span_to(start), ExprKind::Paren(Box::new(inner)))
             }
             T::LBracket => self.parse_array(T::RBracket),
             T::Plus => self.parse_unary(UnOp::Plus, BP_UNARY2),
@@ -2044,7 +2099,7 @@ impl<'a> Parser<'a> {
     fn parse_interp(&mut self, delim: T) -> Expr {
         let start = self.cur_start();
         self.bump(); // opening `"` or backtick
-        let parts = self.parse_interp_parts(delim);
+        let parts = self.parse_interp_parts(delim, false);
         self.expect(delim, "closing string delimiter");
         if delim == T::Backtick {
             self.node(start, ExprKind::ShellExec(parts))
@@ -2055,19 +2110,45 @@ impl<'a> Parser<'a> {
 
     fn parse_heredoc(&mut self) -> Expr {
         let start = self.cur_start();
-        self.bump(); // T_START_HEREDOC
-        let parts = self.parse_interp_parts(T::EndHeredoc);
+        let open = self.bump(); // T_START_HEREDOC
+        // A nowdoc opener quotes its label (`<<<'EOT'`); its body is taken
+        // verbatim with no escape processing.
+        let nowdoc = self.text(open).contains('\'');
+        let mut parts = self.parse_interp_parts(T::EndHeredoc, nowdoc);
+        // The closing marker's leading whitespace is stripped from every body
+        // line (flexible heredoc/nowdoc, PHP 7.3+).
+        let indent = if self.at(T::EndHeredoc) {
+            let t = self.text(self.tokens[self.pos]);
+            t.bytes().take_while(|b| matches!(b, b' ' | b'\t')).count()
+        } else {
+            0
+        };
         self.expect(T::EndHeredoc, "heredoc end marker");
-        self.node(start, ExprKind::Interpolated(parts))
+        process_heredoc_body(&mut parts, indent);
+        // PHP collapses a purely-literal heredoc/nowdoc to a plain string.
+        match parts.len() {
+            0 => self.node(start, ExprKind::Str(String::new())),
+            1 if matches!(parts[0].kind, ExprKind::Str(_)) => {
+                let s = match parts.pop().unwrap().kind {
+                    ExprKind::Str(s) => s,
+                    _ => unreachable!(),
+                };
+                self.node(start, ExprKind::Str(s))
+            }
+            _ => self.node(start, ExprKind::Interpolated(parts)),
+        }
     }
 
-    fn parse_interp_parts(&mut self, close: T) -> Vec<Expr> {
+    fn parse_interp_parts(&mut self, close: T, raw: bool) -> Vec<Expr> {
         let mut parts = Vec::new();
         while !self.at(close) && !self.at_eof() {
             match self.peek() {
                 T::EncapsedAndWhitespace => {
                     let t = self.bump();
-                    parts.push(self.node(t.span.start, ExprKind::Str(decode_double(self.text(t)))));
+                    // Nowdoc bodies are literal; everything else applies
+                    // double-quote escape rules.
+                    let s = if raw { self.text(t).to_string() } else { decode_double(self.text(t)) };
+                    parts.push(self.node(t.span.start, ExprKind::Str(s)));
                 }
                 T::Variable => parts.push(self.parse_simple_interp_var()),
                 T::CurlyOpen => {
@@ -2190,7 +2271,10 @@ fn infix_power(k: T) -> Option<(u8, u8)> {
         | T::XorEq
         | T::SlEq
         | T::SrEq
-        | T::CoalesceEq => (12, 11), // right-assoc
+        | T::CoalesceEq => (51, 11), // right-assoc; high left-bp so `=` binds to
+        // the immediate lvalue (PHP shifts `=` over reducing the LHS: e.g.
+        // `a && $y = b` parses as `a && ($y = b)`, and `clone $b = c` as
+        // `clone($b = c)`), low right-bp so the RHS still captures binary ops.
         T::Question => (14, 13),
         T::Coalesce => (16, 15), // right-assoc
         T::BoolOr => (18, 19),
@@ -2318,6 +2402,60 @@ fn parse_float(text: &str) -> f64 {
         return u128::from_str_radix(o, 8).map(|v| v as f64).unwrap_or(f64::INFINITY);
     }
     cleaned.parse::<f64>().unwrap_or(0.0)
+}
+
+/// Post-process a heredoc/nowdoc body: remove the single trailing newline that
+/// precedes the closing marker, then strip up to `indent` leading whitespace
+/// characters from the start of every body line (PHP 7.3+ flexible syntax).
+fn process_heredoc_body(parts: &mut [Expr], indent: usize) {
+    // 1. Drop the final newline (it terminates the last content line and is not
+    //    part of the string value).
+    if let Some(last) = parts.last_mut() {
+        if let ExprKind::Str(s) = &mut last.kind {
+            if s.ends_with('\n') {
+                s.pop();
+                if s.ends_with('\r') {
+                    s.pop();
+                }
+            }
+        }
+    }
+    // 2. Strip the closing marker's indentation from each line.
+    if indent == 0 {
+        return;
+    }
+    let mut at_line_start = true;
+    for p in parts.iter_mut() {
+        match &mut p.kind {
+            ExprKind::Str(s) => {
+                if !s.is_empty() {
+                    *s = dedent_line_starts(s, indent, at_line_start);
+                    at_line_start = s.ends_with('\n');
+                }
+            }
+            // A non-literal part (interpolation) sits mid-line.
+            _ => at_line_start = false,
+        }
+    }
+}
+
+/// Remove up to `indent` leading whitespace (space/tab) characters at the start
+/// of each line of `s`. `at_line_start` says whether `s` begins a fresh line.
+fn dedent_line_starts(s: &str, indent: usize, at_line_start: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut skip = if at_line_start { indent } else { 0 };
+    for ch in s.chars() {
+        if skip > 0 && (ch == ' ' || ch == '\t') {
+            skip -= 1;
+            continue;
+        }
+        skip = 0;
+        out.push(ch);
+        if ch == '\n' {
+            skip = indent;
+        }
+    }
+    out
 }
 
 /// Decode a `T_CONSTANT_ENCAPSED_STRING` lexeme (with quotes and optional `b`

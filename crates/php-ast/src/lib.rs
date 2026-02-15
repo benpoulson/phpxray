@@ -198,14 +198,37 @@ pub struct PropertyDecl {
     pub modifiers: Modifiers,
     pub ty: Option<Type>,
     pub props: Vec<PropElem>,
-    /// True when the property declares hooks (`{ get; set; }`); bodies are M8.
-    pub hooked: bool,
 }
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct PropElem {
     pub name: Symbol,
     pub default: Option<Expr>,
+    /// Property hooks (`{ get; set { … } }`); empty for a plain property.
+    pub hooks: Vec<PropertyHook>,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct PropertyHook {
+    pub attrs: Vec<AttributeGroup>,
+    pub modifiers: Modifiers,
+    /// `&get` — by-reference hook.
+    pub by_ref: bool,
+    /// `get` or `set`.
+    pub name: Symbol,
+    /// An explicit parameter list (`set(Type $v)`).
+    pub params: Option<Vec<Param>>,
+    pub body: HookBody,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum HookBody {
+    /// `get;` — no body (interface / abstract).
+    Abstract,
+    /// `get { … }`
+    Block(Vec<Stmt>),
+    /// `get => expr;`
+    Short(Expr),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -234,8 +257,24 @@ pub struct EnumCaseDecl {
 #[derive(Clone, PartialEq, Debug)]
 pub struct TraitUseDecl {
     pub traits: Vec<Name>,
-    /// Trait adaptations (`insteadof`/`as`) are recorded as raw source for now.
-    pub has_adaptations: bool,
+    pub adaptations: Vec<TraitAdaptation>,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum TraitAdaptation {
+    /// `A::foo insteadof B, C;`
+    Precedence {
+        class: Name,
+        method: Symbol,
+        insteadof: Vec<Name>,
+    },
+    /// `A::foo as protected bar;` / `foo as bar;` / `foo as protected;`
+    Alias {
+        class: Option<Name>,
+        method: Symbol,
+        visibility: Option<Visibility>,
+        alias: Option<Symbol>,
+    },
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -248,6 +287,8 @@ pub struct Param {
     pub variadic: bool,
     pub name: Symbol,
     pub default: Option<Expr>,
+    /// Hooks on a promoted property param (`public $x { get => … }`).
+    pub hooks: Vec<PropertyHook>,
 }
 
 /// Modifiers on a member, param-promotion, or class.
@@ -545,6 +586,11 @@ pub enum ExprKind {
         class: Box<ClassDecl>,
         args: Vec<Arg>,
     },
+
+    /// A parenthesized expression `( expr )`. Kept because PHP records
+    /// parenthesization on a few node kinds (conditionals, arrow fns, static
+    /// props) and treats a parenthesized name as a constant fetch.
+    Paren(Box<Expr>),
 
     /// A syntactically invalid expression that was recovered from.
     Error,
