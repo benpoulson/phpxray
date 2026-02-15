@@ -546,6 +546,8 @@ dependencies = [
 name = "xtask"
 version = "0.0.0"
 dependencies = [
+ "php-ast",
+ "php-intern",
  "php-lexer",
  "php-parser",
  "php-span",

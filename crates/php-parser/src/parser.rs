@@ -271,18 +271,20 @@ impl<'a> Parser<'a> {
                 StmtKind::Class(self.parse_class_like(Vec::new(), doc))
             }
             T::Keyword(Kw::Const) => {
-                let elems = self.parse_const_elems();
+                let consts = self.parse_const_elems();
                 self.eat_stmt_end();
-                StmtKind::ConstDecl(elems)
+                StmtKind::ConstDecl { consts, attrs: Vec::new() }
             }
             T::Keyword(Kw::HaltCompiler) => {
-                // `__halt_compiler();` — the lexer already turned the trailing
-                // bytes into one T_INLINE_HTML, handled by the statement loop.
                 self.bump();
                 self.eat(T::LParen);
                 self.eat(T::RParen);
                 self.eat_stmt_end();
-                StmtKind::Nop
+                let offset = self.prev_end();
+                // The lexer turned the trailing bytes into one T_INLINE_HTML;
+                // PHP's AST does not include them, so drop it.
+                self.eat(T::InlineHtml);
+                StmtKind::HaltCompiler(offset)
             }
 
             // A label: `name:` (but not `name::` or `name ? :`).
@@ -801,9 +803,9 @@ impl<'a> Parser<'a> {
                 StmtKind::Class(self.parse_class_like(attrs, doc))
             }
             T::Keyword(Kw::Const) => {
-                let elems = self.parse_const_elems();
+                let consts = self.parse_const_elems();
                 self.eat_stmt_end();
-                StmtKind::ConstDecl(elems)
+                StmtKind::ConstDecl { consts, attrs }
             }
             _ => {
                 // Attributes on an expression (e.g. a closure) — parse the expr;
@@ -822,7 +824,7 @@ impl<'a> Parser<'a> {
             let mut attrs = Vec::new();
             while !self.at(T::RBracket) && !self.at_eof() {
                 let name = self.parse_name();
-                let args = if self.at(T::LParen) { self.parse_args() } else { Vec::new() };
+                let args = if self.at(T::LParen) { Some(self.parse_args()) } else { None };
                 attrs.push(Attribute { name, args });
                 if !self.eat(T::Comma) {
                     break;
@@ -1397,7 +1399,7 @@ impl<'a> Parser<'a> {
             }
             T::String => {
                 let t = self.bump();
-                self.node(start, ExprKind::Str(string_inner(self.text(t)).to_string()))
+                self.node(start, ExprKind::Str(decode_string_literal(self.text(t))))
             }
             T::DoubleQuote => self.parse_interp(T::DoubleQuote),
             T::Backtick => self.parse_interp(T::Backtick),
@@ -1483,8 +1485,8 @@ impl<'a> Parser<'a> {
 
     fn parse_keyword_prefix(&mut self, kw: Kw, start: u32) -> Expr {
         let e = match kw {
-            Kw::Array => self.parse_array_call(),
-            Kw::List => self.parse_array_call(), // list(...) parsed like an array (assignment target)
+            Kw::Array => self.parse_array_call(ArraySyntax::Long),
+            Kw::List => self.parse_array_call(ArraySyntax::List),
             Kw::New => self.parse_new(start),
             Kw::Clone => {
                 self.bump();
@@ -1497,8 +1499,9 @@ impl<'a> Parser<'a> {
                         let only = args.pop().unwrap();
                         self.node(start, ExprKind::Clone(Box::new(only.value)))
                     } else {
+                        // PHP synthesizes the `clone` call name as fully-qualified.
                         let callee =
-                            Expr::new(Span::at(start), ExprKind::Name(Name { fq: NameFq::NotFq, text: "clone".into() }));
+                            Expr::new(Span::at(start), ExprKind::Name(Name { fq: NameFq::Fq, text: "clone".into() }));
                         self.node(start, ExprKind::Call { callee: Box::new(callee), args })
                     }
                 } else {
@@ -1827,10 +1830,18 @@ impl<'a> Parser<'a> {
     fn parse_args(&mut self) -> Vec<Arg> {
         self.expect(T::LParen, "`(`");
         let mut args = Vec::new();
-        // First-class callable syntax `f(...)` — consume and stop (M8 refines).
+        // First-class callable syntax `f(...)`.
         if self.at(T::Ellipsis) && self.nth(1) == T::RParen {
+            let astart = self.cur_start();
             self.bump();
             self.bump();
+            args.push(Arg {
+                span: self.span_to(astart),
+                name: None,
+                value: Expr::new(Span::at(astart), ExprKind::Error),
+                spread: false,
+                placeholder: true,
+            });
             return args;
         }
         while !self.at(T::RParen) && !self.at_eof() {
@@ -1846,7 +1857,7 @@ impl<'a> Parser<'a> {
             };
             let spread = self.eat(T::Ellipsis);
             let value = self.parse_expr(0);
-            args.push(Arg { span: self.span_to(astart), name, value, spread });
+            args.push(Arg { span: self.span_to(astart), name, value, spread, placeholder: false });
             if !self.eat(T::Comma) {
                 break;
             }
@@ -1855,14 +1866,14 @@ impl<'a> Parser<'a> {
         args
     }
 
-    fn parse_array_call(&mut self) -> Expr {
+    fn parse_array_call(&mut self, syntax: ArraySyntax) -> Expr {
         // `array` or `list` keyword already current.
         let start = self.cur_start();
         self.bump(); // array / list
         self.expect(T::LParen, "`(`");
         let items = self.parse_array_items(T::RParen);
         self.expect(T::RParen, "`)`");
-        self.node(start, ExprKind::Array(items))
+        self.node(start, ExprKind::Array { items, syntax })
     }
 
     fn parse_array(&mut self, close: T) -> Expr {
@@ -1871,7 +1882,7 @@ impl<'a> Parser<'a> {
         self.bump(); // `[`
         let items = self.parse_array_items(close);
         self.expect(close, "`]`");
-        self.node(start, ExprKind::Array(items))
+        self.node(start, ExprKind::Array { items, syntax: ArraySyntax::Short })
     }
 
     fn parse_array_items(&mut self, close: T) -> Vec<ArrayItem> {
@@ -2035,7 +2046,11 @@ impl<'a> Parser<'a> {
         self.bump(); // opening `"` or backtick
         let parts = self.parse_interp_parts(delim);
         self.expect(delim, "closing string delimiter");
-        self.node(start, ExprKind::Interpolated(parts))
+        if delim == T::Backtick {
+            self.node(start, ExprKind::ShellExec(parts))
+        } else {
+            self.node(start, ExprKind::Interpolated(parts))
+        }
     }
 
     fn parse_heredoc(&mut self) -> Expr {
@@ -2052,7 +2067,7 @@ impl<'a> Parser<'a> {
             match self.peek() {
                 T::EncapsedAndWhitespace => {
                     let t = self.bump();
-                    parts.push(self.node(t.span.start, ExprKind::Str(self.text(t).to_string())));
+                    parts.push(self.node(t.span.start, ExprKind::Str(decode_double(self.text(t)))));
                 }
                 T::Variable => parts.push(self.parse_simple_interp_var()),
                 T::CurlyOpen => {
@@ -2291,21 +2306,128 @@ fn parse_int(text: &str) -> i64 {
 
 fn parse_float(text: &str) -> f64 {
     let cleaned: String = text.chars().filter(|&c| c != '_').collect();
+    let lower = cleaned.to_ascii_lowercase();
+    // Radix-prefixed integer literals that overflow `i64` arrive here as floats.
+    if let Some(h) = lower.strip_prefix("0x") {
+        return u128::from_str_radix(h, 16).map(|v| v as f64).unwrap_or(f64::INFINITY);
+    }
+    if let Some(b) = lower.strip_prefix("0b") {
+        return u128::from_str_radix(b, 2).map(|v| v as f64).unwrap_or(f64::INFINITY);
+    }
+    if let Some(o) = lower.strip_prefix("0o") {
+        return u128::from_str_radix(o, 8).map(|v| v as f64).unwrap_or(f64::INFINITY);
+    }
     cleaned.parse::<f64>().unwrap_or(0.0)
 }
 
-/// Strip an optional `b`/`B` binary prefix and the surrounding quotes from a
-/// `T_CONSTANT_ENCAPSED_STRING` lexeme. Escapes are not yet decoded.
-fn string_inner(text: &str) -> &str {
+/// Decode a `T_CONSTANT_ENCAPSED_STRING` lexeme (with quotes and optional `b`
+/// prefix) to its string value, applying single- or double-quote escape rules.
+fn decode_string_literal(text: &str) -> String {
     let b = text.as_bytes();
     let body = if b.len() > 1 && (b[0] == b'b' || b[0] == b'B') && (b[1] == b'"' || b[1] == b'\'') {
         &text[1..]
     } else {
         text
     };
-    if body.len() >= 2 {
-        &body[1..body.len() - 1]
-    } else {
-        ""
+    let bb = body.as_bytes();
+    if bb.len() < 2 {
+        return String::new();
     }
+    let inner = &body[1..body.len() - 1];
+    if bb[0] == b'\'' {
+        decode_single(inner)
+    } else {
+        decode_double(inner)
+    }
+}
+
+/// Single-quoted: only `\\` and `\'` are escapes; everything else is literal.
+fn decode_single(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 1 < b.len() && (b[i + 1] == b'\\' || b[i + 1] == b'\'') {
+            out.push(b[i + 1] as char);
+            i += 2;
+        } else {
+            let ch = s[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+/// Double-quoted / heredoc / backtick escape rules.
+fn decode_double(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'\\' {
+            let ch = s[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        i += 1;
+        if i >= b.len() {
+            out.push('\\');
+            break;
+        }
+        match b[i] {
+            b'n' => { out.push('\n'); i += 1; }
+            b't' => { out.push('\t'); i += 1; }
+            b'r' => { out.push('\r'); i += 1; }
+            b'v' => { out.push('\u{0b}'); i += 1; }
+            b'f' => { out.push('\u{0c}'); i += 1; }
+            b'e' => { out.push('\u{1b}'); i += 1; }
+            b'\\' => { out.push('\\'); i += 1; }
+            b'$' => { out.push('$'); i += 1; }
+            b'"' => { out.push('"'); i += 1; }
+            b'0'..=b'7' => {
+                let mut val = 0u32;
+                let mut n = 0;
+                while n < 3 && i < b.len() && (b'0'..=b'7').contains(&b[i]) {
+                    val = val * 8 + (b[i] - b'0') as u32;
+                    i += 1;
+                    n += 1;
+                }
+                out.push(((val & 0xff) as u8) as char);
+            }
+            b'x' if i + 1 < b.len() && b[i + 1].is_ascii_hexdigit() => {
+                i += 1;
+                let mut val = 0u32;
+                let mut n = 0;
+                while n < 2 && i < b.len() && b[i].is_ascii_hexdigit() {
+                    val = val * 16 + (b[i] as char).to_digit(16).unwrap();
+                    i += 1;
+                    n += 1;
+                }
+                out.push(((val & 0xff) as u8) as char);
+            }
+            b'u' if i + 1 < b.len() && b[i + 1] == b'{' => {
+                i += 2;
+                let mut val = 0u32;
+                while i < b.len() && b[i] != b'}' {
+                    if let Some(d) = (b[i] as char).to_digit(16) {
+                        val = val * 16 + d;
+                    }
+                    i += 1;
+                }
+                if i < b.len() {
+                    i += 1; // `}`
+                }
+                if let Some(ch) = char::from_u32(val) {
+                    out.push(ch);
+                }
+            }
+            _ => {
+                // Unrecognized escape: backslash is literal.
+                out.push('\\');
+            }
+        }
+    }
+    out
 }

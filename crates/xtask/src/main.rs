@@ -16,6 +16,8 @@ use php_lexer::golden::{self, DEFAULT_IGNORED};
 use walkdir::WalkDir;
 use xtask::phpt;
 
+mod astdump;
+
 fn workspace_root() -> PathBuf {
     // crates/xtask -> crates -> <root>
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -32,6 +34,16 @@ fn main() -> ExitCode {
         Some("triage") => cmd_triage(args.get(1).map(PathBuf::from)),
         Some("diag") => cmd_diag(args.get(1).map(PathBuf::from)),
         Some("difftokens") => cmd_difftokens(&args[1..]),
+        Some("astdiff") => cmd_astdiff(&args[1..]),
+        Some("astone") => {
+            // Print OUR canonical dump for a .phpt's --FILE-- (for eyeball diffs).
+            let path = PathBuf::from(args.get(1).cloned().unwrap_or_default());
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let source = phpt::extract_file_section(&text).unwrap_or_default();
+            let r = php_parser::parse(&source);
+            print!("{}", astdump::dump(&r.program, &source, &r.interner));
+            ExitCode::SUCCESS
+        }
         Some("phpt-extract") => cmd_phpt_extract(args.get(1).map(PathBuf::from)),
         Some("gen-tokens") => cmd_gen_tokens(),
         Some(other) => {
@@ -160,6 +172,128 @@ fn first_divergence(
         return Some((o, u));
     }
     None
+}
+
+/// Structural AST differential: compare our AST against PHP's Zend AST
+/// (`php-ast`) over the corpus, in canonical s-expression form. The measured
+/// path to 100% parser correctness.
+fn cmd_astdiff(args: &[String]) -> ExitCode {
+    // Run on a large stack: left-associative operator chains (`1+1+…+1`) build
+    // very deep ASTs that the recursive dumper would otherwise overflow on.
+    let args: Vec<String> = args.to_vec();
+    std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(move || astdiff_run(&args))
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+fn astdiff_run(args: &[String]) -> ExitCode {
+    let mut dir: Option<PathBuf> = None;
+    let mut limit = usize::MAX;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--limit" => limit = it.next().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX),
+            _ => dir = Some(PathBuf::from(a)),
+        }
+    }
+    let root = workspace_root();
+    let dir = dir.unwrap_or_else(|| root.join("php-src/Zend/tests"));
+    let helper = root.join("crates/xtask/php/dump_ast.php");
+    if Command::new("php").arg("--version").output().is_err() {
+        eprintln!("`php` not found on PATH");
+        return ExitCode::FAILURE;
+    }
+
+    let mut files: Vec<PathBuf> = WalkDir::new(&dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|e| e.into_path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("phpt"))
+        .collect();
+    files.sort();
+
+    let (mut checked, mut matched, mut we_errored) = (0usize, 0usize, 0usize);
+    let mut buckets: BTreeMap<String, (usize, String)> = BTreeMap::new();
+
+    for path in files.into_iter().take(limit) {
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let Some(source) = phpt::extract_file_section(&text) else { continue };
+        let Some(oracle) = run_php(&helper, &source) else { continue };
+        let oracle = oracle.trim_end();
+        if oracle == "<<PARSE_ERROR>>" {
+            continue; // PHP rejects this source; not an AST-match candidate.
+        }
+        let parsed = match catch_unwind(AssertUnwindSafe(|| php_parser::parse(&source))) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        checked += 1;
+        if parsed.has_errors() {
+            we_errored += 1;
+            continue;
+        }
+        let ours = astdump::dump(&parsed.program, &source, &parsed.interner);
+        let ours = ours.trim_end();
+        if ours == oracle {
+            matched += 1;
+            continue;
+        }
+        // First differing line → bucket.
+        let (o, u) = first_diff_line(oracle, ours);
+        let key = o.trim().to_string();
+        let entry = buckets.entry(key).or_insert((0, String::new()));
+        entry.0 += 1;
+        if entry.1.is_empty() {
+            entry.1 = format!(
+                "{}  [oracle: {} | ours: {}]",
+                path.strip_prefix(&root).unwrap_or(&path).display(),
+                o.trim(),
+                u.trim()
+            );
+        }
+    }
+
+    let denom = checked.max(1);
+    println!(
+        "\nAST differential: {matched}/{checked} match ({:.2}%); {we_errored} we-error-but-PHP-ok",
+        100.0 * matched as f64 / denom as f64
+    );
+    let mut rows: Vec<_> = buckets.into_iter().collect();
+    rows.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+    println!("\ntop divergences (by first differing oracle line):");
+    for (key, (n, ex)) in rows.into_iter().take(25) {
+        println!("  {n:>5}  {key}");
+        println!("         {ex}");
+    }
+    ExitCode::SUCCESS
+}
+
+fn first_diff_line<'a>(oracle: &'a str, ours: &'a str) -> (&'a str, &'a str) {
+    let mut o = oracle.lines();
+    let mut u = ours.lines();
+    loop {
+        match (o.next(), u.next()) {
+            (Some(a), Some(b)) if a == b => continue,
+            (a, b) => return (a.unwrap_or("<eof>"), b.unwrap_or("<eof>")),
+        }
+    }
+}
+
+fn run_php(helper: &Path, source: &str) -> Option<String> {
+    let mut child = Command::new("php")
+        .arg(helper)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(source.as_bytes()).ok()?;
+    let out = child.wait_with_output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn run_php_tokens(helper: &Path, source: &str) -> Option<String> {

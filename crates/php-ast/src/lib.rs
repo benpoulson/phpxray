@@ -117,9 +117,14 @@ pub enum StmtKind {
     Function(FunctionDecl),
     Class(ClassDecl),
     /// Top-level `const A = 1, B = 2;`
-    ConstDecl(Vec<ConstElem>),
+    ConstDecl {
+        consts: Vec<ConstElem>,
+        attrs: Vec<AttributeGroup>,
+    },
 
-    /// Literal text outside `<?php ?>` (also `__halt_compiler` trailing data).
+    /// `__halt_compiler();` — the byte offset where the trailing data begins.
+    HaltCompiler(u32),
+    /// Literal text outside `<?php ?>`.
     InlineHtml(String),
     /// An empty statement (`;`).
     Nop,
@@ -309,7 +314,8 @@ pub struct AttributeGroup {
 #[derive(Clone, PartialEq, Debug)]
 pub struct Attribute {
     pub name: Name,
-    pub args: Vec<Arg>,
+    /// `None` for `#[Attr]` (no parens); `Some` for `#[Attr(...)]`.
+    pub args: Option<Vec<Arg>>,
 }
 
 // --- types -----------------------------------------------------------------
@@ -399,9 +405,11 @@ pub enum ExprKind {
     Float(f64),
     /// A non-interpolated string's raw inner text (escapes not yet decoded).
     Str(String),
-    /// An interpolated string / heredoc / backtick: literal parts ([`ExprKind::Str`])
+    /// An interpolated string / heredoc: literal parts ([`ExprKind::Str`])
     /// interleaved with embedded expressions.
     Interpolated(Vec<Expr>),
+    /// A backtick shell-exec `` `cmd $x` ``; same parts as [`ExprKind::Interpolated`].
+    ShellExec(Vec<Expr>),
 
     // --- references ---
     /// `$name` — the interned name without the leading `$`.
@@ -412,7 +420,10 @@ pub enum ExprKind {
     Name(Name),
 
     // --- composite ---
-    Array(Vec<ArrayItem>),
+    Array {
+        items: Vec<ArrayItem>,
+        syntax: ArraySyntax,
+    },
     Call {
         callee: Box<Expr>,
         args: Vec<Arg>,
@@ -596,6 +607,8 @@ pub struct Arg {
     pub value: Expr,
     /// `...$args` spread.
     pub spread: bool,
+    /// The lone `...` first-class-callable placeholder (`f(...)`).
+    pub placeholder: bool,
 }
 
 /// An array element. `value` is `None` only for elision in destructuring.
@@ -647,6 +660,17 @@ pub enum BinOp {
     Pipe,
     /// Only used by `??=` (the `??` operator itself is [`ExprKind::Coalesce`]).
     Coalesce,
+}
+
+/// How an array literal / destructuring target was written.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArraySyntax {
+    /// `list(...)`
+    List,
+    /// `array(...)`
+    Long,
+    /// `[...]`
+    Short,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

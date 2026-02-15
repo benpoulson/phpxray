@@ -14,6 +14,8 @@ path = "src/main.rs"
 
 [dependencies]
 php-span.workspace = true
+php-intern.workspace = true
+php-ast.workspace = true
 php-lexer.workspace = true
 php-parser.workspace = true
 walkdir.workspace = true

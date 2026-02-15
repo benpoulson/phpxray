@@ -27,10 +27,14 @@ fn render(e: &Expr, i: &Interner) -> String {
             let inner: Vec<_> = parts.iter().map(|p| render(p, i)).collect();
             format!("(interp {})", inner.join(" "))
         }
+        ShellExec(parts) => {
+            let inner: Vec<_> = parts.iter().map(|p| render(p, i)).collect();
+            format!("(shell {})", inner.join(" "))
+        }
         Variable(s) => format!("${}", i.resolve(*s)),
         VariableVariable(inner) => format!("($$ {})", render(inner, i)),
         Name(n) => n.text.clone(),
-        Array(items) => {
+        Array { items, .. } => {
             let inner: Vec<_> = items
                 .iter()
                 .map(|it| {
@@ -287,6 +291,9 @@ fn render_args(args: &[Arg], i: &Interner) -> String {
     let parts: Vec<_> = args
         .iter()
         .map(|a| {
+            if a.placeholder {
+                return "...".to_string();
+            }
             let v = render(&a.value, i);
             let v = if a.spread { format!("...{v}") } else { v };
             match a.name {
@@ -675,8 +682,8 @@ fn render_stmt(s: &Stmt, i: &Interner) -> String {
             let doc = c.doc.as_deref().map(|d| format!("{d:?} ")).unwrap_or_default();
             format!("{doc}{}", render_class(c, i))
         }
-        StmtKind::ConstDecl(elems) => {
-            let cs: Vec<_> = elems.iter().map(|c| format!("{}={}", i.resolve(c.name), render(&c.value, i))).collect();
+        StmtKind::ConstDecl { consts, .. } => {
+            let cs: Vec<_> = consts.iter().map(|c| format!("{}={}", i.resolve(c.name), render(&c.value, i))).collect();
             format!("(const {})", cs.join(" "))
         }
         _ => "(unknown)".into(),
