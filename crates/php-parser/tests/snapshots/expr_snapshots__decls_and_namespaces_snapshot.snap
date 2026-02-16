@@ -5,7 +5,7 @@ expression: "prog(\"<?php\\n\\\n        namespace App\\\\Models;\\n\\\n        u
 (namespace App\Models)
 (use Class:App\Support\Str)
 (use Function:App\helpers\tap)
-(use Class:App\A Class:App\B as C Function:App\d)
+(group-use App\{Class:A Class:B as C Function:d})
 (global $a $b)
 (static $x=1 $y)
 (unset $a (idx $b "k"))
