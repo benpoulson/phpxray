@@ -263,6 +263,7 @@ impl<'a> Dumper<'a> {
                 )]
             }
             StmtKind::Use(items) => self.use_decls(items),
+            StmtKind::GroupUse { prefix, kind, items } => vec![self.group_use(prefix, *kind, items)],
             StmtKind::Function(f) => vec![self.func_decl(f)],
             StmtKind::Class(c) => vec![self.class_decl(c)],
             _ => vec![node("UNMAPPED_STMT", vec![])],
@@ -291,6 +292,42 @@ impl<'a> Dumper<'a> {
         let flag = items.first().map(|i| kind_flag(i.kind)).unwrap_or(1);
         out.push(C::N(head("USE", flag), elems));
         out
+    }
+
+    fn group_use(&self, prefix: &Name, kind: Option<UseKind>, items: &[UseItem]) -> C {
+        let kind_flag = |k: UseKind| match k {
+            UseKind::Class => 1,
+            UseKind::Function => 2,
+            UseKind::Const => 4,
+        };
+        // Group-level type keyword (`function`/`const`); class-default groups
+        // carry no flag.
+        let group_flag = kind.map(kind_flag).unwrap_or(0);
+        let elems: Vec<_> = items
+            .iter()
+            .map(|it| {
+                // In a typed group, elements inherit the group type (flag 0); in
+                // an untyped group each element carries its own type.
+                let elem_flag = if kind.is_some() { 0 } else { kind_flag(it.kind) };
+                (
+                    "",
+                    C::N(
+                        head("USE_ELEM", elem_flag),
+                        vec![
+                            ("name", C::Str(it.name.text.trim_start_matches('\\').to_string())),
+                            ("alias", it.alias.map(|a| C::Str(self.sym(a))).unwrap_or(C::Null)),
+                        ],
+                    ),
+                )
+            })
+            .collect();
+        C::N(
+            head("GROUP_USE", group_flag),
+            vec![
+                ("prefix", C::Str(prefix.text.trim_start_matches('\\').to_string())),
+                ("uses", C::N("USE".into(), elems)),
+            ],
+        )
     }
 
     fn func_decl(&self, f: &FunctionDecl) -> C {
@@ -473,7 +510,12 @@ impl<'a> Dumper<'a> {
     }
 
     fn property_hook(&self, h: &PropertyHook) -> C {
-        let flag = modifiers_flag(&h.modifiers, false) | if h.by_ref { 4096 } else { 0 };
+        let gen = match &h.body {
+            HookBody::Block(b) => gen_flag(b),
+            HookBody::Short(e) if expr_yields(e) => 16777216,
+            _ => 0,
+        };
+        let flag = modifiers_flag(&h.modifiers, false) | if h.by_ref { 4096 } else { 0 } | gen;
         let stmts = match &h.body {
             HookBody::Abstract => C::Null,
             HookBody::Block(b) => C::N("STMT_LIST".into(), self.stmt_list(b)),
@@ -637,7 +679,9 @@ impl<'a> Dumper<'a> {
                 )
             }
             ExprKind::ArrowFn(a) => {
-                let flag = if a.is_static { 16 } else { 0 } | if a.by_ref { 4096 } else { 0 };
+                let flag = if a.is_static { 16 } else { 0 }
+                    | if a.by_ref { 4096 } else { 0 }
+                    | if expr_yields(&a.body) { 16777216 } else { 0 };
                 C::N(
                     head("ARROW_FUNC", flag),
                     vec![

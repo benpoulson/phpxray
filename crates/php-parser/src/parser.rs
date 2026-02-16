@@ -252,9 +252,9 @@ impl<'a> Parser<'a> {
             T::Keyword(Kw::Declare) => self.parse_declare(),
             T::Keyword(Kw::Namespace) => self.parse_namespace(),
             T::Keyword(Kw::Use) => {
-                let uses = self.parse_use();
+                let kind = self.parse_use();
                 self.eat_stmt_end();
-                StmtKind::Use(uses)
+                kind
             }
             // --- declarations ---
             T::Attribute => self.parse_attributed_decl(doc),
@@ -659,7 +659,7 @@ impl<'a> Parser<'a> {
         StmtKind::Namespace { name, body }
     }
 
-    fn parse_use(&mut self) -> Vec<UseItem> {
+    fn parse_use(&mut self) -> StmtKind {
         self.bump(); // use
         let group_kind = self.use_type();
         let mut items = Vec::new();
@@ -673,21 +673,18 @@ impl<'a> Parser<'a> {
             if is_group {
                 self.eat(T::NsSeparator);
                 self.expect(T::LBrace, "`{`");
+                let mut group_items = Vec::new();
                 while !self.at(T::RBrace) && !self.at_eof() {
-                    let sub_kind = self.use_type().unwrap_or(item_kind);
+                    let sub_kind = self.use_type().unwrap_or(group_kind.unwrap_or(UseKind::Class));
                     let sub = self.parse_name();
                     let alias = self.parse_use_alias();
-                    items.push(UseItem {
-                        kind: sub_kind,
-                        name: join_names(&name, &sub),
-                        alias,
-                    });
+                    group_items.push(UseItem { kind: sub_kind, name: sub, alias });
                     if !self.eat(T::Comma) {
                         break;
                     }
                 }
                 self.expect(T::RBrace, "`}`");
-                break;
+                return StmtKind::GroupUse { prefix: name, kind: group_kind, items: group_items };
             }
             let alias = self.parse_use_alias();
             items.push(UseItem { kind: item_kind, name, alias });
@@ -695,7 +692,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        items
+        StmtKind::Use(items)
     }
 
     fn use_type(&mut self) -> Option<UseKind> {
@@ -2356,11 +2353,6 @@ fn cast_kind(k: T) -> Option<CastKind> {
 }
 
 // --- literal value decoding ------------------------------------------------
-
-/// Join a group-`use` prefix with a sub-name: `Prefix` + `Sub` → `Prefix\Sub`.
-fn join_names(prefix: &Name, sub: &Name) -> Name {
-    Name { fq: prefix.fq, text: format!("{}\\{}", prefix.text, sub.text) }
-}
 
 fn parse_int(text: &str) -> i64 {
     let cleaned: String = text.chars().filter(|&c| c != '_').collect();

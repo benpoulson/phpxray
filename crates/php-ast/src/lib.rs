@@ -112,6 +112,13 @@ pub enum StmtKind {
         body: Option<Vec<Stmt>>,
     },
     Use(Vec<UseItem>),
+    /// `use Prefix\{ ... }` — group use. `kind` is the optional group-level
+    /// type keyword (`function`/`const`); per-element kinds live on each item.
+    GroupUse {
+        prefix: Name,
+        kind: Option<UseKind>,
+        items: Vec<UseItem>,
+    },
 
     // --- declarations ---
     Function(FunctionDecl),

@@ -693,6 +693,17 @@ fn render_stmt(s: &Stmt, i: &Interner) -> String {
                 .collect();
             format!("(use {})", parts.join(" "))
         }
+        StmtKind::GroupUse { prefix, kind, items } => {
+            let k = kind.map(|k| format!("{k:?} ")).unwrap_or_default();
+            let parts: Vec<_> = items
+                .iter()
+                .map(|u| {
+                    let a = u.alias.map(|a| format!(" as {}", i.resolve(a))).unwrap_or_default();
+                    format!("{:?}:{}{a}", u.kind, u.name.text)
+                })
+                .collect();
+            format!("(group-use {k}{}\\{{{}}})", prefix.text, parts.join(" "))
+        }
         StmtKind::Function(f) => {
             let r = if f.by_ref { "&" } else { "" };
             let doc = f.doc.as_deref().map(|d| format!("{d:?} ")).unwrap_or_default();
