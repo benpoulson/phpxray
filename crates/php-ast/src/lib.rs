@@ -466,6 +466,9 @@ pub enum ExprKind {
     Variable(Symbol),
     /// `$$x` / `${ expr }` — a variable whose name is computed.
     VariableVariable(Box<Expr>),
+    /// The `${ bareword }` / `${ bareword[idx] }` interpolation form. Wraps the
+    /// inner `Variable`/`Index`; PHP flags this distinctly only inside strings.
+    DollarBrace(Box<Expr>),
     /// A bare name: a constant, or a function/class reference depending on context.
     Name(Name),
 

@@ -569,6 +569,8 @@ impl<'a> Dumper<'a> {
             ExprKind::Str(v) => C::Str(v.clone()),
             ExprKind::Variable(s) => node("VAR", vec![("name", C::Str(self.sym(*s)))]),
             ExprKind::VariableVariable(inner) => node("VAR", vec![("name", self.expr(inner))]),
+            // Outside string interpolation `${...}` carries no special flag.
+            ExprKind::DollarBrace(inner) => self.expr(inner),
             ExprKind::Name(n) => self.const_or_magic(n),
             ExprKind::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs),
             ExprKind::Unary { op, expr } => self.unary(*op, expr),
@@ -640,11 +642,8 @@ impl<'a> Dumper<'a> {
             ExprKind::PostDec(e) => node("POST_DEC", vec![("var", self.expr(e))]),
             ExprKind::Cast { kind, expr } => C::N(head("CAST", cast_code(*kind)), vec![("expr", self.expr(expr))]),
             ExprKind::Instanceof { expr, class } => node("INSTANCEOF", vec![("expr", self.expr(expr)), ("class", self.class_or_name(class))]),
-            ExprKind::Interpolated(parts) => C::N("ENCAPS_LIST".into(), parts.iter().map(|p| ("", self.encaps_part(p))).collect()),
-            ExprKind::ShellExec(parts) => {
-                let encaps = C::N("ENCAPS_LIST".into(), parts.iter().map(|p| ("", self.encaps_part(p))).collect());
-                node("SHELL_EXEC", vec![("expr", encaps)])
-            }
+            ExprKind::Interpolated(parts) => self.encaps_or_string(parts),
+            ExprKind::ShellExec(parts) => node("SHELL_EXEC", vec![("expr", self.encaps_or_string(parts))]),
             ExprKind::Match { subject, arms } => {
                 let a: Vec<_> = arms
                     .iter()
@@ -873,8 +872,32 @@ impl<'a> Dumper<'a> {
         C::N(head("ARRAY", flag), kids)
     }
 
+    /// Render interpolation parts, collapsing a purely-literal or empty body to
+    /// a plain string (as PHP does for backtick `SHELL_EXEC` and heredoc).
+    fn encaps_or_string(&self, parts: &[Expr]) -> C {
+        match parts {
+            [] => C::Str(String::new()),
+            [one] if matches!(one.kind, ExprKind::Str(_)) => self.encaps_part(one),
+            _ => C::N("ENCAPS_LIST".into(), parts.iter().map(|p| ("", self.encaps_part(p))).collect()),
+        }
+    }
+
     fn encaps_part(&self, p: &Expr) -> C {
-        self.expr(p)
+        match &p.kind {
+            // `"${ bareword }"` → VAR#1; `"${ bareword[idx] }"` → DIM#1 (the flag
+            // sits on the outermost node, the inner VAR stays plain).
+            ExprKind::DollarBrace(inner) => match &inner.kind {
+                ExprKind::Variable(s) => C::N(head("VAR", 1), vec![("name", C::Str(self.sym(*s)))]),
+                ExprKind::Index { base, index } => C::N(
+                    head("DIM", 1),
+                    vec![("expr", self.expr(base)), ("dim", self.opt(index.as_deref()))],
+                ),
+                _ => self.expr(inner),
+            },
+            // `"${ expr }"` → VAR#2 with the expression as the (computed) name.
+            ExprKind::VariableVariable(inner) => C::N(head("VAR", 2), vec![("name", self.expr(inner))]),
+            _ => self.expr(p),
+        }
     }
 
     fn expr_list(&self, es: &[Expr]) -> C {

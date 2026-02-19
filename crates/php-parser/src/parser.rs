@@ -1389,7 +1389,11 @@ impl<'a> Parser<'a> {
             T::Eq => {
                 self.bump();
                 if self.eat_amp() {
-                    let rhs = self.parse_expr(rbp);
+                    // `=&` binds a *variable* reference, not a full expression:
+                    // `$a = &$b + $c` is `($a = &$b) + $c`. Parse the RHS above
+                    // all binary operators so only the variable (+ postfixes) is
+                    // taken.
+                    let rhs = self.parse_expr(BP_REF_RHS);
                     self.node(start, ExprKind::AssignRef { target: Box::new(lhs), rhs: Box::new(rhs) })
                 } else {
                     let rhs = self.parse_expr(rbp);
@@ -2213,13 +2217,14 @@ impl<'a> Parser<'a> {
             let t = self.bump();
             let s = self.interner.intern(self.text(t));
             let var = self.node(start, ExprKind::Variable(s));
-            if self.eat(T::LBracket) {
+            let inner = if self.eat(T::LBracket) {
                 let index = self.parse_expr(0);
                 self.expect(T::RBracket, "`]`");
                 self.node(start, ExprKind::Index { base: Box::new(var), index: Some(Box::new(index)) })
             } else {
                 var
-            }
+            };
+            self.node(start, ExprKind::DollarBrace(Box::new(inner)))
         } else {
             let inner = self.parse_expr(0);
             self.node(start, ExprKind::VariableVariable(Box::new(inner)))
@@ -2242,6 +2247,7 @@ const BP_YIELD: u8 = 10;
 const BP_NOT: u8 = 42; // `!`
 const BP_UNARY2: u8 = 46; // `~`, casts, `@`, unary `+`/`-`
 const BP_CLONE: u8 = 50;
+const BP_REF_RHS: u8 = 50; // `=&` RHS: a variable, above all binary operators
 const BP_TERNARY_RHS: u8 = 14; // `?:`/`?:` is left-associative (matches `%left '?' ':'`)
 
 fn infix_power(k: T) -> Option<(u8, u8)> {

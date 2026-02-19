@@ -33,6 +33,7 @@ fn render(e: &Expr, i: &Interner) -> String {
         }
         Variable(s) => format!("${}", i.resolve(*s)),
         VariableVariable(inner) => format!("($$ {})", render(inner, i)),
+        DollarBrace(inner) => format!("(${{}} {})", render(inner, i)),
         Name(n) => n.text.clone(),
         Array { items, .. } => {
             let inner: Vec<_> = items
