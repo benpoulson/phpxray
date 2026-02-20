@@ -1795,6 +1795,32 @@ impl<'a> Parser<'a> {
         e
     }
 
+    /// After `::`, parse the `$`-led variable form of a static-member name
+    /// (`$$x`, `${expr}`). The leading `$` denotes "property"; the result is the
+    /// inner name expression (so `Foo::$$x`'s name is the `$x` expression).
+    fn parse_static_prop_name(&mut self) -> Expr {
+        let start = self.cur_start();
+        self.bump(); // leading `$`
+        match self.peek() {
+            T::LBrace => {
+                self.bump();
+                let e = self.parse_expr(0);
+                self.expect(T::RBrace, "`}`");
+                e
+            }
+            T::Variable => {
+                let t = self.bump();
+                let s = self.intern_var(t);
+                self.node(t.span.start, ExprKind::Variable(s))
+            }
+            T::Dollar => self.parse_variable_variable(),
+            _ => {
+                self.error_here("expected variable name after `$`");
+                self.node(start, ExprKind::Error)
+            }
+        }
+    }
+
     fn parse_static_access(&mut self, class: Expr, start: u32) -> Expr {
         self.bump(); // `::`
         match self.peek() {
@@ -1808,10 +1834,11 @@ impl<'a> Parser<'a> {
                     self.node(start, ExprKind::StaticProp { class: Box::new(class), name })
                 }
             }
-            // `Foo::$$var` — a variable-variable static member.
+            // `Foo::$$var` / `Foo::${expr}` — a static member whose name is the
+            // expression after the leading `$`.
             T::Dollar => {
-                let var = self.parse_variable_variable();
-                let name = MemberName::Expr(Box::new(var));
+                let inner = self.parse_static_prop_name();
+                let name = MemberName::Expr(Box::new(inner));
                 if self.at(T::LParen) {
                     let args = self.parse_args();
                     self.node(start, ExprKind::StaticCall { class: Box::new(class), method: name, args })
@@ -2057,21 +2084,38 @@ impl<'a> Parser<'a> {
                 }
                 T::DoubleColon => {
                     self.bump();
-                    let name = match self.peek() {
-                        T::Variable => MemberName::Var({
+                    match self.peek() {
+                        // `Class::$prop` is a static property access.
+                        T::Variable => {
                             let t = self.bump();
-                            self.intern_var(t)
-                        }),
-                        T::Identifier | T::Keyword(_) => MemberName::Ident({
+                            let name = MemberName::Var(self.intern_var(t));
+                            self.node(start, ExprKind::StaticProp { class: Box::new(e), name })
+                        }
+                        // `Class::$$x` / `Class::${expr}` — computed static prop.
+                        T::Dollar => {
+                            let inner = self.parse_static_prop_name();
+                            let name = MemberName::Expr(Box::new(inner));
+                            self.node(start, ExprKind::StaticProp { class: Box::new(e), name })
+                        }
+                        // `Class::{expr}` — computed class constant.
+                        T::LBrace => {
+                            self.bump();
+                            let inner = self.parse_expr(0);
+                            self.expect(T::RBrace, "`}`");
+                            let name = MemberName::Expr(Box::new(inner));
+                            self.node(start, ExprKind::ClassConst { class: Box::new(e), name })
+                        }
+                        T::Identifier | T::Keyword(_) => {
                             let t = self.bump();
-                            self.intern_tok(t)
-                        }),
+                            let name = MemberName::Ident(self.intern_tok(t));
+                            self.node(start, ExprKind::ClassConst { class: Box::new(e), name })
+                        }
                         _ => {
                             self.error_here("expected member after `::`");
-                            MemberName::Ident(self.interner.intern(""))
+                            let name = MemberName::Ident(self.interner.intern(""));
+                            self.node(start, ExprKind::ClassConst { class: Box::new(e), name })
                         }
-                    };
-                    self.node(start, ExprKind::ClassConst { class: Box::new(e), name })
+                    }
                 }
                 T::LBracket => {
                     self.bump();

@@ -586,7 +586,7 @@ impl<'a> Dumper<'a> {
                 "CONDITIONAL",
                 vec![("cond", self.expr(cond)), ("true", self.opt(then.as_deref())), ("false", self.expr(els))],
             ),
-            ExprKind::Call { callee, args } => node("CALL", vec![("expr", self.class_or_name(callee)), ("args", self.args(args))]),
+            ExprKind::Call { callee, args } => node("CALL", vec![("expr", self.callee(callee)), ("args", self.args(args))]),
             ExprKind::MethodCall { recv, nullsafe, method, args } => node(
                 if *nullsafe { "NULLSAFE_METHOD_CALL" } else { "METHOD_CALL" },
                 vec![("expr", self.deref(recv)), ("method", self.member(method)), ("args", self.args(args))],
@@ -778,6 +778,23 @@ impl<'a> Dumper<'a> {
         node("CONST", vec![("name", self.name_ref(n))])
     }
 
+    /// The callee of a call. A constant-string callee (`'foo'()`, `('\foo')()`)
+    /// folds to a function `NAME` with the leading namespace separator stripped.
+    fn callee(&self, e: &Expr) -> C {
+        let lit = match &e.kind {
+            ExprKind::Str(s) => Some(s),
+            ExprKind::Paren(inner) => match &inner.kind {
+                ExprKind::Str(s) => Some(s),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(s) = lit {
+            return node("NAME", vec![("name", C::Str(s.trim_start_matches('\\').to_string()))]);
+        }
+        self.class_or_name(e)
+    }
+
     /// A name used as a class/function reference is a bare NAME (not CONST).
     fn class_or_name(&self, e: &Expr) -> C {
         match &e.kind {
@@ -795,6 +812,9 @@ impl<'a> Dumper<'a> {
                 (2, n.text.split_once('\\').map(|(_, r)| r).unwrap_or(&n.text).to_string())
             }
         };
+        // The reserved `static` keyword is normalized to lowercase by the lexer
+        // (`self`/`parent` are plain identifiers and keep their case).
+        let text = if text.eq_ignore_ascii_case("static") { "static".to_string() } else { text };
         C::N(head("NAME", flag), vec![("name", C::Str(text))])
     }
 
