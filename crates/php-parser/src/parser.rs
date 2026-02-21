@@ -1611,11 +1611,11 @@ impl<'a> Parser<'a> {
                 let t = self.bump();
                 self.node(start, ExprKind::Name(Name { fq: NameFq::NotFq, text: self.text(t).to_string() }))
             }
-            // `readonly` is usable as a function/constant name (PHP grammar's
-            // `function_name: T_STRING | T_READONLY`).
+            // `readonly` is usable as a function name (PHP grammar's dedicated
+            // `T_READONLY '(' ... )` rule), which builds an unflagged NAME.
             Kw::Readonly => {
                 let t = self.bump();
-                self.node(start, ExprKind::Name(Name { fq: NameFq::NotFq, text: self.text(t).to_string() }))
+                self.node(start, ExprKind::Name(Name { fq: NameFq::Fq, text: self.text(t).to_string() }))
             }
             // Magic constants (`__LINE__`, `__DIR__`, …). Represented as plain
             // names for now; a dedicated node can come with const resolution.
@@ -1677,20 +1677,21 @@ impl<'a> Parser<'a> {
 
     fn parse_exit(&mut self, start: u32) -> Expr {
         self.bump(); // exit / die
-        let arg = if self.eat(T::LParen) {
-            // `exit(...)` first-class-callable form has no argument.
-            let a = if self.at(T::RParen) || (self.at(T::Ellipsis) && self.nth(1) == T::RParen) {
-                self.eat(T::Ellipsis);
-                None
-            } else {
-                Some(Box::new(self.parse_expr(0)))
-            };
+        if self.at(T::LParen) {
+            // `exit(...)` is a first-class callable to the `exit` function.
+            if self.nth(1) == T::Ellipsis && self.nth(2) == T::RParen {
+                let args = self.parse_args();
+                let callee =
+                    Expr::new(Span::at(start), ExprKind::Name(Name { fq: NameFq::Fq, text: "exit".into() }));
+                return self.node(start, ExprKind::Call { callee: Box::new(callee), args });
+            }
+            self.bump(); // `(`
+            let arg = if self.at(T::RParen) { None } else { Some(Box::new(self.parse_expr(0))) };
             self.expect(T::RParen, "`)`");
-            a
+            self.node(start, ExprKind::Exit(arg))
         } else {
-            None
-        };
-        self.node(start, ExprKind::Exit(arg))
+            self.node(start, ExprKind::Exit(None))
+        }
     }
 
     fn parse_yield(&mut self, start: u32) -> Expr {
@@ -2064,10 +2065,13 @@ impl<'a> Parser<'a> {
             }
             T::Dollar => self.parse_variable_variable(),
             T::LParen => {
+                // `new (expr)` — keep the parens: a bare name inside is a
+                // constant fetch (`new (FOO)` instantiates the class named by the
+                // constant FOO), not a class name.
                 self.bump();
                 let inner = self.parse_expr(0);
                 self.expect(T::RParen, "`)`");
-                Expr::new(self.span_to(start), inner.kind)
+                self.node(start, ExprKind::Paren(Box::new(inner)))
             }
             _ => {
                 self.error_here("expected class name");

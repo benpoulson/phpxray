@@ -121,7 +121,9 @@ impl<'a> Dumper<'a> {
             StmtKind::Expr(e) => vec![self.expr(e)],
             StmtKind::Echo(es) => es.iter().map(|e| node("ECHO", vec![("expr", self.expr(e))])).collect(),
             StmtKind::Return(v) => vec![node("RETURN", vec![("expr", self.opt(v.as_ref()))])],
-            StmtKind::Block(b) => vec![C::N("STMT_LIST".into(), self.stmt_list(b))],
+            // A bare `{ ... }` block is purely syntactic: PHP inlines its
+            // statements into the enclosing list rather than emitting a node.
+            StmtKind::Block(b) => self.stmt_list(b).into_iter().map(|(_, c)| c).collect(),
             StmtKind::Nop => vec![],
             StmtKind::InlineHtml(s) => vec![node("ECHO", vec![("expr", C::Str(s.clone()))])],
             StmtKind::HaltCompiler(off) => vec![node("HALT_COMPILER", vec![("offset", C::Int(*off as i64))])],
