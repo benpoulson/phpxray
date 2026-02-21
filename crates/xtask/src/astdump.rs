@@ -780,25 +780,18 @@ impl<'a> Dumper<'a> {
         node("CONST", vec![("name", self.name_ref(n))])
     }
 
-    /// The callee of a call. A constant-string callee (`'foo'()`, `('\foo')()`)
-    /// folds to a function `NAME` with the leading namespace separator stripped.
+    /// The callee of a call — same rules as any class/function name position.
     fn callee(&self, e: &Expr) -> C {
-        let lit = match &e.kind {
-            ExprKind::Str(s) => Some(s),
-            ExprKind::Paren(inner) => match &inner.kind {
-                ExprKind::Str(s) => Some(s),
-                _ => None,
-            },
-            _ => None,
-        };
-        if let Some(s) = lit {
-            return node("NAME", vec![("name", C::Str(s.trim_start_matches('\\').to_string()))]);
-        }
         self.class_or_name(e)
     }
 
-    /// A name used as a class/function reference is a bare NAME (not CONST).
+    /// A name used as a class/function reference is a bare NAME (not CONST). A
+    /// constant *string* in this position (`'foo'()`, `'A'::$b`, `("a"."b")()`)
+    /// also folds to a `NAME`, with the leading namespace separator stripped.
     fn class_or_name(&self, e: &Expr) -> C {
+        if let Some(s) = callee_const_string(e) {
+            return node("NAME", vec![("name", C::Str(s.trim_start_matches('\\').to_string()))]);
+        }
         match &e.kind {
             ExprKind::Name(n) => self.name_ref(n),
             _ => self.expr(e),
@@ -1005,6 +998,18 @@ fn modifiers_flag(m: &Modifiers, default_public: bool) -> u32 {
         f |= 128;
     }
     f
+}
+
+/// A constant *string* call target (`"foo"`, `("a"."b")`, parenthesized) used as
+/// a callee, which PHP resolves to a function name. Unlike [`fold_zval_str`] this
+/// rejects bare numeric literals (`5()` keeps an integer callee).
+fn callee_const_string(e: &Expr) -> Option<String> {
+    match &e.kind {
+        ExprKind::Str(s) => Some(s.clone()),
+        ExprKind::Paren(inner) => callee_const_string(inner),
+        ExprKind::Binary { op: BinOp::Concat, .. } => fold_zval_str(e),
+        _ => None,
+    }
 }
 
 /// Fold a constant-expression operand of `.` to its PHP string value, recursing
