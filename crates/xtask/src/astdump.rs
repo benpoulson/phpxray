@@ -1019,6 +1019,8 @@ fn fold_zval_str(e: &Expr) -> Option<String> {
         ExprKind::Binary { op: BinOp::Concat, lhs, rhs } => {
             Some(format!("{}{}", fold_zval_str(lhs)?, fold_zval_str(rhs)?))
         }
+        // Parentheses are transparent to constant folding.
+        ExprKind::Paren(inner) => fold_zval_str(inner),
         _ => None,
     }
 }

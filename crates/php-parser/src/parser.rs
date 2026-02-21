@@ -1545,7 +1545,7 @@ impl<'a> Parser<'a> {
                 // spread args make it a call (matching PHP's own AST).
                 if self.at(T::LParen) {
                     let mut args = self.parse_args();
-                    if args.len() == 1 && !args[0].spread && args[0].name.is_none() {
+                    if args.len() == 1 && !args[0].spread && args[0].name.is_none() && !args[0].placeholder {
                         let only = args.pop().unwrap();
                         self.node(start, ExprKind::Clone(Box::new(only.value)))
                     } else {
@@ -2230,12 +2230,23 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// A simple-interpolation offset (`"$a[X]"`) is an integer only when `X` is a
+    /// canonical integer string (round-trips through i64); `-0`, `00`, `0x0`, and
+    /// out-of-range values stay strings.
+    fn interp_offset_node(&self, start: u32, txt: String) -> Expr {
+        match canonical_int_key(&txt) {
+            Some(n) => self.node(start, ExprKind::Int(n)),
+            None => self.node(start, ExprKind::Str(txt)),
+        }
+    }
+
     fn parse_interp_offset(&mut self) -> Expr {
         let start = self.cur_start();
         match self.peek() {
             T::NumString => {
                 let t = self.bump();
-                self.node(start, ExprKind::Int(parse_int(self.text(t))))
+                let txt = self.text(t).to_string();
+                self.interp_offset_node(start, txt)
             }
             T::Identifier => {
                 let t = self.bump();
@@ -2249,7 +2260,13 @@ impl<'a> Parser<'a> {
             T::Minus => {
                 self.bump();
                 let t = self.bump(); // NumString
-                self.node(start, ExprKind::Int(parse_int(self.text(t)).wrapping_neg()))
+                let txt = self.text(t).to_string();
+                // PHP parses the positive magnitude first; `-0` and a magnitude
+                // that overflows i64 (even if its negation would fit) stay strings.
+                match canonical_int_key(&txt) {
+                    Some(n) if n != 0 => self.node(start, ExprKind::Int(-n)),
+                    _ => self.node(start, ExprKind::Str(format!("-{txt}"))),
+                }
             }
             _ => {
                 self.error_here("invalid offset in string interpolation");
@@ -2407,6 +2424,13 @@ fn cast_kind(k: T) -> Option<CastKind> {
 }
 
 // --- literal value decoding ------------------------------------------------
+
+/// Whether `s` is a canonical integer string (it round-trips through i64): `0`
+/// or `-?[1-9][0-9]*` within range. Used for array/interpolation integer keys.
+fn canonical_int_key(s: &str) -> Option<i64> {
+    let n: i64 = s.parse().ok()?;
+    (n.to_string() == s).then_some(n)
+}
 
 fn parse_int(text: &str) -> i64 {
     let cleaned: String = text.chars().filter(|&c| c != '_').collect();
