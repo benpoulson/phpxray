@@ -269,11 +269,12 @@ fn render_member(m: &Member, i: &Interner) -> String {
                         Some(v) => format!("${}={}", i.resolve(p.name), render(v, i)),
                         None => format!("${}", i.resolve(p.name)),
                     };
-                    if p.hooks.is_empty() {
-                        base
-                    } else {
-                        let hs: Vec<_> = p.hooks.iter().map(|h| render_hook(h, i)).collect();
-                        format!("{base} {{{}}}", hs.join(" "))
+                    match &p.hooks {
+                        None => base,
+                        Some(hooks) => {
+                            let hs: Vec<_> = hooks.iter().map(|h| render_hook(h, i)).collect();
+                            format!("{base} {{{}}}", hs.join(" "))
+                        }
                     }
                 })
                 .collect();

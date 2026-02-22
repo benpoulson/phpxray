@@ -421,7 +421,11 @@ impl<'a> Dumper<'a> {
                             node("PROP_ELEM", vec![
                                 ("name", C::Str(self.sym(p.name))),
                                 ("default", p.default.as_ref().map(|e| self.expr(e)).unwrap_or(C::Null)),
-                                ("hooks", self.hooks(&p.hooks)),
+                                // A present hook block (even empty `{}`) is a STMT_LIST; no block is null.
+                                ("hooks", match &p.hooks {
+                                    None => C::Null,
+                                    Some(v) => C::N("STMT_LIST".into(), v.iter().map(|h| ("", self.property_hook(h))).collect()),
+                                }),
                             ]),
                         )
                     })

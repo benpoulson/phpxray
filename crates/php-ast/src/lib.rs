@@ -214,8 +214,9 @@ pub struct PropertyDecl {
 pub struct PropElem {
     pub name: Symbol,
     pub default: Option<Expr>,
-    /// Property hooks (`{ get; set { … } }`); empty for a plain property.
-    pub hooks: Vec<PropertyHook>,
+    /// Property hooks (`{ get; set { … } }`). `None` = a plain property (no
+    /// brace block); `Some` = a hook block was present (possibly empty `{}`).
+    pub hooks: Option<Vec<PropertyHook>>,
 }
 
 #[derive(Clone, PartialEq, Debug)]

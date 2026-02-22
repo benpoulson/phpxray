@@ -1062,10 +1062,13 @@ impl<'a> Parser<'a> {
                 self.interner.intern("")
             };
             let default = if self.eat(T::Eq) { Some(self.parse_expr(0)) } else { None };
-            let hooks = if self.at(T::LBrace) { self.parse_property_hooks() } else { Vec::new() };
-            if !hooks.is_empty() {
+            // A hook block (`{ … }`, possibly empty) makes this a hooked property.
+            let hooks = if self.at(T::LBrace) {
                 hooked = true;
-            }
+                Some(self.parse_property_hooks())
+            } else {
+                None
+            };
             props.push(PropElem { name, default, hooks });
             // A hooked property is a single declaration (no comma list).
             if hooked || !self.eat(T::Comma) {
