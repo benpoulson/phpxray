@@ -15,6 +15,9 @@
 
 use php_ast::{Name, NameFq};
 
+mod index;
+pub use index::{index_file, ClassSymbol, ConstSymbol, FileIndex, FunctionSymbol};
+
 /// What a name resolves to in a given [`Scope`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolution {
@@ -162,6 +165,12 @@ impl Scope {
                 }
             }
         }
+    }
+
+    /// The fully-qualified name of a symbol *declared* in this scope (a class,
+    /// function, or constant named `local`): the current namespace plus `local`.
+    pub fn qualify(&self, local: &str) -> String {
+        self.prefix(local)
     }
 
     /// Prefix `rel` with the current namespace (or return it unchanged in the

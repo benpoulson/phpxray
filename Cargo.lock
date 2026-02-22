@@ -219,6 +219,7 @@ dependencies = [
  "php-ast",
  "php-diagnostics",
  "php-intern",
+ "php-parser",
  "php-span",
 ]
 
