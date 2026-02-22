@@ -213,6 +213,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "php-resolve"
+version = "0.0.0"
+dependencies = [
+ "php-ast",
+ "php-diagnostics",
+ "php-intern",
+ "php-span",
+]
+
+[[package]]
 name = "php-span"
 version = "0.0.0"
 
