@@ -11,35 +11,50 @@ enum C {
     N(String, Vec<(&'static str, C)>),
     Int(i64),
     Float(f64),
+    /// A leaf that is logically a string but always valid UTF-8 (identifiers,
+    /// names, synthesized labels).
     Str(String),
+    /// A PHP string *value* — an arbitrary byte sequence (may be invalid UTF-8).
+    BStr(Vec<u8>),
     Null,
 }
 
-pub fn dump(program: &Program, _src: &str, interner: &Interner) -> String {
+/// The canonical dump is a byte stream (PHP string literals can contain raw,
+/// non-UTF-8 bytes that must round-trip exactly for the differential).
+pub fn dump(program: &Program, _src: &str, interner: &Interner) -> Vec<u8> {
     let d = Dumper { i: interner };
     let root = C::N("STMT_LIST".into(), d.stmt_list(&program.stmts));
-    let mut out = String::new();
+    let mut out = Vec::new();
     render(&root, 0, &mut out);
     out
 }
 
-fn render(c: &C, ind: usize, out: &mut String) {
+fn render(c: &C, ind: usize, out: &mut Vec<u8>) {
     let p = "  ".repeat(ind);
     match c {
         C::N(head, kids) => {
-            out.push_str(&format!("{p}({head}\n"));
+            out.extend_from_slice(format!("{p}({head}\n").as_bytes());
             for (k, child) in kids {
                 let key = if k.is_empty() { String::new() } else { format!("{k}=") };
-                out.push_str(&format!("{p}  {key}\n"));
+                out.extend_from_slice(format!("{p}  {key}\n").as_bytes());
                 render(child, ind + 2, out);
             }
-            out.push_str(&format!("{p})\n"));
+            out.extend_from_slice(format!("{p})\n").as_bytes());
         }
-        C::Int(v) => out.push_str(&format!("{p}{v}\n")),
-        C::Float(v) => out.push_str(&format!("{p}{}\n", fmt_float(*v))),
-        C::Str(s) => out.push_str(&format!("{p}\"{}\"\n", escape(s))),
-        C::Null => out.push_str(&format!("{p}null\n")),
+        C::Int(v) => out.extend_from_slice(format!("{p}{v}\n").as_bytes()),
+        C::Float(v) => out.extend_from_slice(format!("{p}{}\n", fmt_float(*v)).as_bytes()),
+        C::Str(s) => push_quoted(out, &p, s.as_bytes()),
+        C::BStr(s) => push_quoted(out, &p, s),
+        C::Null => out.extend_from_slice(format!("{p}null\n").as_bytes()),
     }
+}
+
+/// Write `"<escaped bytes>"\n` at indentation `p`.
+fn push_quoted(out: &mut Vec<u8>, p: &str, bytes: &[u8]) {
+    out.extend_from_slice(p.as_bytes());
+    out.push(b'"');
+    escape_into(bytes, out);
+    out.extend_from_slice(b"\"\n");
 }
 
 fn fmt_float(v: f64) -> String {
@@ -65,19 +80,19 @@ fn fmt_float(v: f64) -> String {
     }
 }
 
-fn escape(s: &str) -> String {
-    let mut o = String::with_capacity(s.len());
-    for ch in s.chars() {
+/// Escape a byte string the same way `dump_ast.php`'s `leaf()` does: `\ " \n \r
+/// \t`, all other bytes verbatim (mirrors PHP's `strtr`).
+fn escape_into(s: &[u8], out: &mut Vec<u8>) {
+    for &ch in s {
         match ch {
-            '\\' => o.push_str("\\\\"),
-            '"' => o.push_str("\\\""),
-            '\n' => o.push_str("\\n"),
-            '\r' => o.push_str("\\r"),
-            '\t' => o.push_str("\\t"),
-            _ => o.push(ch),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            _ => out.push(ch),
         }
     }
-    o
 }
 
 fn node(head: &str, kids: Vec<(&'static str, C)>) -> C {
@@ -568,7 +583,7 @@ impl<'a> Dumper<'a> {
         match &e.kind {
             ExprKind::Int(n) => C::Int(*n),
             ExprKind::Float(f) => C::Float(*f),
-            ExprKind::Str(v) => C::Str(v.clone()),
+            ExprKind::Str(v) => C::BStr(v.clone()),
             ExprKind::Variable(s) => node("VAR", vec![("name", C::Str(self.sym(*s)))]),
             ExprKind::VariableVariable(inner) => node("VAR", vec![("name", self.expr(inner))]),
             // Outside string interpolation `${...}` carries no special flag.
@@ -790,7 +805,10 @@ impl<'a> Dumper<'a> {
     /// also folds to a `NAME`, with the leading namespace separator stripped.
     fn class_or_name(&self, e: &Expr) -> C {
         if let Some(s) = callee_const_string(e) {
-            return node("NAME", vec![("name", C::Str(s.trim_start_matches('\\').to_string()))]);
+            // A function name is an identifier; constant-string callees are
+            // effectively always ASCII, so a lossy decode is safe here.
+            let name = String::from_utf8_lossy(&s).trim_start_matches('\\').to_string();
+            return node("NAME", vec![("name", C::Str(name))]);
         }
         match &e.kind {
             ExprKind::Name(n) => self.name_ref(n),
@@ -818,8 +836,9 @@ impl<'a> Dumper<'a> {
         // (zend_ast_create_concat_op): two scalar operands collapse to one
         // string. No other operator is folded into the AST.
         if op == BinOp::Concat {
-            if let (Some(a), Some(b)) = (fold_zval_str(lhs), fold_zval_str(rhs)) {
-                return C::Str(format!("{a}{b}"));
+            if let (Some(mut a), Some(b)) = (fold_zval_str(lhs), fold_zval_str(rhs)) {
+                a.extend_from_slice(&b);
+                return C::BStr(a);
             }
         }
         // php-ast represents every binary operator as BINARY_OP#flag.
@@ -891,7 +910,7 @@ impl<'a> Dumper<'a> {
     /// a plain string (as PHP does for backtick `SHELL_EXEC` and heredoc).
     fn encaps_or_string(&self, parts: &[Expr]) -> C {
         match parts {
-            [] => C::Str(String::new()),
+            [] => C::BStr(Vec::new()),
             [one] if matches!(one.kind, ExprKind::Str(_)) => self.encaps_part(one),
             _ => C::N("ENCAPS_LIST".into(), parts.iter().map(|p| ("", self.encaps_part(p))).collect()),
         }
@@ -1003,7 +1022,7 @@ fn modifiers_flag(m: &Modifiers, default_public: bool) -> u32 {
 /// A constant *string* call target (`"foo"`, `("a"."b")`, parenthesized) used as
 /// a callee, which PHP resolves to a function name. Unlike [`fold_zval_str`] this
 /// rejects bare numeric literals (`5()` keeps an integer callee).
-fn callee_const_string(e: &Expr) -> Option<String> {
+fn callee_const_string(e: &Expr) -> Option<Vec<u8>> {
     match &e.kind {
         ExprKind::Str(s) => Some(s.clone()),
         ExprKind::Paren(inner) => callee_const_string(inner),
@@ -1012,17 +1031,19 @@ fn callee_const_string(e: &Expr) -> Option<String> {
     }
 }
 
-/// Fold a constant-expression operand of `.` to its PHP string value, recursing
-/// through nested constant concatenations. Returns `None` for anything that is
-/// not a literal scalar (variables, named constants, `true`/`false`/`null`,
-/// other operators), which PHP leaves un-folded.
-fn fold_zval_str(e: &Expr) -> Option<String> {
+/// Fold a constant-expression operand of `.` to its PHP byte-string value,
+/// recursing through nested constant concatenations. Returns `None` for anything
+/// that is not a literal scalar (variables, named constants, `true`/`false`/
+/// `null`, other operators), which PHP leaves un-folded.
+fn fold_zval_str(e: &Expr) -> Option<Vec<u8>> {
     match &e.kind {
         ExprKind::Str(s) => Some(s.clone()),
-        ExprKind::Int(i) => Some(i.to_string()),
-        ExprKind::Float(f) => Some(php_runtime_float(*f)),
+        ExprKind::Int(i) => Some(i.to_string().into_bytes()),
+        ExprKind::Float(f) => Some(php_runtime_float(*f).into_bytes()),
         ExprKind::Binary { op: BinOp::Concat, lhs, rhs } => {
-            Some(format!("{}{}", fold_zval_str(lhs)?, fold_zval_str(rhs)?))
+            let mut a = fold_zval_str(lhs)?;
+            a.extend_from_slice(&fold_zval_str(rhs)?);
+            Some(a)
         }
         // Parentheses are transparent to constant folding.
         ExprKind::Paren(inner) => fold_zval_str(inner),

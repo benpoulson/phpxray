@@ -453,8 +453,10 @@ pub enum ExprKind {
     // --- literals ---
     Int(i64),
     Float(f64),
-    /// A non-interpolated string's raw inner text (escapes not yet decoded).
-    Str(String),
+    /// A string literal's decoded value. PHP strings are byte sequences (an
+    /// escape like `\xff` yields a raw byte, not valid UTF-8), so this is a
+    /// `Vec<u8>`, not a `String`.
+    Str(Vec<u8>),
     /// An interpolated string / heredoc: literal parts ([`ExprKind::Str`])
     /// interleaved with embedded expressions.
     Interpolated(Vec<Expr>),

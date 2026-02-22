@@ -2170,7 +2170,7 @@ impl<'a> Parser<'a> {
         process_heredoc_body(&mut parts, indent);
         // PHP collapses a purely-literal heredoc/nowdoc to a plain string.
         match parts.len() {
-            0 => self.node(start, ExprKind::Str(String::new())),
+            0 => self.node(start, ExprKind::Str(Vec::new())),
             1 if matches!(parts[0].kind, ExprKind::Str(_)) => {
                 let s = match parts.pop().unwrap().kind {
                     ExprKind::Str(s) => s,
@@ -2190,7 +2190,7 @@ impl<'a> Parser<'a> {
                     let t = self.bump();
                     // Nowdoc bodies are literal; everything else applies
                     // double-quote escape rules.
-                    let s = if raw { self.text(t).to_string() } else { decode_double(self.text(t)) };
+                    let s = if raw { self.text(t).as_bytes().to_vec() } else { decode_double(self.text(t)) };
                     parts.push(self.node(t.span.start, ExprKind::Str(s)));
                 }
                 T::Variable => parts.push(self.parse_simple_interp_var()),
@@ -2236,7 +2236,7 @@ impl<'a> Parser<'a> {
     fn interp_offset_node(&self, start: u32, txt: String) -> Expr {
         match canonical_int_key(&txt) {
             Some(n) => self.node(start, ExprKind::Int(n)),
-            None => self.node(start, ExprKind::Str(txt)),
+            None => self.node(start, ExprKind::Str(txt.into_bytes())),
         }
     }
 
@@ -2250,7 +2250,7 @@ impl<'a> Parser<'a> {
             }
             T::Identifier => {
                 let t = self.bump();
-                self.node(start, ExprKind::Str(self.text(t).to_string()))
+                self.node(start, ExprKind::Str(self.text(t).as_bytes().to_vec()))
             }
             T::Variable => {
                 let t = self.bump();
@@ -2265,7 +2265,7 @@ impl<'a> Parser<'a> {
                 // that overflows i64 (even if its negation would fit) stay strings.
                 match canonical_int_key(&txt) {
                     Some(n) if n != 0 => self.node(start, ExprKind::Int(-n)),
-                    _ => self.node(start, ExprKind::Str(format!("-{txt}"))),
+                    _ => self.node(start, ExprKind::Str(format!("-{txt}").into_bytes())),
                 }
             }
             _ => {
@@ -2476,9 +2476,9 @@ fn process_heredoc_body(parts: &mut [Expr], indent: usize) {
     //    part of the string value).
     if let Some(last) = parts.last_mut() {
         if let ExprKind::Str(s) = &mut last.kind {
-            if s.ends_with('\n') {
+            if s.last() == Some(&b'\n') {
                 s.pop();
-                if s.ends_with('\r') {
+                if s.last() == Some(&b'\r') {
                     s.pop();
                 }
             }
@@ -2494,7 +2494,7 @@ fn process_heredoc_body(parts: &mut [Expr], indent: usize) {
             ExprKind::Str(s) => {
                 if !s.is_empty() {
                     *s = dedent_line_starts(s, indent, at_line_start);
-                    at_line_start = s.ends_with('\n');
+                    at_line_start = s.last() == Some(&b'\n');
                 }
             }
             // A non-literal part (interpolation) sits mid-line.
@@ -2503,19 +2503,19 @@ fn process_heredoc_body(parts: &mut [Expr], indent: usize) {
     }
 }
 
-/// Remove up to `indent` leading whitespace (space/tab) characters at the start
-/// of each line of `s`. `at_line_start` says whether `s` begins a fresh line.
-fn dedent_line_starts(s: &str, indent: usize, at_line_start: bool) -> String {
-    let mut out = String::with_capacity(s.len());
+/// Remove up to `indent` leading whitespace (space/tab) bytes at the start of
+/// each line of `s`. `at_line_start` says whether `s` begins a fresh line.
+fn dedent_line_starts(s: &[u8], indent: usize, at_line_start: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
     let mut skip = if at_line_start { indent } else { 0 };
-    for ch in s.chars() {
-        if skip > 0 && (ch == ' ' || ch == '\t') {
+    for &ch in s {
+        if skip > 0 && (ch == b' ' || ch == b'\t') {
             skip -= 1;
             continue;
         }
         skip = 0;
         out.push(ch);
-        if ch == '\n' {
+        if ch == b'\n' {
             skip = indent;
         }
     }
@@ -2523,8 +2523,8 @@ fn dedent_line_starts(s: &str, indent: usize, at_line_start: bool) -> String {
 }
 
 /// Decode a `T_CONSTANT_ENCAPSED_STRING` lexeme (with quotes and optional `b`
-/// prefix) to its string value, applying single- or double-quote escape rules.
-fn decode_string_literal(text: &str) -> String {
+/// prefix) to its byte-string value, applying single- or double-quote rules.
+fn decode_string_literal(text: &str) -> Vec<u8> {
     let b = text.as_bytes();
     let body = if b.len() > 1 && (b[0] == b'b' || b[0] == b'B') && (b[1] == b'"' || b[1] == b'\'') {
         &text[1..]
@@ -2533,7 +2533,7 @@ fn decode_string_literal(text: &str) -> String {
     };
     let bb = body.as_bytes();
     if bb.len() < 2 {
-        return String::new();
+        return Vec::new();
     }
     let inner = &body[1..body.len() - 1];
     if bb[0] == b'\'' {
@@ -2544,50 +2544,49 @@ fn decode_string_literal(text: &str) -> String {
 }
 
 /// Single-quoted: only `\\` and `\'` are escapes; everything else is literal.
-fn decode_single(s: &str) -> String {
+fn decode_single(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
+    let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'\\' && i + 1 < b.len() && (b[i + 1] == b'\\' || b[i + 1] == b'\'') {
-            out.push(b[i + 1] as char);
+            out.push(b[i + 1]);
             i += 2;
         } else {
-            let ch = s[i..].chars().next().unwrap();
-            out.push(ch);
-            i += ch.len_utf8();
+            out.push(b[i]);
+            i += 1;
         }
     }
     out
 }
 
-/// Double-quoted / heredoc / backtick escape rules.
-fn decode_double(s: &str) -> String {
+/// Double-quoted / heredoc / backtick escape rules. PHP strings are byte
+/// sequences, so escapes like `\xff`/`\377` yield raw bytes.
+fn decode_double(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
+    let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
         if b[i] != b'\\' {
-            let ch = s[i..].chars().next().unwrap();
-            out.push(ch);
-            i += ch.len_utf8();
+            out.push(b[i]);
+            i += 1;
             continue;
         }
         i += 1;
         if i >= b.len() {
-            out.push('\\');
+            out.push(b'\\');
             break;
         }
         match b[i] {
-            b'n' => { out.push('\n'); i += 1; }
-            b't' => { out.push('\t'); i += 1; }
-            b'r' => { out.push('\r'); i += 1; }
-            b'v' => { out.push('\u{0b}'); i += 1; }
-            b'f' => { out.push('\u{0c}'); i += 1; }
-            b'e' => { out.push('\u{1b}'); i += 1; }
-            b'\\' => { out.push('\\'); i += 1; }
-            b'$' => { out.push('$'); i += 1; }
-            b'"' => { out.push('"'); i += 1; }
+            b'n' => { out.push(b'\n'); i += 1; }
+            b't' => { out.push(b'\t'); i += 1; }
+            b'r' => { out.push(b'\r'); i += 1; }
+            b'v' => { out.push(0x0b); i += 1; }
+            b'f' => { out.push(0x0c); i += 1; }
+            b'e' => { out.push(0x1b); i += 1; }
+            b'\\' => { out.push(b'\\'); i += 1; }
+            b'$' => { out.push(b'$'); i += 1; }
+            b'"' => { out.push(b'"'); i += 1; }
             b'0'..=b'7' => {
                 let mut val = 0u32;
                 let mut n = 0;
@@ -2596,7 +2595,7 @@ fn decode_double(s: &str) -> String {
                     i += 1;
                     n += 1;
                 }
-                out.push(((val & 0xff) as u8) as char);
+                out.push((val & 0xff) as u8);
             }
             b'x' if i + 1 < b.len() && b[i + 1].is_ascii_hexdigit() => {
                 i += 1;
@@ -2607,7 +2606,7 @@ fn decode_double(s: &str) -> String {
                     i += 1;
                     n += 1;
                 }
-                out.push(((val & 0xff) as u8) as char);
+                out.push((val & 0xff) as u8);
             }
             b'u' if i + 1 < b.len() && b[i + 1] == b'{' => {
                 i += 2;
@@ -2621,13 +2620,15 @@ fn decode_double(s: &str) -> String {
                 if i < b.len() {
                     i += 1; // `}`
                 }
+                // `\u{…}` encodes the code point as UTF-8 (PHP's behavior).
                 if let Some(ch) = char::from_u32(val) {
-                    out.push(ch);
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
                 }
             }
             _ => {
                 // Unrecognized escape: backslash is literal.
-                out.push('\\');
+                out.push(b'\\');
             }
         }
     }

@@ -41,7 +41,8 @@ fn main() -> ExitCode {
             let text = std::fs::read_to_string(&path).unwrap_or_default();
             let source = phpt::extract_file_section(&text).unwrap_or_default();
             let r = php_parser::parse(&source);
-            print!("{}", astdump::dump(&r.program, &source, &r.interner));
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(&astdump::dump(&r.program, &source, &r.interner));
             ExitCode::SUCCESS
         }
         Some("phpt-extract") => cmd_phpt_extract(args.get(1).map(PathBuf::from)),
@@ -222,8 +223,8 @@ fn astdiff_run(args: &[String]) -> ExitCode {
         let Ok(text) = std::fs::read_to_string(&path) else { continue };
         let Some(source) = phpt::extract_file_section(&text) else { continue };
         let Some(oracle) = run_php(&helper, &source) else { continue };
-        let oracle = oracle.trim_end();
-        if oracle == "<<PARSE_ERROR>>" {
+        let oracle = oracle.trim_ascii_end();
+        if oracle == b"<<PARSE_ERROR>>" {
             continue; // PHP rejects this source; not an AST-match candidate.
         }
         let parsed = match catch_unwind(AssertUnwindSafe(|| php_parser::parse(&source))) {
@@ -236,13 +237,15 @@ fn astdiff_run(args: &[String]) -> ExitCode {
             continue;
         }
         let ours = astdump::dump(&parsed.program, &source, &parsed.interner);
-        let ours = ours.trim_end();
+        let ours = ours.trim_ascii_end();
         if ours == oracle {
             matched += 1;
             continue;
         }
-        // First differing line → bucket.
-        let (o, u) = first_diff_line(oracle, ours);
+        // First differing line → bucket (lossy text view; values may be binary).
+        let oracle = String::from_utf8_lossy(oracle);
+        let ours = String::from_utf8_lossy(ours);
+        let (o, u) = first_diff_line(&oracle, &ours);
         let key = o.trim().to_string();
         let entry = buckets.entry(key).or_insert((0, String::new()));
         entry.0 += 1;
@@ -282,7 +285,7 @@ fn first_diff_line<'a>(oracle: &'a str, ours: &'a str) -> (&'a str, &'a str) {
     }
 }
 
-fn run_php(helper: &Path, source: &str) -> Option<String> {
+fn run_php(helper: &Path, source: &str) -> Option<Vec<u8>> {
     let mut child = Command::new("php")
         .arg(helper)
         .arg("-")
@@ -293,7 +296,9 @@ fn run_php(helper: &Path, source: &str) -> Option<String> {
         .ok()?;
     child.stdin.take()?.write_all(source.as_bytes()).ok()?;
     let out = child.wait_with_output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    // Raw bytes: PHP string literals can contain non-UTF-8 bytes that must
+    // compare exactly against our dump.
+    out.status.success().then_some(out.stdout)
 }
 
 fn run_php_tokens(helper: &Path, source: &str) -> Option<String> {

@@ -22,7 +22,7 @@ fn render(e: &Expr, i: &Interner) -> String {
     match &e.kind {
         Int(n) => n.to_string(),
         Float(f) => format!("{f:?}"),
-        Str(s) => format!("\"{s}\""),
+        Str(s) => format!("\"{}\"", String::from_utf8_lossy(s)),
         Interpolated(parts) => {
             let inner: Vec<_> = parts.iter().map(|p| render(p, i)).collect();
             format!("(interp {})", inner.join(" "))
