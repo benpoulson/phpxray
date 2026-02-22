@@ -477,16 +477,16 @@ impl<'a> Parser<'a> {
         self.expect_kw(Kw::As, "`as`");
         let by_ref1 = self.eat_amp();
         let first = self.parse_expr(0);
-        let (key, value, by_ref) = if self.eat(T::DoubleArrow) {
+        let (key, value, by_ref, key_by_ref) = if self.eat(T::DoubleArrow) {
             let by_ref2 = self.eat_amp();
             let val = self.parse_expr(0);
-            (Some(first), val, by_ref2)
+            (Some(first), val, by_ref2, by_ref1)
         } else {
-            (None, first, by_ref1)
+            (None, first, by_ref1, false)
         };
         self.expect(T::RParen, "`)`");
         let body = self.parse_loop_body(Kw::Endforeach);
-        StmtKind::Foreach { subject, key, value, by_ref, body }
+        StmtKind::Foreach { subject, key, value, by_ref, key_by_ref, body }
     }
 
     fn parse_switch(&mut self) -> StmtKind {
@@ -1540,20 +1540,16 @@ impl<'a> Parser<'a> {
             Kw::New => self.parse_new(start),
             Kw::Clone => {
                 self.bump();
-                // PHP 8.5 clone-with-args: `clone($obj, [...])`. A single plain
-                // `clone($x)` is the ordinary clone construct; multiple/named/
-                // spread args make it a call (matching PHP's own AST).
-                if self.at(T::LParen) {
-                    let mut args = self.parse_args();
-                    if args.len() == 1 && !args[0].spread && args[0].name.is_none() && !args[0].placeholder {
-                        let only = args.pop().unwrap();
-                        self.node(start, ExprKind::Clone(Box::new(only.value)))
-                    } else {
-                        // PHP synthesizes the `clone` call name as fully-qualified.
-                        let callee =
-                            Expr::new(Span::at(start), ExprKind::Name(Name { fq: NameFq::Fq, text: "clone".into() }));
-                        self.node(start, ExprKind::Call { callee: Box::new(callee), args })
-                    }
+                // PHP 8.5 clone-with-args uses call syntax only for `clone()`,
+                // multiple/named/spread/placeholder args (`clone($a, $b)`,
+                // `clone(...)`). A single `clone(EXPR)` is the clone *construct*
+                // over a parenthesized operand — and that operand can continue
+                // with postfixes (`clone (new C)->x` is `clone ((new C)->x)`).
+                if self.at(T::LParen) && self.clone_uses_call_syntax() {
+                    let args = self.parse_args();
+                    let callee =
+                        Expr::new(Span::at(start), ExprKind::Name(Name { fq: NameFq::Fq, text: "clone".into() }));
+                    self.node(start, ExprKind::Call { callee: Box::new(callee), args })
                 } else {
                     let e = self.parse_expr(BP_CLONE);
                     self.node(start, ExprKind::Clone(Box::new(e)))
@@ -1673,6 +1669,36 @@ impl<'a> Parser<'a> {
         }
         self.expect(T::RBrace, "`}`");
         self.node(start, ExprKind::Match { subject: Box::new(subject), arms })
+    }
+
+    /// With `self.pos` at the `(` after `clone`, decide whether it is the
+    /// clone-with-args *call* form rather than `clone (parenthesized-expr)`.
+    /// Call form: empty `()`, a named first arg (`(x: …)`), or a top-level `,`
+    /// or `...` before the matching `)`.
+    fn clone_uses_call_syntax(&self) -> bool {
+        if self.nth(1) == T::RParen {
+            return true; // clone()
+        }
+        if matches!(self.nth(1), T::Identifier | T::Keyword(_)) && self.nth(2) == T::Colon {
+            return true; // clone(name: …)
+        }
+        let mut depth = 0u32;
+        let mut k = 0;
+        loop {
+            match self.nth(k) {
+                T::LParen | T::LBracket | T::LBrace => depth += 1,
+                T::RParen | T::RBracket | T::RBrace => {
+                    if depth == 1 {
+                        return false; // matching `)` with a single, comma-less expr
+                    }
+                    depth -= 1;
+                }
+                T::Comma | T::Ellipsis if depth == 1 => return true,
+                T::Eof => return false,
+                _ => {}
+            }
+            k += 1;
+        }
     }
 
     fn parse_exit(&mut self, start: u32) -> Expr {
@@ -1836,14 +1862,18 @@ impl<'a> Parser<'a> {
                 }
             }
             // `Foo::$$var` / `Foo::${expr}` — a static member whose name is the
-            // expression after the leading `$`.
+            // expression after the leading `$`. A static *call* keeps the
+            // simple-variable's outer VAR wrapper (`Foo::${e}()` → method =
+            // VAR(e)); a static *property* drops it (prop = e).
             T::Dollar => {
                 let inner = self.parse_static_prop_name();
-                let name = MemberName::Expr(Box::new(inner));
                 if self.at(T::LParen) {
+                    let m = self.node(start, ExprKind::VariableVariable(Box::new(inner)));
+                    let name = MemberName::Expr(Box::new(m));
                     let args = self.parse_args();
                     self.node(start, ExprKind::StaticCall { class: Box::new(class), method: name, args })
                 } else {
+                    let name = MemberName::Expr(Box::new(inner));
                     self.node(start, ExprKind::StaticProp { class: Box::new(class), name })
                 }
             }
@@ -2183,6 +2213,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_interp_parts(&mut self, close: T, raw: bool) -> Vec<Expr> {
+        // The delimiter-specific escapable quote: `\"` in double-quotes, `` \` ``
+        // in backticks, none in heredoc (no closing quote inside the body).
+        let quote = match close {
+            T::Backtick => Some(b'`'),
+            T::EndHeredoc => None,
+            _ => Some(b'"'),
+        };
         let mut parts = Vec::new();
         while !self.at(close) && !self.at_eof() {
             match self.peek() {
@@ -2190,7 +2227,7 @@ impl<'a> Parser<'a> {
                     let t = self.bump();
                     // Nowdoc bodies are literal; everything else applies
                     // double-quote escape rules.
-                    let s = if raw { self.text(t).as_bytes().to_vec() } else { decode_double(self.text(t)) };
+                    let s = if raw { self.text(t).as_bytes().to_vec() } else { decode_double(self.text(t), quote) };
                     parts.push(self.node(t.span.start, ExprKind::Str(s)));
                 }
                 T::Variable => parts.push(self.parse_simple_interp_var()),
@@ -2291,8 +2328,12 @@ impl<'a> Parser<'a> {
             };
             self.node(start, ExprKind::DollarBrace(Box::new(inner)))
         } else {
+            // The general `${ expr }` form. Wrap in DollarBrace so interpolation
+            // can flag it VAR#2 — but only when it is a *direct* `${…}` part, not
+            // a `${…}` nested inside a `{…}` complex interpolation.
             let inner = self.parse_expr(0);
-            self.node(start, ExprKind::VariableVariable(Box::new(inner)))
+            let vv = self.node(start, ExprKind::VariableVariable(Box::new(inner)));
+            self.node(start, ExprKind::DollarBrace(Box::new(vv)))
         };
         self.expect(T::RBrace, "`}`");
         e
@@ -2456,16 +2497,37 @@ fn parse_float(text: &str) -> f64 {
     let cleaned: String = text.chars().filter(|&c| c != '_').collect();
     let lower = cleaned.to_ascii_lowercase();
     // Radix-prefixed integer literals that overflow `i64` arrive here as floats.
+    // PHP's `zend_{hex,oct,bin}_strtod` accumulate digit-by-digit in `double`
+    // (`v = v*base + digit`), which rounds differently from converting the exact
+    // integer once — replicate that so the value matches byte-for-byte.
     if let Some(h) = lower.strip_prefix("0x") {
-        return u128::from_str_radix(h, 16).map(|v| v as f64).unwrap_or(f64::INFINITY);
+        // hex: `value = value*16 + digit` (digit already 0-15).
+        let mut v = 0f64;
+        for c in h.bytes() {
+            if let Some(d) = (c as char).to_digit(16) {
+                v = v * 16.0 + d as f64;
+            }
+        }
+        return v;
     }
     if let Some(b) = lower.strip_prefix("0b") {
-        return u128::from_str_radix(b, 2).map(|v| v as f64).unwrap_or(f64::INFINITY);
+        return radix_strtod_sub(b, 2.0);
     }
     if let Some(o) = lower.strip_prefix("0o") {
-        return u128::from_str_radix(o, 8).map(|v| v as f64).unwrap_or(f64::INFINITY);
+        return radix_strtod_sub(o, 8.0);
     }
     cleaned.parse::<f64>().unwrap_or(0.0)
+}
+
+/// Accumulate base-2/base-8 `digits` exactly as PHP's `zend_{bin,oct}_strtod`:
+/// `value = value*base + c - '0'`. The floating-point operation order (add the
+/// raw char, then subtract `'0'`) matters for overflowing literals.
+fn radix_strtod_sub(digits: &str, base: f64) -> f64 {
+    let mut v = 0f64;
+    for c in digits.bytes() {
+        v = v * base + c as f64 - 48.0;
+    }
+    v
 }
 
 /// Post-process a heredoc/nowdoc body: remove the single trailing newline that
@@ -2539,7 +2601,7 @@ fn decode_string_literal(text: &str) -> Vec<u8> {
     if bb[0] == b'\'' {
         decode_single(inner)
     } else {
-        decode_double(inner)
+        decode_double(inner, Some(b'"'))
     }
 }
 
@@ -2561,8 +2623,10 @@ fn decode_single(s: &str) -> Vec<u8> {
 }
 
 /// Double-quoted / heredoc / backtick escape rules. PHP strings are byte
-/// sequences, so escapes like `\xff`/`\377` yield raw bytes.
-fn decode_double(s: &str) -> Vec<u8> {
+/// sequences, so escapes like `\xff`/`\377` yield raw bytes. `quote` is the
+/// delimiter-specific escapable quote (`\"` in double-quotes, `` \` `` in
+/// backticks, `None` in heredoc).
+fn decode_double(s: &str, quote: Option<u8>) -> Vec<u8> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -2577,6 +2641,12 @@ fn decode_double(s: &str) -> Vec<u8> {
             out.push(b'\\');
             break;
         }
+        // The closing-delimiter quote is escapable (`\"` / `` \` ``).
+        if Some(b[i]) == quote {
+            out.push(b[i]);
+            i += 1;
+            continue;
+        }
         match b[i] {
             b'n' => { out.push(b'\n'); i += 1; }
             b't' => { out.push(b'\t'); i += 1; }
@@ -2586,7 +2656,6 @@ fn decode_double(s: &str) -> Vec<u8> {
             b'e' => { out.push(0x1b); i += 1; }
             b'\\' => { out.push(b'\\'); i += 1; }
             b'$' => { out.push(b'$'); i += 1; }
-            b'"' => { out.push(b'"'); i += 1; }
             b'0'..=b'7' => {
                 let mut val = 0u32;
                 let mut n = 0;

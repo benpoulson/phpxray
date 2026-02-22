@@ -83,6 +83,9 @@ pub enum StmtKind {
         key: Option<Expr>,
         value: Expr,
         by_ref: bool,
+        /// A `&` on the key (`foreach ($a as &$k => $v)`) — illegal in PHP but
+        /// still parsed (PHP wraps the key in a `REF` node, then errors).
+        key_by_ref: bool,
         body: Box<Stmt>,
     },
     Switch {

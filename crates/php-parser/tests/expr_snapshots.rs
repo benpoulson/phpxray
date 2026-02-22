@@ -613,10 +613,13 @@ fn render_stmt(s: &Stmt, i: &Interner) -> String {
             exprs(update, i),
             render_stmt(body, i)
         ),
-        StmtKind::Foreach { subject, key, value, by_ref, body } => {
+        StmtKind::Foreach { subject, key, value, by_ref, key_by_ref, body } => {
             let v = if *by_ref { format!("&{}", render(value, i)) } else { render(value, i) };
             let kv = match key {
-                Some(k) => format!("{} => {v}", render(k, i)),
+                Some(k) => {
+                    let kr = if *key_by_ref { "&" } else { "" };
+                    format!("{kr}{} => {v}", render(k, i))
+                }
                 None => v,
             };
             format!("(foreach {} as {kv} {})", render(subject, i), render_stmt(body, i))

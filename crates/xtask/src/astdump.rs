@@ -189,14 +189,19 @@ impl<'a> Dumper<'a> {
                     ("stmts", self.body(body)),
                 ],
             )],
-            StmtKind::Foreach { subject, key, value, by_ref, body } => {
+            StmtKind::Foreach { subject, key, value, by_ref, key_by_ref, body } => {
                 let val = if *by_ref { node("REF", vec![("var", self.expr(value))]) } else { self.expr(value) };
+                let key = match key {
+                    Some(k) if *key_by_ref => node("REF", vec![("var", self.expr(k))]),
+                    Some(k) => self.expr(k),
+                    None => C::Null,
+                };
                 vec![node(
                     "FOREACH",
                     vec![
                         ("expr", self.expr(subject)),
                         ("value", val),
-                        ("key", key.as_ref().map(|k| self.expr(k)).unwrap_or(C::Null)),
+                        ("key", key),
                         ("stmts", self.body(body)),
                     ],
                 )]
@@ -603,7 +608,22 @@ impl<'a> Dumper<'a> {
                 "CONDITIONAL",
                 vec![("cond", self.expr(cond)), ("true", self.opt(then.as_deref())), ("false", self.expr(els))],
             ),
-            ExprKind::Call { callee, args } => node("CALL", vec![("expr", self.callee(callee)), ("args", self.args(args))]),
+            ExprKind::Call { callee, args } => {
+                // `\clone($x)` — the fully-qualified clone keyword is the clone
+                // construct (a single positional arg), not a function call.
+                if let ExprKind::Name(n) = &callee.kind {
+                    if n.fq == NameFq::Fq
+                        && n.text.trim_start_matches('\\').eq_ignore_ascii_case("clone")
+                        && args.len() == 1
+                        && !args[0].spread
+                        && args[0].name.is_none()
+                        && !args[0].placeholder
+                    {
+                        return node("CLONE", vec![("expr", self.expr(&args[0].value))]);
+                    }
+                }
+                node("CALL", vec![("expr", self.callee(callee)), ("args", self.args(args))])
+            }
             ExprKind::MethodCall { recv, nullsafe, method, args } => node(
                 if *nullsafe { "NULLSAFE_METHOD_CALL" } else { "METHOD_CALL" },
                 vec![("expr", self.deref(recv)), ("method", self.member(method)), ("args", self.args(args))],
@@ -917,19 +937,22 @@ impl<'a> Dumper<'a> {
     }
 
     fn encaps_part(&self, p: &Expr) -> C {
+        // Only a *direct* `${…}` interpolation part (an `ExprKind::DollarBrace`)
+        // gets the special VAR flags; a `${…}` nested inside a `{…}` complex part
+        // is a plain expression.
         match &p.kind {
-            // `"${ bareword }"` → VAR#1; `"${ bareword[idx] }"` → DIM#1 (the flag
-            // sits on the outermost node, the inner VAR stays plain).
             ExprKind::DollarBrace(inner) => match &inner.kind {
+                // `"${ bareword }"` → VAR#1; `"${ bareword[idx] }"` → DIM#1 (the
+                // flag sits on the outermost node, the inner VAR stays plain).
                 ExprKind::Variable(s) => C::N(head("VAR", 1), vec![("name", C::Str(self.sym(*s)))]),
                 ExprKind::Index { base, index } => C::N(
                     head("DIM", 1),
                     vec![("expr", self.expr(base)), ("dim", self.opt(index.as_deref()))],
                 ),
+                // `"${ expr }"` → VAR#2 with the expression as the computed name.
+                ExprKind::VariableVariable(v) => C::N(head("VAR", 2), vec![("name", self.expr(v))]),
                 _ => self.expr(inner),
             },
-            // `"${ expr }"` → VAR#2 with the expression as the (computed) name.
-            ExprKind::VariableVariable(inner) => C::N(head("VAR", 2), vec![("name", self.expr(inner))]),
             _ => self.expr(p),
         }
     }
