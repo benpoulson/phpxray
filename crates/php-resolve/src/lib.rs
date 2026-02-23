@@ -16,7 +16,9 @@
 use php_ast::{Name, NameFq};
 
 mod index;
+mod references;
 pub use index::{index_file, ClassSymbol, ConstSymbol, FileIndex, FunctionSymbol};
+pub use references::{resolve_references, RefKind, ResolvedRef};
 
 /// What a name resolves to in a given [`Scope`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,7 +239,7 @@ mod tests {
     use super::*;
 
     fn n(fq: NameFq, text: &str) -> Name {
-        Name { fq, text: text.to_string() }
+        Name { span: php_span::Span::at(0), fq, text: text.to_string() }
     }
     fn unq(text: &str) -> Name {
         n(NameFq::NotFq, text)

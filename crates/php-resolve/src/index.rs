@@ -46,8 +46,79 @@ pub struct ConstSymbol {
 /// Build the symbol table for one parsed file.
 pub fn index_file(program: &Program, interner: &Interner) -> FileIndex {
     let mut indexer = Indexer { i: interner, out: FileIndex::default() };
-    indexer.walk_top(&program.stmts);
+    for_each_region(&program.stmts, interner, |scope, region| {
+        for st in region {
+            indexer.collect_stmt(scope, st);
+        }
+    });
     indexer.out
+}
+
+/// Partition top-level statements into namespace regions (braced body /
+/// non-braced run / global) and invoke `f` with each region's [`Scope`] (its
+/// namespace + `use` imports) and its statements. Shared by indexing and
+/// reference resolution.
+pub(crate) fn for_each_region(stmts: &[Stmt], i: &Interner, mut f: impl FnMut(&Scope, &[Stmt])) {
+    let mut idx = 0;
+    while idx < stmts.len() {
+        let (name, region, next) = match &stmts[idx].kind {
+            // Braced `namespace X { … }`: the body is a self-contained region.
+            StmtKind::Namespace { name, body: Some(body) } => (name.as_ref(), &body[..], idx + 1),
+            // Non-braced `namespace X;`: runs until the next namespace.
+            StmtKind::Namespace { name, body: None } => {
+                let end = region_end(stmts, idx + 1);
+                (name.as_ref(), &stmts[idx + 1..end], end)
+            }
+            // Code before any namespace declaration: a global region.
+            _ => {
+                let end = region_end(stmts, idx);
+                (None, &stmts[idx..end], end)
+            }
+        };
+        let scope = build_scope(name, region, i);
+        f(&scope, region);
+        idx = next;
+    }
+}
+
+/// Build a region's scope: its namespace plus all `use`/group-`use` imports
+/// declared directly in the region (imports apply to the whole block).
+fn build_scope(name: Option<&Name>, stmts: &[Stmt], i: &Interner) -> Scope {
+    let mut scope = match name {
+        Some(n) => Scope::in_namespace(n.text.trim_start_matches('\\')),
+        None => Scope::global(),
+    };
+    for st in stmts {
+        match &st.kind {
+            StmtKind::Use(items) => {
+                for it in items {
+                    add_import(&mut scope, it.kind, &it.name.text, it.alias, i);
+                }
+            }
+            StmtKind::GroupUse { prefix, items, .. } => {
+                let prefix = prefix.text.trim_start_matches('\\');
+                for it in items {
+                    let fqn = format!("{prefix}\\{}", it.name.text);
+                    add_import(&mut scope, it.kind, &fqn, it.alias, i);
+                }
+            }
+            _ => {}
+        }
+    }
+    scope
+}
+
+fn add_import(scope: &mut Scope, kind: UseKind, target: &str, alias: Option<Symbol>, i: &Interner) {
+    let target = target.trim_start_matches('\\');
+    let alias = match alias {
+        Some(s) => i.resolve(s),
+        None => target.rsplit('\\').next().unwrap_or(target),
+    };
+    match kind {
+        UseKind::Class => scope.add_class_use(alias, target),
+        UseKind::Function => scope.add_function_use(alias, target),
+        UseKind::Const => scope.add_const_use(alias, target),
+    }
 }
 
 struct Indexer<'a> {
@@ -56,72 +127,6 @@ struct Indexer<'a> {
 }
 
 impl Indexer<'_> {
-    /// Partition top-level statements into namespace regions and index each.
-    fn walk_top(&mut self, stmts: &[Stmt]) {
-        let mut idx = 0;
-        while idx < stmts.len() {
-            let (name, region, next) = match &stmts[idx].kind {
-                // Braced `namespace X { … }`: the body is a self-contained region.
-                StmtKind::Namespace { name, body: Some(body) } => (name.clone(), &body[..], idx + 1),
-                // Non-braced `namespace X;`: runs until the next namespace.
-                StmtKind::Namespace { name, body: None } => {
-                    let end = region_end(stmts, idx + 1);
-                    (name.clone(), &stmts[idx + 1..end], end)
-                }
-                // Code before any namespace declaration: a global region.
-                _ => {
-                    let end = region_end(stmts, idx);
-                    (None, &stmts[idx..end], end)
-                }
-            };
-            let scope = self.build_scope(name.as_ref(), region);
-            for st in region {
-                self.collect_stmt(&scope, st);
-            }
-            idx = next;
-        }
-    }
-
-    /// Build a region's scope: its namespace plus all `use`/group-`use` imports
-    /// declared directly in the region (imports apply to the whole block).
-    fn build_scope(&self, name: Option<&Name>, stmts: &[Stmt]) -> Scope {
-        let mut scope = match name {
-            Some(n) => Scope::in_namespace(n.text.trim_start_matches('\\')),
-            None => Scope::global(),
-        };
-        for st in stmts {
-            match &st.kind {
-                StmtKind::Use(items) => {
-                    for it in items {
-                        self.add_import(&mut scope, it.kind, &it.name.text, it.alias);
-                    }
-                }
-                StmtKind::GroupUse { prefix, items, .. } => {
-                    let prefix = prefix.text.trim_start_matches('\\');
-                    for it in items {
-                        let fqn = format!("{prefix}\\{}", it.name.text);
-                        self.add_import(&mut scope, it.kind, &fqn, it.alias);
-                    }
-                }
-                _ => {}
-            }
-        }
-        scope
-    }
-
-    fn add_import(&self, scope: &mut Scope, kind: UseKind, target: &str, alias: Option<Symbol>) {
-        let target = target.trim_start_matches('\\');
-        let alias = match alias {
-            Some(s) => self.i.resolve(s),
-            None => target.rsplit('\\').next().unwrap_or(target),
-        };
-        match kind {
-            UseKind::Class => scope.add_class_use(alias, target),
-            UseKind::Function => scope.add_function_use(alias, target),
-            UseKind::Const => scope.add_const_use(alias, target),
-        }
-    }
-
     /// Collect declarations in a statement, descending into nested bodies so
     /// conditionally declared classes/functions are indexed too.
     fn collect_stmt(&mut self, scope: &Scope, st: &Stmt) {

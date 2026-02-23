@@ -726,16 +726,16 @@ impl<'a> Parser<'a> {
                     T::NameRelative => NameFq::Relative,
                     _ => NameFq::NotFq,
                 };
-                Name { fq, text: self.text(t).to_string() }
+                Name { span: t.span, fq, text: self.text(t).to_string() }
             }
             T::Keyword(_) => {
                 // A reserved word used as a name segment (e.g. in `use`).
                 let t = self.bump();
-                Name { fq: NameFq::NotFq, text: self.text(t).to_string() }
+                Name { span: t.span, fq: NameFq::NotFq, text: self.text(t).to_string() }
             }
             _ => {
                 self.error_here("expected a name");
-                Name { fq: NameFq::NotFq, text: String::new() }
+                Name { span: Span::at(self.cur_start()), fq: NameFq::NotFq, text: String::new() }
             }
         }
     }
@@ -1126,7 +1126,7 @@ impl<'a> Parser<'a> {
             };
             if self.eat(T::Keyword(Kw::Insteadof)) {
                 let insteadof = self.name_list();
-                let class = class.unwrap_or(Name { fq: NameFq::NotFq, text: String::new() });
+                let class = class.unwrap_or(Name { span: Span::at(self.cur_start()), fq: NameFq::NotFq, text: String::new() });
                 out.push(TraitAdaptation::Precedence { class, method, insteadof });
             } else if self.eat(T::Keyword(Kw::As)) {
                 // `as` may be followed by member modifiers (visibility, `final`,
@@ -1205,11 +1205,11 @@ impl<'a> Parser<'a> {
                     T::NameRelative => NameFq::Relative,
                     _ => NameFq::NotFq,
                 };
-                Name { fq, text: self.text(t).to_string() }
+                Name { span: t.span, fq, text: self.text(t).to_string() }
             }
             _ => {
                 self.error_here("expected a type");
-                Name { fq: NameFq::NotFq, text: String::new() }
+                Name { span: Span::at(self.cur_start()), fq: NameFq::NotFq, text: String::new() }
             }
         };
         Type { span: self.span_to(start), kind: TypeKind::Simple(name) }
@@ -1551,7 +1551,7 @@ impl<'a> Parser<'a> {
                 if self.at(T::LParen) && self.clone_uses_call_syntax() {
                     let args = self.parse_args();
                     let callee =
-                        Expr::new(Span::at(start), ExprKind::Name(Name { fq: NameFq::Fq, text: "clone".into() }));
+                        Expr::new(Span::at(start), ExprKind::Name(Name { span: Span::at(start), fq: NameFq::Fq, text: "clone".into() }));
                     self.node(start, ExprKind::Call { callee: Box::new(callee), args })
                 } else {
                     let e = self.parse_expr(BP_CLONE);
@@ -1608,20 +1608,20 @@ impl<'a> Parser<'a> {
             }
             Kw::Static => {
                 let t = self.bump();
-                self.node(start, ExprKind::Name(Name { fq: NameFq::NotFq, text: self.text(t).to_string() }))
+                self.node(start, ExprKind::Name(Name { span: t.span, fq: NameFq::NotFq, text: self.text(t).to_string() }))
             }
             // `readonly` is usable as a function name (PHP grammar's dedicated
             // `T_READONLY '(' ... )` rule), which builds an unflagged NAME.
             Kw::Readonly => {
                 let t = self.bump();
-                self.node(start, ExprKind::Name(Name { fq: NameFq::Fq, text: self.text(t).to_string() }))
+                self.node(start, ExprKind::Name(Name { span: t.span, fq: NameFq::Fq, text: self.text(t).to_string() }))
             }
             // Magic constants (`__LINE__`, `__DIR__`, …). Represented as plain
             // names for now; a dedicated node can come with const resolution.
             Kw::Line | Kw::File | Kw::Dir | Kw::ClassC | Kw::TraitC | Kw::MethodC | Kw::FuncC
             | Kw::PropertyC | Kw::NsC => {
                 let t = self.bump();
-                self.node(start, ExprKind::Name(Name { fq: NameFq::NotFq, text: self.text(t).to_string() }))
+                self.node(start, ExprKind::Name(Name { span: t.span, fq: NameFq::NotFq, text: self.text(t).to_string() }))
             }
             _ => {
                 // Deferred to later milestones (closures `function`/`fn`,
@@ -1711,7 +1711,7 @@ impl<'a> Parser<'a> {
             if self.nth(1) == T::Ellipsis && self.nth(2) == T::RParen {
                 let args = self.parse_args();
                 let callee =
-                    Expr::new(Span::at(start), ExprKind::Name(Name { fq: NameFq::Fq, text: "exit".into() }));
+                    Expr::new(Span::at(start), ExprKind::Name(Name { span: Span::at(start), fq: NameFq::Fq, text: "exit".into() }));
                 return self.node(start, ExprKind::Call { callee: Box::new(callee), args });
             }
             self.bump(); // `(`
@@ -1752,7 +1752,7 @@ impl<'a> Parser<'a> {
             T::NameRelative => NameFq::Relative,
             _ => NameFq::NotFq,
         };
-        self.node(start, ExprKind::Name(Name { fq, text: self.text(t).to_string() }))
+        self.node(start, ExprKind::Name(Name { span: t.span, fq, text: self.text(t).to_string() }))
     }
 
     fn parse_variable_variable(&mut self) -> Expr {
@@ -2089,7 +2089,7 @@ impl<'a> Parser<'a> {
             }
             T::Keyword(Kw::Static) => {
                 let t = self.bump();
-                self.node(start, ExprKind::Name(Name { fq: NameFq::NotFq, text: self.text(t).to_string() }))
+                self.node(start, ExprKind::Name(Name { span: t.span, fq: NameFq::NotFq, text: self.text(t).to_string() }))
             }
             T::Variable => {
                 let t = self.bump();

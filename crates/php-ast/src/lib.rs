@@ -634,9 +634,11 @@ pub enum IncludeKind {
 // ---------------------------------------------------------------------------
 
 /// A (possibly qualified) name reference, stored as written (segments joined by
-/// `\`). Resolution to a FQN happens in a later phase.
+/// `\`). Resolution to a FQN happens in a later phase; `span` makes each
+/// occurrence addressable for resolution results and diagnostics.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Name {
+    pub span: Span,
     pub fq: NameFq,
     pub text: String,
 }
