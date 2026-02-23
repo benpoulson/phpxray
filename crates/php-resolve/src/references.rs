@@ -30,17 +30,27 @@ pub struct ResolvedRef {
     pub span: Span,
     pub kind: RefKind,
     pub resolution: Resolution,
+    /// The name exactly as written (e.g. `Str`, `Support\Arr`, `\Foo\bar`).
+    pub name: String,
+    pub fq: NameFq,
 }
 
 /// Resolve every name reference in a parsed file, in source order.
 pub fn resolve_references(program: &Program, interner: &Interner) -> Vec<ResolvedRef> {
-    let mut c = Collector { refs: Vec::new() };
+    let mut refs = Vec::new();
     for_each_region(&program.stmts, interner, |scope, region| {
-        for st in region {
-            c.stmt(scope, st);
-        }
+        refs.extend(collect_region(scope, region));
     });
-    c.refs.sort_by_key(|r| r.span.start);
+    refs.sort_by_key(|r| r.span.start);
+    refs
+}
+
+/// Collect the references in one namespace region (its statements share `scope`).
+pub(crate) fn collect_region(scope: &Scope, stmts: &[Stmt]) -> Vec<ResolvedRef> {
+    let mut c = Collector { refs: Vec::new() };
+    for st in stmts {
+        c.stmt(scope, st);
+    }
     c.refs
 }
 
@@ -51,17 +61,27 @@ struct Collector {
 impl Collector {
     // --- reference recording --------------------------------------------
 
+    fn push(&mut self, name: &Name, kind: RefKind, resolution: Resolution) {
+        self.refs.push(ResolvedRef {
+            span: name.span,
+            kind,
+            resolution,
+            name: name.text.clone(),
+            fq: name.fq,
+        });
+    }
+
     fn class_ref(&mut self, scope: &Scope, name: &Name) {
         let resolution = scope.resolve_class(name);
         // Built-in scalar/compound types are not user symbols.
         if !matches!(resolution, Resolution::BuiltinType(_)) {
-            self.refs.push(ResolvedRef { span: name.span, kind: RefKind::Class, resolution });
+            self.push(name, RefKind::Class, resolution);
         }
     }
 
     fn function_ref(&mut self, scope: &Scope, name: &Name) {
         let resolution = scope.resolve_function(name);
-        self.refs.push(ResolvedRef { span: name.span, kind: RefKind::Function, resolution });
+        self.push(name, RefKind::Function, resolution);
     }
 
     fn const_ref(&mut self, scope: &Scope, name: &Name) {
@@ -71,7 +91,7 @@ impl Collector {
             return;
         }
         let resolution = scope.resolve_const(name);
-        self.refs.push(ResolvedRef { span: name.span, kind: RefKind::Const, resolution });
+        self.push(name, RefKind::Const, resolution);
     }
 
     /// A class position that may hold a name (`new X`) or an expression
