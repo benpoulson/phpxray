@@ -31,6 +31,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("corpus") => cmd_corpus(args.get(1).map(PathBuf::from)),
+        Some("resolve") => cmd_resolve(args.get(1).map(PathBuf::from)),
         Some("triage") => cmd_triage(args.get(1).map(PathBuf::from)),
         Some("diag") => cmd_diag(args.get(1).map(PathBuf::from)),
         Some("difftokens") => cmd_difftokens(&args[1..]),
@@ -324,6 +325,51 @@ struct CorpusStats {
     panicked: usize,
     lex_panicked: usize,
     expects_error: usize,
+}
+
+/// Robustness check for the resolution layer: run index_file + resolve_references
+/// + diagnostics over every corpus file under `catch_unwind`. Invariant: 0 panics.
+fn cmd_resolve(dir: Option<PathBuf>) -> ExitCode {
+    let dir = dir.unwrap_or_else(|| workspace_root().join("php-src/Zend/tests"));
+    if !dir.is_dir() {
+        eprintln!("corpus dir not found: {}", dir.display());
+        return ExitCode::FAILURE;
+    }
+    let (mut files, mut panics, mut classes, mut refs, mut diags) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    for entry in WalkDir::new(&dir).into_iter().filter_map(Result::ok) {
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("phpt") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
+        let Some(source) = phpt::extract_file_section(&text) else { continue };
+        files += 1;
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let r = php_parser::parse(&source);
+            let idx = php_resolve::index_file(&r.program, &r.interner);
+            let refs = php_resolve::resolve_references(&r.program, &r.interner);
+            let diags = php_resolve::diagnostics(&r.program, &r.interner);
+            (idx.classes.len(), refs.len(), diags.len())
+        }));
+        match outcome {
+            Ok((c, r, d)) => {
+                classes += c as u64;
+                refs += r as u64;
+                diags += d as u64;
+            }
+            Err(_) => {
+                panics += 1;
+                eprintln!("RESOLVE PANIC on {}", entry.path().display());
+            }
+        }
+    }
+    println!(
+        "resolve over {files} files: {panics} panics; {classes} classes, {refs} references, {diags} diagnostics"
+    );
+    if panics == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 fn cmd_corpus(dir: Option<PathBuf>) -> ExitCode {

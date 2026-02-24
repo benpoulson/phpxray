@@ -561,6 +561,7 @@ dependencies = [
  "php-intern",
  "php-lexer",
  "php-parser",
+ "php-resolve",
  "php-span",
  "walkdir",
 ]

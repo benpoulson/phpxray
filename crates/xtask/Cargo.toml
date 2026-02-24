@@ -18,4 +18,5 @@ php-intern.workspace = true
 php-ast.workspace = true
 php-lexer.workspace = true
 php-parser.workspace = true
+php-resolve.workspace = true
 walkdir.workspace = true
