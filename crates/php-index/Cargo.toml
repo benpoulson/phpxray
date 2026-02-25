@@ -1,0 +1,13 @@
+[package]
+name = "php-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+php-ast.workspace = true
+php-resolve.workspace = true
+
+[dev-dependencies]
+# Tests build per-file indexes from source via the parser + resolver.
+php-parser.workspace = true

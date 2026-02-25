@@ -188,6 +188,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "php-index"
+version = "0.0.0"
+dependencies = [
+ "php-ast",
+ "php-parser",
+ "php-resolve",
+]
+
+[[package]]
 name = "php-intern"
 version = "0.0.0"
 
@@ -558,6 +567,7 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "php-ast",
+ "php-index",
  "php-intern",
  "php-lexer",
  "php-parser",

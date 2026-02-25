@@ -32,6 +32,7 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("corpus") => cmd_corpus(args.get(1).map(PathBuf::from)),
         Some("resolve") => cmd_resolve(args.get(1).map(PathBuf::from)),
+        Some("index") => cmd_index(args.get(1).map(PathBuf::from)),
         Some("triage") => cmd_triage(args.get(1).map(PathBuf::from)),
         Some("diag") => cmd_diag(args.get(1).map(PathBuf::from)),
         Some("difftokens") => cmd_difftokens(&args[1..]),
@@ -370,6 +371,44 @@ fn cmd_resolve(dir: Option<PathBuf>) -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Build one project-wide symbol index over the whole corpus and report scale
+/// stats. (The corpus is many independent tests, so duplicate class names are
+/// expected — this exercises aggregation + the index at scale, 0 panics.)
+fn cmd_index(dir: Option<PathBuf>) -> ExitCode {
+    let dir = dir.unwrap_or_else(|| workspace_root().join("php-src/Zend/tests"));
+    if !dir.is_dir() {
+        eprintln!("corpus dir not found: {}", dir.display());
+        return ExitCode::FAILURE;
+    }
+    let mut index = php_index::ProjectIndex::new();
+    let mut files = 0u64;
+    for entry in WalkDir::new(&dir).into_iter().filter_map(Result::ok) {
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("phpt") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
+        let Some(source) = phpt::extract_file_section(&text) else { continue };
+        files += 1;
+        let label = entry.path().strip_prefix(&dir).unwrap_or(entry.path()).display().to_string();
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let r = php_parser::parse(&source);
+            php_resolve::index_file(&r.program, &r.interner)
+        }));
+        match outcome {
+            Ok(file_index) => index.add_file(&label, &file_index),
+            Err(_) => eprintln!("INDEX PANIC on {}", entry.path().display()),
+        }
+    }
+    let dup = index.duplicate_classes().count();
+    println!(
+        "indexed {files} files: {} unique classes ({dup} redeclared across files), {} functions, {} constants",
+        index.class_count(),
+        index.function_count(),
+        index.constant_count(),
+    );
+    ExitCode::SUCCESS
 }
 
 fn cmd_corpus(dir: Option<PathBuf>) -> ExitCode {
