@@ -49,6 +49,7 @@ fn main() -> ExitCode {
         }
         Some("phpt-extract") => cmd_phpt_extract(args.get(1).map(PathBuf::from)),
         Some("gen-tokens") => cmd_gen_tokens(),
+        Some("gen-stubs") => cmd_gen_stubs(),
         Some(other) => {
             eprintln!("unknown command: {other}");
             usage();
@@ -571,6 +572,40 @@ fn cmd_phpt_extract(path: Option<PathBuf>) -> ExitCode {
 
 /// Generate golden token fixtures: for every `test-fixtures/tokens/*.php`, run
 /// the PHP oracle and (over)write the paired `*.tokens`. Requires `php` on PATH.
+/// Regenerate the committed built-in-names manifest (`crates/php-index/stubs/
+/// builtins.txt`) from the installed PHP via reflection. Needs PHP; CI never
+/// runs it (the output is committed). Names only — types come later.
+fn cmd_gen_stubs() -> ExitCode {
+    let root = workspace_root();
+    let helper = root.join("crates/xtask/php/gen_stubs.php");
+    let dest = root.join("crates/php-index/stubs/builtins.txt");
+    if !helper.is_file() {
+        eprintln!("missing PHP helper: {}", helper.display());
+        return ExitCode::FAILURE;
+    }
+    let out = match Command::new("php").arg(&helper).output() {
+        Ok(o) if o.status.success() => o.stdout,
+        Ok(o) => {
+            eprintln!("php errored:\n{}", String::from_utf8_lossy(&o.stderr));
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("`php` not found on PATH (brew install php): {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&dest, &out) {
+        eprintln!("write failed {}: {e}", dest.display());
+        return ExitCode::FAILURE;
+    }
+    let lines = out.iter().filter(|&&b| b == b'\n').count();
+    println!("wrote {} ({lines} lines)", dest.strip_prefix(&root).unwrap_or(&dest).display());
+    ExitCode::SUCCESS
+}
+
 fn cmd_gen_tokens() -> ExitCode {
     let root = workspace_root();
     let tokens_dir = root.join("test-fixtures/tokens");

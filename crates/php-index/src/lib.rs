@@ -40,9 +40,69 @@ pub struct ProjectIndex {
     constants: HashMap<String, SymbolEntry>, // key: exact FQN (case-sensitive)
 }
 
+/// The committed manifest of built-in symbol names (see `xtask gen-stubs`).
+const BUILTINS: &str = include_str!("../stubs/builtins.txt");
+
 impl ProjectIndex {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A project index pre-populated with PHP's built-in functions, classes,
+    /// interfaces, traits, enums and constants (names only — see `xtask
+    /// gen-stubs`). Names are version-stable, so a single snapshot is safe for
+    /// existence checks. Built-in *hierarchies* and *types* are intentionally not
+    /// captured here; they come from version-aware stubs at the type-system stage.
+    pub fn with_builtins() -> Self {
+        let mut idx = Self::new();
+        idx.load_builtins(BUILTINS);
+        idx
+    }
+
+    fn load_builtins(&mut self, manifest: &str) {
+        #[derive(Clone, Copy)]
+        enum Sec {
+            None,
+            Functions,
+            Classes(ClassKind),
+            Constants,
+        }
+        let mut sec = Sec::None;
+        for line in manifest.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(head) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+                sec = match head {
+                    "functions" => Sec::Functions,
+                    "classes" => Sec::Classes(ClassKind::Class),
+                    "interfaces" => Sec::Classes(ClassKind::Interface),
+                    "traits" => Sec::Classes(ClassKind::Trait),
+                    "enums" => Sec::Classes(ClassKind::Enum),
+                    "constants" => Sec::Constants,
+                    _ => Sec::None,
+                };
+                continue;
+            }
+            match sec {
+                Sec::Functions => {
+                    push_symbol(&mut self.functions, line.to_ascii_lowercase(), line, "<builtin>");
+                }
+                Sec::Constants => push_symbol(&mut self.constants, line.to_string(), line, "<builtin>"),
+                Sec::Classes(kind) => {
+                    self.classes.entry(line.to_ascii_lowercase()).or_insert_with(|| ClassEntry {
+                        fqn: line.to_string(),
+                        kind,
+                        extends: Vec::new(),
+                        implements: Vec::new(),
+                        uses_traits: Vec::new(),
+                        sources: vec!["<builtin>".to_string()],
+                    });
+                }
+                Sec::None => {}
+            }
+        }
     }
 
     /// Merge one file's resolved declarations into the project index, labelling
@@ -253,6 +313,36 @@ mod tests {
         assert!(idx.is_subclass_of("App\\User", "App\\Arrayable")); // transitive via interface
         assert!(idx.is_subclass_of("app\\user", "APP\\BASE")); // case-insensitive
         assert!(!idx.is_subclass_of("App\\Base", "App\\User")); // not the other way
+    }
+
+    #[test]
+    fn builtins_are_loaded_with_correct_case_rules() {
+        let idx = ProjectIndex::with_builtins();
+        // Functions: case-insensitive.
+        assert!(idx.has_function("strlen"));
+        assert!(idx.has_function("STRLEN"));
+        assert!(idx.has_function("array_map"));
+        // Classes/interfaces: case-insensitive.
+        assert!(idx.has_class("Exception"));
+        assert!(idx.has_class("stdclass"));
+        assert!(idx.has_class("Throwable"));
+        // Constants: case-sensitive.
+        assert!(idx.has_constant("PHP_EOL"));
+        assert!(idx.has_constant("PHP_INT_MAX"));
+        assert!(!idx.has_constant("php_eol"));
+        // Nonsense isn't there.
+        assert!(!idx.has_function("definitely_not_a_real_php_function"));
+        // Sanity on scale.
+        assert!(idx.function_count() > 1000, "expected many builtins, got {}", idx.function_count());
+    }
+
+    #[test]
+    fn user_files_merge_on_top_of_builtins() {
+        let mut idx = ProjectIndex::with_builtins();
+        let r = php_parser::parse("<?php namespace App; class User {}");
+        idx.add_file("user.php", &index_file(&r.program, &r.interner));
+        assert!(idx.has_class("App\\User"));
+        assert!(idx.has_function("strlen"));
     }
 
     #[test]

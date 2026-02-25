@@ -9,6 +9,7 @@ members = [
     "crates/php-parser",
     "crates/php-resolve",
     "crates/php-index",
+    "crates/php-rules",
     "crates/xtask",
 ]
 
@@ -28,6 +29,7 @@ php-ast = { path = "crates/php-ast" }
 php-parser = { path = "crates/php-parser" }
 php-resolve = { path = "crates/php-resolve" }
 php-index = { path = "crates/php-index" }
+php-rules = { path = "crates/php-rules" }
 
 # Third-party
 insta = "1"

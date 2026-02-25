@@ -1,0 +1,14 @@
+[package]
+name = "php-rules"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+php-span.workspace = true
+php-diagnostics.workspace = true
+php-resolve.workspace = true
+php-index.workspace = true
+
+[dev-dependencies]
+php-parser.workspace = true
