@@ -92,6 +92,21 @@ mod tests {
     }
 
     #[test]
+    fn non_core_extension_symbols_are_known() {
+        // phpstorm-stubs covers PECL/optional extensions a local PHP build often
+        // lacks (sqlsrv/mssql, oci8, redis, …) — these must not be flagged.
+        let d = unknowns(
+            r#"<?php
+            sqlsrv_connect("s", []);
+            oci_connect("u", "p", "db");
+            $r = new Redis();
+            $i = new Imagick();
+            "#,
+        );
+        assert!(d.is_empty(), "non-core extension symbols should be known: {d:?}");
+    }
+
+    #[test]
     fn builtin_call_inside_namespace_uses_global_fallback() {
         let d = unknowns(r#"<?php namespace App; strlen("x"); echo PHP_EOL;"#);
         assert!(d.is_empty(), "global fallback should find builtins: {d:?}");

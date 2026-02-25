@@ -170,6 +170,14 @@ impl Indexer<'_> {
                 }
             }
             StmtKind::Declare { body: Some(b), .. } => self.collect_stmt(scope, b),
+            // `define('NAME', …)` is a runtime constant declaration. `define`
+            // takes the name literally (ignores the current namespace), so the
+            // FQN is the string as written.
+            StmtKind::Expr(e) => {
+                if let Some(fqn) = define_constant(e) {
+                    self.out.constants.push(ConstSymbol { fqn });
+                }
+            }
             _ => {}
         }
     }
@@ -205,6 +213,22 @@ impl Indexer<'_> {
 /// built-in types (which never appear as real parents/interfaces).
 fn resolved_fqn(scope: &Scope, name: &Name) -> Option<String> {
     scope.resolve_class(name).fqn().map(str::to_string)
+}
+
+/// If `e` is a `define("NAME", …)` call with a literal string name, the declared
+/// constant's FQN (taken verbatim — `define` ignores the active namespace).
+fn define_constant(e: &Expr) -> Option<String> {
+    let ExprKind::Call { callee, args } = &e.kind else { return None };
+    let ExprKind::Name(n) = &callee.kind else { return None };
+    if !n.text.trim_start_matches('\\').eq_ignore_ascii_case("define") {
+        return None;
+    }
+    let first = args.first()?;
+    if first.spread || first.name.is_some() {
+        return None;
+    }
+    let ExprKind::Str(bytes) = &first.value.kind else { return None };
+    Some(String::from_utf8_lossy(bytes).trim_start_matches('\\').to_string())
 }
 
 /// The index one past the last statement of a region starting at `start`: the
@@ -333,5 +357,22 @@ mod tests {
     fn anonymous_classes_are_not_indexed() {
         let idx = index(r#"<?php namespace App; $x = new class {};"#);
         assert!(idx.classes.is_empty());
+    }
+
+    #[test]
+    fn define_declares_constants_verbatim_ignoring_namespace() {
+        let idx = index(
+            r#"<?php
+            namespace App;
+            define('GLOBAL_FLAG', 1);
+            define('App\\Scoped', 2);
+            if (!defined('GUARDED')) { define('GUARDED', 3); }
+            "#,
+        );
+        let consts: Vec<_> = idx.constants.iter().map(|c| c.fqn.as_str()).collect();
+        // `define` takes the name literally — never prefixed with `App\`.
+        assert!(consts.contains(&"GLOBAL_FLAG"));
+        assert!(consts.contains(&"App\\Scoped"));
+        assert!(consts.contains(&"GUARDED")); // found inside the conditional
     }
 }
