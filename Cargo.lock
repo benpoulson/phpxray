@@ -222,6 +222,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "php-phpdoc"
+version = "0.0.0"
+dependencies = [
+ "php-span",
+]
+
+[[package]]
 name = "php-resolve"
 version = "0.0.0"
 dependencies = [
