@@ -219,10 +219,24 @@ impl Parser {
 
     fn intersection(&mut self) -> Option<DocType> {
         let mut parts = vec![self.postfix()?];
-        while self.eat(Tk::Amp) {
+        // `&` is intersection only when a type follows. `&$var` is a by-reference
+        // marker that belongs to the param layer, not the type (the same `&`
+        // ambiguity PHP's own grammar has).
+        while self.at(Tk::Amp) && self.amp_is_intersection() {
+            self.bump();
             parts.push(self.postfix()?);
         }
         Some(if parts.len() == 1 { parts.pop().unwrap() } else { DocType::Intersection(parts) })
+    }
+
+    /// Whether the `&` at the current position joins another type (vs. preceding
+    /// a `$variable`, i.e. a by-ref marker).
+    fn amp_is_intersection(&self) -> bool {
+        match self.toks.get(self.pos + 1).map(|t| &t.kind) {
+            Some(Tk::Ident(s)) => !s.starts_with('$'),
+            Some(Tk::Question | Tk::LParen | Tk::Str(_) | Tk::Int(_)) => true,
+            _ => false,
+        }
     }
 
     fn postfix(&mut self) -> Option<DocType> {

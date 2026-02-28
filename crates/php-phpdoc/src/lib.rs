@@ -12,7 +12,9 @@
 //! - **M-D1:** the type-expression grammar (`DocType`).
 //! - **M-D2:** parse each tag's operand into types → a typed `DocBlock`.
 
+mod doc;
 mod types;
+pub use doc::{parse, Doc, Param, Template, Var};
 pub use types::{parse_type, parse_type_prefix, DocType, ShapeField};
 
 /// A parsed docblock: its leading description and its block tags, in order.
