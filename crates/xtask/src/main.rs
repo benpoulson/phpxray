@@ -427,6 +427,7 @@ fn cmd_phpdoc(dir: Option<PathBuf>) -> ExitCode {
     }
     let type_tags = ["param", "return", "var", "throws"];
     let (mut blocks, mut total, mut parsed, mut panics) = (0u64, 0u64, 0u64, 0u64);
+    let (mut methods, mut properties) = (0u64, 0u64);
     let mut fails: HashMap<String, u32> = HashMap::new();
 
     for entry in WalkDir::new(&dir).into_iter().filter_map(Result::ok) {
@@ -442,6 +443,9 @@ fn cmd_phpdoc(dir: Option<PathBuf>) -> ExitCode {
         for t in tokens.iter().filter(|t| t.kind == php_lexer::TokenKind::DocComment) {
             let raw = t.span.text(&source);
             let outcome = catch_unwind(AssertUnwindSafe(|| {
+                // Exercise the full typed parse (incl. @method/@property/@mixin/
+                // generic-extends) for no-panics across the corpus.
+                let doc = php_phpdoc::parse(raw);
                 let mut local = Vec::new();
                 for tag in php_phpdoc::parse_block(raw).tags {
                     let base = tag
@@ -459,11 +463,13 @@ fn cmd_phpdoc(dir: Option<PathBuf>) -> ExitCode {
                     }
                     local.push((php_phpdoc::parse_type_prefix(v).is_some(), v.to_string()));
                 }
-                local
+                (local, doc.methods.len(), doc.properties.len())
             }));
             match outcome {
-                Ok(results) => {
+                Ok((results, m, p)) => {
                     blocks += 1;
+                    methods += m as u64;
+                    properties += p as u64;
                     for (ok, v) in results {
                         total += 1;
                         if ok {
@@ -486,6 +492,7 @@ fn cmd_phpdoc(dir: Option<PathBuf>) -> ExitCode {
     println!(
         "\nPHPDoc sweep: {blocks} docblocks, {total} type operands, {parsed} parsed ({pct:.2}%); {panics} panics"
     );
+    println!("  also parsed: {methods} @method, {properties} @property declarations");
     if !fails.is_empty() {
         let mut rows: Vec<_> = fails.into_iter().collect();
         rows.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
