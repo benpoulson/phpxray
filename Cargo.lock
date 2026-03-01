@@ -229,6 +229,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "php-reflect"
+version = "0.0.0"
+dependencies = [
+ "php-ast",
+ "php-parser",
+ "php-phpdoc",
+ "php-resolve",
+ "php-span",
+ "php-types",
+]
+
+[[package]]
 name = "php-resolve"
 version = "0.0.0"
 dependencies = [
@@ -252,6 +264,10 @@ dependencies = [
 
 [[package]]
 name = "php-span"
+version = "0.0.0"
+
+[[package]]
+name = "php-types"
 version = "0.0.0"
 
 [[package]]
