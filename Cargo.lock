@@ -589,6 +589,7 @@ dependencies = [
  "php-intern",
  "php-lexer",
  "php-parser",
+ "php-phpdoc",
  "php-resolve",
  "php-span",
  "walkdir",

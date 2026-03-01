@@ -33,6 +33,7 @@ fn main() -> ExitCode {
         Some("corpus") => cmd_corpus(args.get(1).map(PathBuf::from)),
         Some("resolve") => cmd_resolve(args.get(1).map(PathBuf::from)),
         Some("index") => cmd_index(args.get(1).map(PathBuf::from)),
+        Some("phpdoc") => cmd_phpdoc(args.get(1).map(PathBuf::from)),
         Some("triage") => cmd_triage(args.get(1).map(PathBuf::from)),
         Some("diag") => cmd_diag(args.get(1).map(PathBuf::from)),
         Some("difftokens") => cmd_difftokens(&args[1..]),
@@ -410,6 +411,94 @@ fn cmd_index(dir: Option<PathBuf>) -> ExitCode {
         index.constant_count(),
     );
     ExitCode::SUCCESS
+}
+
+/// M-D3: sweep every docblock in a corpus (default: the phpstorm-stubs
+/// submodule) through the PHPDoc parser. Asserts 0 panics and reports type-
+/// expression *coverage* — what fraction of `@param`/`@return`/`@var`/`@throws`
+/// type operands parse — plus the most common unparsed forms, to drive grammar
+/// completeness. No external oracle; our parser vs. real-world docblocks.
+fn cmd_phpdoc(dir: Option<PathBuf>) -> ExitCode {
+    use std::collections::HashMap;
+    let dir = dir.unwrap_or_else(|| workspace_root().join("vendor/phpstorm-stubs"));
+    if !dir.is_dir() {
+        eprintln!("corpus dir not found: {} (try `git submodule update --init`)", dir.display());
+        return ExitCode::FAILURE;
+    }
+    let type_tags = ["param", "return", "var", "throws"];
+    let (mut blocks, mut total, mut parsed, mut panics) = (0u64, 0u64, 0u64, 0u64);
+    let mut fails: HashMap<String, u32> = HashMap::new();
+
+    for entry in WalkDir::new(&dir).into_iter().filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("php") {
+            continue;
+        }
+        if path.to_string_lossy().contains("/tests/") {
+            continue;
+        }
+        let Ok(source) = std::fs::read_to_string(path) else { continue };
+        let (tokens, _) = php_lexer::tokenize(&source);
+        for t in tokens.iter().filter(|t| t.kind == php_lexer::TokenKind::DocComment) {
+            let raw = t.span.text(&source);
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                let mut local = Vec::new();
+                for tag in php_phpdoc::parse_block(raw).tags {
+                    let base = tag
+                        .name
+                        .strip_prefix("phpstan-")
+                        .or_else(|| tag.name.strip_prefix("psalm-"))
+                        .unwrap_or(&tag.name);
+                    if !type_tags.contains(&base) {
+                        continue;
+                    }
+                    let v = tag.value.trim_start();
+                    // No type operand (just `$var`/`&$var`/`...$var`/description).
+                    if v.is_empty() || v.starts_with(['$', '&']) || v.starts_with("...") {
+                        continue;
+                    }
+                    local.push((php_phpdoc::parse_type_prefix(v).is_some(), v.to_string()));
+                }
+                local
+            }));
+            match outcome {
+                Ok(results) => {
+                    blocks += 1;
+                    for (ok, v) in results {
+                        total += 1;
+                        if ok {
+                            parsed += 1;
+                        } else {
+                            let key: String = v.chars().take(50).collect();
+                            *fails.entry(key).or_insert(0) += 1;
+                        }
+                    }
+                }
+                Err(_) => {
+                    panics += 1;
+                    eprintln!("PHPDOC PANIC on {}", path.display());
+                }
+            }
+        }
+    }
+
+    let pct = if total == 0 { 100.0 } else { 100.0 * parsed as f64 / total as f64 };
+    println!(
+        "\nPHPDoc sweep: {blocks} docblocks, {total} type operands, {parsed} parsed ({pct:.2}%); {panics} panics"
+    );
+    if !fails.is_empty() {
+        let mut rows: Vec<_> = fails.into_iter().collect();
+        rows.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        println!("\ntop unparsed type forms (by leading token):");
+        for (key, n) in rows.into_iter().take(25) {
+            println!("  {n:>5}  {key}");
+        }
+    }
+    if panics == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 fn cmd_corpus(dir: Option<PathBuf>) -> ExitCode {

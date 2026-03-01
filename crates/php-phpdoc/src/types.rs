@@ -42,6 +42,15 @@ pub enum DocType {
     ConstString(String),
     /// A literal integer type (`0`, `-1`).
     ConstInt(String),
+    /// A conditional type `($subject is [not] target ? then : else)`.
+    Conditional {
+        /// The tested template name or `$param`.
+        subject: String,
+        negated: bool,
+        target: Box<DocType>,
+        then: Box<DocType>,
+        els: Box<DocType>,
+    },
 }
 
 /// One field of an array/object shape (`key?: type`, or keyless `type`).
@@ -241,11 +250,13 @@ impl Parser {
 
     fn postfix(&mut self) -> Option<DocType> {
         let mut t = self.atom()?;
-        while self.at(Tk::LBracket) {
+        // `T[]` only — a `[` not immediately closed (e.g. `[readonly]` prose in a
+        // description) is not part of the type; stop and leave it to the caller.
+        while self.at(Tk::LBracket)
+            && matches!(self.toks.get(self.pos + 1).map(|x| &x.kind), Some(Tk::RBracket))
+        {
             self.bump();
-            if !self.eat(Tk::RBracket) {
-                return None; // `[` without `]` (offset access etc. unsupported)
-            }
+            self.bump();
             t = DocType::Array(Box::new(t));
         }
         Some(t)
@@ -259,6 +270,13 @@ impl Parser {
             }
             Tk::LParen => {
                 self.bump();
+                // `($x is T ? A : B)` — a conditional type; otherwise a plain
+                // parenthesised type.
+                let save = self.pos;
+                if let Some(c) = self.conditional() {
+                    return Some(c);
+                }
+                self.pos = save;
                 let t = self.union()?;
                 self.eat(Tk::RParen).then_some(t)
             }
@@ -279,30 +297,82 @@ impl Parser {
     }
 
     /// A name optionally followed by generics `<…>`, a shape `{…}`, or a callable
-    /// signature `(…): ret`.
+    /// signature `(…): ret`. If a suffix doesn't form a valid construct — e.g. a
+    /// `{description}` or `[readonly]` from prose after the type — it is *not*
+    /// part of the type: we backtrack and return the bare name, leaving the rest
+    /// for the caller.
     fn named_suffix(&mut self, name: String) -> Option<DocType> {
-        match self.peek() {
+        let start = self.pos;
+        let attempted = match self.peek() {
             Tk::Lt => {
                 self.bump();
-                let mut args = vec![self.union()?];
-                while self.eat(Tk::Comma) {
-                    if self.at(Tk::Gt) {
-                        break; // trailing comma
-                    }
-                    args.push(self.union()?);
-                }
-                self.eat(Tk::Gt).then_some(DocType::Generic { base: name, args })
+                self.generic_args(name.clone())
             }
             Tk::LBrace => {
                 self.bump();
-                self.shape(name)
+                self.shape(name.clone())
             }
             Tk::LParen if is_callable(&name) => {
                 self.bump();
-                self.callable(name)
+                self.callable(name.clone())
             }
-            _ => Some(DocType::Named(name)),
+            _ => return Some(DocType::Named(name)),
+        };
+        attempted.or_else(|| {
+            self.pos = start;
+            Some(DocType::Named(name))
+        })
+    }
+
+    /// Parse a conditional type body (the opening `(` is already consumed).
+    /// Returns `None` to let the caller fall back to a parenthesised type.
+    fn conditional(&mut self) -> Option<DocType> {
+        let subject = match self.peek() {
+            Tk::Ident(s) => s.clone(),
+            _ => return None,
+        };
+        self.bump();
+        if !self.eat_ident("is") {
+            return None;
         }
+        let negated = self.eat_ident("not");
+        let target = self.union()?;
+        if !self.eat(Tk::Question) {
+            return None;
+        }
+        let then = self.union()?;
+        if !self.eat(Tk::Colon) {
+            return None;
+        }
+        let els = self.union()?;
+        self.eat(Tk::RParen).then_some(DocType::Conditional {
+            subject,
+            negated,
+            target: Box::new(target),
+            then: Box::new(then),
+            els: Box::new(els),
+        })
+    }
+
+    /// Eat an identifier token equal to `word` (a keyword like `is`/`not`).
+    fn eat_ident(&mut self, word: &str) -> bool {
+        if matches!(self.peek(), Tk::Ident(s) if s == word) {
+            self.bump();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn generic_args(&mut self, base: String) -> Option<DocType> {
+        let mut args = vec![self.union()?];
+        while self.eat(Tk::Comma) {
+            if self.at(Tk::Gt) {
+                break; // trailing comma
+            }
+            args.push(self.union()?);
+        }
+        self.eat(Tk::Gt).then_some(DocType::Generic { base, args })
     }
 
     fn shape(&mut self, base: String) -> Option<DocType> {
@@ -497,6 +567,56 @@ mod tests {
         let (t, n) = parse_type_prefix("array<int> $items the items").unwrap();
         assert_eq!(t, Generic { base: "array".into(), args: vec![named("int")] });
         assert_eq!(&"array<int> $items the items"[n..], " $items the items");
+    }
+
+    #[test]
+    fn conditional_types() {
+        assert_eq!(
+            p("($x is true ? int : string)"),
+            Conditional {
+                subject: "$x".into(),
+                negated: false,
+                target: Box::new(named("true")),
+                then: Box::new(named("int")),
+                els: Box::new(named("string")),
+            }
+        );
+        // Negated, with a nested conditional in the else branch.
+        assert_eq!(
+            p("(T is not null ? T : (T is int ? string : bool))"),
+            Conditional {
+                subject: "T".into(),
+                negated: true,
+                target: Box::new(named("null")),
+                then: Box::new(named("T")),
+                els: Box::new(Conditional {
+                    subject: "T".into(),
+                    negated: false,
+                    target: Box::new(named("int")),
+                    then: Box::new(named("string")),
+                    els: Box::new(named("bool")),
+                }),
+            }
+        );
+        // A plain parenthesised union still works (not a conditional).
+        assert_eq!(p("(int|string)"), Union(vec![named("int"), named("string")]));
+    }
+
+    #[test]
+    fn type_then_description_prose_backtracks() {
+        // A `{` or `[` from a description after the type must not be eaten as a
+        // shape/array — the leading type is still recovered.
+        let (t, n) = parse_type_prefix("bool {@see true} on success").unwrap();
+        assert_eq!(t, named("bool"));
+        assert_eq!(&"bool {@see true} on success"[n..], " {@see true} on success");
+
+        let (t, n) = parse_type_prefix("string [readonly] the name").unwrap();
+        assert_eq!(t, named("string"));
+        assert_eq!(&"string [readonly] the name"[n..], " [readonly] the name");
+
+        // Genuine shapes/arrays still parse.
+        assert!(matches!(parse_type("array{id: int}"), Some(Shape { .. })));
+        assert_eq!(parse_type("int[]"), Some(Array(Box::new(named("int")))));
     }
 
     #[test]
