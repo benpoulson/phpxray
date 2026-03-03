@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 php-span.workspace = true
+php-intern.workspace = true
 php-ast.workspace = true
 php-resolve.workspace = true
 php-phpdoc.workspace = true

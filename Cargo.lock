@@ -233,6 +233,7 @@ name = "php-reflect"
 version = "0.0.0"
 dependencies = [
  "php-ast",
+ "php-intern",
  "php-parser",
  "php-phpdoc",
  "php-resolve",

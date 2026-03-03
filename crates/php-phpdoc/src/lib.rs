@@ -14,7 +14,9 @@
 
 mod doc;
 mod types;
-pub use doc::{parse, Doc, Param, Template, Var};
+pub use doc::{
+    parse, Doc, MethodParam, MethodTag, Param, PropertyAccess, PropertyTag, Template, Var,
+};
 pub use types::{parse_type, parse_type_prefix, DocType, ShapeField};
 
 /// A parsed docblock: its leading description and its block tags, in order.
