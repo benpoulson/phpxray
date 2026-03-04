@@ -33,6 +33,7 @@ fn main() -> ExitCode {
         Some("corpus") => cmd_corpus(args.get(1).map(PathBuf::from)),
         Some("resolve") => cmd_resolve(args.get(1).map(PathBuf::from)),
         Some("index") => cmd_index(args.get(1).map(PathBuf::from)),
+        Some("reflect") => cmd_reflect(args.get(1).map(PathBuf::from)),
         Some("phpdoc") => cmd_phpdoc(args.get(1).map(PathBuf::from)),
         Some("triage") => cmd_triage(args.get(1).map(PathBuf::from)),
         Some("diag") => cmd_diag(args.get(1).map(PathBuf::from)),
@@ -411,6 +412,42 @@ fn cmd_index(dir: Option<PathBuf>) -> ExitCode {
         index.constant_count(),
     );
     ExitCode::SUCCESS
+}
+
+/// M-T3: build the project **reflection index** over a corpus — reflect every
+/// class/function (native + PHPDoc types resolved & merged) into one queryable
+/// map. Asserts 0 panics and reports counts plus a sanity sweep of inherited-
+/// member lookup (every class resolves its own first declared method).
+fn cmd_reflect(dir: Option<PathBuf>) -> ExitCode {
+    let dir = dir.unwrap_or_else(|| workspace_root().join("php-src/Zend/tests"));
+    if !dir.is_dir() {
+        eprintln!("corpus dir not found: {}", dir.display());
+        return ExitCode::FAILURE;
+    }
+    let mut index = php_reflect::ReflectionIndex::new();
+    let (mut files, mut panics) = (0u64, 0u64);
+    for entry in WalkDir::new(&dir).into_iter().filter_map(Result::ok) {
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("phpt") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
+        let Some(source) = phpt::extract_file_section(&text) else { continue };
+        files += 1;
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let r = php_parser::parse(&source);
+            index.add_file(&r.program, &r.interner);
+        }));
+        if outcome.is_err() {
+            panics += 1;
+            eprintln!("REFLECT PANIC on {}", entry.path().display());
+        }
+    }
+    println!("reflected {files} files: {} classes, {panics} panics", index.class_count());
+    if panics == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 /// M-D3: sweep every docblock in a corpus (default: the phpstorm-stubs

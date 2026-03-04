@@ -56,9 +56,9 @@ pub fn index_file(program: &Program, interner: &Interner) -> FileIndex {
 
 /// Partition top-level statements into namespace regions (braced body /
 /// non-braced run / global) and invoke `f` with each region's [`Scope`] (its
-/// namespace + `use` imports) and its statements. Shared by indexing and
-/// reference resolution.
-pub(crate) fn for_each_region(stmts: &[Stmt], i: &Interner, mut f: impl FnMut(&Scope, &[Stmt])) {
+/// namespace + `use` imports) and its statements. Shared by indexing, reference
+/// resolution, and the reflection layer.
+pub fn for_each_region(stmts: &[Stmt], i: &Interner, mut f: impl FnMut(&Scope, &[Stmt])) {
     let mut idx = 0;
     while idx < stmts.len() {
         let (name, region, next) = match &stmts[idx].kind {

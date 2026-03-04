@@ -13,10 +13,12 @@ use php_span::Span;
 use php_types::{CallableSig, ShapeField, Type};
 
 mod model;
+mod project;
 pub use model::{
     reflect_class, reflect_function, ClassReflection, ConstReflection, FunctionReflection,
     MethodReflection, ParamReflection, PropertyReflection,
 };
+pub use project::{Found, ReflectionIndex};
 
 /// Resolve a native PHP type declaration to a semantic [`Type`] in `scope`.
 pub fn resolve_ast_type(scope: &Scope, ty: &AstType) -> Type {

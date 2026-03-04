@@ -607,6 +607,7 @@ dependencies = [
  "php-lexer",
  "php-parser",
  "php-phpdoc",
+ "php-reflect",
  "php-resolve",
  "php-span",
  "walkdir",

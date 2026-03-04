@@ -19,7 +19,7 @@ mod diagnostics;
 mod index;
 mod references;
 pub use diagnostics::diagnostics;
-pub use index::{index_file, ClassSymbol, ConstSymbol, FileIndex, FunctionSymbol};
+pub use index::{for_each_region, index_file, ClassSymbol, ConstSymbol, FileIndex, FunctionSymbol};
 pub use references::{resolve_references, RefKind, ResolvedRef};
 
 /// What a name resolves to in a given [`Scope`].
