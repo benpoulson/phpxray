@@ -12,6 +12,8 @@
 //! we can't pin down resolves to [`Type::Mixed`] — inference is best-effort and
 //! never panics.
 
+mod flow;
+
 use php_ast::{BinOp, CastKind, Expr, ExprKind, MemberName, Name, UnOp};
 use php_intern::Interner;
 use php_reflect::ReflectionIndex;
