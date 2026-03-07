@@ -7,8 +7,13 @@ license.workspace = true
 [dependencies]
 php-span.workspace = true
 php-diagnostics.workspace = true
+php-ast.workspace = true
+php-intern.workspace = true
 php-resolve.workspace = true
 php-index.workspace = true
+php-types.workspace = true
+php-reflect.workspace = true
+php-infer.workspace = true
 
 [dev-dependencies]
 php-parser.workspace = true

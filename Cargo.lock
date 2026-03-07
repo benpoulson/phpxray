@@ -269,11 +269,16 @@ dependencies = [
 name = "php-rules"
 version = "0.0.0"
 dependencies = [
+ "php-ast",
  "php-diagnostics",
  "php-index",
+ "php-infer",
+ "php-intern",
  "php-parser",
+ "php-reflect",
  "php-resolve",
  "php-span",
+ "php-types",
 ]
 
 [[package]]

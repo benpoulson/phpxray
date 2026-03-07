@@ -10,6 +10,9 @@ use php_diagnostics::Diagnostic;
 use php_index::ProjectIndex;
 use php_resolve::{RefKind, Resolution, ResolvedRef};
 
+mod return_type;
+pub use return_type::return_type_errors;
+
 /// Report every reference in `refs` whose target is unknown to `index` (neither
 /// a project declaration nor a PHP built-in). `index` must already contain the
 /// whole project's declarations plus the built-ins (see
