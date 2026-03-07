@@ -1,0 +1,16 @@
+[package]
+name = "php-infer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+php-span.workspace = true
+php-intern.workspace = true
+php-ast.workspace = true
+php-resolve.workspace = true
+php-types.workspace = true
+php-reflect.workspace = true
+
+[dev-dependencies]
+php-parser.workspace = true

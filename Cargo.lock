@@ -197,6 +197,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "php-infer"
+version = "0.0.0"
+dependencies = [
+ "php-ast",
+ "php-intern",
+ "php-parser",
+ "php-reflect",
+ "php-resolve",
+ "php-span",
+ "php-types",
+]
+
+[[package]]
 name = "php-intern"
 version = "0.0.0"
 

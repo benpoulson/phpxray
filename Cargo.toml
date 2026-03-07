@@ -13,6 +13,7 @@ members = [
     "crates/php-phpdoc",
     "crates/php-types",
     "crates/php-reflect",
+    "crates/php-infer",
     "crates/xtask",
 ]
 
@@ -36,6 +37,7 @@ php-rules = { path = "crates/php-rules" }
 php-phpdoc = { path = "crates/php-phpdoc" }
 php-types = { path = "crates/php-types" }
 php-reflect = { path = "crates/php-reflect" }
+php-infer = { path = "crates/php-infer" }
 
 # Third-party
 insta = "1"
