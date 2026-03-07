@@ -12,7 +12,10 @@
 //! we can't pin down resolves to [`Type::Mixed`] — inference is best-effort and
 //! never panics.
 
+mod assign;
 mod flow;
+
+pub use assign::is_assignable;
 
 use php_ast::{BinOp, CastKind, Expr, ExprKind, MemberName, Name, UnOp};
 use php_intern::Interner;

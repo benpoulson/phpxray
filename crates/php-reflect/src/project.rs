@@ -70,6 +70,36 @@ impl ReflectionIndex {
         self.classes.len()
     }
 
+    /// Whether `sub` is `sup` or transitively extends/implements/uses it
+    /// (reflexive, case-insensitive). Walks parents, interfaces, and traits;
+    /// tolerant of unknown links and cycles. Returns `false` if the relationship
+    /// can't be established from the indexed classes — callers that must avoid
+    /// false positives should treat an *unknown* class leniently themselves.
+    pub fn is_subclass_of(&self, sub: &str, sup: &str) -> bool {
+        let mut visited = Vec::new();
+        self.is_sub(&key(sub), &key(sup), &mut visited)
+    }
+
+    fn is_sub(&self, sub_key: &str, sup_key: &str, visited: &mut Vec<String>) -> bool {
+        if sub_key == sup_key {
+            return true; // reflexive
+        }
+        if visited.iter().any(|v| v == sub_key) {
+            return false;
+        }
+        visited.push(sub_key.to_string());
+        let Some(c) = self.classes.get(sub_key) else { return false };
+        c.parents
+            .iter()
+            .chain(&c.interfaces)
+            .chain(&c.traits)
+            .filter_map(|p| match p {
+                Type::Named { fqn, .. } => Some(key(fqn)),
+                _ => None,
+            })
+            .any(|pk| self.is_sub(&pk, sup_key, visited))
+    }
+
     /// Resolve a method by name through `class_fqn`'s hierarchy (own members
     /// first, then traits, parent class, interfaces, mixins). Method names match
     /// case-insensitively. Returns the method with generic args substituted.
