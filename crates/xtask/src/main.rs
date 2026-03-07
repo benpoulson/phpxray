@@ -35,6 +35,7 @@ fn main() -> ExitCode {
         Some("index") => cmd_index(args.get(1).map(PathBuf::from)),
         Some("reflect") => cmd_reflect(args.get(1).map(PathBuf::from)),
         Some("infer") => cmd_infer(args.get(1).map(PathBuf::from)),
+        Some("check") => cmd_check(args.get(1).map(PathBuf::from)),
         Some("phpdoc") => cmd_phpdoc(args.get(1).map(PathBuf::from)),
         Some("triage") => cmd_triage(args.get(1).map(PathBuf::from)),
         Some("diag") => cmd_diag(args.get(1).map(PathBuf::from)),
@@ -569,6 +570,68 @@ fn cmd_infer(dir: Option<PathBuf>) -> ExitCode {
         }
     }
     println!("inferred over {files} files: {bodies} function/method bodies analysed, {panics} panics");
+    if panics == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// M-T7: the **multi-file driver** — index a whole project (reflection), then
+/// run the type rules (currently the return-type rule) over each file. Reports
+/// the total diagnostics and a sample, and asserts 0 panics. Over the Zend
+/// corpus (intentionally weird code) this is mostly a false-positive gauge.
+fn cmd_check(dir: Option<PathBuf>) -> ExitCode {
+    use php_reflect::ReflectionIndex;
+
+    let dir = dir.unwrap_or_else(|| workspace_root().join("php-src/Zend/tests"));
+    if !dir.is_dir() {
+        eprintln!("corpus dir not found: {}", dir.display());
+        return ExitCode::FAILURE;
+    }
+
+    // Pass 1: build the project reflection index (keep sources for pass 2).
+    let mut index = ReflectionIndex::new();
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for entry in WalkDir::new(&dir).into_iter().filter_map(Result::ok) {
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("phpt") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
+        let Some(source) = phpt::extract_file_section(&text) else { continue };
+        let r = php_parser::parse(&source);
+        index.add_file(&r.program, &r.interner);
+        sources.push((entry.path().display().to_string(), source));
+    }
+
+    // Pass 2: run the rules over each file.
+    let (mut files, mut diags, mut panics) = (0u64, 0u64, 0u64);
+    let mut samples: Vec<String> = Vec::new();
+    for (label, source) in &sources {
+        files += 1;
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let r = php_parser::parse(source);
+            php_rules::return_type_errors(&index, &r.program, &r.interner)
+        }));
+        match outcome {
+            Ok(ds) => {
+                diags += ds.len() as u64;
+                for d in ds {
+                    if samples.len() < 25 {
+                        samples.push(format!("{label}: {}", d.message));
+                    }
+                }
+            }
+            Err(_) => {
+                panics += 1;
+                eprintln!("CHECK PANIC on {label}");
+            }
+        }
+    }
+    println!("checked {files} files: {diags} return-type diagnostics, {panics} panics");
+    for s in &samples {
+        println!("  {s}");
+    }
     if panics == 0 {
         ExitCode::SUCCESS
     } else {

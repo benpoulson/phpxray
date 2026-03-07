@@ -24,4 +24,5 @@ php-phpdoc.workspace = true
 php-reflect.workspace = true
 php-types.workspace = true
 php-infer.workspace = true
+php-rules.workspace = true
 walkdir.workspace = true

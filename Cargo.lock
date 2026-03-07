@@ -628,6 +628,7 @@ dependencies = [
  "php-phpdoc",
  "php-reflect",
  "php-resolve",
+ "php-rules",
  "php-span",
  "php-types",
  "walkdir",
