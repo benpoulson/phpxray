@@ -34,6 +34,7 @@ fn main() -> ExitCode {
         Some("resolve") => cmd_resolve(args.get(1).map(PathBuf::from)),
         Some("index") => cmd_index(args.get(1).map(PathBuf::from)),
         Some("reflect") => cmd_reflect(args.get(1).map(PathBuf::from)),
+        Some("infer") => cmd_infer(args.get(1).map(PathBuf::from)),
         Some("phpdoc") => cmd_phpdoc(args.get(1).map(PathBuf::from)),
         Some("triage") => cmd_triage(args.get(1).map(PathBuf::from)),
         Some("diag") => cmd_diag(args.get(1).map(PathBuf::from)),
@@ -443,6 +444,131 @@ fn cmd_reflect(dir: Option<PathBuf>) -> ExitCode {
         }
     }
     println!("reflected {files} files: {} classes, {panics} panics", index.class_count());
+    if panics == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// M-T4/M-T5: run **type inference** over a corpus. Pass 1 builds the project
+/// reflection index; pass 2 runs flow analysis over every function and method
+/// body (which infers every contained expression). Asserts 0 panics — the
+/// inference layer must be total, like the parser.
+fn cmd_infer(dir: Option<PathBuf>) -> ExitCode {
+    use php_ast::{Member, Stmt, StmtKind};
+    use php_infer::TypeCtx;
+    use php_reflect::{resolve_ast_type, ReflectionIndex};
+    use php_resolve::{for_each_region, Scope};
+    use php_types::Type;
+
+    let dir = dir.unwrap_or_else(|| workspace_root().join("php-src/Zend/tests"));
+    if !dir.is_dir() {
+        eprintln!("corpus dir not found: {}", dir.display());
+        return ExitCode::FAILURE;
+    }
+
+    // Pass 1: build the project-wide reflection index (and keep the sources to
+    // re-parse in pass 2).
+    let mut index = ReflectionIndex::new();
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for entry in WalkDir::new(&dir).into_iter().filter_map(Result::ok) {
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("phpt") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
+        let Some(source) = phpt::extract_file_section(&text) else { continue };
+        let label = entry.path().display().to_string();
+        let r = php_parser::parse(&source);
+        index.add_file(&r.program, &r.interner);
+        sources.push((label, source));
+    }
+
+    // Recursive descent: analyse each function/method body, descending into
+    // nested/conditional declarations.
+    fn infer_stmt(idx: &ReflectionIndex, scope: &Scope, i: &php_intern::Interner, st: &Stmt, bodies: &mut u64) {
+        match &st.kind {
+            StmtKind::Function(f) => {
+                let mut ctx = TypeCtx::new(idx, scope, i);
+                ctx.analyze_function_body(f);
+                *bodies += 1;
+                infer_all(idx, scope, i, &f.body, bodies);
+            }
+            StmtKind::Class(c) => {
+                let fqn = c.name.map(|n| scope.qualify(i.resolve(n)));
+                for m in &c.members {
+                    let Member::Method(md) = m else { continue };
+                    let Some(body) = &md.body else { continue };
+                    let mut ctx = TypeCtx::new(idx, scope, i);
+                    ctx.class = fqn.clone();
+                    for p in &md.params {
+                        let ty = p.ty.as_ref().map(|t| resolve_ast_type(scope, t)).unwrap_or(Type::Mixed);
+                        ctx.vars.insert(i.resolve(p.name).to_string(), ty);
+                    }
+                    ctx.exec_block(body);
+                    *bodies += 1;
+                    infer_all(idx, scope, i, body, bodies);
+                }
+            }
+            StmtKind::Block(b) => infer_all(idx, scope, i, b, bodies),
+            StmtKind::If { then, elseifs, els, .. } => {
+                infer_stmt(idx, scope, i, then, bodies);
+                for e in elseifs {
+                    infer_stmt(idx, scope, i, &e.body, bodies);
+                }
+                if let Some(e) = els {
+                    infer_stmt(idx, scope, i, e, bodies);
+                }
+            }
+            StmtKind::While { body, .. }
+            | StmtKind::DoWhile { body, .. }
+            | StmtKind::For { body, .. }
+            | StmtKind::Foreach { body, .. } => infer_stmt(idx, scope, i, body, bodies),
+            StmtKind::Try { body, catches, finally } => {
+                infer_all(idx, scope, i, body, bodies);
+                for c in catches {
+                    infer_all(idx, scope, i, &c.body, bodies);
+                }
+                if let Some(f) = finally {
+                    infer_all(idx, scope, i, f, bodies);
+                }
+            }
+            StmtKind::Switch { cases, .. } => {
+                for case in cases {
+                    infer_all(idx, scope, i, &case.body, bodies);
+                }
+            }
+            StmtKind::Declare { body: Some(b), .. } => infer_stmt(idx, scope, i, b, bodies),
+            _ => {}
+        }
+    }
+    fn infer_all(idx: &ReflectionIndex, scope: &Scope, i: &php_intern::Interner, stmts: &[Stmt], bodies: &mut u64) {
+        for st in stmts {
+            infer_stmt(idx, scope, i, st, bodies);
+        }
+    }
+
+    // Pass 2: run inference, isolating panics per file.
+    let (mut files, mut bodies, mut panics) = (0u64, 0u64, 0u64);
+    for (label, source) in &sources {
+        files += 1;
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let r = php_parser::parse(source);
+            let mut count = 0u64;
+            for_each_region(&r.program.stmts, &r.interner, |scope, region| {
+                infer_all(&index, scope, &r.interner, region, &mut count);
+            });
+            count
+        }));
+        match outcome {
+            Ok(n) => bodies += n,
+            Err(_) => {
+                panics += 1;
+                eprintln!("INFER PANIC on {label}");
+            }
+        }
+    }
+    println!("inferred over {files} files: {bodies} function/method bodies analysed, {panics} panics");
     if panics == 0 {
         ExitCode::SUCCESS
     } else {

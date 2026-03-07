@@ -22,4 +22,6 @@ php-resolve.workspace = true
 php-index.workspace = true
 php-phpdoc.workspace = true
 php-reflect.workspace = true
+php-types.workspace = true
+php-infer.workspace = true
 walkdir.workspace = true

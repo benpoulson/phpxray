@@ -616,6 +616,7 @@ version = "0.0.0"
 dependencies = [
  "php-ast",
  "php-index",
+ "php-infer",
  "php-intern",
  "php-lexer",
  "php-parser",
@@ -623,6 +624,7 @@ dependencies = [
  "php-reflect",
  "php-resolve",
  "php-span",
+ "php-types",
  "walkdir",
 ]
 
