@@ -10,7 +10,9 @@ use php_diagnostics::Diagnostic;
 use php_index::ProjectIndex;
 use php_resolve::{RefKind, Resolution, ResolvedRef};
 
+mod registry;
 mod return_type;
+pub use registry::{analyze_file, rules_for_level, FileAnalysis, RuleEntry};
 pub use return_type::return_type_errors;
 
 /// Report every reference in `refs` whose target is unknown to `index` (neither
@@ -44,9 +46,12 @@ pub fn unknown_symbols(index: &ProjectIndex, refs: &[ResolvedRef]) -> Vec<Diagno
             (RefKind::Class, _) => None,
         };
         if let Some((what, name)) = unknown {
-            out.push(
-                Diagnostic::error(r.span, format!("unknown {what} `{name}`")).with_code("unknown-symbol"),
-            );
+            let code = match what {
+                "class" => "class.notFound",
+                "function" => "function.notFound",
+                _ => "constant.notFound",
+            };
+            out.push(Diagnostic::error(r.span, format!("unknown {what} `{name}`")).with_code(code));
         }
     }
     out
