@@ -14,6 +14,7 @@ members = [
     "crates/php-types",
     "crates/php-reflect",
     "crates/php-infer",
+    "crates/php-config",
     "crates/xtask",
 ]
 
@@ -38,10 +39,16 @@ php-phpdoc = { path = "crates/php-phpdoc" }
 php-types = { path = "crates/php-types" }
 php-reflect = { path = "crates/php-reflect" }
 php-infer = { path = "crates/php-infer" }
+php-config = { path = "crates/php-config" }
+php-cli = { path = "crates/php-cli" }
 
 # Third-party
 insta = "1"
 walkdir = "2"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+regex = "1"
+clap = { version = "4", features = ["derive"] }
 
 [profile.release]
 # The whole point of the project is speed; optimise the corpus runner & lexer hard.
