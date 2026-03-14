@@ -15,6 +15,7 @@ members = [
     "crates/php-reflect",
     "crates/php-infer",
     "crates/php-config",
+    "crates/php-cli",
     "crates/xtask",
 ]
 
