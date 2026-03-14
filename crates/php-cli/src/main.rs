@@ -54,10 +54,13 @@ fn main() -> ExitCode {
     }
 
     let report = run(&config, &root);
-    let rendered = match cli.error_format.as_str() {
-        "table" => report::render_table(&report),
-        other => {
-            eprintln!("error: unknown error format {other:?} (supported: table)");
+    let rendered = match report::render(&report, &cli.error_format) {
+        Some(s) => s,
+        None => {
+            eprintln!(
+                "error: unknown error format {:?} (supported: table, json, github, checkstyle)",
+                cli.error_format
+            );
             return ExitCode::from(2);
         }
     };
