@@ -18,6 +18,9 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 pub mod report;
+pub mod suppress;
+
+use std::collections::HashMap;
 
 /// One parsed source file kept alive for analysis.
 pub struct ParsedFile {
@@ -78,7 +81,10 @@ pub fn run(config: &Config, root: &Path) -> Report {
             ParsedFile::new(display, source)
         })
         .collect();
-    analyze_parsed(&parsed, config.level.value())
+    let report = analyze_parsed(&parsed, config.level.value());
+    let sources: HashMap<&str, &str> =
+        parsed.iter().map(|f| (f.path.as_str(), f.source.as_str())).collect();
+    suppress::apply(report, &config.ignore, config.report_unmatched_ignored, &sources)
 }
 
 /// Analyze already-parsed files at `level`. Pure over its inputs (no disk I/O) —

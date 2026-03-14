@@ -310,6 +310,7 @@ dependencies = [
  "php-resolve",
  "php-rules",
  "php-span",
+ "regex",
  "serde",
  "serde_json",
  "walkdir",
