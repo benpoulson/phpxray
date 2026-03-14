@@ -1,7 +1,7 @@
 //! The `php-analyzer` command-line entry point.
 
 use clap::Parser;
-use php_cli::{report, run};
+use php_cli::{baseline, report, run};
 use php_config::{Config, Level};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -21,6 +21,9 @@ struct Cli {
     /// Output format.
     #[arg(long = "error-format", value_name = "FORMAT", default_value = "table")]
     error_format: String,
+    /// Write current findings to a baseline file (default: phpanalyzer-baseline.yaml).
+    #[arg(long = "generate-baseline", value_name = "FILE", num_args = 0..=1, default_missing_value = "phpanalyzer-baseline.yaml")]
+    generate_baseline: Option<String>,
     /// Suppress progress output (accepted for compatibility; currently a no-op).
     #[arg(long = "no-progress")]
     no_progress: bool,
@@ -51,6 +54,33 @@ fn main() -> ExitCode {
     if config.paths.is_empty() {
         eprintln!("error: no paths to analyze (set `paths` in the config or pass paths on the command line)");
         return ExitCode::from(2);
+    }
+
+    // Generate-baseline mode: run without applying any baseline, write the
+    // findings out, and exit. (The configured baseline is intentionally not
+    // loaded so the snapshot captures the full current state.)
+    if let Some(out) = &cli.generate_baseline {
+        let report = run(&config, &root);
+        let entries = baseline::entries(&report);
+        let yaml = baseline::to_yaml(&entries);
+        let path = root.join(out);
+        if let Err(e) = std::fs::write(&path, yaml) {
+            eprintln!("error: writing baseline {}: {e}", path.display());
+            return ExitCode::from(2);
+        }
+        eprintln!("Wrote baseline with {} entries to {}", entries.len(), path.display());
+        return ExitCode::SUCCESS;
+    }
+
+    // Normal run: merge a configured baseline into the ignore set.
+    if let Some(b) = &config.baseline {
+        match Config::load(root.join(b)) {
+            Ok(bc) => config.ignore.extend(bc.ignore),
+            Err(e) => {
+                eprintln!("error: loading baseline {b}: {e}");
+                return ExitCode::from(2);
+            }
+        }
     }
 
     let report = run(&config, &root);

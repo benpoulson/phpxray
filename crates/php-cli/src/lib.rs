@@ -17,6 +17,7 @@ use php_span::LineIndex;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+pub mod baseline;
 pub mod report;
 pub mod suppress;
 
