@@ -10,5 +10,11 @@
 # committed golden fixtures under test-fixtures/ make the test suite self-contained.
 /php-src
 
+# phpstan reference source (a shallow checkout of phpstan/phpstan-src @ 2.2.x).
+# Spec oracle for replicating phpstan's rules + level mapping (conf/config.level*.neon,
+# src/Rules/**). Not vendored — obtain via `git clone --depth 1 --branch 2.2.x
+# https://github.com/phpstan/phpstan-src.git phpstan-src`.
+/phpstan-src
+
 # JetBrains IDE
 /.idea
