@@ -6,7 +6,7 @@ attr_re = re.compile(r'#\[RegisteredRule\(level:\s*(\d+)\)\]')
 class_re = re.compile(r'(?:final |abstract )?class (\w+)')
 ident_re = re.compile(r"->identifier\(\s*'([^']+)'")
 
-# level -> category -> list of (class, [identifiers])
+# level -> category -> list of (class, src_path, [identifiers])
 data = collections.defaultdict(lambda: collections.defaultdict(list))
 total = 0
 for root, _, files in os.walk(RULES_DIR):
@@ -33,7 +33,8 @@ for root, _, files in os.walk(RULES_DIR):
         else:
             cat = parts[0]
         idents = sorted(set(ident_re.findall(text)))
-        data[level][cat].append((cls, idents))
+        src_path = "phpstan-src/" + os.path.relpath(path, SRC).replace(os.sep, "/")
+        data[level][cat].append((cls, src_path, idents))
         total += 1
 
 # feature-toggle-gated rules from conf level files
@@ -114,9 +115,9 @@ for level in range(0, 10):
     w(f"*{n_rules} discrete rules.*\n")
     for cat in sorted(cats):
         w(f"### {cat}")
-        for cls, idents in sorted(cats[cat]):
+        for cls, src_path, idents in sorted(cats[cat]):
             idtxt = f" — `id:` {', '.join('`'+i+'`' for i in idents)}" if idents else ""
-            w(f"- [ ] **{cls}**{idtxt}")
+            w(f"- [ ] **{cls}** — `{src_path}`{idtxt}")
         w("")
     if toggle.get(level):
         w(f"*Feature-toggle-gated rules at this level (often bleeding-edge):* " +
