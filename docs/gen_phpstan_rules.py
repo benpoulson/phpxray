@@ -71,7 +71,35 @@ level_params = {
 7:["checkUnionTypes","reportMaybes"],
 8:["checkNullables"],
 9:["checkExplicitMixed"],
-10:["(implicit mixed)"],
+10:["checkImplicitMixed"],
+}
+
+# Levels 7-10 are not rule classes but modes of RuleLevelHelper. These are the
+# concrete work items (checkbox title, description).
+strictness_items = {
+7:[
+ ("Union-type member access (`checkUnionTypes`)",
+  "A method call / property access / array offset on a union must be valid for **all** members; report "
+  "when only some support it (partial union). Today `php_infer::is_assignable` accepts a union if any arm fits."),
+ ("Report \"maybe\" mismatches (`reportMaybes`)",
+  "Report argument/return/offset mismatches that only *might* be wrong — consumed by ~10 existing rules "
+  "(e.g. `Functions/CallCallablesRule`, `Methods/MethodSignatureRule`, `Arrays/NonexistentOffsetInArrayDimFetchRule`)."),
+],
+8:[
+ ("Nullable member access (`checkNullables`)",
+  "Calling a method / accessing a property / offset on a `T|null` is an error — don't silently strip null "
+  "first. (The classic \"Cannot call method X() on T|null\".)"),
+],
+9:[
+ ("Strict explicit mixed (`checkExplicitMixed`)",
+  "A value declared `mixed` is only assignable to `mixed`; using it where a concrete type is required "
+  "(call/access/argument/return) is an error. Tightens `is_assignable(mixed, T)` from its lenient `true`."),
+],
+10:[
+ ("Strict implicit mixed (`checkImplicitMixed`)",
+  "Same as level 9 but also for **implicit** mixed — values whose type we couldn't infer, not just those "
+  "declared `mixed`. (PHPStan 2.0; `max` = level 10.)"),
+],
 }
 
 out = []
@@ -123,13 +151,23 @@ for level in range(0, 10):
         w(f"*Feature-toggle-gated rules at this level (often bleeding-edge):* " +
           ", ".join(sorted(set(toggle[level]))) + "\n")
 
-w("## Levels 7–10 — strictness modes (no new rules)")
+w("## Levels 7–10 — strictness modes (RuleLevelHelper)\n")
+w("These add **no new rule classes**. They are flags on phpstan's central type-acceptance helper")
+w("`phpstan-src/src/Rules/RuleLevelHelper.php` (`findTypeToCheck`/`accepts`), which nearly every")
+w("type-aware rule calls. In our architecture they are **modes of `php_infer::is_assignable` plus the")
+w("member-access / argument rules** — `is_assignable` is currently lenient on nullables / unions / mixed,")
+w("and each level tightens one of those. Implement them as the corresponding lower-level rules land.\n")
 for level in range(7, 11):
-    w(f"- **Level {level}** — {level_theme[level]} (params: `{'`, `'.join(level_params[level])}`)")
-w("")
+    w(f"### Level {level} — {level_theme[level]}")
+    w(f"*Enables parameters:* `{'`, `'.join(level_params[level])}` · *location:* `phpstan-src/src/Rules/RuleLevelHelper.php`\n")
+    for title, desc in strictness_items[level]:
+        w(f"- [ ] **{title}** — {desc}")
+    w("")
+strict_count = sum(len(v) for v in strictness_items.values())
 w("---\n")
-w(f"**Totals:** {grand} discrete rules across levels 0–9 "
-  f"(level breakdown: " + ", ".join(f"L{l}={sum(len(v) for v in data.get(l,{}).values())}" for l in range(0,10)) + ").")
+w(f"**Totals:** {grand} discrete rules across levels 0–9, plus {strict_count} strictness-mode work "
+  f"items for levels 7–10 = **{grand + strict_count} checklist items**. "
+  f"Level breakdown: " + ", ".join(f"L{l}={sum(len(v) for v in data.get(l,{}).values())}" for l in range(0,10)) + ".")
 
 open("/Users/ben/Projects/php-ast/docs/phpstan-rules.md","w").write("\n".join(out)+"\n")
 print(f"wrote docs/phpstan-rules.md — {total} rules")
