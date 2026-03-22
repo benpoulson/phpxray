@@ -61,6 +61,11 @@ level_theme = {
 9:"Strict mixed (explicit mixed only assignable to mixed)",
 10:"Implicit mixed reported too (PHPStan 2.0)",
 }
+# Implemented phpstan rule classes (tick the checklist box on regeneration).
+DONE = {"UnsetCastRule", "VoidCastRule"}
+# Rules we can't implement yet, with the reason.
+DEFERRED = {"DeprecatedCastRule": "lexer normalizes cast spelling; AST lacks (integer)/(boolean)/(double)/(binary) distinction"}
+
 level_params = {
 0:[], 1:["checkMaybeUndefinedVariables","checkExtraArguments","reportMagicMethods","reportMagicProperties"],
 2:["checkClassCaseSensitivity","checkPhpDocMissingReturn"],
@@ -119,6 +124,8 @@ w("error identifier(s) the rule emits (literal ones; some are built dynamically)
 w("### Already implemented in `php-analyzer`")
 w("- [x] **unknown-symbol** — `id:` `class.notFound`, `function.notFound`, `constant.notFound` (level 0; our single rule covers what phpstan spreads across many existence rules)")
 w("- [x] **return-type** — `id:` `return.type` (level ~3; flow-tracked return vs declared type)")
+w("- [x] **Cast/UnsetCastRule** — `id:` `cast.unset` (level 0)")
+w("- [x] **Cast/VoidCastRule** — `id:` `cast.void` (level 0)")
 w("")
 w("### Prioritization note")
 w("Not every level-0 rule matters for a general analyzer. The **`Api`** category and a few")
@@ -145,7 +152,9 @@ for level in range(0, 10):
         w(f"### {cat}")
         for cls, src_path, idents in sorted(cats[cat]):
             idtxt = f" — `id:` {', '.join('`'+i+'`' for i in idents)}" if idents else ""
-            w(f"- [ ] **{cls}** — `{src_path}`{idtxt}")
+            box = "x" if cls in DONE else " "
+            note = f" — _deferred: {DEFERRED[cls]}_" if cls in DEFERRED else ""
+            w(f"- [{box}] **{cls}** — `{src_path}`{idtxt}{note}")
         w("")
     if toggle.get(level):
         w(f"*Feature-toggle-gated rules at this level (often bleeding-edge):* " +

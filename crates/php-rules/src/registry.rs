@@ -69,10 +69,17 @@ mod tests {
 
     #[test]
     fn level_selection_is_cumulative() {
-        assert_eq!(names_at(0), ["unknown-symbol"]);
-        assert_eq!(names_at(2), ["unknown-symbol"]);
-        assert_eq!(names_at(3), ["unknown-symbol", "return-type"]);
-        assert_eq!(names_at(9), ["unknown-symbol", "return-type"]);
+        // Level 0 has the existence + cast rules but not the (level-3) return-type rule.
+        let l0 = names_at(0);
+        assert!(l0.contains(&"unknown-symbol"));
+        assert!(l0.contains(&"cast.unset"));
+        assert!(!l0.contains(&"return-type"));
+        // The return-type rule appears at level 3.
+        assert!(!names_at(2).contains(&"return-type"));
+        assert!(names_at(3).contains(&"return-type"));
+        // Cumulative: higher levels include everything from lower ones.
+        assert!(names_at(9).len() >= names_at(3).len());
+        assert!(names_at(3).len() > l0.len());
     }
 
     #[test]

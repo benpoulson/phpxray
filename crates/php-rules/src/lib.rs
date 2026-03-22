@@ -13,6 +13,9 @@ use php_resolve::{RefKind, Resolution, ResolvedRef};
 mod registry;
 mod return_type;
 mod rules;
+mod walk;
+#[cfg(test)]
+mod testutil;
 pub use registry::{analyze_file, rules_for_level, FileAnalysis, RuleEntry};
 pub use return_type::return_type_errors;
 
