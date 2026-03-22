@@ -1,0 +1,80 @@
+//! Rule implementations, **one module per phpstan category** (the subdirectories
+//! of `phpstan-src/src/Rules/`). Each category module exposes a `RULES` slice of
+//! [`RuleEntry`]; [`CATEGORY_RULES`] aggregates them for the registry's
+//! level-based selection. The full per-rule checklist is `docs/phpstan-rules.md`.
+//!
+//! Predefined categories (phpstan dir → module, with rule count @ levels):
+//! Functions→functions (41 @0–6), Classes→classes (37 @0,1,2,4),
+//! Properties→properties (31), Methods→methods (29), PhpDoc→phpdoc (22),
+//! Comparison→comparison (19), Generics→generics (15), Arrays→arrays (13),
+//! Variables→variables (12), Constants→constants (11), Exceptions→exceptions (9),
+//! DeadCode→dead_code (9), Operators→operators (7), Cast→cast (7),
+//! TooWideTypehints→too_wide_typehints (7), Traits→traits (4), Keywords→keywords (4),
+//! Generators→generators (3), Regexp→regexp (2), Namespaces→namespaces (2),
+//! EnumCases→enum_cases (2), Pure→pure (2), Types→types (1), Names→names (1),
+//! Missing→missing (1), Whitespace→whitespace (1), (root)→misc (1).
+//!
+//! Skipped (phpstan-internal, not user-code analysis): **Api** (phpstan
+//! extension-development API) and **Ignore** (phpstan's own ignore-comment
+//! handling — we do suppression in `php-cli`).
+
+use crate::RuleEntry;
+
+mod arrays;
+mod cast;
+mod classes;
+mod comparison;
+mod constants;
+mod dead_code;
+mod enum_cases;
+mod exceptions;
+mod functions;
+mod generators;
+mod generics;
+mod keywords;
+mod methods;
+mod misc;
+mod missing;
+mod names;
+mod namespaces;
+mod operators;
+mod phpdoc;
+mod properties;
+mod pure;
+mod regexp;
+mod too_wide_typehints;
+mod traits;
+mod types;
+mod variables;
+mod whitespace;
+
+/// Every category's rule slice. The registry flattens this and filters by level.
+pub(crate) static CATEGORY_RULES: &[&[RuleEntry]] = &[
+    arrays::RULES,
+    cast::RULES,
+    classes::RULES,
+    comparison::RULES,
+    constants::RULES,
+    dead_code::RULES,
+    enum_cases::RULES,
+    exceptions::RULES,
+    functions::RULES,
+    generators::RULES,
+    generics::RULES,
+    keywords::RULES,
+    methods::RULES,
+    misc::RULES,
+    missing::RULES,
+    names::RULES,
+    namespaces::RULES,
+    operators::RULES,
+    phpdoc::RULES,
+    properties::RULES,
+    pure::RULES,
+    regexp::RULES,
+    too_wide_typehints::RULES,
+    traits::RULES,
+    types::RULES,
+    variables::RULES,
+    whitespace::RULES,
+];

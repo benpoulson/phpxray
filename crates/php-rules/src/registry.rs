@@ -8,7 +8,6 @@
 //! and has no shared mutable state, the engine's per-file loop is trivially
 //! parallelizable later (Phase 2).
 
-use crate::{return_type_errors, unknown_symbols};
 use php_ast::Program;
 use php_diagnostics::Diagnostic;
 use php_index::ProjectIndex;
@@ -41,25 +40,10 @@ pub struct RuleEntry {
     pub run: fn(&FileAnalysis) -> Vec<Diagnostic>,
 }
 
-fn run_unknown_symbols(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    unknown_symbols(fa.project, fa.resolved_refs)
-}
-
-fn run_return_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    return_type_errors(fa.reflection, fa.program, fa.interner)
-}
-
-/// The full rule catalog, ordered by level.
-static RULES: &[RuleEntry] = &[
-    // Level 0: existence of referenced classes/functions/constants.
-    RuleEntry { name: "unknown-symbol", level: 0, run: run_unknown_symbols },
-    // Level 3: return statements vs declared return type.
-    RuleEntry { name: "return-type", level: 3, run: run_return_type },
-];
-
-/// The rules active at `level` (cumulative: every rule with `rule.level <= level`).
+/// The rules active at `level` (cumulative: every rule with `rule.level <= level`),
+/// gathered from every per-category module in [`crate::rules`].
 pub fn rules_for_level(level: u8) -> impl Iterator<Item = &'static RuleEntry> {
-    RULES.iter().filter(move |r| r.level <= level)
+    crate::rules::CATEGORY_RULES.iter().flat_map(|cat| cat.iter()).filter(move |r| r.level <= level)
 }
 
 /// Run every rule active at `level` over one file and collect the diagnostics.
