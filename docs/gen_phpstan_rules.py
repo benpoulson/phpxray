@@ -62,9 +62,37 @@ level_theme = {
 10:"Implicit mixed reported too (PHPStan 2.0)",
 }
 # Implemented phpstan rule classes (tick the checklist box on regeneration).
-DONE = {"UnsetCastRule", "VoidCastRule"}
+DONE = {
+    # Cast
+    "UnsetCastRule", "VoidCastRule",
+    # Keywords
+    "ContinueBreakInLoopRule", "DeclareStrictTypesRule", "GotoUndefinedLabelRule", "UnusedLabelRule",
+    # Arrays
+    "DuplicateKeysInLiteralArraysRule", "OffsetAccessWithoutDimForReadingRule",
+    # Operators
+    "InvalidAssignVarRule", "InvalidIncDecOperationRule", "BacktickRule",
+}
 # Rules we can't implement yet, with the reason.
-DEFERRED = {"DeprecatedCastRule": "lexer normalizes cast spelling; AST lacks (integer)/(boolean)/(double)/(binary) distinction"}
+_TYPES = "needs the type system (operand/value types)"
+DEFERRED = {
+    "DeprecatedCastRule": "lexer normalizes cast spelling; AST lacks (integer)/(boolean)/(double)/(binary) distinction",
+    "RequireFileExistsRule": "needs the type system (const-string operand) + filesystem access",
+    "InvalidBinaryOperationRule": _TYPES,
+    "InvalidComparisonOperationRule": _TYPES,
+    "InvalidUnaryOperationRule": _TYPES,
+    "PipeOperatorRule": "needs the resolved callable type of the right operand",
+    "NonexistentOffsetInArrayDimFetchRule": _TYPES,
+    "InvalidKeyInArrayDimFetchRule": _TYPES,
+    "InvalidKeyInArrayItemRule": _TYPES,
+    "OffsetAccessAssignmentRule": _TYPES,
+    "OffsetAccessAssignOpRule": _TYPES,
+    "OffsetAccessValueAssignmentRule": _TYPES,
+    "IterableInForeachRule": _TYPES,
+    "DeadForeachRule": _TYPES,
+    "ArrayUnpackingRule": _TYPES,
+    "UnpackIterableInArrayRule": _TYPES,
+    "ArrayDestructuringRule": _TYPES,
+}
 
 level_params = {
 0:[], 1:["checkMaybeUndefinedVariables","checkExtraArguments","reportMagicMethods","reportMagicProperties"],
@@ -126,6 +154,15 @@ w("- [x] **unknown-symbol** — `id:` `class.notFound`, `function.notFound`, `co
 w("- [x] **return-type** — `id:` `return.type` (level ~3; flow-tracked return vs declared type)")
 w("- [x] **Cast/UnsetCastRule** — `id:` `cast.unset` (level 0)")
 w("- [x] **Cast/VoidCastRule** — `id:` `cast.void` (level 0)")
+w("- [x] **Keywords/ContinueBreakInLoopRule** — `id:` `continue.outOfLoop`, `break.outOfLoop` (level 0)")
+w("- [x] **Keywords/DeclareStrictTypesRule** — `id:` `declareStrictTypes.value`, `declareStrictTypes.notFirst` (level 0)")
+w("- [x] **Keywords/GotoUndefinedLabelRule** — `id:` `goto.labelUndefined` (level 0)")
+w("- [x] **Keywords/UnusedLabelRule** — `id:` `label.unused` (level 0)")
+w("- [x] **Arrays/DuplicateKeysInLiteralArraysRule** — `id:` `array.duplicateKey` (level 0)")
+w("- [x] **Arrays/OffsetAccessWithoutDimForReadingRule** — `id:` `offsetAccess.noDim` (level 0)")
+w("- [x] **Operators/InvalidAssignVarRule** — `id:` `assign.invalidExpr`, `nullsafe.assign`, `nullsafe.byRef` (level 0)")
+w("- [x] **Operators/InvalidIncDecOperationRule** — `id:` `pre/postInc/Dec.expr` (level 0; syntactic half — type half deferred)")
+w("- [x] **Operators/BacktickRule** — `id:` `backtick.deprecated` (level 0)")
 w("")
 w("### Prioritization note")
 w("Not every level-0 rule matters for a general analyzer. The **`Api`** category and a few")
