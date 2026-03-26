@@ -40,9 +40,10 @@ pub fn unknown_symbols(index: &ProjectIndex, refs: &[ResolvedRef]) -> Vec<Diagno
             (RefKind::Class, Resolution::Fqn(fqn)) => {
                 (!index.has_class(fqn)).then(|| ("class", fqn.clone()))
             }
-            (RefKind::Function, res) => {
-                callable_missing(res, |n| index.has_function(n)).then(|| ("function", primary(res)))
-            }
+            // Function existence is owned by the Functions category rules
+            // (CallToNonExistentFunctionRule), so we skip it here to avoid
+            // emitting a duplicate `function.notFound` at the same span.
+            (RefKind::Function, _) => continue,
             (RefKind::Const, res) => {
                 callable_missing(res, |n| index.has_constant(n)).then(|| ("constant", primary(res)))
             }
@@ -131,9 +132,10 @@ mod tests {
     }
 
     #[test]
-    fn unknown_function_and_constant() {
-        let d = unknowns(r#"<?php no_such_function(); echo NO_SUCH_CONST;"#);
-        assert!(d.contains(&"unknown function `no_such_function`".to_string()));
+    fn unknown_constant() {
+        // Function existence is now owned by the Functions rules; this consolidated
+        // rule covers classes + constants only.
+        let d = unknowns(r#"<?php echo NO_SUCH_CONST;"#);
         assert!(d.contains(&"unknown constant `NO_SUCH_CONST`".to_string()));
     }
 

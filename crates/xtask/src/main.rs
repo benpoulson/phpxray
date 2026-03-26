@@ -582,7 +582,11 @@ fn cmd_infer(dir: Option<PathBuf>) -> ExitCode {
 /// the total diagnostics and a sample, and asserts 0 panics. Over the Zend
 /// corpus (intentionally weird code) this is mostly a false-positive gauge.
 fn cmd_check(dir: Option<PathBuf>) -> ExitCode {
+    use php_index::ProjectIndex;
     use php_reflect::ReflectionIndex;
+    use php_resolve::{index_file, resolve_references};
+    use php_rules::{analyze_file, FileAnalysis};
+    use std::collections::BTreeMap;
 
     let dir = dir.unwrap_or_else(|| workspace_root().join("php-src/Zend/tests"));
     if !dir.is_dir() {
@@ -590,8 +594,9 @@ fn cmd_check(dir: Option<PathBuf>) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Pass 1: build the project reflection index (keep sources for pass 2).
-    let mut index = ReflectionIndex::new();
+    // Pass 1: build the project symbol + reflection indexes (keep sources).
+    let mut project = ProjectIndex::with_builtins();
+    let mut reflection = ReflectionIndex::new();
     let mut sources: Vec<(String, String)> = Vec::new();
     for entry in WalkDir::new(&dir).into_iter().filter_map(Result::ok) {
         if entry.path().extension().and_then(|e| e.to_str()) != Some("phpt") {
@@ -599,27 +604,40 @@ fn cmd_check(dir: Option<PathBuf>) -> ExitCode {
         }
         let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
         let Some(source) = phpt::extract_file_section(&text) else { continue };
+        let label = entry.path().display().to_string();
         let r = php_parser::parse(&source);
-        index.add_file(&r.program, &r.interner);
-        sources.push((entry.path().display().to_string(), source));
+        project.add_file(&label, &index_file(&r.program, &r.interner));
+        reflection.add_file(&r.program, &r.interner);
+        sources.push((label, source));
     }
 
-    // Pass 2: run the rules over each file.
+    // Pass 2: run ALL rules at level max, isolating panics per file.
     let (mut files, mut diags, mut panics) = (0u64, 0u64, 0u64);
-    let mut samples: Vec<String> = Vec::new();
+    let mut by_code: BTreeMap<String, u64> = BTreeMap::new();
     for (label, source) in &sources {
         files += 1;
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let r = php_parser::parse(source);
-            php_rules::return_type_errors(&index, &r.program, &r.interner)
+            let refs = resolve_references(&r.program, &r.interner);
+            let fa = FileAnalysis {
+                path: label,
+                source,
+                program: &r.program,
+                interner: &r.interner,
+                project: &project,
+                reflection: &reflection,
+                resolved_refs: &refs,
+            };
+            analyze_file(&fa, 10)
+                .into_iter()
+                .map(|d| d.code.unwrap_or("?").to_string())
+                .collect::<Vec<_>>()
         }));
         match outcome {
-            Ok(ds) => {
-                diags += ds.len() as u64;
-                for d in ds {
-                    if samples.len() < 25 {
-                        samples.push(format!("{label}: {}", d.message));
-                    }
+            Ok(codes) => {
+                diags += codes.len() as u64;
+                for c in codes {
+                    *by_code.entry(c).or_default() += 1;
                 }
             }
             Err(_) => {
@@ -628,9 +646,11 @@ fn cmd_check(dir: Option<PathBuf>) -> ExitCode {
             }
         }
     }
-    println!("checked {files} files: {diags} return-type diagnostics, {panics} panics");
-    for s in &samples {
-        println!("  {s}");
+    println!("checked {files} files at level max: {diags} diagnostics, {panics} panics");
+    let mut rows: Vec<(&String, &u64)> = by_code.iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(a.1));
+    for (code, n) in rows {
+        println!("  {n:>7}  {code}");
     }
     if panics == 0 {
         ExitCode::SUCCESS

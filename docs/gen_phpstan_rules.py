@@ -71,6 +71,25 @@ DONE = {
     "DuplicateKeysInLiteralArraysRule", "OffsetAccessWithoutDimForReadingRule",
     # Operators
     "InvalidAssignVarRule", "InvalidIncDecOperationRule", "BacktickRule",
+    # Functions
+    "RedefinedParametersRule", "InvalidParameterNameRule", "VariadicParametersDeclarationRule",
+    "InnerFunctionRule", "InvalidLexicalVariablesInClosureUseRule", "UnusedClosureUsesRule",
+    "CallToNonExistentFunctionRule", "PrintfParametersRule", "DefineParametersRule", "FunctionCallableRule",
+    # Classes
+    "InstantiationRule", "InstantiationCallableRule", "NewStaticRule", "ExistingClassInClassExtendsRule",
+    "ExistingClassesInClassImplementsRule", "ExistingClassesInInterfaceExtendsRule",
+    "ExistingClassInTraitUseRule", "ExistingClassInInstanceOfRule", "EnumSanityRule",
+    "DuplicateDeclarationRule", "DuplicateClassDeclarationRule", "NonClassAttributeClassRule",
+    "InvalidPromotedPropertiesRule",
+    # Properties
+    "ReadOnlyPropertyRule", "PropertyInClassRule", "PropertiesInInterfaceRule", "PropertyHookAttributesRule",
+    "OverridingPropertyRule", "AccessPropertiesRule", "ReadOnlyPropertyAssignRule",
+    # Methods
+    "AbstractMethodInNonAbstractClassRule", "AbstractPrivateMethodRule", "FinalPrivateMethodRule",
+    "MethodVisibilityInInterfaceRule", "ConstructorReturnTypeRule", "MissingMethodImplementationRule",
+    "MissingMagicSerializationMethodsRule", "MethodAttributesRule", "OverridingMethodRule",
+    "CallMethodsRule", "CallStaticMethodsRule", "MissingMethodReturnTypehintRule",
+    "MissingMethodParameterTypehintRule",
 }
 # Rules we can't implement yet, with the reason.
 _TYPES = "needs the type system (operand/value types)"
@@ -163,6 +182,10 @@ w("- [x] **Arrays/OffsetAccessWithoutDimForReadingRule** — `id:` `offsetAccess
 w("- [x] **Operators/InvalidAssignVarRule** — `id:` `assign.invalidExpr`, `nullsafe.assign`, `nullsafe.byRef` (level 0)")
 w("- [x] **Operators/InvalidIncDecOperationRule** — `id:` `pre/postInc/Dec.expr` (level 0; syntactic half — type half deferred)")
 w("- [x] **Operators/BacktickRule** — `id:` `backtick.deprecated` (level 0)")
+w("- [x] **Functions** — 10 rules: parameter.duplicate/name/variadicNotLast, function.inner/nameCase, closure.invalidUse/unusedUse, argument.printf/define, arguments.count (existence via unknown-symbol)")
+w("- [x] **Classes** — 13 rules: new.* (interface/trait/enum/abstract/static), class/interface extends + implements + traitUse kind checks, instanceof.trait, enum.* sanity, duplicate declaration/member, attribute.* target, property.invalidPromoted")
+w("- [x] **Properties** — 7 rules: readonly misuse, property-in-class/interface modifiers, hook attributes, override compatibility, $this->prop existence, readonly-assign-outside-ctor")
+w("- [x] **Methods** — 13 rules: abstract/final/visibility modifiers, constructor return/static, missing-impl, magic-serialization, attributes, override compatibility, method existence + arg-count, missing param/return typehints")
 w("")
 w("### Prioritization note")
 w("Not every level-0 rule matters for a general analyzer. The **`Api`** category and a few")
