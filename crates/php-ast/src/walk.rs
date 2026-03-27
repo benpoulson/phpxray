@@ -1,124 +1,141 @@
-//! A reusable AST traversal for syntactic rules — the analogue of phpstan's
-//! "node type + processNode" dispatch. [`walk`] visits every statement and
-//! expression in a program (pre-order, descending into all bodies including
-//! closures/arrow-fns and class members); [`for_each_expr`] / [`for_each_stmt`]
-//! are the common single-callback wrappers.
+//! A reusable AST traversal — the analogue of phpstan's "node type + processNode"
+//! dispatch. [`walk`] visits every statement and expression in a program
+//! (pre-order). The `cross` flag controls whether traversal descends into nested
+//! *function-like scopes* (named functions, class member bodies, closures, arrow
+//! fns, anonymous-class bodies): `for_each_expr`/`for_each_stmt` cross every
+//! boundary; [`for_each_expr_in_scope`] stops at them (the expressions that
+//! belong to one scope), which is what flow-sensitive passes need.
 
-use php_ast::*;
+use crate::*;
 
-/// Visit every statement and expression in `program`.
-pub(crate) fn walk<S, E>(program: &Program, on_stmt: &mut S, on_expr: &mut E)
+/// Visit every statement and expression in `program` (crossing all scopes).
+pub fn walk<S, E>(program: &Program, on_stmt: &mut S, on_expr: &mut E)
 where
     S: FnMut(&Stmt),
     E: FnMut(&Expr),
 {
     for s in &program.stmts {
-        walk_stmt(s, on_stmt, on_expr);
+        walk_stmt(s, on_stmt, on_expr, true);
     }
 }
 
-/// Visit every expression in `program`.
-pub(crate) fn for_each_expr<E: FnMut(&Expr)>(program: &Program, f: &mut E) {
+/// Visit every expression in `program` (crossing all scopes).
+pub fn for_each_expr<E: FnMut(&Expr)>(program: &Program, f: &mut E) {
     walk(program, &mut |_| {}, f);
 }
 
-/// Visit every statement in `program`.
-pub(crate) fn for_each_stmt<S: FnMut(&Stmt)>(program: &Program, f: &mut S) {
+/// Visit every statement in `program` (crossing all scopes).
+pub fn for_each_stmt<S: FnMut(&Stmt)>(program: &Program, f: &mut S) {
     walk(program, f, &mut |_| {});
 }
 
-fn walk_stmt<S, E>(s: &Stmt, on_s: &mut S, on_e: &mut E)
+/// Visit every statement within a single `stmt` (crossing all scopes).
+pub fn for_each_stmt_in_stmt<S: FnMut(&Stmt)>(stmt: &Stmt, f: &mut S) {
+    walk_stmt(stmt, f, &mut |_| {}, true);
+}
+
+/// Visit the expressions of `stmt` that belong to its *own* scope — descends
+/// control flow but stops at nested function-like scopes (closures, arrow fns,
+/// anonymous classes, nested function/class declarations). The closure/anon-class
+/// node itself is visited; its body is not.
+pub fn for_each_expr_in_scope<E: FnMut(&Expr)>(stmt: &Stmt, f: &mut E) {
+    walk_stmt(stmt, &mut |_| {}, f, false);
+}
+
+fn walk_stmt<S, E>(s: &Stmt, on_s: &mut S, on_e: &mut E, cross: bool)
 where
     S: FnMut(&Stmt),
     E: FnMut(&Expr),
 {
     on_s(s);
     match &s.kind {
-        StmtKind::Expr(e) => walk_expr(e, on_s, on_e),
-        StmtKind::Echo(es) => es.iter().for_each(|e| walk_expr(e, on_s, on_e)),
-        StmtKind::Return(Some(e)) => walk_expr(e, on_s, on_e),
-        StmtKind::Block(b) => b.iter().for_each(|st| walk_stmt(st, on_s, on_e)),
+        StmtKind::Expr(e) => walk_expr(e, on_s, on_e, cross),
+        StmtKind::Echo(es) => es.iter().for_each(|e| walk_expr(e, on_s, on_e, cross)),
+        StmtKind::Return(Some(e)) => walk_expr(e, on_s, on_e, cross),
+        StmtKind::Block(b) => b.iter().for_each(|st| walk_stmt(st, on_s, on_e, cross)),
         StmtKind::If { cond, then, elseifs, els } => {
-            walk_expr(cond, on_s, on_e);
-            walk_stmt(then, on_s, on_e);
+            walk_expr(cond, on_s, on_e, cross);
+            walk_stmt(then, on_s, on_e, cross);
             for ei in elseifs {
-                walk_expr(&ei.cond, on_s, on_e);
-                walk_stmt(&ei.body, on_s, on_e);
+                walk_expr(&ei.cond, on_s, on_e, cross);
+                walk_stmt(&ei.body, on_s, on_e, cross);
             }
             if let Some(e) = els {
-                walk_stmt(e, on_s, on_e);
+                walk_stmt(e, on_s, on_e, cross);
             }
         }
         StmtKind::While { cond, body } => {
-            walk_expr(cond, on_s, on_e);
-            walk_stmt(body, on_s, on_e);
+            walk_expr(cond, on_s, on_e, cross);
+            walk_stmt(body, on_s, on_e, cross);
         }
         StmtKind::DoWhile { body, cond } => {
-            walk_stmt(body, on_s, on_e);
-            walk_expr(cond, on_s, on_e);
+            walk_stmt(body, on_s, on_e, cross);
+            walk_expr(cond, on_s, on_e, cross);
         }
         StmtKind::For { init, cond, update, body } => {
             for e in init.iter().chain(cond).chain(update) {
-                walk_expr(e, on_s, on_e);
+                walk_expr(e, on_s, on_e, cross);
             }
-            walk_stmt(body, on_s, on_e);
+            walk_stmt(body, on_s, on_e, cross);
         }
         StmtKind::Foreach { subject, key, value, body, .. } => {
-            walk_expr(subject, on_s, on_e);
+            walk_expr(subject, on_s, on_e, cross);
             if let Some(k) = key {
-                walk_expr(k, on_s, on_e);
+                walk_expr(k, on_s, on_e, cross);
             }
-            walk_expr(value, on_s, on_e);
-            walk_stmt(body, on_s, on_e);
+            walk_expr(value, on_s, on_e, cross);
+            walk_stmt(body, on_s, on_e, cross);
         }
         StmtKind::Switch { subject, cases } => {
-            walk_expr(subject, on_s, on_e);
+            walk_expr(subject, on_s, on_e, cross);
             for c in cases {
                 if let Some(t) = &c.test {
-                    walk_expr(t, on_s, on_e);
+                    walk_expr(t, on_s, on_e, cross);
                 }
-                c.body.iter().for_each(|st| walk_stmt(st, on_s, on_e));
+                c.body.iter().for_each(|st| walk_stmt(st, on_s, on_e, cross));
             }
         }
         StmtKind::Try { body, catches, finally } => {
-            body.iter().for_each(|st| walk_stmt(st, on_s, on_e));
+            body.iter().for_each(|st| walk_stmt(st, on_s, on_e, cross));
             for c in catches {
-                c.body.iter().for_each(|st| walk_stmt(st, on_s, on_e));
+                c.body.iter().for_each(|st| walk_stmt(st, on_s, on_e, cross));
             }
             if let Some(f) = finally {
-                f.iter().for_each(|st| walk_stmt(st, on_s, on_e));
+                f.iter().for_each(|st| walk_stmt(st, on_s, on_e, cross));
             }
         }
         StmtKind::Break(o) | StmtKind::Continue(o) => {
             if let Some(e) = o {
-                walk_expr(e, on_s, on_e);
+                walk_expr(e, on_s, on_e, cross);
             }
         }
-        StmtKind::Global(es) | StmtKind::Unset(es) => es.iter().for_each(|e| walk_expr(e, on_s, on_e)),
+        StmtKind::Global(es) | StmtKind::Unset(es) => es.iter().for_each(|e| walk_expr(e, on_s, on_e, cross)),
         StmtKind::StaticVars(vars) => {
             for v in vars {
                 if let Some(e) = &v.default {
-                    walk_expr(e, on_s, on_e);
+                    walk_expr(e, on_s, on_e, cross);
                 }
             }
         }
         StmtKind::Declare { directives, body } => {
             for (_, e) in directives {
-                walk_expr(e, on_s, on_e);
+                walk_expr(e, on_s, on_e, cross);
             }
             if let Some(b) = body {
-                walk_stmt(b, on_s, on_e);
+                walk_stmt(b, on_s, on_e, cross);
             }
         }
-        StmtKind::Namespace { body: Some(b), .. } => b.iter().for_each(|st| walk_stmt(st, on_s, on_e)),
-        StmtKind::Function(fd) => {
+        StmtKind::Namespace { body: Some(b), .. } => b.iter().for_each(|st| walk_stmt(st, on_s, on_e, cross)),
+        // Nested declarations introduce new scopes: only descend when crossing.
+        StmtKind::Function(fd) if cross => {
             walk_params(&fd.params, on_s, on_e);
-            fd.body.iter().for_each(|st| walk_stmt(st, on_s, on_e));
+            fd.body.iter().for_each(|st| walk_stmt(st, on_s, on_e, true));
         }
-        StmtKind::Class(c) => walk_class(c, on_s, on_e),
-        StmtKind::ConstDecl { consts, .. } => consts.iter().for_each(|c| walk_expr(&c.value, on_s, on_e)),
-        // No nested expressions/statements: Use, GroupUse, Goto, Label,
-        // HaltCompiler, InlineHtml, Nop, Error.
+        StmtKind::Class(c) if cross => walk_class(c, on_s, on_e),
+        StmtKind::ConstDecl { consts, .. } => consts.iter().for_each(|c| walk_expr(&c.value, on_s, on_e, cross)),
+        // No nested expressions/statements (or a scope boundary we don't cross):
+        // Function/Class when !cross, Use, GroupUse, Goto, Label, HaltCompiler,
+        // InlineHtml, Nop, Error.
         _ => {}
     }
 }
@@ -130,7 +147,7 @@ where
 {
     for p in params {
         if let Some(d) = &p.default {
-            walk_expr(d, on_s, on_e);
+            walk_expr(d, on_s, on_e, true);
         }
         walk_attrs(&p.attrs, on_s, on_e);
     }
@@ -144,7 +161,7 @@ where
     for group in attrs {
         for attr in &group.attrs {
             if let Some(args) = &attr.args {
-                args.iter().for_each(|a| walk_expr(&a.value, on_s, on_e));
+                args.iter().for_each(|a| walk_expr(&a.value, on_s, on_e, true));
             }
         }
     }
@@ -161,13 +178,13 @@ where
             Member::Method(md) => {
                 walk_params(&md.params, on_s, on_e);
                 if let Some(body) = &md.body {
-                    body.iter().for_each(|st| walk_stmt(st, on_s, on_e));
+                    body.iter().for_each(|st| walk_stmt(st, on_s, on_e, true));
                 }
             }
             Member::Property(pd) => {
                 for elem in &pd.props {
                     if let Some(d) = &elem.default {
-                        walk_expr(d, on_s, on_e);
+                        walk_expr(d, on_s, on_e, true);
                     }
                     if let Some(hooks) = &elem.hooks {
                         for h in hooks {
@@ -176,10 +193,10 @@ where
                     }
                 }
             }
-            Member::ClassConst(cd) => cd.consts.iter().for_each(|c| walk_expr(&c.value, on_s, on_e)),
+            Member::ClassConst(cd) => cd.consts.iter().for_each(|c| walk_expr(&c.value, on_s, on_e, true)),
             Member::EnumCase(ec) => {
                 if let Some(v) = &ec.value {
-                    walk_expr(v, on_s, on_e);
+                    walk_expr(v, on_s, on_e, true);
                 }
             }
             Member::TraitUse(_) => {}
@@ -196,19 +213,19 @@ where
         walk_params(params, on_s, on_e);
     }
     match &h.body {
-        HookBody::Block(stmts) => stmts.iter().for_each(|st| walk_stmt(st, on_s, on_e)),
-        HookBody::Short(e) => walk_expr(e, on_s, on_e),
+        HookBody::Block(stmts) => stmts.iter().for_each(|st| walk_stmt(st, on_s, on_e, true)),
+        HookBody::Short(e) => walk_expr(e, on_s, on_e, true),
         HookBody::Abstract => {}
     }
 }
 
-fn walk_expr<S, E>(e: &Expr, on_s: &mut S, on_e: &mut E)
+fn walk_expr<S, E>(e: &Expr, on_s: &mut S, on_e: &mut E, cross: bool)
 where
     S: FnMut(&Stmt),
     E: FnMut(&Expr),
 {
     on_e(e);
-    let go = |x: &Expr, on_s: &mut S, on_e: &mut E| walk_expr(x, on_s, on_e);
+    let go = |x: &Expr, on_s: &mut S, on_e: &mut E| walk_expr(x, on_s, on_e, cross);
     match &e.kind {
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Str(_) | ExprKind::Variable(_) | ExprKind::Name(_) | ExprKind::Error => {}
         ExprKind::Interpolated(parts) | ExprKind::ShellExec(parts) => parts.iter().for_each(|p| go(p, on_s, on_e)),
@@ -225,25 +242,29 @@ where
         }
         ExprKind::Call { callee, args } => {
             go(callee, on_s, on_e);
-            walk_args(args, on_s, on_e);
+            walk_args(args, on_s, on_e, cross);
         }
         ExprKind::MethodCall { recv, method, args, .. } => {
             go(recv, on_s, on_e);
-            walk_member(method, on_s, on_e);
-            walk_args(args, on_s, on_e);
+            walk_member(method, on_s, on_e, cross);
+            walk_args(args, on_s, on_e, cross);
         }
         ExprKind::StaticCall { class, method, args } => {
             go(class, on_s, on_e);
-            walk_member(method, on_s, on_e);
-            walk_args(args, on_s, on_e);
+            walk_member(method, on_s, on_e, cross);
+            walk_args(args, on_s, on_e, cross);
         }
         ExprKind::New { class, args } => {
             go(class, on_s, on_e);
-            walk_args(args, on_s, on_e);
+            walk_args(args, on_s, on_e, cross);
         }
         ExprKind::NewAnon { class, args } => {
-            walk_class(class, on_s, on_e);
-            walk_args(args, on_s, on_e);
+            // The constructor arguments are in the current scope; the anonymous
+            // class body is its own scope (only descend when crossing).
+            walk_args(args, on_s, on_e, cross);
+            if cross {
+                walk_class(class, on_s, on_e);
+            }
         }
         ExprKind::Index { base, index } => {
             go(base, on_s, on_e);
@@ -253,15 +274,15 @@ where
         }
         ExprKind::Prop { base, name, .. } => {
             go(base, on_s, on_e);
-            walk_member(name, on_s, on_e);
+            walk_member(name, on_s, on_e, cross);
         }
         ExprKind::StaticProp { class, name } => {
             go(class, on_s, on_e);
-            walk_member(name, on_s, on_e);
+            walk_member(name, on_s, on_e, cross);
         }
         ExprKind::ClassConst { class, name } => {
             go(class, on_s, on_e);
-            walk_member(name, on_s, on_e);
+            walk_member(name, on_s, on_e, cross);
         }
         ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => go(expr, on_s, on_e),
         ExprKind::Binary { lhs, rhs, .. }
@@ -307,34 +328,35 @@ where
         }
         ExprKind::Include { expr, .. } => go(expr, on_s, on_e),
         ExprKind::Isset(es) => es.iter().for_each(|e| go(e, on_s, on_e)),
-        ExprKind::Closure(c) => {
+        // Closures / arrow fns are their own scopes: only descend when crossing.
+        ExprKind::Closure(c) if cross => {
             walk_params(&c.params, on_s, on_e);
-            c.body.iter().for_each(|st| walk_stmt(st, on_s, on_e));
+            c.body.iter().for_each(|st| walk_stmt(st, on_s, on_e, true));
         }
-        ExprKind::ArrowFn(a) => {
+        ExprKind::ArrowFn(a) if cross => {
             walk_params(&a.params, on_s, on_e);
-            walk_expr(&a.body, on_s, on_e);
+            walk_expr(&a.body, on_s, on_e, true);
         }
         ExprKind::Paren(x) => go(x, on_s, on_e),
-        // `#[non_exhaustive]`: anything new is visited but not descended into.
+        // `#[non_exhaustive]`; closures/arrow fns when !cross; anything new.
         _ => {}
     }
 }
 
-fn walk_args<S, E>(args: &[Arg], on_s: &mut S, on_e: &mut E)
+fn walk_args<S, E>(args: &[Arg], on_s: &mut S, on_e: &mut E, cross: bool)
 where
     S: FnMut(&Stmt),
     E: FnMut(&Expr),
 {
-    args.iter().for_each(|a| walk_expr(&a.value, on_s, on_e));
+    args.iter().for_each(|a| walk_expr(&a.value, on_s, on_e, cross));
 }
 
-fn walk_member<S, E>(m: &MemberName, on_s: &mut S, on_e: &mut E)
+fn walk_member<S, E>(m: &MemberName, on_s: &mut S, on_e: &mut E, cross: bool)
 where
     S: FnMut(&Stmt),
     E: FnMut(&Expr),
 {
     if let MemberName::Expr(e) = m {
-        walk_expr(e, on_s, on_e);
+        walk_expr(e, on_s, on_e, cross);
     }
 }

@@ -23,6 +23,8 @@
 use php_intern::Symbol;
 use php_span::Span;
 
+pub mod walk;
+
 /// A whole parsed source unit.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Program {

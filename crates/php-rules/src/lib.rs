@@ -13,7 +13,7 @@ use php_resolve::{RefKind, Resolution, ResolvedRef};
 mod registry;
 mod return_type;
 mod rules;
-mod walk;
+pub use php_ast::walk;
 #[cfg(test)]
 mod testutil;
 pub use registry::{analyze_file, rules_for_level, FileAnalysis, RuleEntry};
