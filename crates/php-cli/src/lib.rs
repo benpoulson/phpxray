@@ -103,6 +103,7 @@ pub fn analyze_parsed(parsed: &[ParsedFile], level: u8) -> Report {
     let mut findings = Vec::new();
     for f in parsed {
         let refs = resolve_references(&f.parse.program, &f.parse.interner);
+        let types = php_rules::type_map(&reflection, &f.parse.program, &f.parse.interner);
         let fa = FileAnalysis {
             path: &f.path,
             source: &f.source,
@@ -111,6 +112,7 @@ pub fn analyze_parsed(parsed: &[ParsedFile], level: u8) -> Report {
             project: &project,
             reflection: &reflection,
             resolved_refs: &refs,
+            types: &types,
         };
         let line_index = LineIndex::new(&f.source);
         for d in analyze_file(&fa, level) {

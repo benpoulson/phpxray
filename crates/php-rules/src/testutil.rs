@@ -3,6 +3,7 @@
 use crate::FileAnalysis;
 use php_diagnostics::Diagnostic;
 use php_index::ProjectIndex;
+use php_infer::type_map;
 use php_reflect::ReflectionIndex;
 use php_resolve::{index_file, resolve_references};
 
@@ -16,6 +17,7 @@ pub(crate) fn run(src: &str, rule: fn(&FileAnalysis) -> Vec<Diagnostic>) -> Vec<
     let mut reflection = ReflectionIndex::new();
     reflection.add_file(&r.program, &r.interner);
     let refs = resolve_references(&r.program, &r.interner);
+    let types = type_map(&reflection, &r.program, &r.interner);
     let fa = FileAnalysis {
         path: "test.php",
         source: src,
@@ -24,6 +26,7 @@ pub(crate) fn run(src: &str, rule: fn(&FileAnalysis) -> Vec<Diagnostic>) -> Vec<
         project: &project,
         reflection: &reflection,
         resolved_refs: &refs,
+        types: &types,
     };
     rule(&fa)
 }

@@ -8,12 +8,14 @@
 //! and has no shared mutable state, the engine's per-file loop is trivially
 //! parallelizable later (Phase 2).
 
-use php_ast::Program;
+use php_ast::{Expr, Program};
 use php_diagnostics::Diagnostic;
 use php_index::ProjectIndex;
+use php_infer::TypeMap;
 use php_intern::Interner;
 use php_reflect::ReflectionIndex;
 use php_resolve::ResolvedRef;
+use php_types::Type;
 
 /// The read-only inputs a rule reads about one file. The shared project/reflection
 /// indexes are borrowed (built once for the whole run).
@@ -28,6 +30,17 @@ pub struct FileAnalysis<'a> {
     pub reflection: &'a ReflectionIndex,
     /// Resolved name references in this file.
     pub resolved_refs: &'a [ResolvedRef],
+    /// Inferred type of every expression in the file, keyed by span.
+    pub types: &'a TypeMap,
+}
+
+impl FileAnalysis<'_> {
+    /// The inferred type of expression `e` (`mixed` if it wasn't typed — e.g.
+    /// inside a closure body, which the type map leaves opaque for now).
+    pub fn type_of(&self, e: &Expr) -> Type {
+        let r = e.span.range();
+        self.types.get(&(r.start as u32, r.end as u32)).cloned().unwrap_or(Type::Mixed)
+    }
 }
 
 /// A registered rule: a name, the level at which it activates, and its check.
@@ -95,6 +108,7 @@ mod tests {
         let mut reflection = ReflectionIndex::new();
         reflection.add_file(&r.program, &r.interner);
         let refs = resolve_references(&r.program, &r.interner);
+        let types = php_infer::type_map(&reflection, &r.program, &r.interner);
         let fa = FileAnalysis {
             path: "t.php",
             source: src,
@@ -103,6 +117,7 @@ mod tests {
             project: &project,
             reflection: &reflection,
             resolved_refs: &refs,
+            types: &types,
         };
 
         // Level 0: only the unknown-symbol rule fires.

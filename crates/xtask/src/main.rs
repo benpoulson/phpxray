@@ -619,6 +619,7 @@ fn cmd_check(dir: Option<PathBuf>) -> ExitCode {
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let r = php_parser::parse(source);
             let refs = resolve_references(&r.program, &r.interner);
+            let types = php_rules::type_map(&reflection, &r.program, &r.interner);
             let fa = FileAnalysis {
                 path: label,
                 source,
@@ -627,6 +628,7 @@ fn cmd_check(dir: Option<PathBuf>) -> ExitCode {
                 project: &project,
                 reflection: &reflection,
                 resolved_refs: &refs,
+                types: &types,
             };
             analyze_file(&fa, 10)
                 .into_iter()
