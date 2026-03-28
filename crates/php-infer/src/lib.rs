@@ -14,8 +14,10 @@
 
 mod assign;
 mod flow;
+mod type_map;
 
 pub use assign::is_assignable;
+pub use type_map::{type_map, TypeMap};
 
 use php_ast::{BinOp, CastKind, Expr, ExprKind, MemberName, Name, UnOp};
 use php_intern::Interner;
