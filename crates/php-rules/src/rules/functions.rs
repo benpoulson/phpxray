@@ -894,6 +894,59 @@ fn run_argument_count(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
+/// `CallToFunctionParametersRule` (the argument-**type** half). Each positional
+/// argument is checked against the matching parameter's type via the type map +
+/// assignability. Lenient: unknown callee, `mixed`/unresolved arg or param types
+/// produce no diagnostic.
+fn run_argument_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let fmap = function_refs(fa.resolved_refs);
+    let mut out = Vec::new();
+    crate::walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Call { callee, args } = &e.kind else { return };
+        let Some(r) = resolved_callee(callee, &fmap) else { return };
+        // Positional, fully-spelled-out calls only (named/spread/first-class break
+        // positional pairing).
+        if args.iter().any(|a| a.spread || a.placeholder || a.name.is_some()) {
+            return;
+        }
+        let fqn = match &r.resolution {
+            Resolution::Fqn(fqn) => fqn.clone(),
+            Resolution::Fallback { namespaced, global } => {
+                if fa.reflection.function(namespaced).is_some() {
+                    namespaced.clone()
+                } else {
+                    global.clone()
+                }
+            }
+            _ => return,
+        };
+        let Some(func) = fa.reflection.function(&fqn) else { return };
+        let display = primary_name(r);
+        for (i, arg) in args.iter().enumerate() {
+            let Some(param) = func.params.get(i) else { break };
+            if param.variadic {
+                break; // variadic absorbs the rest; element-type checking is later
+            }
+            let given = fa.type_of(&arg.value);
+            if !crate::is_assignable(fa.reflection, &given, &param.ty) {
+                out.push(
+                    Diagnostic::error(
+                        arg.value.span,
+                        format!(
+                            "Parameter #{} ${} of function {display} expects {}, {given} given.",
+                            i + 1,
+                            param.name,
+                            param.ty
+                        ),
+                    )
+                    .with_code("argument.type"),
+                );
+            }
+        }
+    });
+    out
+}
+
 fn plural(n: usize, word: &str) -> String {
     if n == 1 {
         word.to_string()
@@ -956,8 +1009,9 @@ pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "argument.define", level: 0, run: run_define_parameters },
     // Level 1 — closure use analysis.
     RuleEntry { name: "closure.unusedUse", level: 1, run: run_unused_closure_uses },
-    // Level 5 — argument count (no type inference).
+    // Level 5 — arguments: count + types.
     RuleEntry { name: "arguments.count", level: 5, run: run_argument_count },
+    RuleEntry { name: "argument.type", level: 5, run: run_argument_types },
 ];
 
 #[cfg(test)]
@@ -1219,5 +1273,36 @@ mod tests {
     #[test]
     fn first_class_callable_builtin_is_clean() {
         assert!(codes("<?php $f = strlen(...);", run_function_callable).is_empty());
+    }
+
+    // --- argument types --------------------------------------------------
+
+    #[test]
+    fn wrong_argument_type_is_flagged() {
+        assert_eq!(
+            codes("<?php function f(int $x) {} f('nope');", run_argument_types),
+            ["argument.type"]
+        );
+    }
+
+    #[test]
+    fn correct_argument_type_is_clean() {
+        assert!(codes("<?php function f(int $x) {} f(42);", run_argument_types).is_empty());
+        // int widens to float.
+        assert!(codes("<?php function f(float $x) {} f(1);", run_argument_types).is_empty());
+    }
+
+    #[test]
+    fn argument_type_from_local_flow() {
+        let src = "<?php function f(int $x) {} $v = 'str'; f($v);";
+        assert_eq!(codes(src, run_argument_types), ["argument.type"]);
+    }
+
+    #[test]
+    fn unknown_arg_type_is_lenient() {
+        // $u is never assigned -> mixed -> no diagnostic.
+        assert!(codes("<?php function f(int $x) {} f($u);", run_argument_types).is_empty());
+        // mixed parameter accepts anything.
+        assert!(codes("<?php function f($x) {} f('s');", run_argument_types).is_empty());
     }
 }

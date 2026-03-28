@@ -1042,6 +1042,61 @@ fn collect_expr<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
     }
 }
 
+/// Argument-**type** checking for instance method calls, using the type map.
+/// `$recv->m($arg)` — when the receiver's type resolves to a known class, each
+/// positional argument is checked against the method parameter's type. Static
+/// calls (`self::`/`static::`/`Foo::`) need scope-aware class resolution and are
+/// deferred. Lenient: unknown receiver/arg/param types produce no diagnostic.
+fn run_method_argument_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    crate::walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::MethodCall { recv, method, args, .. } = &e.kind else { return };
+        let MemberName::Ident(name) = method else { return };
+        if args.iter().any(|a| a.spread || a.name.is_some() || a.placeholder) {
+            return;
+        }
+        let Some(fqn) = named_fqn(&fa.type_of(recv)) else { return };
+        let mname = fa.interner.resolve(*name);
+        let Some(found) = fa.reflection.find_method(&fqn, mname) else { return };
+        let mr = &found.member;
+        if mr.magic {
+            return;
+        }
+        let short = fqn.trim_start_matches('\\');
+        for (i, arg) in args.iter().enumerate() {
+            let Some(param) = mr.params.get(i) else { break };
+            if param.variadic {
+                break;
+            }
+            let given = fa.type_of(&arg.value);
+            if !crate::is_assignable(fa.reflection, &given, &param.ty) {
+                out.push(
+                    Diagnostic::error(
+                        arg.value.span,
+                        format!(
+                            "Parameter #{} ${} of method {short}::{mname}() expects {}, {given} given.",
+                            i + 1,
+                            param.name,
+                            param.ty
+                        ),
+                    )
+                    .with_code("argument.type"),
+                );
+            }
+        }
+    });
+    out
+}
+
+/// The class FQN named by a type (through nullability), if any.
+fn named_fqn(t: &Type) -> Option<String> {
+    match t {
+        Type::Named { fqn, .. } => Some(fqn.clone()),
+        Type::Nullable(inner) => named_fqn(inner),
+        _ => None,
+    }
+}
+
 pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "method.abstract", level: 0, run: run_abstract_in_non_abstract },
     RuleEntry { name: "method.abstractPrivate", level: 0, run: run_abstract_private },
@@ -1056,6 +1111,7 @@ pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "method.attributeTarget", level: 0, run: run_method_attribute_target },
     RuleEntry { name: "method.overriding", level: 0, run: run_overriding_method },
     RuleEntry { name: "method.callExistence", level: 0, run: run_call_existence },
+    RuleEntry { name: "argument.type", level: 5, run: run_method_argument_types },
     RuleEntry { name: "missingType.return", level: 6, run: run_missing_return_type },
     RuleEntry { name: "missingType.parameter", level: 6, run: run_missing_param_type },
 ];
@@ -1338,5 +1394,32 @@ mod tests {
     fn phpdoc_param_type_clean() {
         let src = "<?php class C { /** @param int $a */ public function f($a): void {} }";
         assert!(codes(src, run_missing_param_type).is_empty());
+    }
+
+    // --- method argument types -------------------------------------------
+
+    #[test]
+    fn wrong_method_argument_type_on_this_is_flagged() {
+        let src = "<?php class C { public function set(int $n): void {} public function go(): void { $this->set('x'); } }";
+        assert_eq!(codes(src, run_method_argument_types), ["argument.type"]);
+    }
+
+    #[test]
+    fn wrong_method_argument_type_on_typed_local_is_flagged() {
+        let src = "<?php class C { public function set(int $n): void {} } function f(): void { $c = new C(); $c->set('x'); }";
+        assert_eq!(codes(src, run_method_argument_types), ["argument.type"]);
+    }
+
+    #[test]
+    fn correct_method_argument_type_is_clean() {
+        let src = "<?php class C { public function set(int $n): void {} public function go(): void { $this->set(5); } }";
+        assert!(codes(src, run_method_argument_types).is_empty());
+    }
+
+    #[test]
+    fn unknown_receiver_is_lenient() {
+        // $x untyped -> mixed receiver -> no class -> no diagnostic.
+        let src = "<?php function f($x): void { $x->set('s'); }";
+        assert!(codes(src, run_method_argument_types).is_empty());
     }
 }
