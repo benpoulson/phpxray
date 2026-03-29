@@ -90,15 +90,32 @@ DONE = {
     "MissingMagicSerializationMethodsRule", "MethodAttributesRule", "OverridingMethodRule",
     "CallMethodsRule", "CallStaticMethodsRule", "MissingMethodReturnTypehintRule",
     "MissingMethodParameterTypehintRule",
+    # Comparison (constant-condition + strict-comparison; type-map driven, level 4)
+    "IfConstantConditionRule", "ElseIfConstantConditionRule", "TernaryOperatorConstantConditionRule",
+    "WhileLoopAlwaysFalseConditionRule", "WhileLoopAlwaysTrueConditionRule", "DoWhileLoopConstantConditionRule",
+    "BooleanNotConstantConditionRule", "BooleanAndConstantConditionRule", "BooleanOrConstantConditionRule",
+    "LogicalXorConstantConditionRule", "StrictComparisonOfDifferentTypesRule",
+    # Operators (invalid binary/unary/comparison; type-map driven, level 2)
+    "InvalidBinaryOperationRule", "InvalidUnaryOperationRule", "InvalidComparisonOperationRule",
+    # Cast (invalid cast + echo/print/encapsed non-string; type-map driven, level 2)
+    "InvalidCastRule", "EchoRule", "PrintRule", "InvalidPartOfEncapsedStringRule",
+    # PhpDoc (structural, via our own php_phpdoc parser, level 2)
+    "WrongVariableNameInVarTagRule", "InvalidPHPStanDocTagRule",
+    # Functions (structural + missing-typehint)
+    "PrintfArrayParametersRule", "DuplicateFunctionDeclarationRule", "ReturnNullsafeByRefRule",
+    "ArrowFunctionReturnNullsafeByRefRule", "CallToFunctionStatementWithoutSideEffectsRule",
+    "UselessFunctionReturnValueRule", "MissingFunctionReturnTypehintRule", "MissingFunctionParameterTypehintRule",
+    # Variables
+    "ThisInGlobalStatementRule", "ThisInStaticStatementRule", "InvalidVariableAssignRule", "VariableCloningRule",
+    # DeadCode
+    "UnreachableStatementRule", "UnusedPrivateMethodRule", "UnusedPrivateConstantRule",
+    "UnusedPrivatePropertyRule", "NoopRule",
 }
 # Rules we can't implement yet, with the reason.
 _TYPES = "needs the type system (operand/value types)"
 DEFERRED = {
     "DeprecatedCastRule": "lexer normalizes cast spelling; AST lacks (integer)/(boolean)/(double)/(binary) distinction",
     "RequireFileExistsRule": "needs the type system (const-string operand) + filesystem access",
-    "InvalidBinaryOperationRule": _TYPES,
-    "InvalidComparisonOperationRule": _TYPES,
-    "InvalidUnaryOperationRule": _TYPES,
     "PipeOperatorRule": "needs the resolved callable type of the right operand",
     "NonexistentOffsetInArrayDimFetchRule": _TYPES,
     "InvalidKeyInArrayDimFetchRule": _TYPES,

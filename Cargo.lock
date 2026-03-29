@@ -421,6 +421,7 @@ dependencies = [
  "php-infer",
  "php-intern",
  "php-parser",
+ "php-phpdoc",
  "php-reflect",
  "php-resolve",
  "php-span",

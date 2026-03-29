@@ -15,19 +15,31 @@
 //! - `backtick.deprecated` (`BacktickRule`, level 0) — the backtick shell-exec
 //!   operator is deprecated (PHP 8.5+); our target is 8.6-dev so it always fires.
 //!
-//! Deferred (need the type system — operand TYPES drive these):
-//! - DEFERRED: `InvalidBinaryOperationRule` — needs type system (operand types).
-//! - DEFERRED: `InvalidComparisonOperationRule` — needs type system.
-//! - DEFERRED: `InvalidUnaryOperationRule` — needs type system.
+//! Implemented (type-based — use `fa.type_of` + the conservative classifiers
+//! below; flag only when EVERY member of an operand type is concrete and
+//! known-incompatible, never on `mixed`/unknown/objects-with-overloads):
+//! - `binaryOp.invalid` / `assignOp.invalid` (`InvalidBinaryOperationRule`,
+//!   level 2) — an arithmetic/bitwise/shift/concat operator whose operand
+//!   type can never be coerced to the operand kind the operator needs
+//!   (e.g. `[] * 2`, `$arr . 'x'`, `"a" - "b"` is fine but `[] - 1` is not).
+//! - `unaryOp.invalid` (`InvalidUnaryOperationRule`, level 2) — `+`/`-`/`~` on
+//!   a non-numeric (and, for `~`, non-string) operand (`-[]`, `~$arr`).
+//! - `equal.invalid` / `notEqual.invalid` / `smaller.invalid` /
+//!   `smallerOrEqual.invalid` / `greater.invalid` / `greaterOrEqual.invalid` /
+//!   `spaceship.invalid` (`InvalidComparisonOperationRule`, level 2) —
+//!   comparing a number against a (possibly-nullable) object or array.
+//!
+//! Deferred (need richer type info than we model conservatively):
 //! - DEFERRED: `InvalidIncDecOperationRule` (the `*.type` half — "Cannot use ++
-//!   on <type>") — needs type system. Only the non-variable `*.expr` half is
-//!   syntactic and implemented above.
+//!   on <type>") — needs PHP's exact inc/dec type rules. Only the non-variable
+//!   `*.expr` half is syntactic and implemented above.
 //! - DEFERRED: `PipeOperatorRule` (`pipe.byRef`) — needs the callable type of the
 //!   right operand (whether its first parameter is by-reference).
 
 use crate::{walk, FileAnalysis, RuleEntry};
-use php_ast::{Expr, ExprKind};
+use php_ast::{BinOp, Expr, ExprKind, UnOp};
 use php_diagnostics::Diagnostic;
+use php_types::Type;
 
 /// Strip a single layer of `( … )`. phpstan's parser produces no parenthesis
 /// nodes, so structural checks should look through ours to stay faithful.
@@ -177,10 +189,225 @@ fn run_backtick(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Conservative operand-type classifiers
+//
+// The cardinal rule for these type-driven operator rules is ZERO false
+// positives: we only flag an operand when we are *certain* every possible
+// runtime value of its inferred type is incompatible with the operator. So the
+// classifiers return `false` (= "could be ok, don't flag") for anything we are
+// unsure about — `mixed`, unknown/template/conditional types, objects (which
+// may define operator overloads via extensions or be `SimpleXMLElement`-like),
+// resources, and any union/nullable that has even one compatible member.
+// ---------------------------------------------------------------------------
+
+/// `true` only if `t` can NEVER be coerced to a number (so a numeric operator on
+/// it is definitely an error). Mirrors phpstan's `$type->toNumber()` returning
+/// `ErrorType`. Conservative: unknown/object/mixed → `false`.
+fn never_number(t: &Type) -> bool {
+    match t {
+        // Definitely-not-numeric value kinds.
+        Type::Array(_) | Type::Iterable(_) | Type::List(_) | Type::Shape { .. } => true,
+        // Numeric-coercible scalars (PHP coerces strings/bools/null in arithmetic).
+        Type::Int
+        | Type::Float
+        | Type::Bool
+        | Type::True
+        | Type::False
+        | Type::Null
+        | Type::String
+        | Type::LiteralInt(_)
+        | Type::LiteralString(_) => false,
+        // A union/nullable is never-number only if *every* member is.
+        Type::Union(parts) => parts.iter().all(never_number),
+        Type::Nullable(inner) => never_number(inner),
+        // Everything else (objects, callables, resources, mixed, templates,
+        // class-string, self/static/parent, unknown, …) → not certain → don't flag.
+        _ => false,
+    }
+}
+
+/// `true` only if `t` can NEVER be coerced to a string (so `.`/`echo`/`print`/a
+/// string cast on it is definitely an error). Mirrors `$type->toString()`
+/// returning `ErrorType`. Arrays cannot be stringified; objects *might*
+/// (`__toString`), so they are NOT flagged.
+fn never_string(t: &Type) -> bool {
+    match t {
+        Type::Array(_) | Type::Iterable(_) | Type::List(_) | Type::Shape { .. } => true,
+        Type::Int
+        | Type::Float
+        | Type::Bool
+        | Type::True
+        | Type::False
+        | Type::Null
+        | Type::String
+        | Type::LiteralInt(_)
+        | Type::LiteralString(_) => false,
+        Type::Union(parts) => parts.iter().all(never_string),
+        Type::Nullable(inner) => never_string(inner),
+        _ => false,
+    }
+}
+
+/// `true` only if `t` is *definitely* not `string|int|float` (the operands `~`
+/// accepts). Conservative on objects/mixed/unknown.
+fn never_bitnot_operand(t: &Type) -> bool {
+    match t {
+        Type::Array(_) | Type::Iterable(_) | Type::List(_) | Type::Shape { .. } | Type::Null => true,
+        Type::Bool | Type::True | Type::False => true,
+        Type::Int | Type::Float | Type::String | Type::LiteralInt(_) | Type::LiteralString(_) => {
+            false
+        }
+        Type::Union(parts) => parts.iter().all(never_bitnot_operand),
+        Type::Nullable(inner) => never_bitnot_operand(inner),
+        _ => false,
+    }
+}
+
+/// `true` only if `t` is *definitely* `int|float` (and nothing else) — used by
+/// the comparison rule to detect the "number vs object/array" mismatch.
+fn is_definitely_number(t: &Type) -> bool {
+    match t {
+        Type::Int | Type::Float | Type::LiteralInt(_) => true,
+        Type::Union(parts) => !parts.is_empty() && parts.iter().all(is_definitely_number),
+        _ => false,
+    }
+}
+
+/// `true` only if `t` is *definitely* an object or array (with no `null`/scalar
+/// alternatives) — the other side of the comparison mismatch.
+fn is_definitely_object_or_array(t: &Type) -> bool {
+    match t {
+        Type::Object
+        | Type::Named { .. }
+        | Type::Array(_)
+        | Type::List(_)
+        | Type::Shape { .. }
+        | Type::Iterable(_) => true,
+        Type::Union(parts) => !parts.is_empty() && parts.iter().all(is_definitely_object_or_array),
+        _ => false,
+    }
+}
+
+/// `InvalidBinaryOperationRule` (level 2): an arithmetic / bitwise / shift /
+/// concat operator applied to an operand whose type can never be coerced to what
+/// the operator needs. We only flag when an operand is *definitely*
+/// incompatible (`never_number`/`never_string`), so `mixed`, objects, and mixed
+/// unions are silently allowed (zero false positives).
+fn run_invalid_binary(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e| {
+        // Both `a OP b` and `a OP= b` share the operand-coercion check.
+        let (op, lhs, rhs, ident) = match &e.kind {
+            ExprKind::Binary { op, lhs, rhs } => (*op, lhs, rhs, "binaryOp.invalid"),
+            ExprKind::AssignOp { op, target, rhs } => (*op, target, rhs, "assignOp.invalid"),
+            _ => return,
+        };
+
+        // Pick the per-operator operand predicate + sigil. `Plus` allows arrays
+        // (array + array is the union operator), so it is excluded from the
+        // numeric check entirely (deciding `array + int` needs array-aware
+        // logic we don't model — defer to avoid false positives).
+        let (sigil, bad): (&str, fn(&Type) -> bool) = match op {
+            BinOp::Concat => (".", never_string),
+            BinOp::Sub => ("-", never_number),
+            BinOp::Mul => ("*", never_number),
+            BinOp::Div => ("/", never_number),
+            BinOp::Mod => ("%", never_number),
+            BinOp::Pow => ("**", never_number),
+            BinOp::BitOr => ("|", never_number),
+            BinOp::BitAnd => ("&", never_number),
+            BinOp::BitXor => ("^", never_number),
+            BinOp::Shl => ("<<", never_number),
+            BinOp::Shr => (">>", never_number),
+            // Add (`+`), comparisons, logical, coalesce, pipe, spaceship: not here.
+            _ => return,
+        };
+
+        let lt = fa.type_of(lhs);
+        let rt = fa.type_of(rhs);
+        if bad(&lt) || bad(&rt) {
+            out.push(
+                Diagnostic::error(
+                    e.span,
+                    format!(
+                        "Binary operation \"{sigil}\" between {lt} and {rt} results in an error."
+                    ),
+                )
+                .with_code(ident),
+            );
+        }
+    });
+    out
+}
+
+/// `InvalidUnaryOperationRule` (level 2): `+`/`-`/`~` on an operand that can
+/// never be the kind the operator needs (`+`/`-` need a number, `~` needs
+/// int/float/string). `!` is always valid (any value is boolean-coercible).
+fn run_invalid_unary(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Unary { op, expr } = &e.kind else { return };
+        let (sigil, bad): (&str, fn(&Type) -> bool) = match op {
+            UnOp::Plus => ("+", never_number),
+            UnOp::Minus => ("-", never_number),
+            UnOp::BitNot => ("~", never_bitnot_operand),
+            UnOp::Not => return,
+        };
+        let t = fa.type_of(expr);
+        if bad(&t) {
+            out.push(
+                Diagnostic::error(e.span, format!("Unary operation \"{sigil}\" on {t} results in an error."))
+                    .with_code("unaryOp.invalid"),
+            );
+        }
+    });
+    out
+}
+
+/// `InvalidComparisonOperationRule` (level 2): comparing a value that is
+/// *definitely* a number against one that is *definitely* an object or array
+/// (which PHP cannot meaningfully order). Only the certain "number vs
+/// object/array" shape is flagged.
+fn run_invalid_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Binary { op, lhs, rhs } = &e.kind else { return };
+        let (sigil, ident) = match op {
+            BinOp::Eq => ("==", "equal.invalid"),
+            BinOp::NotEq => ("!=", "notEqual.invalid"),
+            BinOp::Lt => ("<", "smaller.invalid"),
+            BinOp::LtEq => ("<=", "smallerOrEqual.invalid"),
+            BinOp::Gt => (">", "greater.invalid"),
+            BinOp::GtEq => (">=", "greaterOrEqual.invalid"),
+            BinOp::Spaceship => ("<=>", "spaceship.invalid"),
+            _ => return,
+        };
+        let lt = fa.type_of(lhs);
+        let rt = fa.type_of(rhs);
+        // Exactly one side a number, the other an object/array → invalid.
+        let mismatch = (is_definitely_number(&lt) && is_definitely_object_or_array(&rt))
+            || (is_definitely_number(&rt) && is_definitely_object_or_array(&lt));
+        if mismatch {
+            out.push(
+                Diagnostic::error(
+                    e.span,
+                    format!("Comparison operation \"{sigil}\" between {lt} and {rt} results in an error."),
+                )
+                .with_code(ident),
+            );
+        }
+    });
+    out
+}
+
 pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "operators.invalidAssignVar", level: 0, run: run_invalid_assign_var },
     RuleEntry { name: "operators.invalidIncDec", level: 0, run: run_invalid_inc_dec },
     RuleEntry { name: "operators.backtick", level: 0, run: run_backtick },
+    RuleEntry { name: "operators.invalidBinary", level: 2, run: run_invalid_binary },
+    RuleEntry { name: "operators.invalidUnary", level: 2, run: run_invalid_unary },
+    RuleEntry { name: "operators.invalidComparison", level: 2, run: run_invalid_comparison },
 ];
 
 #[cfg(test)]
@@ -265,5 +492,109 @@ mod tests {
     #[test]
     fn no_backtick_no_diagnostic() {
         assert!(codes("<?php shell_exec('ls');", run_backtick).is_empty());
+    }
+
+    // --- InvalidBinaryOperationRule -------------------------------------------
+
+    #[test]
+    fn arithmetic_on_array_literal_is_flagged() {
+        assert_eq!(codes("<?php $x = [] - 1;", run_invalid_binary), ["binaryOp.invalid"]);
+        assert_eq!(codes("<?php $x = [1] * 2;", run_invalid_binary), ["binaryOp.invalid"]);
+        assert_eq!(codes("<?php $x = 3 % [];", run_invalid_binary), ["binaryOp.invalid"]);
+    }
+
+    #[test]
+    fn concat_with_array_literal_is_flagged() {
+        assert_eq!(codes("<?php $x = [] . 'a';", run_invalid_binary), ["binaryOp.invalid"]);
+        assert_eq!(codes("<?php $x = 'a' . [1, 2];", run_invalid_binary), ["binaryOp.invalid"]);
+    }
+
+    #[test]
+    fn assign_op_on_array_literal_is_flagged() {
+        // `$y .= []` — concat-assign with an array operand.
+        assert_eq!(codes("<?php $y = 'x'; $y .= [];", run_invalid_binary), ["assignOp.invalid"]);
+    }
+
+    #[test]
+    fn valid_arithmetic_and_concat_are_ok() {
+        assert!(codes("<?php $x = 1 + 2;", run_invalid_binary).is_empty());
+        assert!(codes("<?php $x = 3 - 4;", run_invalid_binary).is_empty());
+        assert!(codes("<?php $x = 'a' . 'b';", run_invalid_binary).is_empty());
+        // strings coerce to numbers in arithmetic — not flagged.
+        assert!(codes("<?php $x = '5' * 2;", run_invalid_binary).is_empty());
+    }
+
+    #[test]
+    fn unknown_operand_is_not_flagged() {
+        // An untyped param is `mixed` — never flag (zero false positives).
+        assert!(codes("<?php function f($a) { return $a * 2; }", run_invalid_binary).is_empty());
+        assert!(codes("<?php function f($a) { return $a . 'x'; }", run_invalid_binary).is_empty());
+    }
+
+    #[test]
+    fn nested_binary_is_reached() {
+        assert_eq!(
+            codes("<?php function f() { $z = (1 + ([] * 3)); return $z; }", run_invalid_binary),
+            ["binaryOp.invalid"]
+        );
+    }
+
+    // --- InvalidUnaryOperationRule --------------------------------------------
+
+    #[test]
+    fn unary_minus_on_array_is_flagged() {
+        assert_eq!(codes("<?php $x = -[];", run_invalid_unary), ["unaryOp.invalid"]);
+        assert_eq!(codes("<?php $x = +[1];", run_invalid_unary), ["unaryOp.invalid"]);
+    }
+
+    #[test]
+    fn bitnot_on_array_is_flagged() {
+        assert_eq!(codes("<?php $x = ~[];", run_invalid_unary), ["unaryOp.invalid"]);
+    }
+
+    #[test]
+    fn bitnot_on_string_is_ok() {
+        // `~` accepts strings (byte-wise complement).
+        assert!(codes("<?php $x = ~'abc';", run_invalid_unary).is_empty());
+    }
+
+    #[test]
+    fn valid_unary_is_ok() {
+        assert!(codes("<?php $x = -5;", run_invalid_unary).is_empty());
+        assert!(codes("<?php $x = ~5;", run_invalid_unary).is_empty());
+        assert!(codes("<?php $x = ![];", run_invalid_unary).is_empty()); // ! is always ok
+    }
+
+    #[test]
+    fn unary_on_unknown_is_not_flagged() {
+        assert!(codes("<?php function f($a) { return -$a; }", run_invalid_unary).is_empty());
+    }
+
+    // --- InvalidComparisonOperationRule ---------------------------------------
+
+    #[test]
+    fn number_vs_array_comparison_is_flagged() {
+        assert_eq!(codes("<?php $x = 1 < [];", run_invalid_comparison), ["smaller.invalid"]);
+        assert_eq!(codes("<?php $x = [] > 2;", run_invalid_comparison), ["greater.invalid"]);
+        assert_eq!(codes("<?php $x = 1 <=> [1];", run_invalid_comparison), ["spaceship.invalid"]);
+    }
+
+    #[test]
+    fn number_vs_new_object_comparison_is_flagged() {
+        let src = "<?php class A {} $x = 1 < new A();";
+        assert_eq!(codes(src, run_invalid_comparison), ["smaller.invalid"]);
+    }
+
+    #[test]
+    fn valid_comparisons_are_ok() {
+        assert!(codes("<?php $x = 1 < 2;", run_invalid_comparison).is_empty());
+        assert!(codes("<?php $x = 'a' < 'b';", run_invalid_comparison).is_empty());
+        // array vs array is fine.
+        assert!(codes("<?php $x = [] < [1];", run_invalid_comparison).is_empty());
+    }
+
+    #[test]
+    fn comparison_with_unknown_is_not_flagged() {
+        assert!(codes("<?php function f($a) { return 1 < $a; }", run_invalid_comparison).is_empty());
     }
 }
