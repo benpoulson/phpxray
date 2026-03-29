@@ -101,6 +101,8 @@ DONE = {
     "InvalidCastRule", "EchoRule", "PrintRule", "InvalidPartOfEncapsedStringRule",
     # PhpDoc (structural, via our own php_phpdoc parser, level 2)
     "WrongVariableNameInVarTagRule", "InvalidPHPStanDocTagRule",
+    # PhpDoc type-subtyping (Cap #3: resolve_doc_type + resolve_ast_type + is_assignable)
+    "IncompatiblePhpDocTypeRule",
     # Functions (structural + missing-typehint)
     "PrintfArrayParametersRule", "DuplicateFunctionDeclarationRule", "ReturnNullsafeByRefRule",
     "ArrowFunctionReturnNullsafeByRefRule", "CallToFunctionStatementWithoutSideEffectsRule",

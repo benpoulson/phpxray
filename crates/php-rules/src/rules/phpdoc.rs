@@ -18,6 +18,10 @@
 //!   it has no effect (`WrongVariableNameInVarTagRule`).
 //! - `phpDoc.phpstanTag`      — an unknown `@phpstan-*` tag
 //!   (`InvalidPHPStanDocTagRule`).
+//! - `parameter.phpDocType` / `return.phpDocType` — a `@param`/`@return` PHPDoc
+//!   type that is not a subtype of the native type hint
+//!   (`IncompatiblePhpDocTypeRule`, via `resolve_doc_type`/`resolve_ast_type`/
+//!   `is_assignable`).
 //!
 //! Deferred (need machinery our pipeline doesn't yet expose):
 //! - `InvalidPhpDocTagValueRule` (`phpDoc.parseError`): phpstan reports the
@@ -25,11 +29,9 @@
 //!   intentionally lenient (malformed operands yield `None`/empty rather than a
 //!   structured error with a message), so we cannot reproduce phpstan's
 //!   "has invalid value (...): <exception message>" wording faithfully.
-//! - `InvalidPhpDocVarTagTypeRule` / `IncompatiblePhpDocTypeRule` type-subtyping
-//!   parts (`parameter.phpDocType`, `return.phpDocType`, `varTag.unknownClass`):
-//!   need full PHPDoc-type → semantic-`Type` resolution against the reflection
-//!   index plus a subtype check at the doc/native boundary. That belongs with
-//!   the type rules (see `is_assignable`), not this structural file.
+//! - `varTag.unknownClass` / `InvalidPhpDocVarTagTypeRule`: still need a
+//!   "does this class exist?" query at the `@var` doc/native boundary (the
+//!   `@param`/`@return` subtype check is now done — see above).
 //! - `parameter.notByRef`: phpstan emits this for `@param-out` tags on a
 //!   non-by-ref parameter. Our `php_phpdoc` model does not surface `@param-out`
 //!   as a distinct tag, so the rule is deferred (emitting it for `@param &$x`
@@ -45,6 +47,8 @@ use crate::{walk, FileAnalysis, RuleEntry};
 use php_ast::{ClassDecl, FunctionDecl, Member, MethodDecl, Param, PropertyDecl, StmtKind};
 use php_diagnostics::Diagnostic;
 use php_intern::Interner;
+use php_reflect::{resolve_ast_type, resolve_doc_type};
+use php_resolve::{for_each_region, Scope};
 use php_span::Span;
 use std::collections::HashSet;
 
@@ -309,6 +313,115 @@ fn check_phpstan_tags(raw: &str, span: Span, out: &mut Vec<Diagnostic>) {
     }
 }
 
+// --- parameter.phpDocType / return.phpDocType (IncompatiblePhpDocTypeRule) --
+
+/// A `@param`/`@return` PHPDoc type must be a *subtype* of the parameter's /
+/// function's native type hint (phpstan checks `native->isSuperTypeOf(phpDoc)`).
+/// We reuse the type machinery built for reflection — `resolve_doc_type` +
+/// `resolve_ast_type` + `is_assignable` — resolving both sides to semantic
+/// `Type`s in the declaration's name-resolution scope, and flag when the PHPDoc
+/// type is **not** assignable to the native type. `is_assignable` is lenient
+/// (true when either side is unknown/`mixed`/an unindexed class, or a template),
+/// so we only ever report a *definite* incompatibility — false-positive-safe.
+fn run_incompatible_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            match &st.kind {
+                StmtKind::Function(f) => {
+                    if let Some(doc) = &f.doc {
+                        let templates = template_names(doc);
+                        check_incompat(
+                            fa, scope, &templates, doc, &f.params,
+                            f.return_type.as_ref(), st.span, &mut out,
+                        );
+                    }
+                }
+                StmtKind::Class(c) => {
+                    let class_templates =
+                        c.doc.as_deref().map(template_names).unwrap_or_default();
+                    for m in &c.members {
+                        let Member::Method(mth) = m else { continue };
+                        let Some(doc) = &mth.doc else { continue };
+                        let mut templates = class_templates.clone();
+                        templates.extend(template_names(doc));
+                        check_incompat(
+                            fa, scope, &templates, doc, &mth.params,
+                            mth.return_type.as_ref(), st.span, &mut out,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+    out
+}
+
+/// `@template` names declared in a docblock.
+fn template_names(raw: &str) -> Vec<String> {
+    php_phpdoc::parse(raw).templates.into_iter().map(|t| t.name).collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_incompat(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    templates: &[String],
+    doc_raw: &str,
+    params: &[Param],
+    return_type: Option<&php_ast::Type>,
+    span: Span,
+    out: &mut Vec<Diagnostic>,
+) {
+    let doc = php_phpdoc::parse(doc_raw);
+
+    // `@param` tags (already merged across @param/@phpstan-param by precedence).
+    for p in &doc.params {
+        if p.variadic {
+            continue; // variadic native/doc shapes differ; phpstan special-cases.
+        }
+        let (Some(pname), Some(doc_ty)) = (&p.name, &p.ty) else { continue };
+        let Some(native) = params.iter().find(|np| fa.interner.resolve(np.name) == pname)
+        else {
+            continue; // unknown param -> parameter.notFound (a different rule).
+        };
+        let Some(native_ast) = &native.ty else { continue }; // no native hint -> mixed.
+        let native_t = resolve_ast_type(scope, native_ast);
+        let doc_t = resolve_doc_type(scope, templates, doc_ty);
+        if !crate::is_assignable(fa.reflection, &doc_t, &native_t) {
+            out.push(
+                Diagnostic::error(
+                    span,
+                    format!(
+                        "PHPDoc tag @param for parameter ${pname} with type {doc_t} \
+                         is incompatible with native type {native_t}."
+                    ),
+                )
+                .with_code("parameter.phpDocType"),
+            );
+        }
+    }
+
+    // `@return` tag.
+    if let (Some(native_ast), Some(doc_ty)) = (return_type, &doc.returns) {
+        let native_t = resolve_ast_type(scope, native_ast);
+        let doc_t = resolve_doc_type(scope, templates, doc_ty);
+        if !crate::is_assignable(fa.reflection, &doc_t, &native_t) {
+            out.push(
+                Diagnostic::error(
+                    span,
+                    format!(
+                        "PHPDoc tag @return with type {doc_t} \
+                         is incompatible with native type {native_t}."
+                    ),
+                )
+                .with_code("return.phpDocType"),
+            );
+        }
+    }
+}
+
 // --- shared helpers ---------------------------------------------------------
 
 /// Split a doc tag name into its base and an optional `phpstan`/`psalm` prefix.
@@ -327,6 +440,7 @@ pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "phpdoc.paramTags", level: 2, run: run_param_tags },
     RuleEntry { name: "phpdoc.varTags", level: 2, run: run_var_tags },
     RuleEntry { name: "phpdoc.phpstanTag", level: 2, run: run_phpstan_tags },
+    RuleEntry { name: "phpdoc.incompatibleType", level: 2, run: run_incompatible_types },
 ];
 
 #[cfg(test)]
@@ -444,5 +558,72 @@ mod tests {
     fn unknown_phpstan_tag_on_a_method_is_flagged() {
         let src = "<?php class C { /** @phpstan-nope */ public function m() {} }";
         assert_eq!(codes(src, run_phpstan_tags), ["phpDoc.phpstanTag"]);
+    }
+
+    // --- parameter.phpDocType / return.phpDocType ---
+
+    #[test]
+    fn param_phpdoc_type_incompatible_with_native_is_flagged() {
+        let src = "<?php /** @param string $a */ function f(int $a) {}";
+        assert_eq!(codes(src, run_incompatible_types), ["parameter.phpDocType"]);
+    }
+
+    #[test]
+    fn param_phpdoc_type_subtype_of_native_is_clean() {
+        // int is a subtype of int|null (the native `?int`).
+        let src = "<?php /** @param int $a */ function f(?int $a) {}";
+        assert!(codes(src, run_incompatible_types).is_empty());
+    }
+
+    #[test]
+    fn param_phpdoc_nullable_widening_native_is_flagged() {
+        // doc `int|null` is wider than native `int` -> not a subtype.
+        let src = "<?php /** @param int|null $a */ function f(int $a) {}";
+        assert_eq!(codes(src, run_incompatible_types), ["parameter.phpDocType"]);
+    }
+
+    #[test]
+    fn param_without_native_type_is_skipped() {
+        // No native hint == mixed; everything is a subtype of mixed.
+        let src = "<?php /** @param string $a */ function f($a) {}";
+        assert!(codes(src, run_incompatible_types).is_empty());
+    }
+
+    #[test]
+    fn return_phpdoc_type_incompatible_is_flagged() {
+        let src = "<?php /** @return string */ function f(): int { return 1; }";
+        assert_eq!(codes(src, run_incompatible_types), ["return.phpDocType"]);
+    }
+
+    #[test]
+    fn return_phpdoc_subtype_is_clean() {
+        let src = "<?php /** @return int */ function f(): ?int { return 1; }";
+        assert!(codes(src, run_incompatible_types).is_empty());
+    }
+
+    #[test]
+    fn method_param_phpdoc_type_incompatible_is_flagged() {
+        let src = "<?php class C { /** @param string $a */ public function m(int $a) {} }";
+        assert_eq!(codes(src, run_incompatible_types), ["parameter.phpDocType"]);
+    }
+
+    #[test]
+    fn array_doc_under_iterable_native_is_clean() {
+        // array<int, string> is a subtype of iterable.
+        let src = "<?php /** @param array<int, string> $a */ function f(iterable $a) {}";
+        assert!(codes(src, run_incompatible_types).is_empty());
+    }
+
+    #[test]
+    fn template_param_is_not_flagged() {
+        // A @template type is unknown -> lenient -> never flagged.
+        let src = "<?php /** @template T\n * @param T $a */ function f(int $a) {}";
+        assert!(codes(src, run_incompatible_types).is_empty());
+    }
+
+    #[test]
+    fn int_to_float_widening_param_is_clean() {
+        let src = "<?php /** @param int $a */ function f(float $a) {}";
+        assert!(codes(src, run_incompatible_types).is_empty());
     }
 }

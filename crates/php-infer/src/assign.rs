@@ -21,6 +21,9 @@ pub fn is_assignable(index: &ReflectionIndex, value: &Type, target: &Type) -> bo
         (Never, _) => return true,           // never is the bottom type
         (Mixed, _) => return true,           // unknown value — don't flag
         (Unknown(_), _) | (_, Unknown(_)) => return true,
+        // A template variable's concrete type is unknown (bounded by its
+        // `@template T of …`, which we don't track) — stay lenient either way.
+        (TemplateVar(_), _) | (_, TemplateVar(_)) => return true,
         _ => {}
     }
     if value == target {
