@@ -186,6 +186,7 @@ w("- [x] **Functions** — 10 rules: parameter.duplicate/name/variadicNotLast, f
 w("- [x] **Classes** — 13 rules: new.* (interface/trait/enum/abstract/static), class/interface extends + implements + traitUse kind checks, instanceof.trait, enum.* sanity, duplicate declaration/member, attribute.* target, property.invalidPromoted")
 w("- [x] **Properties** — 7 rules: readonly misuse, property-in-class/interface modifiers, hook attributes, override compatibility, $this->prop existence, readonly-assign-outside-ctor")
 w("- [x] **Methods** — 13 rules: abstract/final/visibility modifiers, constructor return/static, missing-impl, magic-serialization, attributes, override compatibility, method existence + arg-count, missing param/return typehints")
+w("- [x] **argument.type** (M-T8) — type-aware argument checks at call sites (functions + instance methods) via the per-file type map (`fa.type_of` + `is_assignable`); level 5")
 w("")
 w("### Prioritization note")
 w("Not every level-0 rule matters for a general analyzer. The **`Api`** category and a few")
