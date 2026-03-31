@@ -12,12 +12,25 @@
 //! to drive diagnostics and never panics.
 
 use crate::TypeCtx;
-use php_ast::{Expr, ExprKind, FunctionDecl, Stmt, StmtKind};
+use php_ast::{BinOp, Expr, ExprKind, FunctionDecl, Stmt, StmtKind, UnOp};
 use php_types::Type;
 use std::collections::HashMap;
 
 /// A variable environment: name (without `$`) → type.
 type Env = HashMap<String, Type>;
+
+/// A flow-narrowing fact about a single variable, deduced from a condition.
+/// Only *sound* refinements are produced (the branch guarantees them), so
+/// under-narrowing is safe and over-narrowing — which would cause false
+/// positives in rules reading the type map — never happens.
+enum Narrow {
+    /// The variable definitely has this type in the branch (e.g. `instanceof`,
+    /// `is_int($x)`, `$x === null`).
+    To(Type),
+    /// `null` is removed from the variable's type (e.g. `$x !== null`, a truthy
+    /// `if ($x)`, `!is_null($x)`).
+    StripNull,
+}
 
 impl TypeCtx<'_> {
     /// Seed parameters from a function/method's reflected signature, then analyse
@@ -54,7 +67,7 @@ impl TypeCtx<'_> {
             StmtKind::Block(b) => self.exec_block(b),
             StmtKind::If { cond, then, elseifs, els } => {
                 self.apply_expr(cond);
-                self.exec_if(then, elseifs, els.as_deref());
+                self.exec_if(cond, then, elseifs, els.as_deref());
             }
             // A loop body may run zero or more times: merge the pre-loop env with
             // the post-body env.
@@ -144,32 +157,159 @@ impl TypeCtx<'_> {
         }
     }
 
-    /// Analyse an `if`/`elseif`/`else` chain, merging the branch environments.
-    fn exec_if(&mut self, then: &Stmt, elseifs: &[php_ast::ElseIf], els: Option<&Stmt>) {
+    /// Analyse an `if`/`elseif`/`else` chain, applying condition **narrowing** to
+    /// each branch's entry environment and merging the branch exits.
+    ///
+    /// Only the environments of branches that can *fall through* (don't
+    /// unconditionally `return`/`throw`/`break`/…) flow past the `if`. This is
+    /// what makes a guard clause narrow: after `if ($x === null) { return; }` the
+    /// continuation sees `$x` with `null` stripped.
+    fn exec_if(&mut self, cond: &Expr, then: &Stmt, elseifs: &[php_ast::ElseIf], els: Option<&Stmt>) {
         let base = self.vars.clone();
-        let mut envs = Vec::new();
+        let mut envs: Vec<Env> = Vec::new();
 
+        // then-branch: the condition is truthy here.
+        let then_facts = self.narrow_facts(cond, true);
         self.vars = base.clone();
+        self.apply_facts(&then_facts);
         self.exec_stmt(then);
-        envs.push(std::mem::take(&mut self.vars));
+        if !always_terminates(then) {
+            envs.push(std::mem::take(&mut self.vars));
+        }
+
+        // Facts that hold once every preceding condition is false.
+        let mut else_facts = self.narrow_facts(cond, false);
 
         for ei in elseifs {
             self.vars = base.clone();
+            self.apply_facts(&else_facts);
             self.apply_expr(&ei.cond);
+            let pos = self.narrow_facts(&ei.cond, true);
+            self.apply_facts(&pos);
             self.exec_stmt(&ei.body);
-            envs.push(std::mem::take(&mut self.vars));
+            if !always_terminates(&ei.body) {
+                envs.push(std::mem::take(&mut self.vars));
+            }
+            // Subsequent branches additionally know this elseif was false.
+            else_facts.extend(self.narrow_facts(&ei.cond, false));
         }
 
         match els {
             Some(e) => {
                 self.vars = base.clone();
+                self.apply_facts(&else_facts);
                 self.exec_stmt(e);
-                envs.push(std::mem::take(&mut self.vars));
+                if !always_terminates(e) {
+                    envs.push(std::mem::take(&mut self.vars));
+                }
             }
-            // No `else`: the "no branch taken" path keeps the base env.
-            None => envs.push(base),
+            // No `else`: the fall-through path took no branch, so every condition
+            // is false there — apply the accumulated negative facts.
+            None => {
+                let mut fall = base.clone();
+                apply_facts_to(&mut fall, &else_facts, self.index);
+                envs.push(fall);
+            }
         }
-        self.vars = merge(envs);
+
+        // If every branch terminated (and there was an `else`), code after the
+        // `if` is unreachable; keep the base env rather than panicking on empty.
+        self.vars = if envs.is_empty() { base } else { merge(envs) };
+    }
+
+    /// Collect the narrowing facts implied by `cond` evaluating to `truthy`.
+    fn narrow_facts(&self, cond: &Expr, truthy: bool) -> Vec<(String, Narrow)> {
+        let mut out = Vec::new();
+        self.collect_facts(cond, truthy, &mut out);
+        out
+    }
+
+    fn collect_facts(&self, cond: &Expr, truthy: bool, out: &mut Vec<(String, Narrow)>) {
+        match &cond.kind {
+            ExprKind::Paren(inner) => self.collect_facts(inner, truthy, out),
+            ExprKind::Unary { op: UnOp::Not, expr } => self.collect_facts(expr, !truthy, out),
+            ExprKind::Binary { op, lhs, rhs } => match op {
+                // `a && b` true ⇒ both true. `a || b` false ⇒ both false.
+                BinOp::BoolAnd | BinOp::LogicalAnd if truthy => {
+                    self.collect_facts(lhs, true, out);
+                    self.collect_facts(rhs, true, out);
+                }
+                BinOp::BoolOr | BinOp::LogicalOr if !truthy => {
+                    self.collect_facts(lhs, false, out);
+                    self.collect_facts(rhs, false, out);
+                }
+                // `$x === null` true ⇒ $x is null; false ⇒ null stripped.
+                BinOp::Identical | BinOp::Eq => self.null_cmp(lhs, rhs, truthy, out),
+                BinOp::NotIdentical | BinOp::NotEq => self.null_cmp(lhs, rhs, !truthy, out),
+                _ => {}
+            },
+            ExprKind::Instanceof { expr, class } if truthy => {
+                if let (Some(name), Some(t)) = (self.var_name(expr), self.class_type(class)) {
+                    out.push((name, Narrow::To(t)));
+                }
+            }
+            ExprKind::Call { callee, args } => {
+                if let ExprKind::Name(n) = &callee.kind {
+                    let fname = last_segment(&n.text).to_ascii_lowercase();
+                    if let Some(arg0) = args.first() {
+                        if let Some(name) = self.var_name(&arg0.value) {
+                            if truthy {
+                                if let Some(t) = predicate_type(&fname) {
+                                    out.push((name, Narrow::To(t)));
+                                }
+                            } else if fname == "is_null" {
+                                out.push((name, Narrow::StripNull));
+                            }
+                        }
+                    }
+                }
+            }
+            // A bare truthy variable (`if ($x)`) is non-null in the then-branch.
+            _ if truthy => {
+                if let Some(name) = self.var_name(cond) {
+                    out.push((name, Narrow::StripNull));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `$x <cmp> null` / `null <cmp> $x`. `is_null` = whether the comparison
+    /// asserts the variable *is* null in this branch.
+    fn null_cmp(&self, lhs: &Expr, rhs: &Expr, is_null: bool, out: &mut Vec<(String, Narrow)>) {
+        let var = if self.is_null_lit(rhs) {
+            self.var_name(lhs)
+        } else if self.is_null_lit(lhs) {
+            self.var_name(rhs)
+        } else {
+            None
+        };
+        if let Some(name) = var {
+            out.push((name, if is_null { Narrow::To(Type::Null) } else { Narrow::StripNull }));
+        }
+    }
+
+    fn apply_facts(&mut self, facts: &[(String, Narrow)]) {
+        let idx = self.index;
+        let mut vars = std::mem::take(&mut self.vars);
+        apply_facts_to(&mut vars, facts, idx);
+        self.vars = vars;
+    }
+
+    /// The simple variable name (without `$`) of `e`, or `None` (`$this` is never
+    /// narrowed).
+    fn var_name(&self, e: &Expr) -> Option<String> {
+        match &e.kind {
+            ExprKind::Variable(sym) => {
+                let n = self.interner.resolve(*sym);
+                (n != "this").then(|| n.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    fn is_null_lit(&self, e: &Expr) -> bool {
+        matches!(&e.kind, ExprKind::Name(n) if n.text.eq_ignore_ascii_case("null"))
     }
 
     /// Analyse a body that may or may not run (a loop), merging with the env from
@@ -194,6 +334,80 @@ impl TypeCtx<'_> {
         let after = std::mem::take(&mut self.vars);
         // The loop may not run, so merge with the pre-loop env.
         self.vars = merge(vec![base, after]);
+    }
+}
+
+/// Apply narrowing facts to an environment in place.
+fn apply_facts_to(vars: &mut Env, facts: &[(String, Narrow)], index: &php_reflect::ReflectionIndex) {
+    for (name, n) in facts {
+        let cur = vars.get(name).cloned().unwrap_or(Type::Mixed);
+        let nt = match n {
+            Narrow::To(t) => narrow_to(&cur, t, index),
+            Narrow::StripNull => strip_null(&cur),
+        };
+        vars.insert(name.clone(), nt);
+    }
+}
+
+/// Refine `cur` to `t`, keeping `cur` when it is already a (more precise) subtype
+/// of `t`. `mixed`/`Unknown` always adopt `t` (that's the point of `instanceof`/
+/// `is_*` narrowing). Sound: the branch guarantees the value is a `t`.
+fn narrow_to(cur: &Type, t: &Type, index: &php_reflect::ReflectionIndex) -> Type {
+    match cur {
+        Type::Mixed | Type::Unknown(_) => t.clone(),
+        _ if crate::is_assignable(index, cur, t) => cur.clone(),
+        _ => t.clone(),
+    }
+}
+
+/// Remove `null` from a type. `?T` → `T`; a union drops its `null` arm; a bare
+/// `null` becomes `never` (the branch is unreachable).
+fn strip_null(t: &Type) -> Type {
+    match t {
+        Type::Nullable(inner) => (**inner).clone(),
+        Type::Null => Type::Never,
+        Type::Union(parts) => {
+            let kept: Vec<Type> = parts.iter().filter(|p| !matches!(p, Type::Null)).cloned().collect();
+            Type::union(kept)
+        }
+        other => other.clone(),
+    }
+}
+
+/// The narrowed type asserted by a `is_*($x)` type-predicate built-in, if known.
+fn predicate_type(fname: &str) -> Option<Type> {
+    Some(match fname {
+        "is_int" | "is_integer" | "is_long" => Type::Int,
+        "is_string" => Type::String,
+        "is_bool" => Type::Bool,
+        "is_float" | "is_double" => Type::Float,
+        "is_array" => Type::Array(None),
+        "is_callable" => Type::Callable(None),
+        "is_object" => Type::Object,
+        "is_iterable" => Type::Iterable(None),
+        "is_null" => Type::Null,
+        _ => return None, // is_scalar/is_numeric etc. are unions — skip (safe).
+    })
+}
+
+/// The last `\`-separated segment of a (possibly-qualified) name.
+fn last_segment(name: &str) -> &str {
+    name.rsplit('\\').next().unwrap_or(name)
+}
+
+/// Does executing `s` always leave the current block (so its environment never
+/// flows past it)? Conservative — only unconditional terminators count.
+fn always_terminates(s: &Stmt) -> bool {
+    match &s.kind {
+        StmtKind::Return(_) | StmtKind::Break(_) | StmtKind::Continue(_) | StmtKind::Goto(_) => true,
+        StmtKind::Expr(e) => matches!(&e.kind, ExprKind::Throw(_) | ExprKind::Exit(_)),
+        StmtKind::Block(b) => b.last().is_some_and(always_terminates),
+        StmtKind::If { then, elseifs, els: Some(els), .. } => {
+            always_terminates(then)
+                && elseifs.iter().all(|ei| always_terminates(&ei.body))
+                && always_terminates(els)
+        }
+        _ => false,
     }
 }
 
@@ -308,6 +522,68 @@ mod tests {
             }
         "#;
         assert_eq!(var_after(src, "x"), "int|string");
+    }
+
+    // --- M-T9 condition narrowing -----------------------------------------
+
+    #[test]
+    fn null_guard_strips_null_on_fall_through() {
+        // After an early-return null guard, $x is non-null in the continuation.
+        let src = "function f(?int $x) { if ($x === null) { return; } $y = $x; }";
+        assert_eq!(var_after(src, "y"), "int");
+    }
+
+    #[test]
+    fn not_null_guard_strips_null() {
+        let src = "function f(?string $x) { if ($x === null) { return; } $z = $x; }";
+        assert_eq!(var_after(src, "z"), "string");
+    }
+
+    #[test]
+    fn truthy_guard_strips_null() {
+        let src = "function f(?int $x) { if (!$x) { return; } $y = $x; }";
+        assert_eq!(var_after(src, "y"), "int");
+    }
+
+    #[test]
+    fn is_int_predicate_narrows() {
+        let src = "function f($x) { if (!is_int($x)) { return; } $y = $x; }";
+        assert_eq!(var_after(src, "y"), "int");
+    }
+
+    #[test]
+    fn instanceof_guard_narrows_to_class() {
+        let src = "function f($x) { if (!($x instanceof Foo)) { return; } $y = $x; }";
+        assert_eq!(var_after(src, "y"), "Foo");
+    }
+
+    #[test]
+    fn instanceof_then_branch_narrows() {
+        // No early return: the then-branch sees the narrowed type.
+        let src = "function f($x) { $y = 0; if ($x instanceof Foo) { $y = $x; } }";
+        // then: $y = Foo; fall-through: $y = int(0). Merged.
+        assert_eq!(var_after(src, "y"), "Foo|int");
+    }
+
+    #[test]
+    fn and_composition_narrows_both() {
+        let src = "function f(?int $a, ?int $b) { if ($a === null || $b === null) { return; } $x = $a; $y = $b; }";
+        assert_eq!(var_after(src, "x"), "int");
+        assert_eq!(var_after(src, "y"), "int");
+    }
+
+    #[test]
+    fn equals_null_branch_is_null() {
+        // `!== null` false on the fall-through ⇒ $x is null there.
+        let src = "function f(?int $x) { if ($x !== null) { return; } $y = $x; }";
+        assert_eq!(var_after(src, "y"), "null");
+    }
+
+    #[test]
+    fn no_guard_keeps_nullable() {
+        // Sanity: without narrowing the nullable survives.
+        let src = "function f(?int $x) { $y = $x; }";
+        assert_eq!(var_after(src, "y"), "?int");
     }
 
     #[test]
