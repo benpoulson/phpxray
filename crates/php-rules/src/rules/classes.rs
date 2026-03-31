@@ -43,12 +43,14 @@
 
 use crate::{unknown_symbols, walk, FileAnalysis, RuleEntry};
 use php_ast::{
-    ClassDecl, ClassKind, Expr, ExprKind, Member, MethodDecl, Name, Param, Stmt, StmtKind, Visibility,
+    AttributeGroup, ClassDecl, ClassKind, Expr, ExprKind, Member, MethodDecl, Name, Param, Stmt,
+    StmtKind, Visibility,
 };
 use php_diagnostics::Diagnostic;
 use php_index::ProjectIndex;
 use php_intern::Interner;
-use php_resolve::{for_each_region, Scope};
+use php_reflect::attr_target;
+use php_resolve::{for_each_region, Resolution, Scope};
 use std::collections::{HashMap, HashSet};
 
 // Our consolidated existence check: emits `class.notFound` + `function.notFound`
@@ -840,6 +842,117 @@ fn attribute_kind_code(kind: ClassKind) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// Attribute *usage* checks — Class/Function/Method/Property/ClassConstant/
+// EnumCase/Param AttributesRule family (via attribute-target reflection)
+// ---------------------------------------------------------------------------
+
+/// For each attribute applied to a declaration, look the attribute class up in
+/// the reflection index and check it against the usage site: that the class is
+/// actually an `#[Attribute]` (`attribute.notAttribute`), allows this target
+/// (`attribute.target`), and — unless `IS_REPEATABLE` — isn't repeated
+/// (`attribute.nonRepeatable`). A *missing* attribute class is left to the
+/// existing `class.notFound` rule; built-in attributes (not in the reflection
+/// index, only names) are skipped — keeping us false-positive-free.
+fn run_attribute_usages(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            collect_attr_targets(scope, fa, st, &mut out);
+        }
+    });
+    out
+}
+
+fn collect_attr_targets(scope: &Scope, fa: &FileAnalysis, st: &Stmt, out: &mut Vec<Diagnostic>) {
+    match &st.kind {
+        StmtKind::Function(f) => {
+            check_attr_usage(scope, fa, &f.attrs, attr_target::FUNCTION, "function", out);
+            for p in &f.params {
+                check_attr_usage(scope, fa, &p.attrs, attr_target::PARAMETER, "parameter", out);
+            }
+        }
+        StmtKind::Class(c) => {
+            check_attr_usage(scope, fa, &c.attrs, attr_target::CLASS, "class", out);
+            for m in &c.members {
+                match m {
+                    Member::Method(md) => {
+                        check_attr_usage(scope, fa, &md.attrs, attr_target::METHOD, "method", out);
+                        for p in &md.params {
+                            check_attr_usage(scope, fa, &p.attrs, attr_target::PARAMETER, "parameter", out);
+                        }
+                    }
+                    Member::Property(pd) => {
+                        check_attr_usage(scope, fa, &pd.attrs, attr_target::PROPERTY, "property", out)
+                    }
+                    Member::ClassConst(cc) => check_attr_usage(
+                        scope, fa, &cc.attrs, attr_target::CLASS_CONSTANT, "class constant", out,
+                    ),
+                    Member::EnumCase(ec) => check_attr_usage(
+                        scope, fa, &ec.attrs, attr_target::CLASS_CONSTANT, "enum case", out,
+                    ),
+                    _ => {}
+                }
+            }
+        }
+        StmtKind::Namespace { body: Some(b), .. } => {
+            for s in b {
+                collect_attr_targets(scope, fa, s, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn check_attr_usage(
+    scope: &Scope,
+    fa: &FileAnalysis,
+    attrs: &[AttributeGroup],
+    target: u32,
+    target_name: &str,
+    out: &mut Vec<Diagnostic>,
+) {
+    let mut seen: HashSet<String> = HashSet::new();
+    for g in attrs {
+        for a in &g.attrs {
+            let Resolution::Fqn(fqn) = scope.resolve_class(&a.name) else { continue };
+            // Only user attribute classes are reflected; builtins/missing are
+            // handled elsewhere (names-only index / class.notFound).
+            let Some(cr) = fa.reflection.class(&fqn) else { continue };
+            let display = &cr.fqn;
+            match cr.attribute {
+                None => out.push(
+                    Diagnostic::error(
+                        a.name.span,
+                        format!("Class {display} is not an Attribute class."),
+                    )
+                    .with_code("attribute.notAttribute"),
+                ),
+                Some(spec) => {
+                    if spec.targets & target == 0 {
+                        out.push(
+                            Diagnostic::error(
+                                a.name.span,
+                                format!("Attribute class {display} does not have the {target_name} target."),
+                            )
+                            .with_code("attribute.target"),
+                        );
+                    }
+                    if !spec.repeatable && !seen.insert(fqn.to_ascii_lowercase()) {
+                        out.push(
+                            Diagnostic::error(
+                                a.name.span,
+                                format!("Attribute class {display} is not repeatable but is already present above the {target_name}."),
+                            )
+                            .with_code("attribute.nonRepeatable"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // InvalidPromotedPropertiesRule
 // ---------------------------------------------------------------------------
 
@@ -929,6 +1042,7 @@ pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "duplicate.declaration", level: 0, run: run_duplicate_declaration },
     RuleEntry { name: "duplicate.class", level: 0, run: run_duplicate_class },
     RuleEntry { name: "attribute.class", level: 0, run: run_non_class_attribute },
+    RuleEntry { name: "attribute.usage", level: 0, run: run_attribute_usages },
     RuleEntry { name: "property.invalidPromoted", level: 0, run: run_invalid_promoted },
 ];
 
@@ -936,6 +1050,69 @@ pub(crate) static RULES: &[RuleEntry] = &[
 mod tests {
     use super::*;
     use crate::testutil::codes;
+
+    // --- attribute usage (target / repeatable / not-an-attribute) --------
+
+    #[test]
+    fn attribute_used_on_wrong_target_is_flagged() {
+        // #[A] allows only TARGET_PROPERTY but is used on a class.
+        let src = "<?php \
+            #[\\Attribute(\\Attribute::TARGET_PROPERTY)] class A {} \
+            #[A] class B {}";
+        assert_eq!(codes(src, run_attribute_usages), ["attribute.target"]);
+    }
+
+    #[test]
+    fn attribute_on_allowed_target_is_clean() {
+        let src = "<?php \
+            #[\\Attribute(\\Attribute::TARGET_CLASS)] class A {} \
+            #[A] class B {}";
+        assert!(codes(src, run_attribute_usages).is_empty());
+    }
+
+    #[test]
+    fn attribute_all_target_is_clean() {
+        // No args ⇒ TARGET_ALL.
+        let src = "<?php #[\\Attribute] class A {} #[A] class B {}";
+        assert!(codes(src, run_attribute_usages).is_empty());
+    }
+
+    #[test]
+    fn non_attribute_class_used_as_attribute_is_flagged() {
+        let src = "<?php class A {} #[A] class B {}";
+        assert_eq!(codes(src, run_attribute_usages), ["attribute.notAttribute"]);
+    }
+
+    #[test]
+    fn non_repeatable_attribute_used_twice_is_flagged() {
+        let src = "<?php \
+            #[\\Attribute(\\Attribute::TARGET_CLASS)] class A {} \
+            #[A] #[A] class B {}";
+        assert_eq!(codes(src, run_attribute_usages), ["attribute.nonRepeatable"]);
+    }
+
+    #[test]
+    fn repeatable_attribute_used_twice_is_clean() {
+        let src = "<?php \
+            #[\\Attribute(\\Attribute::TARGET_CLASS | \\Attribute::IS_REPEATABLE)] class A {} \
+            #[A] #[A] class B {}";
+        assert!(codes(src, run_attribute_usages).is_empty());
+    }
+
+    #[test]
+    fn attribute_on_method_target_check() {
+        let src = "<?php \
+            #[\\Attribute(\\Attribute::TARGET_CLASS)] class A {} \
+            class B { #[A] public function m() {} }";
+        assert_eq!(codes(src, run_attribute_usages), ["attribute.target"]);
+    }
+
+    #[test]
+    fn unknown_attribute_class_is_not_flagged_here() {
+        // Missing class -> class.notFound (a different rule), not attribute.*.
+        let src = "<?php #[Nonexistent] class B {}";
+        assert!(codes(src, run_attribute_usages).is_empty());
+    }
 
     // --- instantiation ---------------------------------------------------
 

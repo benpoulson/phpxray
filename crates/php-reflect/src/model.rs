@@ -17,12 +17,12 @@
 
 use crate::{resolve_ast_type, resolve_doc_type};
 use php_ast::{
-    ClassDecl, ClassKind, FunctionDecl, Member, MethodDecl, Name, Param as AstParam, PropertyDecl,
-    Type as AstType, Visibility,
+    AttributeGroup, BinOp, ClassDecl, ClassKind, Expr, ExprKind, FunctionDecl, Member, MemberName,
+    MethodDecl, Name, Param as AstParam, PropertyDecl, Type as AstType, Visibility,
 };
 use php_intern::Interner;
 use php_phpdoc::{Doc, DocType, MethodParam, PropertyAccess};
-use php_resolve::Scope;
+use php_resolve::{Resolution, Scope};
 use php_types::Type;
 
 /// A reflected function or method parameter.
@@ -119,6 +119,89 @@ pub struct ClassReflection {
     /// `@mixin` targets, resolved.
     pub mixins: Vec<Type>,
     pub deprecated: bool,
+    /// If this class is itself an attribute (`#[Attribute]`), its target/repeatable
+    /// flags — what the *AttributesRule family checks usages against.
+    pub attribute: Option<AttributeSpec>,
+}
+
+/// `#[Attribute(...)]` metadata on an attribute class: which targets it may be
+/// applied to and whether it is repeatable. Mirrors PHP's `\Attribute` constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttributeSpec {
+    /// Bit-mask of the `attr_target::*` flags (`#[Attribute]` with no args ⇒ ALL).
+    pub targets: u32,
+    pub repeatable: bool,
+}
+
+/// PHP `\Attribute` flag constants.
+pub mod attr_target {
+    pub const CLASS: u32 = 1;
+    pub const FUNCTION: u32 = 2;
+    pub const METHOD: u32 = 4;
+    pub const PROPERTY: u32 = 8;
+    pub const CLASS_CONSTANT: u32 = 16;
+    pub const PARAMETER: u32 = 32;
+    pub const ALL: u32 = 63;
+    pub const IS_REPEATABLE: u32 = 64;
+}
+
+/// Parse the `#[Attribute]` / `#[Attribute(flags)]` group on a declaration, if
+/// present, into an [`AttributeSpec`]. The attribute name must resolve to the
+/// global `\Attribute`.
+fn attribute_spec(scope: &Scope, interner: &Interner, attrs: &[AttributeGroup]) -> Option<AttributeSpec> {
+    for g in attrs {
+        for a in &g.attrs {
+            if !is_php_attribute(scope, &a.name) {
+                continue;
+            }
+            return Some(match &a.args {
+                None => AttributeSpec { targets: attr_target::ALL, repeatable: false },
+                Some(args) => {
+                    let flags = args
+                        .first()
+                        .and_then(|arg| eval_attr_flags(interner, &arg.value))
+                        .unwrap_or(attr_target::ALL);
+                    let targets = flags & attr_target::ALL;
+                    AttributeSpec {
+                        targets: if targets != 0 { targets } else { attr_target::ALL },
+                        repeatable: flags & attr_target::IS_REPEATABLE != 0,
+                    }
+                }
+            });
+        }
+    }
+    None
+}
+
+fn is_php_attribute(scope: &Scope, name: &Name) -> bool {
+    matches!(scope.resolve_class(name), Resolution::Fqn(fqn) if fqn.eq_ignore_ascii_case("Attribute"))
+}
+
+/// Evaluate an `#[Attribute(...)]` flag expression (`Attribute::TARGET_X | …`).
+fn eval_attr_flags(interner: &Interner, e: &Expr) -> Option<u32> {
+    match &e.kind {
+        ExprKind::Paren(inner) => eval_attr_flags(interner, inner),
+        ExprKind::Binary { op: BinOp::BitOr, lhs, rhs } => {
+            Some(eval_attr_flags(interner, lhs)? | eval_attr_flags(interner, rhs)?)
+        }
+        ExprKind::ClassConst { name: MemberName::Ident(sym), .. } => attr_const(interner.resolve(*sym)),
+        ExprKind::Int(n) => u32::try_from(*n).ok(),
+        _ => None,
+    }
+}
+
+fn attr_const(name: &str) -> Option<u32> {
+    Some(match name {
+        "TARGET_CLASS" => attr_target::CLASS,
+        "TARGET_FUNCTION" => attr_target::FUNCTION,
+        "TARGET_METHOD" => attr_target::METHOD,
+        "TARGET_PROPERTY" => attr_target::PROPERTY,
+        "TARGET_CLASS_CONSTANT" => attr_target::CLASS_CONSTANT,
+        "TARGET_PARAMETER" => attr_target::PARAMETER,
+        "TARGET_ALL" => attr_target::ALL,
+        "IS_REPEATABLE" => attr_target::IS_REPEATABLE,
+        _ => return None,
+    })
 }
 
 /// Reflect a free function declaration.
@@ -186,6 +269,7 @@ pub fn reflect_class(scope: &Scope, interner: &Interner, fqn: &str, c: &ClassDec
         properties,
         constants,
         deprecated: doc.deprecated,
+        attribute: attribute_spec(scope, interner, &c.attrs),
     }
 }
 

@@ -15,8 +15,8 @@ use php_types::{CallableSig, ShapeField, Type};
 mod model;
 mod project;
 pub use model::{
-    reflect_class, reflect_function, ClassReflection, ConstReflection, FunctionReflection,
-    MethodReflection, ParamReflection, PropertyReflection,
+    attr_target, reflect_class, reflect_function, AttributeSpec, ClassReflection, ConstReflection,
+    FunctionReflection, MethodReflection, ParamReflection, PropertyReflection,
 };
 pub use project::{Found, ReflectionIndex};
 

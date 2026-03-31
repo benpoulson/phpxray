@@ -114,6 +114,10 @@ DONE = {
     # DeadCode
     "UnreachableStatementRule", "UnusedPrivateMethodRule", "UnusedPrivateConstantRule",
     "UnusedPrivatePropertyRule", "NoopRule",
+    # Attribute-usage family (Cap #7: attribute-target reflection -> attribute.usage rule)
+    "ClassAttributesRule", "ClassConstantAttributesRule", "EnumCaseAttributesRule",
+    "FunctionAttributesRule", "MethodAttributesRule", "ParamAttributesRule",
+    "PropertyAttributesRule", "TraitAttributesRule",
 }
 # Rules we can't implement yet, with the reason.
 _TYPES = "needs the type system (operand/value types)"
