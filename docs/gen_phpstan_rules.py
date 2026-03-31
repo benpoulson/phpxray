@@ -95,6 +95,8 @@ DONE = {
     "WhileLoopAlwaysFalseConditionRule", "WhileLoopAlwaysTrueConditionRule", "DoWhileLoopConstantConditionRule",
     "BooleanNotConstantConditionRule", "BooleanAndConstantConditionRule", "BooleanOrConstantConditionRule",
     "LogicalXorConstantConditionRule", "StrictComparisonOfDifferentTypesRule",
+    # Comparison constant folding (Cap #2: php_infer::eval_const)
+    "ConstantLooseComparisonRule", "NumberComparisonOperatorsConstantConditionRule",
     # Operators (invalid binary/unary/comparison; type-map driven, level 2)
     "InvalidBinaryOperationRule", "InvalidUnaryOperationRule", "InvalidComparisonOperationRule",
     # Cast (invalid cast + echo/print/encapsed non-string; type-map driven, level 2)

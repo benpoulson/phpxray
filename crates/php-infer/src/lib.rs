@@ -13,10 +13,12 @@
 //! never panics.
 
 mod assign;
+mod const_eval;
 mod flow;
 mod type_map;
 
 pub use assign::is_assignable;
+pub use const_eval::{eval_const, ConstVal};
 pub use type_map::{type_map, TypeMap};
 
 use php_ast::{BinOp, CastKind, Expr, ExprKind, MemberName, Name, UnOp};

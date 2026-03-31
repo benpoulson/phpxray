@@ -30,17 +30,17 @@
 //! - `booleanAnd.leftAlways*` / `.rightAlways*` (`BooleanAndConstantConditionRule`).
 //! - `booleanOr.leftAlways*` / `.rightAlways*` (`BooleanOrConstantConditionRule`).
 //! - `logicalXor.leftAlways*` / `.rightAlways*` (`LogicalXorConstantConditionRule`).
-//! - `identical.alwaysFalse` / `notIdentical.alwaysTrue`
-//!   (`StrictComparisonOfDifferentTypesRule`) — disjoint-types subset only.
+//! - `identical.alwaysTrue`/`.alwaysFalse` / `notIdentical.alwaysTrue`/`.alwaysFalse`
+//!   (`StrictComparisonOfDifferentTypesRule`) — disjoint *types* via the type map,
+//!   plus same-category *constant* operands folded by `php_infer::eval_const`.
+//! - `equal.*`/`notEqual.*` (`ConstantLooseComparisonRule`) and
+//!   `greater.*`/`smaller.*`/`greaterOrEqual.*`/`smallerOrEqual.*`
+//!   (`NumberComparisonOperatorsConstantConditionRule`) — constant operands folded.
 //!
-//! Deferred (need a constant evaluator / type-predicate narrowing we don't have):
-//! - `ConstantLooseComparisonRule` (`equal.*`/`notEqual.*`) and
-//!   `NumberComparisonOperatorsConstantConditionRule` (`greater.*`/`smaller.*`/…)
-//!   — need folding of the comparison's *result*, not just operand types.
-//! - the strict-comparison *always-true* / loose *always-*-cases beyond disjoint
-//!   types — need value-level constant folding.
+//! Deferred (need machinery we don't have):
 //! - `ImpossibleCheckTypeFunctionCall/MethodCall/StaticMethodCallRule`
-//!   (`function.impossibleType`, …) — need `is_int()`-style predicate narrowing.
+//!   (`function.impossibleType`, …) — needs evaluating a type-predicate against
+//!   the (now narrowable) type map; a follow-up rule, not a capability gap.
 //! - `MatchExpressionRule` (`match.alwaysTrue`/`match.unhandled`) — needs
 //!   exhaustiveness + constant arm folding.
 //! - `UsageOfVoidMatchExpressionRule` (`match.void`) — needs first-level-statement
@@ -50,6 +50,7 @@
 use crate::{walk, FileAnalysis, RuleEntry};
 use php_ast::{BinOp, ElseIf, Expr, ExprKind, StmtKind, UnOp};
 use php_diagnostics::Diagnostic;
+use php_infer::{eval_const, ConstVal};
 use php_span::Span;
 use php_types::Type;
 
@@ -96,6 +97,11 @@ fn const_bool(fa: &FileAnalysis, e: &Expr) -> Option<bool> {
             _ => {}
         },
         _ => {}
+    }
+
+    // Constant-fold operators over literals (`1 === 1`, `5 > 3`, `A && false`).
+    if let Some(v) = eval_const(e) {
+        return Some(v.truthy());
     }
 
     // Otherwise trust the type map only for the three constant-boolean types.
@@ -368,19 +374,100 @@ fn run_strict_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
         };
         let lt = fa.type_of(lhs);
         let rt = fa.type_of(rhs);
-        if !disjoint(&lt, &rt) {
+        // 1. Disjoint *types* — provably never/always equal, even for non-constant
+        //    typed operands (`int $a === string $b`).
+        if disjoint(&lt, &rt) {
+            let (verb, code) = if always_false {
+                ("false", "identical.alwaysFalse")
+            } else {
+                ("true", "notIdentical.alwaysTrue")
+            };
+            out.push(diag(
+                e.span,
+                format!("Strict comparison using {sigil} between {lt} and {rt} will always evaluate to {verb}."),
+                code,
+            ));
             return;
         }
-        let (verb, code) = if always_false {
-            ("false", "identical.alwaysFalse")
-        } else {
-            ("true", "notIdentical.alwaysTrue")
+        // 2. Same-category but constant-foldable (`1 === 1`, `1 === 2`).
+        if let (Some(ConstVal::Bool(result)), Some(l), Some(r)) =
+            (eval_const(e), eval_const(lhs), eval_const(rhs))
+        {
+            let code = match (op, result) {
+                (BinOp::Identical, true) => "identical.alwaysTrue",
+                (BinOp::Identical, false) => "identical.alwaysFalse",
+                (BinOp::NotIdentical, true) => "notIdentical.alwaysTrue",
+                (BinOp::NotIdentical, false) => "notIdentical.alwaysFalse",
+                _ => return,
+            };
+            out.push(diag(
+                e.span,
+                format!(
+                    "Strict comparison using {sigil} between {} and {} will always evaluate to {result}.",
+                    l.describe(),
+                    r.describe()
+                ),
+                code,
+            ));
+        }
+    });
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Constant loose (`==`/`!=`) and number (`<`/`>`/`<=`/`>=`) comparisons
+// (ConstantLooseComparisonRule / NumberComparisonOperatorsConstantConditionRule)
+// ---------------------------------------------------------------------------
+
+fn run_constant_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Binary { op, lhs, rhs } = &e.kind else { return };
+        // (sigil, node-type for `<` family, loose flag)
+        let (sigil, ntype, loose) = match op {
+            BinOp::Eq => ("==", "equal", true),
+            BinOp::NotEq => ("!=", "notEqual", true),
+            BinOp::Lt => ("<", "smaller", false),
+            BinOp::Gt => (">", "greater", false),
+            BinOp::LtEq => ("<=", "smallerOrEqual", false),
+            BinOp::GtEq => (">=", "greaterOrEqual", false),
+            _ => return,
         };
-        out.push(diag(
-            e.span,
-            format!("Strict comparison using {sigil} between {lt} and {rt} will always evaluate to {verb}."),
-            code,
-        ));
+        let (Some(ConstVal::Bool(result)), Some(l), Some(r)) =
+            (eval_const(e), eval_const(lhs), eval_const(rhs))
+        else {
+            return;
+        };
+        // The registry needs a `&'static str` code; enumerate the variants.
+        let code = match (ntype, result) {
+            ("equal", true) => "equal.alwaysTrue",
+            ("equal", false) => "equal.alwaysFalse",
+            ("notEqual", true) => "notEqual.alwaysTrue",
+            ("notEqual", false) => "notEqual.alwaysFalse",
+            ("smaller", true) => "smaller.alwaysTrue",
+            ("smaller", false) => "smaller.alwaysFalse",
+            ("greater", true) => "greater.alwaysTrue",
+            ("greater", false) => "greater.alwaysFalse",
+            ("smallerOrEqual", true) => "smallerOrEqual.alwaysTrue",
+            ("smallerOrEqual", false) => "smallerOrEqual.alwaysFalse",
+            ("greaterOrEqual", true) => "greaterOrEqual.alwaysTrue",
+            ("greaterOrEqual", false) => "greaterOrEqual.alwaysFalse",
+            _ => return,
+        };
+        let msg = if loose {
+            format!(
+                "Loose comparison using {sigil} between {} and {} will always evaluate to {result}.",
+                l.describe(),
+                r.describe()
+            )
+        } else {
+            format!(
+                "Comparison operation \"{sigil}\" between {} and {} is always {result}.",
+                l.describe(),
+                r.describe()
+            )
+        };
+        out.push(diag(e.span, msg, code));
     });
     out
 }
@@ -399,6 +486,7 @@ pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "comparison.booleanOr", level: 4, run: run_boolean_or },
     RuleEntry { name: "comparison.logicalXor", level: 4, run: run_logical_xor },
     RuleEntry { name: "comparison.strict", level: 4, run: run_strict_comparison },
+    RuleEntry { name: "comparison.constant", level: 4, run: run_constant_comparison },
 ];
 
 #[cfg(test)]
@@ -559,11 +647,38 @@ mod tests {
     }
 
     #[test]
-    fn strict_same_category_is_clean() {
-        // Two ints: values might match — not disjoint.
-        assert!(codes("<?php $x = (1 === 2);", run_strict_comparison).is_empty());
-        // Two strings: same category.
-        assert!(codes("<?php $x = ('a' === 'b');", run_strict_comparison).is_empty());
+    fn strict_same_category_nonconstant_is_clean() {
+        // Two int variables: same category, values unknown -> no report.
+        let src = "<?php function f(int $a, int $b) { return $a === $b; }";
+        assert!(codes(src, run_strict_comparison).is_empty());
+    }
+
+    #[test]
+    fn strict_constant_equal_values_fold() {
+        // Constant operands fold to a definite result (phpstan reports these).
+        assert_eq!(codes("<?php $x = (1 === 1);", run_strict_comparison), ["identical.alwaysTrue"]);
+        assert_eq!(codes("<?php $x = (1 === 2);", run_strict_comparison), ["identical.alwaysFalse"]);
+        assert_eq!(codes("<?php $x = (2 !== 2);", run_strict_comparison), ["notIdentical.alwaysFalse"]);
+    }
+
+    // --- constant loose / number comparison ---
+
+    #[test]
+    fn constant_loose_comparison_folds() {
+        assert_eq!(codes("<?php $x = (1 == 1);", run_constant_comparison), ["equal.alwaysTrue"]);
+        assert_eq!(codes("<?php $x = (1 != 1);", run_constant_comparison), ["notEqual.alwaysFalse"]);
+    }
+
+    #[test]
+    fn constant_number_comparison_folds() {
+        assert_eq!(codes("<?php $x = (5 > 3);", run_constant_comparison), ["greater.alwaysTrue"]);
+        assert_eq!(codes("<?php $x = (2 <= 1);", run_constant_comparison), ["smallerOrEqual.alwaysFalse"]);
+    }
+
+    #[test]
+    fn nonconstant_comparison_is_clean() {
+        let src = "<?php function f(int $a) { return $a > 3; }";
+        assert!(codes(src, run_constant_comparison).is_empty());
     }
 
     #[test]
