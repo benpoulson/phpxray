@@ -12,6 +12,7 @@ use php_resolve::{Resolution, Scope};
 use php_span::Span;
 use php_types::{CallableSig, ShapeField, Type};
 
+mod builtins;
 mod model;
 mod project;
 pub use model::{

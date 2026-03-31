@@ -50,6 +50,11 @@ pub struct FunctionReflection {
     /// `@template` names in scope for this function.
     pub templates: Vec<String>,
     pub deprecated: bool,
+    /// Loaded from the built-in stub manifest (Cap #4) rather than reflected from
+    /// project source. The stub *arity* is unreliable (phpstorm-stubs omits
+    /// defaults on some optional params and over-/under-counts variadics), so the
+    /// arguments-count rule skips these; their *types* still drive inference.
+    pub builtin: bool,
 }
 
 /// A reflected method (real or magic `@method`).
@@ -215,6 +220,7 @@ pub fn reflect_function(scope: &Scope, interner: &Interner, f: &FunctionDecl) ->
         by_ref: f.by_ref,
         templates,
         deprecated: doc.deprecated,
+        builtin: false,
     }
 }
 

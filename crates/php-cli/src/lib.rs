@@ -93,7 +93,7 @@ pub fn run(config: &Config, root: &Path) -> Report {
 pub fn analyze_parsed(parsed: &[ParsedFile], level: u8) -> Report {
     // Build the shared immutable indexes once.
     let mut project = ProjectIndex::with_builtins();
-    let mut reflection = ReflectionIndex::new();
+    let mut reflection = ReflectionIndex::with_builtins();
     for f in parsed {
         project.add_file(&f.path, &index_file(&f.parse.program, &f.parse.interner));
         reflection.add_file(&f.parse.program, &f.parse.interner);

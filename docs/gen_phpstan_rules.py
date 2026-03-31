@@ -118,6 +118,8 @@ DONE = {
     "ClassAttributesRule", "ClassConstantAttributesRule", "EnumCaseAttributesRule",
     "FunctionAttributesRule", "MethodAttributesRule", "ParamAttributesRule",
     "PropertyAttributesRule", "TraitAttributesRule",
+    # Cap #4: typed builtin stubs + castable-to-string predicate
+    "ImplodeParameterCastableToStringRule",
 }
 # Rules we can't implement yet, with the reason.
 _TYPES = "needs the type system (operand/value types)"

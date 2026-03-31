@@ -17,7 +17,7 @@ mod const_eval;
 mod flow;
 mod type_map;
 
-pub use assign::is_assignable;
+pub use assign::{is_assignable, is_castable_to_string};
 pub use const_eval::{eval_const, ConstVal};
 pub use type_map::{type_map, TypeMap};
 

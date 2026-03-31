@@ -11,6 +11,25 @@
 use php_reflect::ReflectionIndex;
 use php_types::Type;
 
+/// Whether every value of `ty` can be coerced to a string — PHP's `(string)` /
+/// string-interpolation / `implode` element rules. Lenient like [`is_assignable`]:
+/// scalars/`null`/`mixed`/templates and any object with `__toString` (or an
+/// *unknown* class) are castable; only arrays, iterables, shapes, callables, and
+/// `void` are definitely not. Used by the castable-to-string argument rules.
+pub fn is_castable_to_string(index: &ReflectionIndex, ty: &Type) -> bool {
+    use Type::*;
+    match ty {
+        Array(_) | List(_) | Iterable(_) | Shape { .. } | Callable(_) | Void => false,
+        Nullable(inner) => is_castable_to_string(index, inner),
+        Union(parts) => parts.iter().all(|p| is_castable_to_string(index, p)),
+        // An object is castable iff it declares `__toString` (Stringable); be
+        // lenient when the class isn't indexed (built-in / unknown).
+        Named { fqn, .. } => index.find_method(fqn, "__toString").is_some() || index.class(fqn).is_none(),
+        // scalars, `null`, `mixed`, `object`, `self`/`static`, templates, literals.
+        _ => true,
+    }
+}
+
 /// Whether a value of type `value` is assignable to a slot of type `target`.
 pub fn is_assignable(index: &ReflectionIndex, value: &Type, target: &Type) -> bool {
     use Type::*;

@@ -675,6 +675,51 @@ fn run_define_parameters(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
+/// `ImplodeParameterCastableToStringRule` — `implode`/`join`'s array argument
+/// must have elements castable to string. Uses the type map (`fa.type_of`) +
+/// `is_castable_to_string`; only fires when the element type is concrete and
+/// definitely not stringable (arrays of arrays, etc.) — false-positive-safe.
+fn run_implode_castable(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let fmap = function_refs(fa.resolved_refs);
+    let mut out = Vec::new();
+    crate::walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Call { callee, args } = &e.kind else { return };
+        let Some(r) = resolved_callee(callee, &fmap) else { return };
+        if !matches!(global_tail_lower(r).as_deref(), Some("implode") | Some("join")) {
+            return;
+        }
+        if args.iter().any(|a| a.spread || a.placeholder || a.name.is_some()) {
+            return;
+        }
+        // PHP 8: `implode($separator, $array)` or `implode($array)`. The array is
+        // the last positional argument.
+        let (idx, label) = match args.len() {
+            1 => (0usize, "#1 $array"),
+            2 => (1usize, "#2 $array"),
+            _ => return,
+        };
+        let arr_ty = fa.type_of(&args[idx].value);
+        let elem = match &arr_ty {
+            php_types::Type::Array(Some(kv)) => kv.1.clone(),
+            php_types::Type::List(v) => (**v).clone(),
+            _ => return, // unknown / non-array element type — leave to argument.type.
+        };
+        if !crate::is_castable_to_string(fa.reflection, &elem) {
+            out.push(
+                Diagnostic::error(
+                    e.span,
+                    format!(
+                        "Parameter {label} of function {} expects array<string>, {arr_ty} given.",
+                        global_tail_lower(r).unwrap_or_default()
+                    ),
+                )
+                .with_code("argument.type"),
+            );
+        }
+    });
+    out
+}
+
 /// `PrintfParametersRule` (count subset). For `printf`/`sprintf` with a constant
 /// (single literal) format string, count the conversion specifiers and compare
 /// to the number of value args. We only handle a literal format operand (no type
@@ -860,6 +905,12 @@ fn run_argument_count(fa: &FileAnalysis) -> Vec<Diagnostic> {
             _ => return,
         };
         let Some(func) = fa.reflection.function(&fqn) else { return };
+        // Built-in stub arity is unreliable (phpstorm-stubs omits defaults on some
+        // optional params and mis-counts variadics — phpstan uses a curated
+        // functionMap instead). Only check user-defined functions for arity.
+        if func.builtin {
+            return;
+        }
         let supplied = args.len();
         let variadic = func.params.iter().any(|p| p.variadic);
         let required = func.params.iter().filter(|p| !p.optional && !p.variadic).count();
@@ -1582,6 +1633,7 @@ pub(crate) static RULES: &[RuleEntry] = &[
     // Level 5 — arguments: count + types.
     RuleEntry { name: "arguments.count", level: 5, run: run_argument_count },
     RuleEntry { name: "argument.type", level: 5, run: run_argument_types },
+    RuleEntry { name: "argument.implodeCastable", level: 5, run: run_implode_castable },
     // Level 6 — missing typehints.
     RuleEntry { name: "missingType.return", level: 6, run: run_missing_function_return_type },
     RuleEntry { name: "missingType.parameter", level: 6, run: run_missing_function_parameter_type },
@@ -1591,6 +1643,39 @@ pub(crate) static RULES: &[RuleEntry] = &[
 mod tests {
     use super::*;
     use crate::testutil::codes;
+
+    // --- implode castable-to-string --------------------------------------
+
+    #[test]
+    fn implode_array_of_arrays_is_flagged() {
+        // $x is array<int, array<...>> -> elements not castable to string.
+        let src = "<?php $x = [[1], [2]]; echo implode(',', $x);";
+        assert_eq!(codes(src, run_implode_castable), ["argument.type"]);
+    }
+
+    #[test]
+    fn implode_array_of_strings_is_clean() {
+        let src = "<?php $x = ['a', 'b']; echo implode(',', $x);";
+        assert!(codes(src, run_implode_castable).is_empty());
+    }
+
+    #[test]
+    fn implode_array_of_ints_is_clean() {
+        let src = "<?php $x = [1, 2]; echo implode(',', $x);";
+        assert!(codes(src, run_implode_castable).is_empty());
+    }
+
+    #[test]
+    fn implode_single_arg_array_of_arrays_is_flagged() {
+        let src = "<?php $x = [[1]]; echo implode($x);";
+        assert_eq!(codes(src, run_implode_castable), ["argument.type"]);
+    }
+
+    #[test]
+    fn implode_untyped_array_is_clean() {
+        let src = "<?php function f(array $a) { return implode(',', $a); }";
+        assert!(codes(src, run_implode_castable).is_empty());
+    }
 
     // --- parameter name rules --------------------------------------------
 

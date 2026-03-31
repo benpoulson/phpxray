@@ -45,6 +45,18 @@ impl ReflectionIndex {
         Self::default()
     }
 
+    /// A fresh index pre-loaded with the typed built-in **function** signatures
+    /// (Cap #4). Project files added afterward (`add_file`) override a builtin of
+    /// the same FQN. This is what makes `argument.type` / return inference work
+    /// on `strlen`, `array_map`, … without any per-rule special-casing.
+    pub fn with_builtins() -> Self {
+        let mut idx = Self::new();
+        for fr in crate::builtins::builtin_functions() {
+            idx.functions.insert(key(&fr.fqn), fr);
+        }
+        idx
+    }
+
     /// Reflect every class and function in a parsed file and add them to the
     /// index. Later definitions of the same FQN overwrite earlier ones.
     pub fn add_file(&mut self, program: &Program, interner: &Interner) {
