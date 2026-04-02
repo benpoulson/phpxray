@@ -14,11 +14,13 @@
 
 mod assign;
 mod const_eval;
+mod definedness;
 mod flow;
 mod type_map;
 
 pub use assign::{is_assignable, is_castable_to_string};
 pub use const_eval::{eval_const, ConstVal};
+pub use definedness::{undefined_variables, UndefVar};
 pub use type_map::{type_map, TypeMap};
 
 use php_ast::{BinOp, CastKind, Expr, ExprKind, MemberName, Name, UnOp};

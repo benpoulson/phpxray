@@ -14,11 +14,14 @@
 //!   inferred type is a concrete non-object (scalar/array/null). Lenient: only
 //!   fires when the type is *known* non-cloneable.
 //!
+//! - **DefinedVariableRule** (`variable.undefined`, level 0) — a variable read
+//!   that is undefined (or, flow-sensitively, possibly undefined) on the path to
+//!   its use. Backed by the Cap #5 definedness lattice (`php_infer`), which bails
+//!   conservatively on scopes using `extract`/`$$x`/`eval`/… so it under-reports
+//!   rather than false-positives.
+//!
 //! Deferred (need real flow / definedness tracking we don't expose):
-//! - `DefinedVariableRule` (`variable.undefined`) — needs per-statement
-//!   definedness (phpstan's flow-sensitive scope); our flow pass doesn't track
-//!   "definitely undefined", so flagging would risk false positives.
-//! - `CompactVariablesRule` (`variable.undefined`) — same: needs the set of
+//! - `CompactVariablesRule` (`variable.undefined`) — needs the set of
 //!   defined variables at the `compact()` call site.
 //! - `IssetRule` / `NullCoalesceRule` / `EmptyRule` / `UnsetRule` — need the
 //!   "always-set / never-set" certainty of an expression (flow + offsets).
@@ -211,10 +214,44 @@ fn is_definitely_non_object(ty: &Type) -> bool {
     )
 }
 
+// ---------------------------------------------------------------------------
+// DefinedVariableRule — `variable.undefined`
+// ---------------------------------------------------------------------------
+
+/// `variable.undefined` (level 0): a variable read that is *definitely* undefined
+/// on the path to its use (phpstan's `Undefined variable:` case). Backed by the
+/// Cap #5 definedness lattice.
+fn run_defined_variable(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    crate::undefined_variables(fa.program, fa.interner)
+        .into_iter()
+        .filter(|u| u.definite)
+        .map(|u| {
+            Diagnostic::error(u.span, format!("Undefined variable: ${}", u.name))
+                .with_code("variable.undefined")
+        })
+        .collect()
+}
+
+/// `variable.undefined` (level 1): a variable read that is *possibly* undefined
+/// (assigned on only some paths). phpstan gates this behind
+/// `checkMaybeUndefinedVariables`, enabled from level 1.
+fn run_maybe_undefined_variable(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    crate::undefined_variables(fa.program, fa.interner)
+        .into_iter()
+        .filter(|u| !u.definite)
+        .map(|u| {
+            Diagnostic::error(u.span, format!("Variable ${} might not be defined.", u.name))
+                .with_code("variable.undefined")
+        })
+        .collect()
+}
+
 pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "global.this", level: 0, run: run_this_in_global },
     RuleEntry { name: "static.this", level: 0, run: run_this_in_static },
     RuleEntry { name: "assign.this", level: 0, run: run_invalid_this_assign },
+    RuleEntry { name: "variable.undefined", level: 0, run: run_defined_variable },
+    RuleEntry { name: "variable.maybeUndefined", level: 1, run: run_maybe_undefined_variable },
     RuleEntry { name: "clone.nonObject", level: 3, run: run_variable_cloning },
 ];
 
@@ -222,6 +259,111 @@ pub(crate) static RULES: &[RuleEntry] = &[
 mod tests {
     use super::*;
     use crate::testutil::codes;
+
+    // --- variable.undefined ----------------------------------------------
+
+    #[test]
+    fn undefined_variable_is_flagged() {
+        assert_eq!(
+            codes("<?php function f() { return $x; }", run_defined_variable),
+            ["variable.undefined"]
+        );
+    }
+
+    #[test]
+    fn assigned_variable_is_clean() {
+        assert!(codes("<?php function f() { $x = 1; return $x; }", run_defined_variable).is_empty());
+    }
+
+    #[test]
+    fn parameter_is_defined() {
+        assert!(codes("<?php function f($x) { return $x; }", run_defined_variable).is_empty());
+    }
+
+    #[test]
+    fn use_before_assign_is_flagged() {
+        assert_eq!(
+            codes("<?php function f() { echo $x; $x = 1; }", run_defined_variable),
+            ["variable.undefined"]
+        );
+    }
+
+    #[test]
+    fn maybe_undefined_after_if() {
+        // $x assigned only in the then-branch -> possibly undefined after.
+        let src = "<?php function f($c) { if ($c) { $x = 1; } return $x; }";
+        // Not a *definite* undefined, so the level-0 rule stays quiet...
+        assert!(codes(src, run_defined_variable).is_empty());
+        // ...but the level-1 maybe rule reports it.
+        assert_eq!(codes(src, run_maybe_undefined_variable), ["variable.undefined"]);
+    }
+
+    #[test]
+    fn defined_in_both_branches_is_clean() {
+        let src = "<?php function f($c) { if ($c) { $x = 1; } else { $x = 2; } return $x; }";
+        assert!(codes(src, run_defined_variable).is_empty());
+    }
+
+    #[test]
+    fn foreach_binding_is_defined_in_body() {
+        let src = "<?php function f(array $a) { foreach ($a as $v) { echo $v; } }";
+        assert!(codes(src, run_defined_variable).is_empty());
+    }
+
+    #[test]
+    fn list_destructuring_defines() {
+        let src = "<?php function f(array $a) { [$x, $y] = $a; return $x + $y; }";
+        assert!(codes(src, run_defined_variable).is_empty());
+    }
+
+    #[test]
+    fn isset_guard_is_not_a_read() {
+        let src = "<?php function f() { if (isset($x)) { return 1; } return 0; }";
+        assert!(codes(src, run_defined_variable).is_empty());
+    }
+
+    #[test]
+    fn coalesce_left_is_not_a_read() {
+        let src = "<?php function f() { return $x ?? 'default'; }";
+        assert!(codes(src, run_defined_variable).is_empty());
+    }
+
+    #[test]
+    fn extract_bails_the_scope() {
+        // extract() can define arbitrary variables -> no reports for this scope.
+        let src = "<?php function f(array $a) { extract($a); return $x; }";
+        assert!(codes(src, run_defined_variable).is_empty());
+    }
+
+    #[test]
+    fn byref_call_argument_is_not_flagged() {
+        // preg_match defines $m by reference; don't flag the bare-variable arg.
+        let src = "<?php function f() { preg_match('/x/', 'x', $m); return $m; }";
+        assert!(codes(src, run_defined_variable).is_empty());
+    }
+
+    #[test]
+    fn superglobal_is_defined() {
+        assert!(codes("<?php function f() { return $_GET['x']; }", run_defined_variable).is_empty());
+    }
+
+    #[test]
+    fn global_statement_defines() {
+        let src = "<?php function f() { global $config; return $config; }";
+        assert!(codes(src, run_defined_variable).is_empty());
+    }
+
+    #[test]
+    fn catch_variable_is_defined() {
+        let src = "<?php function f() { try { g(); } catch (\\Exception $e) { return $e; } return null; }";
+        assert!(codes(src, run_defined_variable).is_empty());
+    }
+
+    #[test]
+    fn closure_use_is_defined_inside() {
+        let src = "<?php function f() { $x = 1; return function () use ($x) { return $x; }; }";
+        assert!(codes(src, run_defined_variable).is_empty());
+    }
 
     // --- global.this -----------------------------------------------------
 
