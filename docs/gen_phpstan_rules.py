@@ -122,13 +122,14 @@ DONE = {
     "ImplodeParameterCastableToStringRule",
     # Cap #5: definedness lattice
     "DefinedVariableRule",
+    # Cap #8: callable-type resolution
+    "PipeOperatorRule", "CallCallablesRule",
 }
 # Rules we can't implement yet, with the reason.
 _TYPES = "needs the type system (operand/value types)"
 DEFERRED = {
     "DeprecatedCastRule": "lexer normalizes cast spelling; AST lacks (integer)/(boolean)/(double)/(binary) distinction",
     "RequireFileExistsRule": "needs the type system (const-string operand) + filesystem access",
-    "PipeOperatorRule": "needs the resolved callable type of the right operand",
     "NonexistentOffsetInArrayDimFetchRule": _TYPES,
     "InvalidKeyInArrayDimFetchRule": _TYPES,
     "InvalidKeyInArrayItemRule": _TYPES,

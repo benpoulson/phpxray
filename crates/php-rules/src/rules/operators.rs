@@ -39,7 +39,9 @@
 use crate::{walk, FileAnalysis, RuleEntry};
 use php_ast::{BinOp, Expr, ExprKind, UnOp};
 use php_diagnostics::Diagnostic;
+use php_resolve::{RefKind, Resolution, ResolvedRef};
 use php_types::Type;
+use std::collections::HashMap;
 
 /// Strip a single layer of `( … )`. phpstan's parser produces no parenthesis
 /// nodes, so structural checks should look through ours to stay faithful.
@@ -401,10 +403,87 @@ fn run_invalid_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// PipeOperatorRule — `pipe.byRef`
+// ---------------------------------------------------------------------------
+
+/// The `|>` pipe (`$x |> $callable`) feeds its left value to the callable's first
+/// parameter, which therefore may not be by-reference. We resolve the right
+/// operand to a callable signature (a closure/arrow-fn directly, or a
+/// first-class-callable `f(...)` / function-name string via reflection — including
+/// the typed built-ins from Cap #4) and flag a by-ref first parameter.
+fn run_pipe_byref(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let fmap: HashMap<(u32, u32), &ResolvedRef> = fa
+        .resolved_refs
+        .iter()
+        .filter(|r| r.kind == RefKind::Function)
+        .map(|r| ((r.span.start, r.span.end), r))
+        .collect();
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Binary { op: BinOp::Pipe, rhs, .. } = &e.kind else { return };
+        if let Some((true, name)) = callable_first_param(fa, rhs, &fmap) {
+            let suffix = if name.is_empty() { String::new() } else { format!(" ${name}") };
+            out.push(
+                Diagnostic::error(
+                    rhs.span,
+                    format!(
+                        "Parameter #1{suffix} of callable on the right side of pipe operator is passed by reference."
+                    ),
+                )
+                .with_code("pipe.byRef"),
+            );
+        }
+    });
+    out
+}
+
+/// Resolve a callable expression to `(first_param_is_by_ref, first_param_name)`.
+fn callable_first_param(
+    fa: &FileAnalysis,
+    e: &Expr,
+    fmap: &HashMap<(u32, u32), &ResolvedRef>,
+) -> Option<(bool, String)> {
+    match &e.kind {
+        ExprKind::Closure(c) => {
+            c.params.first().map(|p| (p.by_ref, fa.interner.resolve(p.name).to_string()))
+        }
+        ExprKind::ArrowFn(a) => {
+            a.params.first().map(|p| (p.by_ref, fa.interner.resolve(p.name).to_string()))
+        }
+        // First-class-callable `f(...)`.
+        ExprKind::Call { callee, args } if args.iter().any(|a| a.placeholder) => {
+            let ExprKind::Name(n) = &callee.kind else { return None };
+            let r = fmap.get(&(n.span.start, n.span.end))?;
+            let fqn = match &r.resolution {
+                Resolution::Fqn(f) => f.clone(),
+                Resolution::Fallback { namespaced, global } => {
+                    if fa.reflection.function(namespaced).is_some() {
+                        namespaced.clone()
+                    } else {
+                        global.clone()
+                    }
+                }
+                _ => return None,
+            };
+            let f = fa.reflection.function(&fqn)?;
+            f.params.first().map(|p| (p.by_ref, p.name.clone()))
+        }
+        // A function-name string literal.
+        ExprKind::Str(b) => {
+            let name = std::str::from_utf8(b).ok()?;
+            let f = fa.reflection.function(name)?;
+            f.params.first().map(|p| (p.by_ref, p.name.clone()))
+        }
+        _ => None,
+    }
+}
+
 pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "operators.invalidAssignVar", level: 0, run: run_invalid_assign_var },
     RuleEntry { name: "operators.invalidIncDec", level: 0, run: run_invalid_inc_dec },
     RuleEntry { name: "operators.backtick", level: 0, run: run_backtick },
+    RuleEntry { name: "operators.pipeByRef", level: 0, run: run_pipe_byref },
     RuleEntry { name: "operators.invalidBinary", level: 2, run: run_invalid_binary },
     RuleEntry { name: "operators.invalidUnary", level: 2, run: run_invalid_unary },
     RuleEntry { name: "operators.invalidComparison", level: 2, run: run_invalid_comparison },
@@ -414,6 +493,39 @@ pub(crate) static RULES: &[RuleEntry] = &[
 mod tests {
     use super::*;
     use crate::testutil::codes;
+
+    // --- PipeOperatorRule (pipe.byRef) ----------------------------------------
+
+    #[test]
+    fn pipe_into_byref_closure_is_flagged() {
+        let src = "<?php $r = 1 |> function (&$x) { return $x; };";
+        assert_eq!(codes(src, run_pipe_byref), ["pipe.byRef"]);
+    }
+
+    #[test]
+    fn pipe_into_byval_closure_is_clean() {
+        let src = "<?php $r = 1 |> function ($x) { return $x; };";
+        assert!(codes(src, run_pipe_byref).is_empty());
+    }
+
+    #[test]
+    fn pipe_into_byref_arrow_is_flagged() {
+        let src = "<?php $r = 1 |> fn (&$x) => $x;";
+        assert_eq!(codes(src, run_pipe_byref), ["pipe.byRef"]);
+    }
+
+    #[test]
+    fn pipe_into_user_function_first_class_callable() {
+        // A by-ref-first-param function piped via first-class-callable syntax.
+        let src = "<?php function inc(int &$n): void { $n++; } $r = 1 |> inc(...);";
+        assert_eq!(codes(src, run_pipe_byref), ["pipe.byRef"]);
+    }
+
+    #[test]
+    fn pipe_into_normal_function_is_clean() {
+        let src = "<?php function dbl(int $n): int { return $n * 2; } $r = 1 |> dbl(...);";
+        assert!(codes(src, run_pipe_byref).is_empty());
+    }
 
     // --- InvalidAssignVarRule -------------------------------------------------
 

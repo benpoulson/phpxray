@@ -675,6 +675,38 @@ fn run_define_parameters(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
+/// `CallCallablesRule` (`callable.nonCallable`, subset) — invoking a value that
+/// is definitely not callable, e.g. `$n = 5; $n();`. Conservative: only fires for
+/// concrete non-callable scalars (`int`/`float`/`bool`/`null`), never for
+/// `string`/`array`/objects (which *can* be callables) or `mixed`/unknown.
+fn run_invoke_non_callable(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    crate::walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Call { callee, args } = &e.kind else { return };
+        // A named call (`foo()`) is a function reference, not a value invocation;
+        // `f(...)` is a first-class-callable, not an invocation.
+        if matches!(callee.kind, ExprKind::Name(_)) || args.iter().any(|a| a.placeholder) {
+            return;
+        }
+        let t = fa.type_of(callee);
+        if is_definitely_not_callable(&t) {
+            out.push(
+                Diagnostic::error(
+                    e.span,
+                    format!("Trying to invoke {t} but it's not a callable."),
+                )
+                .with_code("callable.nonCallable"),
+            );
+        }
+    });
+    out
+}
+
+fn is_definitely_not_callable(t: &php_types::Type) -> bool {
+    use php_types::Type::*;
+    matches!(t, Int | Float | Bool | True | False | Null | LiteralInt(_) | Void | Never)
+}
+
 /// `ImplodeParameterCastableToStringRule` — `implode`/`join`'s array argument
 /// must have elements castable to string. Uses the type map (`fa.type_of`) +
 /// `is_castable_to_string`; only fires when the element type is concrete and
@@ -1634,6 +1666,8 @@ pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "arguments.count", level: 5, run: run_argument_count },
     RuleEntry { name: "argument.type", level: 5, run: run_argument_types },
     RuleEntry { name: "argument.implodeCastable", level: 5, run: run_implode_castable },
+    // Level 2 — invoking a non-callable value.
+    RuleEntry { name: "callable.nonCallable", level: 2, run: run_invoke_non_callable },
     // Level 6 — missing typehints.
     RuleEntry { name: "missingType.return", level: 6, run: run_missing_function_return_type },
     RuleEntry { name: "missingType.parameter", level: 6, run: run_missing_function_parameter_type },
@@ -1643,6 +1677,32 @@ pub(crate) static RULES: &[RuleEntry] = &[
 mod tests {
     use super::*;
     use crate::testutil::codes;
+
+    // --- callable.nonCallable --------------------------------------------
+
+    #[test]
+    fn invoking_int_is_flagged() {
+        let src = "<?php function f() { $n = 5; return $n(); }";
+        assert_eq!(codes(src, run_invoke_non_callable), ["callable.nonCallable"]);
+    }
+
+    #[test]
+    fn invoking_closure_is_clean() {
+        let src = "<?php function f() { $g = fn() => 1; return $g(); }";
+        assert!(codes(src, run_invoke_non_callable).is_empty());
+    }
+
+    #[test]
+    fn invoking_string_is_clean() {
+        // A string may be a function name -> not flagged.
+        let src = "<?php function f() { $s = 'strlen'; return $s('x'); }";
+        assert!(codes(src, run_invoke_non_callable).is_empty());
+    }
+
+    #[test]
+    fn named_call_is_not_invocation() {
+        assert!(codes("<?php strlen('x');", run_invoke_non_callable).is_empty());
+    }
 
     // --- implode castable-to-string --------------------------------------
 
