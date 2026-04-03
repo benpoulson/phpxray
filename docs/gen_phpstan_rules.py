@@ -124,6 +124,9 @@ DONE = {
     "DefinedVariableRule",
     # Cap #8: callable-type resolution
     "PipeOperatorRule", "CallCallablesRule",
+    # Cap #6: by-ref / @param-out flow (parameter.notByRef is part of the
+    # already-ticked IncompatiblePhpDocTypeRule; the foreach rule is toggle-gated)
+    "AssignToByRefExprFromForeachRule",
 }
 # Rules we can't implement yet, with the reason.
 _TYPES = "needs the type system (operand/value types)"

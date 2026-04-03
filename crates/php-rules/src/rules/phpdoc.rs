@@ -32,10 +32,6 @@
 //! - `varTag.unknownClass` / `InvalidPhpDocVarTagTypeRule`: still need a
 //!   "does this class exist?" query at the `@var` doc/native boundary (the
 //!   `@param`/`@return` subtype check is now done — see above).
-//! - `parameter.notByRef`: phpstan emits this for `@param-out` tags on a
-//!   non-by-ref parameter. Our `php_phpdoc` model does not surface `@param-out`
-//!   as a distinct tag, so the rule is deferred (emitting it for `@param &$x`
-//!   would be the wrong semantics).
 //! - `InvalidThrowsPhpDocValueRule` (`throws.notThrowable`): needs to know
 //!   whether the `@throws` type is a `Throwable` subtype — a type/reflection
 //!   query, deferred to the type-rule wave.
@@ -156,6 +152,65 @@ fn run_param_tags(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 if let Member::Method(mth) = m {
                     if let Some(doc) = &mth.doc {
                         check_params(doc, &mth.params, fa.interner, s.span, &mut out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    });
+    out
+}
+
+// --- parameter.notByRef (@param-out on a non-by-ref param) ------------------
+
+/// `@param-out $x` documents what a function writes back through a by-reference
+/// parameter — so `$x` must actually be declared `&$x`. Mirrors phpstan's
+/// `parameter.notByRef` (from `IncompatiblePhpDocTypeCheck`).
+fn check_param_out(
+    doc_raw: &str,
+    params: &[Param],
+    interner: &Interner,
+    span: Span,
+    out: &mut Vec<Diagnostic>,
+) {
+    let block = php_phpdoc::parse_block(doc_raw);
+    for tag in &block.tags {
+        let (base, prefix) = strip_doc_prefix(&tag.name);
+        if base != "param-out" || prefix == Some("psalm") {
+            continue;
+        }
+        // `@param-out` shares `@param`'s "Type $name" grammar — reuse the parser.
+        let parsed = php_phpdoc::parse(&format!("/** @param {} */", tag.value));
+        let Some(p) = parsed.params.first() else { continue };
+        let Some(name) = &p.name else { continue };
+        if let Some(np) = params.iter().find(|np| interner.resolve(np.name) == name) {
+            if !np.by_ref {
+                out.push(
+                    Diagnostic::error(
+                        span,
+                        format!("Parameter ${name} for PHPDoc tag @param-out is not passed by reference."),
+                    )
+                    .with_code("parameter.notByRef"),
+                );
+            }
+        }
+    }
+}
+
+/// `parameter.notByRef` — walk every function & method.
+fn run_param_out_tags(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    walk::for_each_stmt(fa.program, &mut |s| match &s.kind {
+        StmtKind::Function(f) => {
+            if let Some(doc) = &f.doc {
+                check_param_out(doc, &f.params, fa.interner, s.span, &mut out);
+            }
+        }
+        StmtKind::Class(c) => {
+            for m in &c.members {
+                if let Member::Method(mth) = m {
+                    if let Some(doc) = &mth.doc {
+                        check_param_out(doc, &mth.params, fa.interner, s.span, &mut out);
                     }
                 }
             }
@@ -441,6 +496,7 @@ pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "phpdoc.varTags", level: 2, run: run_var_tags },
     RuleEntry { name: "phpdoc.phpstanTag", level: 2, run: run_phpstan_tags },
     RuleEntry { name: "phpdoc.incompatibleType", level: 2, run: run_incompatible_types },
+    RuleEntry { name: "phpdoc.paramOut", level: 2, run: run_param_out_tags },
 ];
 
 #[cfg(test)]
@@ -625,5 +681,31 @@ mod tests {
     fn int_to_float_widening_param_is_clean() {
         let src = "<?php /** @param int $a */ function f(float $a) {}";
         assert!(codes(src, run_incompatible_types).is_empty());
+    }
+
+    // --- parameter.notByRef (@param-out) ---
+
+    #[test]
+    fn param_out_on_non_byref_is_flagged() {
+        let src = "<?php /** @param-out int $x */ function f($x) {}";
+        assert_eq!(codes(src, run_param_out_tags), ["parameter.notByRef"]);
+    }
+
+    #[test]
+    fn param_out_on_byref_is_clean() {
+        let src = "<?php /** @param-out int $x */ function f(&$x) {}";
+        assert!(codes(src, run_param_out_tags).is_empty());
+    }
+
+    #[test]
+    fn plain_param_is_not_param_out() {
+        let src = "<?php /** @param int $x */ function f($x) {}";
+        assert!(codes(src, run_param_out_tags).is_empty());
+    }
+
+    #[test]
+    fn param_out_on_method_is_checked() {
+        let src = "<?php class C { /** @param-out int $x */ function m($x) {} }";
+        assert_eq!(codes(src, run_param_out_tags), ["parameter.notByRef"]);
     }
 }

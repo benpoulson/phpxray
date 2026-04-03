@@ -25,15 +25,16 @@
 //!   defined variables at the `compact()` call site.
 //! - `IssetRule` / `NullCoalesceRule` / `EmptyRule` / `UnsetRule` — need the
 //!   "always-set / never-set" certainty of an expression (flow + offsets).
-//! - `AssignToByRefExprFromForeachRule`, `ParameterOut*` — need by-ref / out
-//!   parameter flow modelling.
+//! - **AssignToByRefExprFromForeachRule** (`assign.byRefForeachExpr`, level 0) —
+//!   assigning to a dangling by-ref `foreach` variable after the loop (Cap #6).
 
 #![allow(unused_imports)]
 use crate::{walk, FileAnalysis, RuleEntry};
-use php_ast::{ClassDecl, ExprKind, Member, Stmt, StmtKind};
+use php_ast::{ClassDecl, Expr, ExprKind, Member, Stmt, StmtKind};
 use php_diagnostics::Diagnostic;
 use php_resolve::for_each_region;
 use php_types::Type;
+use std::collections::HashSet;
 
 // ---------------------------------------------------------------------------
 // ThisInGlobalStatementRule — `global $this;`
@@ -246,8 +247,113 @@ fn run_maybe_undefined_variable(fa: &FileAnalysis) -> Vec<Diagnostic> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// AssignToByRefExprFromForeachRule — `assign.byRefForeachExpr`
+// ---------------------------------------------------------------------------
+
+/// After `foreach ($arr as &$v) { … }`, `$v` is a dangling reference to the last
+/// element; assigning to `$v` afterwards (without `unset($v)`) silently
+/// overwrites that element. We track, in execution order within each scope, the
+/// set of "dangling" by-ref foreach variables and flag a later plain assignment
+/// to one. `unset`/re-binding clears it. Conservative (direct `$v = …` only).
+fn run_byref_foreach(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    let mut dangling = HashSet::new();
+    byref_seq(&fa.program.stmts, fa, &mut dangling, &mut out);
+    out
+}
+
+fn byref_seq(stmts: &[Stmt], fa: &FileAnalysis, dangling: &mut HashSet<String>, out: &mut Vec<Diagnostic>) {
+    for s in stmts {
+        byref_stmt(s, fa, dangling, out);
+    }
+}
+
+fn byref_stmt(s: &Stmt, fa: &FileAnalysis, dangling: &mut HashSet<String>, out: &mut Vec<Diagnostic>) {
+    let var_name = |e: &Expr| match &e.kind {
+        ExprKind::Variable(sym) => Some(fa.interner.resolve(*sym).to_string()),
+        _ => None,
+    };
+    match &s.kind {
+        StmtKind::Foreach { value, by_ref, body, .. } => {
+            byref_stmt(body, fa, dangling, out);
+            if let Some(name) = var_name(value) {
+                // by-ref arms the variable; by-value rebinds (clears) it.
+                if *by_ref {
+                    dangling.insert(name);
+                } else {
+                    dangling.remove(&name);
+                }
+            }
+        }
+        StmtKind::Expr(e) => {
+            if let ExprKind::Assign { target, .. } = &e.kind {
+                if let Some(name) = var_name(target) {
+                    if dangling.remove(&name) {
+                        out.push(
+                            Diagnostic::error(
+                                e.span,
+                                format!("Assign to ${name} overwrites the last element from array."),
+                            )
+                            .with_code("assign.byRefForeachExpr"),
+                        );
+                    }
+                }
+            }
+        }
+        StmtKind::Unset(vars) => {
+            for v in vars {
+                if let Some(name) = var_name(v) {
+                    dangling.remove(&name);
+                }
+            }
+        }
+        StmtKind::Block(b) => byref_seq(b, fa, dangling, out),
+        StmtKind::If { then, elseifs, els, .. } => {
+            byref_stmt(then, fa, dangling, out);
+            for ei in elseifs {
+                byref_stmt(&ei.body, fa, dangling, out);
+            }
+            if let Some(e) = els {
+                byref_stmt(e, fa, dangling, out);
+            }
+        }
+        StmtKind::While { body, .. } | StmtKind::DoWhile { body, .. } | StmtKind::For { body, .. } => {
+            byref_stmt(body, fa, dangling, out);
+        }
+        StmtKind::Switch { cases, .. } => {
+            for c in cases {
+                byref_seq(&c.body, fa, dangling, out);
+            }
+        }
+        StmtKind::Try { body, catches, finally } => {
+            byref_seq(body, fa, dangling, out);
+            for c in catches {
+                byref_seq(&c.body, fa, dangling, out);
+            }
+            if let Some(f) = finally {
+                byref_seq(f, fa, dangling, out);
+            }
+        }
+        // New scopes get a fresh dangling set.
+        StmtKind::Function(f) => byref_seq(&f.body, fa, &mut HashSet::new(), out),
+        StmtKind::Class(c) => {
+            for m in &c.members {
+                if let Member::Method(md) = m {
+                    if let Some(b) = &md.body {
+                        byref_seq(b, fa, &mut HashSet::new(), out);
+                    }
+                }
+            }
+        }
+        StmtKind::Namespace { body: Some(b), .. } => byref_seq(b, fa, dangling, out),
+        _ => {}
+    }
+}
+
 pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "global.this", level: 0, run: run_this_in_global },
+    RuleEntry { name: "assign.byRefForeachExpr", level: 0, run: run_byref_foreach },
     RuleEntry { name: "static.this", level: 0, run: run_this_in_static },
     RuleEntry { name: "assign.this", level: 0, run: run_invalid_this_assign },
     RuleEntry { name: "variable.undefined", level: 0, run: run_defined_variable },
@@ -363,6 +469,32 @@ mod tests {
     fn closure_use_is_defined_inside() {
         let src = "<?php function f() { $x = 1; return function () use ($x) { return $x; }; }";
         assert!(codes(src, run_defined_variable).is_empty());
+    }
+
+    // --- assign.byRefForeachExpr -----------------------------------------
+
+    #[test]
+    fn assign_to_dangling_byref_foreach_var_is_flagged() {
+        let src = "<?php function f(array $a) { foreach ($a as &$v) {} $v = 1; }";
+        assert_eq!(codes(src, run_byref_foreach), ["assign.byRefForeachExpr"]);
+    }
+
+    #[test]
+    fn unset_after_foreach_clears_it() {
+        let src = "<?php function f(array $a) { foreach ($a as &$v) {} unset($v); $v = 1; }";
+        assert!(codes(src, run_byref_foreach).is_empty());
+    }
+
+    #[test]
+    fn byvalue_foreach_is_clean() {
+        let src = "<?php function f(array $a) { foreach ($a as $v) {} $v = 1; }";
+        assert!(codes(src, run_byref_foreach).is_empty());
+    }
+
+    #[test]
+    fn assign_inside_foreach_body_is_clean() {
+        let src = "<?php function f(array $a) { foreach ($a as &$v) { $v = 1; } }";
+        assert!(codes(src, run_byref_foreach).is_empty());
     }
 
     // --- global.this -----------------------------------------------------
