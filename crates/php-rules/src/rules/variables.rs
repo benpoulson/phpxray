@@ -20,9 +20,15 @@
 //!   conservatively on scopes using `extract`/`$$x`/`eval`/… so it under-reports
 //!   rather than false-positives.
 //!
+//! - **CompactVariablesRule** (`variable.undefined`, level 0) — a constant-string
+//!   argument to `compact()` (directly, or nested in an array literal) that names
+//!   a variable never bound anywhere in the enclosing scope. We answer at *scope*
+//!   granularity (never-assigned ⇒ definitely undefined), not flow-position
+//!   granularity: this under-reports (misses use-before-assign) but cannot false-
+//!   positive. The scope is skipped entirely when it uses an escape hatch
+//!   (`extract`/`$$x`/`eval`/…) that could define arbitrary variables.
+//!
 //! Deferred (need real flow / definedness tracking we don't expose):
-//! - `CompactVariablesRule` (`variable.undefined`) — needs the set of
-//!   defined variables at the `compact()` call site.
 //! - `IssetRule` / `NullCoalesceRule` / `EmptyRule` / `UnsetRule` — need the
 //!   "always-set / never-set" certainty of an expression (flow + offsets).
 //! - **AssignToByRefExprFromForeachRule** (`assign.byRefForeachExpr`, level 0) —
@@ -30,8 +36,12 @@
 
 #![allow(unused_imports)]
 use crate::{walk, FileAnalysis, RuleEntry};
-use php_ast::{ClassDecl, Expr, ExprKind, Member, Stmt, StmtKind};
+use php_ast::{
+    Arg, ArrowFn, ClassDecl, ClosureExpr, Expr, ExprKind, FunctionDecl, Member, MethodDecl, Param,
+    Program, Stmt, StmtKind,
+};
 use php_diagnostics::Diagnostic;
+use php_intern::Interner;
 use php_resolve::for_each_region;
 use php_types::Type;
 use std::collections::HashSet;
@@ -351,8 +361,288 @@ fn byref_stmt(s: &Stmt, fa: &FileAnalysis, dangling: &mut HashSet<String>, out: 
     }
 }
 
+// ---------------------------------------------------------------------------
+// CompactVariablesRule — `compact('undefinedVar')`
+// ---------------------------------------------------------------------------
+
+/// PHP superglobals + always-available variables (never "undefined").
+const ALWAYS_DEFINED: &[&str] = &[
+    "GLOBALS", "_SERVER", "_GET", "_POST", "_FILES", "_COOKIE", "_SESSION", "_REQUEST", "_ENV",
+    "this", "http_response_header", "argc", "argv", "php_errormsg",
+];
+
+/// Functions that can introduce arbitrary variables into a scope — their presence
+/// makes scope-level "never assigned" reasoning unsafe, so we skip the scope.
+const ESCAPE_FUNCTIONS: &[&str] = &["extract", "parse_str", "mb_parse_str", "eval", "get_defined_vars"];
+
+/// `compact('x')` (or `compact(['x', 'y'])`) naming a variable that is never
+/// bound anywhere in the enclosing scope. Mirrors phpstan's
+/// `CompactVariablesRule` for the definite-undefined case (`$scopeHasVariable->no()`).
+fn run_compact_variables(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    // Each scope: collect the names it ever binds, then check its compact() calls.
+    // The global region is one scope; functions/methods/closures/arrows are their
+    // own scopes (a captured/param/global var bound there is "defined").
+    check_scope(&fa.program.stmts, &HashSet::new(), fa, &mut out);
+    out
+}
+
+/// Analyse one scope. `seed` holds names defined by the signature/captures.
+fn check_scope(body: &[Stmt], seed: &HashSet<String>, fa: &FileAnalysis, out: &mut Vec<Diagnostic>) {
+    // Descend into nested scopes regardless (they're checked independently).
+    descend_scopes(body, fa, out);
+
+    if scope_has_escape(body, fa.interner) {
+        return; // can't reason about definedness in this scope
+    }
+
+    // All variables ever bound anywhere in this scope (flow-insensitive: a name
+    // bound on *any* path means it's not "never defined").
+    let mut bound: HashSet<String> = seed.clone();
+    for s in body {
+        collect_bound(s, fa.interner, &mut bound);
+    }
+
+    // Check every compact() call in this scope (not crossing into nested scopes).
+    for s in body {
+        walk::for_each_expr_in_scope(s, &mut |e| {
+            let Some(args) = compact_args(e, fa) else { return };
+            for arg in args {
+                for (name, span) in constant_string_names(&arg.value) {
+                    if ALWAYS_DEFINED.contains(&name.as_str()) || bound.contains(&name) {
+                        continue;
+                    }
+                    out.push(
+                        Diagnostic::error(
+                            span,
+                            format!("Call to function compact() contains undefined variable ${name}."),
+                        )
+                        .with_code("variable.undefined"),
+                    );
+                }
+            }
+        });
+    }
+}
+
+/// Recurse into nested function/method/closure/arrow scopes, seeding each with
+/// its parameter (and closure-`use`) names.
+fn descend_scopes(body: &[Stmt], fa: &FileAnalysis, out: &mut Vec<Diagnostic>) {
+    for s in body {
+        match &s.kind {
+            StmtKind::Function(f) => check_scope(&f.body, &param_names(&f.params, fa.interner), fa, out),
+            StmtKind::Class(c) => {
+                for m in &c.members {
+                    if let Member::Method(md) = m {
+                        if let Some(b) = &md.body {
+                            check_scope(b, &param_names(&md.params, fa.interner), fa, out);
+                        }
+                    }
+                }
+            }
+            StmtKind::Namespace { body: Some(b), .. } => descend_scopes(b, fa, out),
+            _ => {}
+        }
+        // Closures / arrow-fns appear inside expressions; find them too.
+        walk::for_each_expr_in_scope(s, &mut |e| match &e.kind {
+            ExprKind::Closure(cl) => {
+                let mut seed = param_names(&cl.params, fa.interner);
+                for u in &cl.uses {
+                    seed.insert(fa.interner.resolve(u.name).to_string());
+                }
+                check_scope(&cl.body, &seed, fa, out);
+            }
+            ExprKind::ArrowFn(_) => {} // single-expr body can't contain compact() bindings worth checking; arrow captures all outer vars by value anyway
+            _ => {}
+        });
+    }
+}
+
+fn param_names(params: &[Param], i: &Interner) -> HashSet<String> {
+    params.iter().map(|p| i.resolve(p.name).to_string()).collect()
+}
+
+/// If `e` is a call to the global `compact(...)`, return its arguments.
+fn compact_args<'a>(e: &'a Expr, _fa: &FileAnalysis) -> Option<&'a [Arg]> {
+    let ExprKind::Call { callee, args } = &e.kind else { return None };
+    let ExprKind::Name(n) = &callee.kind else { return None };
+    let last = n.text.rsplit('\\').next().unwrap_or(&n.text);
+    (last.eq_ignore_ascii_case("compact")).then_some(args.as_slice())
+}
+
+/// Collect the constant-string variable names an argument denotes: a bare string
+/// literal, or string literals nested in an array literal. Each with the span to
+/// report at. Non-constant arguments yield nothing (we can't know the name).
+fn constant_string_names(e: &Expr) -> Vec<(String, php_span::Span)> {
+    let mut out = Vec::new();
+    collect_const_strings(e, &mut out);
+    out
+}
+
+fn collect_const_strings(e: &Expr, out: &mut Vec<(String, php_span::Span)>) {
+    match &e.kind {
+        ExprKind::Str(bytes) => {
+            if let Ok(s) = std::str::from_utf8(bytes) {
+                out.push((s.to_string(), e.span));
+            }
+        }
+        ExprKind::Array { items, .. } => {
+            for it in items {
+                if let Some(v) = &it.value {
+                    collect_const_strings(v, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether `body` contains an escape-hatch construct in *this* scope (not
+/// crossing into nested function-likes).
+fn scope_has_escape(body: &[Stmt], _i: &Interner) -> bool {
+    let mut found = false;
+    for s in body {
+        walk::for_each_expr_in_scope(s, &mut |e| {
+            if found {
+                return;
+            }
+            match &e.kind {
+                ExprKind::VariableVariable(_)
+                | ExprKind::DollarBrace(_)
+                | ExprKind::Eval(_)
+                | ExprKind::Include { .. } => found = true,
+                ExprKind::Call { callee, .. } => {
+                    if let ExprKind::Name(n) = &callee.kind {
+                        let last = n.text.rsplit('\\').next().unwrap_or(&n.text).to_ascii_lowercase();
+                        if ESCAPE_FUNCTIONS.contains(&last.as_str()) {
+                            found = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        });
+    }
+    found
+}
+
+/// Collect every variable name bound by statement `s` in this scope (assignments,
+/// foreach bindings, catch vars, global/static, by-ref call args, list-destructure,
+/// `&$x` array elements). Flow-insensitive: any binding on any path counts.
+fn collect_bound(s: &Stmt, i: &Interner, bound: &mut HashSet<String>) {
+    match &s.kind {
+        StmtKind::Global(vars) | StmtKind::Unset(vars) => {
+            for v in vars {
+                if let ExprKind::Variable(sym) = &v.kind {
+                    bound.insert(i.resolve(*sym).to_string());
+                }
+            }
+        }
+        StmtKind::StaticVars(vars) => {
+            for sv in vars {
+                bound.insert(i.resolve(sv.name).to_string());
+            }
+        }
+        StmtKind::Foreach { key, value, body, .. } => {
+            if let Some(k) = key {
+                bind_target(k, i, bound);
+            }
+            bind_target(value, i, bound);
+            collect_bound(body, i, bound);
+        }
+        StmtKind::Try { body, catches, finally } => {
+            for st in body {
+                collect_bound(st, i, bound);
+            }
+            for c in catches {
+                if let Some(v) = c.var {
+                    bound.insert(i.resolve(v).to_string());
+                }
+                for st in &c.body {
+                    collect_bound(st, i, bound);
+                }
+            }
+            if let Some(f) = finally {
+                for st in f {
+                    collect_bound(st, i, bound);
+                }
+            }
+        }
+        StmtKind::Block(b) => b.iter().for_each(|st| collect_bound(st, i, bound)),
+        StmtKind::If { then, elseifs, els, .. } => {
+            collect_bound(then, i, bound);
+            for ei in elseifs {
+                collect_bound(&ei.body, i, bound);
+            }
+            if let Some(e) = els {
+                collect_bound(e, i, bound);
+            }
+        }
+        StmtKind::While { body, .. } | StmtKind::DoWhile { body, .. } | StmtKind::For { body, .. } => {
+            collect_bound(body, i, bound)
+        }
+        StmtKind::Switch { cases, .. } => {
+            for c in cases {
+                for st in &c.body {
+                    collect_bound(st, i, bound);
+                }
+            }
+        }
+        StmtKind::Namespace { body: Some(b), .. } => b.iter().for_each(|st| collect_bound(st, i, bound)),
+        StmtKind::Declare { body: Some(b), .. } => collect_bound(b, i, bound),
+        // Don't descend into nested function/class scopes for *this* scope's binds.
+        StmtKind::Function(_) | StmtKind::Class(_) => {}
+        _ => {
+            // Any other statement: scan its expressions (in this scope) for the
+            // variables they assign/bind.
+            walk::for_each_expr_in_scope(s, &mut |e| collect_bound_expr(e, i, bound));
+        }
+    }
+}
+
+/// Collect variables that expression `e` binds (assignment targets, by-ref args).
+fn collect_bound_expr(e: &Expr, i: &Interner, bound: &mut HashSet<String>) {
+    match &e.kind {
+        ExprKind::Assign { target, .. }
+        | ExprKind::AssignOp { target, .. }
+        | ExprKind::AssignRef { target, .. } => bind_target(target, i, bound),
+        ExprKind::PreInc(t) | ExprKind::PreDec(t) | ExprKind::PostInc(t) | ExprKind::PostDec(t) => {
+            bind_target(t, i, bound)
+        }
+        // A bare `$var` passed to a call may be a by-ref out-parameter ⇒ defines it.
+        ExprKind::Call { args, .. } | ExprKind::MethodCall { args, .. } | ExprKind::StaticCall { args, .. } => {
+            for a in args {
+                if let ExprKind::Variable(sym) = &a.value.kind {
+                    bound.insert(i.resolve(*sym).to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Record the variables an assignment *target* introduces (`$x`, `[$a,$b]`,
+/// `$arr[…]` base, `&$x` array elements).
+fn bind_target(target: &Expr, i: &Interner, bound: &mut HashSet<String>) {
+    match &target.kind {
+        ExprKind::Variable(sym) => {
+            bound.insert(i.resolve(*sym).to_string());
+        }
+        ExprKind::Array { items, .. } => {
+            for it in items {
+                if let Some(v) = &it.value {
+                    bind_target(v, i, bound);
+                }
+            }
+        }
+        ExprKind::Index { base, .. } => bind_target(base, i, bound),
+        _ => {}
+    }
+}
+
 pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "global.this", level: 0, run: run_this_in_global },
+    RuleEntry { name: "variable.undefined/compact", level: 0, run: run_compact_variables },
     RuleEntry { name: "assign.byRefForeachExpr", level: 0, run: run_byref_foreach },
     RuleEntry { name: "static.this", level: 0, run: run_this_in_static },
     RuleEntry { name: "assign.this", level: 0, run: run_invalid_this_assign },
@@ -469,6 +759,76 @@ mod tests {
     fn closure_use_is_defined_inside() {
         let src = "<?php function f() { $x = 1; return function () use ($x) { return $x; }; }";
         assert!(codes(src, run_defined_variable).is_empty());
+    }
+
+    // --- variable.undefined/compact --------------------------------------
+
+    #[test]
+    fn compact_undefined_variable_is_flagged() {
+        let src = "<?php function f() { $a = 1; return compact('a', 'b'); }";
+        assert_eq!(codes(src, run_compact_variables), ["variable.undefined"]);
+    }
+
+    #[test]
+    fn compact_all_defined_is_clean() {
+        let src = "<?php function f() { $a = 1; $b = 2; return compact('a', 'b'); }";
+        assert!(codes(src, run_compact_variables).is_empty());
+    }
+
+    #[test]
+    fn compact_parameter_is_defined() {
+        let src = "<?php function f($a) { return compact('a'); }";
+        assert!(codes(src, run_compact_variables).is_empty());
+    }
+
+    #[test]
+    fn compact_array_argument_is_checked() {
+        let src = "<?php function f() { $a = 1; return compact(['a', 'b']); }";
+        assert_eq!(codes(src, run_compact_variables), ["variable.undefined"]);
+    }
+
+    #[test]
+    fn compact_superglobal_is_defined() {
+        let src = "<?php function f() { return compact('_GET'); }";
+        assert!(codes(src, run_compact_variables).is_empty());
+    }
+
+    #[test]
+    fn compact_with_extract_is_skipped() {
+        // extract() can define arbitrary variables ⇒ scope skipped (no FP).
+        let src = "<?php function f(array $d) { extract($d); return compact('whatever'); }";
+        assert!(codes(src, run_compact_variables).is_empty());
+    }
+
+    #[test]
+    fn compact_non_constant_argument_is_ignored() {
+        let src = "<?php function f(string $name) { return compact($name); }";
+        assert!(codes(src, run_compact_variables).is_empty());
+    }
+
+    #[test]
+    fn compact_variable_bound_later_is_clean() {
+        // Scope-granular: bound anywhere in the scope ⇒ not "never defined".
+        let src = "<?php function f() { $r = compact('a'); $a = 1; return $r; }";
+        assert!(codes(src, run_compact_variables).is_empty());
+    }
+
+    #[test]
+    fn compact_foreach_binding_is_defined() {
+        let src = "<?php function f(array $xs) { foreach ($xs as $a) {} return compact('a'); }";
+        assert!(codes(src, run_compact_variables).is_empty());
+    }
+
+    #[test]
+    fn compact_in_method_uses_method_scope() {
+        let src = "<?php class C { function m() { $a = 1; return compact('a', 'b'); } }";
+        assert_eq!(codes(src, run_compact_variables), ["variable.undefined"]);
+    }
+
+    #[test]
+    fn compact_in_closure_use_is_defined() {
+        let src = "<?php function f() { $a = 1; return function () use ($a) { return compact('a'); }; }";
+        assert!(codes(src, run_compact_variables).is_empty());
     }
 
     // --- assign.byRefForeachExpr -----------------------------------------

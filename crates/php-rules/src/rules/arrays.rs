@@ -13,22 +13,44 @@
 //!   used for *reading* (an `Index` with no dimension outside a write/assignment
 //!   position).
 //!
-//! Deferred (need the type system — flagged here, not faked):
-//! - `NonexistentOffsetInArrayDimFetchRule` / `…Check` — needs the value's type
-//!   to know which offsets exist.
-//! - `InvalidKeyInArrayDimFetchRule` / `InvalidKeyInArrayItemRule` /
-//!   `AllowedArrayKeysTypes` — need the *type* of the key expression.
-//! - `OffsetAccessAssignmentRule` / `OffsetAccessAssignOpRule` /
-//!   `OffsetAccessValueAssignmentRule` — need the offset/value types.
-//! - `IterableInForeachRule` / `DeadForeachRule` — need the iterated type.
-//! - `ArrayUnpackingRule` / `UnpackIterableInArrayRule` — need the spread
-//!   operand's type (string-keyed pre-8.1, non-iterable, …).
-//! - `ArrayDestructuringRule` — needs the assigned-value type.
+//! Implemented (type-based — use `fa.type_of` + the conservative classifiers
+//! below; flag only when the inferred type is *concrete and certainly*
+//! incompatible, never on `mixed`/unknown/objects-of-unindexed-classes/unions
+//! that contain a compatible member):
+//! - `foreach.nonIterable` (`IterableInForeachRule`, level 3) — `foreach` over a
+//!   value that is definitely not iterable (a scalar/null, or an object of a
+//!   fully-known class that does not implement `Traversable`).
+//! - `arrayUnpacking.nonIterable` (`UnpackIterableInArrayRule`, level 3) — a
+//!   spread element `[...$x]` whose operand is definitely not iterable.
+//! - `offsetAccess.nonArray` (`ArrayDestructuringRule`, level 3) — array
+//!   destructuring `[$a, $b] = $x` / `list(...) = $x` where `$x` is definitely
+//!   neither an array nor `ArrayAccess`.
+//! - `array.invalidKey` (`InvalidKeyInArrayItemRule`, level 3) — an array-literal
+//!   key whose type can never be a valid array key (array/object/resource).
+//! - `offsetAccess.invalidOffset` (`InvalidKeyInArrayDimFetchRule`, level 3) — an
+//!   array dim-fetch `$arr[$k]` on a definite array with a key whose type can
+//!   never be a valid array key.
+//!
+//! Deferred (need richer type modelling than we have):
+//! - DEFERRED: `NonexistentOffsetInArrayDimFetchRule` / `…Check` — needs precise
+//!   per-offset shape tracking (`hasOffsetValueType`) to know which offsets a
+//!   value actually has; we model only `array<K,V>`, not constant-key shapes
+//!   with definedness, so any check would either false-positive or do nothing.
+//! - DEFERRED: `OffsetAccessAssignmentRule` / `OffsetAccessAssignOpRule` /
+//!   `OffsetAccessValueAssignmentRule` — need `Type::setOffsetValueType` (whether
+//!   a *specific* offset/value can be written into a type), which we don't model.
+//! - DEFERRED: `ArrayUnpackingRule` (`arrayUnpacking.stringOffset`) — only fires
+//!   when string keys in `[...]` unpacking are unsupported, i.e. PHP < 8.1; our
+//!   target is 8.6, where it is always supported, so the rule never reports.
+//! - DEFERRED: `DeadForeachRule` (`foreach.emptyArray`) — fires only on a value
+//!   that is iterable but *never iterable at least once* (an empty-array type);
+//!   we don't track non-emptiness, so we can't tell `array{}` from `array`.
 
 use crate::{walk, FileAnalysis, RuleEntry};
 use php_ast::{ArrayItem, Expr, ExprKind, StmtKind};
 use php_diagnostics::Diagnostic;
 use php_span::Span;
+use php_types::Type;
 use std::collections::HashSet;
 
 /// A constant array-key value, after PHP's array-key coercion. Booleans/floats
@@ -263,9 +285,241 @@ fn mark_write_targets(target: &Expr, allowed: &mut HashSet<(u32, u32)>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Conservative type classifiers for the type-driven Arrays rules.
+//
+// Cardinal rule: ZERO false positives. Every classifier returns `false`
+// ("don't flag — could be ok") for anything we are not certain about: `mixed`,
+// `Unknown`, templates/conditionals, `self`/`static`/`parent`, objects whose
+// class we cannot fully resolve, and any union/nullable with one acceptable
+// member. We flag only when the type is concrete and *certainly* incompatible.
+// ---------------------------------------------------------------------------
+
+/// Interfaces/classes that make an object iterable (`foreach`-able). Any class
+/// reaching one of these — or any of their descendants — is iterable.
+const TRAVERSABLE_FQNS: &[&str] = &["Traversable", "Iterator", "IteratorAggregate", "Generator"];
+
+/// `true` iff every runtime value of `t` is definitely NOT iterable. Mirrors
+/// phpstan's `$type->isIterable()->no()`. Arrays/iterables/lists/shapes ARE
+/// iterable; scalars/null are not; an object is non-iterable only if its class
+/// is *fully known* (so we'd see any `Traversable` ancestor) and reaches no
+/// traversable interface. Conservative on everything else.
+fn definitely_not_iterable(fa: &FileAnalysis, t: &Type) -> bool {
+    match t {
+        Type::Int
+        | Type::Float
+        | Type::String
+        | Type::Bool
+        | Type::True
+        | Type::False
+        | Type::Null
+        | Type::Resource
+        | Type::LiteralInt(_)
+        | Type::LiteralString(_) => true,
+        Type::Named { fqn, .. } => {
+            fa.class_fully_known(fqn)
+                && !TRAVERSABLE_FQNS.iter().any(|tr| fa.reflection.is_subclass_of(fqn, tr))
+        }
+        // A union is non-iterable only when *every* member is.
+        Type::Union(parts) => !parts.is_empty() && parts.iter().all(|p| definitely_not_iterable(fa, p)),
+        // `?T` includes `null` (non-iterable) and `T`: non-iterable iff `T` is.
+        Type::Nullable(inner) => definitely_not_iterable(fa, inner),
+        // Arrays/iterables/lists/shapes are iterable; everything we are unsure
+        // about (`mixed`, `object`, `self`, templates, callables, class-string,
+        // unknown, …) is treated as possibly-iterable → not flagged.
+        _ => false,
+    }
+}
+
+/// `true` iff `t` is definitely neither an array nor (possibly) `ArrayAccess`,
+/// i.e. array destructuring can never apply. Mirrors phpstan's
+/// `!isArray()->yes() && !ObjectType(ArrayAccess)->isSuperTypeOf()->yes()`, but
+/// conservatively: an object is rejected only when its class is fully known and
+/// does not implement `ArrayAccess`.
+fn definitely_not_array_destructurable(fa: &FileAnalysis, t: &Type) -> bool {
+    match t {
+        Type::Int
+        | Type::Float
+        | Type::String
+        | Type::Bool
+        | Type::True
+        | Type::False
+        | Type::Null
+        | Type::Resource
+        | Type::LiteralInt(_)
+        | Type::LiteralString(_) => true,
+        Type::Named { fqn, .. } => {
+            fa.class_fully_known(fqn) && !fa.reflection.is_subclass_of(fqn, "ArrayAccess")
+        }
+        Type::Union(parts) => {
+            !parts.is_empty() && parts.iter().all(|p| definitely_not_array_destructurable(fa, p))
+        }
+        Type::Nullable(inner) => definitely_not_array_destructurable(fa, inner),
+        _ => false,
+    }
+}
+
+/// `true` iff `t` is definitely an array (so an offset access on it is an array
+/// dim-fetch, not an object/string offset). Used to gate the invalid-key rule.
+fn definitely_array(t: &Type) -> bool {
+    match t {
+        Type::Array(_) | Type::List(_) | Type::Shape { .. } => true,
+        Type::Union(parts) => !parts.is_empty() && parts.iter().all(definitely_array),
+        _ => false,
+    }
+}
+
+/// `true` iff `t` can never be a legal PHP array key. Legal keys are
+/// `int|string` (and PHP also coerces `bool|float|null` to int/"", so those are
+/// NOT errors). Only array/object/resource (and unions wholly of those) are
+/// definitely invalid. Conservative on `mixed`/unknown/scalars.
+fn definitely_invalid_key(t: &Type) -> bool {
+    match t {
+        Type::Array(_) | Type::Iterable(_) | Type::List(_) | Type::Shape { .. } => true,
+        Type::Object | Type::Named { .. } | Type::Resource => true,
+        // Legal or coercible-to-legal keys.
+        Type::Int
+        | Type::Float
+        | Type::String
+        | Type::Bool
+        | Type::True
+        | Type::False
+        | Type::Null
+        | Type::LiteralInt(_)
+        | Type::LiteralString(_) => false,
+        Type::Union(parts) => !parts.is_empty() && parts.iter().all(definitely_invalid_key),
+        Type::Nullable(inner) => definitely_invalid_key(inner),
+        _ => false,
+    }
+}
+
+/// `IterableInForeachRule` (`foreach.nonIterable`, level 3): the subject of a
+/// `foreach` must be iterable. We flag only when the subject's inferred type is
+/// definitely non-iterable (see [`definitely_not_iterable`]).
+fn run_iterable_in_foreach(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    walk::for_each_stmt(fa.program, &mut |s| {
+        if let StmtKind::Foreach { subject, .. } = &s.kind {
+            let ty = fa.type_of(subject);
+            if definitely_not_iterable(fa, &ty) {
+                out.push(
+                    Diagnostic::error(
+                        subject.span,
+                        format!(
+                            "Argument of an invalid type {ty} supplied for foreach, only iterables are supported.",
+                        ),
+                    )
+                    .with_code("foreach.nonIterable"),
+                );
+            }
+        }
+    });
+    out
+}
+
+/// `UnpackIterableInArrayRule` (`arrayUnpacking.nonIterable`, level 3): a spread
+/// element `[...$x]` requires `$x` to be iterable.
+fn run_unpack_iterable_in_array(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Array { items, .. } = &e.kind else { return };
+        for it in items {
+            if !it.spread {
+                continue;
+            }
+            let Some(value) = &it.value else { continue };
+            let ty = fa.type_of(value);
+            if definitely_not_iterable(fa, &ty) {
+                out.push(
+                    Diagnostic::error(
+                        value.span,
+                        format!("Only iterables can be unpacked, {ty} given."),
+                    )
+                    .with_code("arrayUnpacking.nonIterable"),
+                );
+            }
+        }
+    });
+    out
+}
+
+/// `ArrayDestructuringRule` (`offsetAccess.nonArray`, level 3): the right side of
+/// an array-destructuring assignment (`[$a, $b] = $x` or `list(...) = $x`) must
+/// be an array or `ArrayAccess`.
+fn run_array_destructuring(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Assign { target, rhs } = &e.kind else { return };
+        // Only a list/array destructuring target triggers this rule.
+        if !matches!(target.kind, ExprKind::Array { .. }) {
+            return;
+        }
+        let ty = fa.type_of(rhs);
+        if definitely_not_array_destructurable(fa, &ty) {
+            out.push(
+                Diagnostic::error(
+                    rhs.span,
+                    format!("Cannot use array destructuring on {ty}."),
+                )
+                .with_code("offsetAccess.nonArray"),
+            );
+        }
+    });
+    out
+}
+
+/// `InvalidKeyInArrayItemRule` (`array.invalidKey`, level 3): a key in an array
+/// literal must be a valid array-key type (`int|string`, or a bool/float/null
+/// PHP coerces). We flag only keys whose type is definitely invalid
+/// (array/object/resource).
+fn run_invalid_key_in_array_item(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Array { items, .. } = &e.kind else { return };
+        for it in items {
+            let Some(key) = &it.key else { continue };
+            let ty = fa.type_of(key);
+            if definitely_invalid_key(&ty) {
+                out.push(
+                    Diagnostic::error(key.span, format!("Invalid array key type {ty}."))
+                        .with_code("array.invalidKey"),
+                );
+            }
+        }
+    });
+    out
+}
+
+/// `InvalidKeyInArrayDimFetchRule` (`offsetAccess.invalidOffset`, level 3): an
+/// array dim-fetch `$arr[$k]` (on a value we know is an array) must use a valid
+/// array-key type. Gated on the base being *definitely* an array so we don't
+/// misfire on string offsets (`$s[$i]`) or `ArrayAccess` objects.
+fn run_invalid_key_in_dim_fetch(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Index { base, index: Some(dim) } = &e.kind else { return };
+        if !definitely_array(&fa.type_of(base)) {
+            return;
+        }
+        let ty = fa.type_of(dim);
+        if definitely_invalid_key(&ty) {
+            out.push(
+                Diagnostic::error(dim.span, format!("Invalid array key type {ty}."))
+                    .with_code("offsetAccess.invalidOffset"),
+            );
+        }
+    });
+    out
+}
+
 pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "array.duplicateKey", level: 0, run: run_duplicate_keys },
     RuleEntry { name: "offsetAccess.noDim", level: 0, run: run_offset_access_no_dim },
+    RuleEntry { name: "foreach.nonIterable", level: 3, run: run_iterable_in_foreach },
+    RuleEntry { name: "arrayUnpacking.nonIterable", level: 3, run: run_unpack_iterable_in_array },
+    RuleEntry { name: "offsetAccess.nonArray", level: 3, run: run_array_destructuring },
+    RuleEntry { name: "array.invalidKey", level: 3, run: run_invalid_key_in_array_item },
+    RuleEntry { name: "offsetAccess.invalidOffset", level: 3, run: run_invalid_key_in_dim_fetch },
 ];
 
 #[cfg(test)]
@@ -383,5 +637,140 @@ mod tests {
     #[test]
     fn no_offset_access_no_diagnostics() {
         assert!(codes("<?php $a = 1 + 2; echo $a;", run_offset_access_no_dim).is_empty());
+    }
+
+    // --- foreach.nonIterable ---
+
+    #[test]
+    fn foreach_over_int_flagged() {
+        assert_eq!(
+            codes("<?php $n = 1; foreach ($n as $x) {}", run_iterable_in_foreach),
+            ["foreach.nonIterable"]
+        );
+    }
+
+    #[test]
+    fn foreach_over_string_flagged() {
+        assert_eq!(
+            codes("<?php $s = 'hi'; foreach ($s as $x) {}", run_iterable_in_foreach),
+            ["foreach.nonIterable"]
+        );
+    }
+
+    #[test]
+    fn foreach_over_array_ok() {
+        assert!(codes("<?php $a = [1, 2]; foreach ($a as $x) {}", run_iterable_in_foreach).is_empty());
+    }
+
+    #[test]
+    fn foreach_over_mixed_ok() {
+        // Unknown/mixed subject: never flagged.
+        assert!(codes("<?php foreach ($a as $x) {}", run_iterable_in_foreach).is_empty());
+    }
+
+    #[test]
+    fn foreach_over_plain_object_flagged() {
+        // A fully-known class with no Traversable ancestor is not iterable.
+        let src = "<?php class Foo {} $o = new Foo(); foreach ($o as $x) {}";
+        assert_eq!(codes(src, run_iterable_in_foreach), ["foreach.nonIterable"]);
+    }
+
+    #[test]
+    fn foreach_over_traversable_object_ok() {
+        let src = "<?php class Foo implements \\IteratorAggregate {} $o = new Foo(); foreach ($o as $x) {}";
+        assert!(codes(src, run_iterable_in_foreach).is_empty());
+    }
+
+    // --- arrayUnpacking.nonIterable ---
+
+    #[test]
+    fn unpack_int_flagged() {
+        assert_eq!(
+            codes("<?php $n = 1; $a = [...$n];", run_unpack_iterable_in_array),
+            ["arrayUnpacking.nonIterable"]
+        );
+    }
+
+    #[test]
+    fn unpack_array_ok() {
+        assert!(codes("<?php $b = [1]; $a = [...$b];", run_unpack_iterable_in_array).is_empty());
+    }
+
+    #[test]
+    fn unpack_unknown_ok() {
+        assert!(codes("<?php $a = [...$b];", run_unpack_iterable_in_array).is_empty());
+    }
+
+    // --- offsetAccess.nonArray ---
+
+    #[test]
+    fn destructure_int_flagged() {
+        assert_eq!(
+            codes("<?php $n = 1; [$a, $b] = $n;", run_array_destructuring),
+            ["offsetAccess.nonArray"]
+        );
+    }
+
+    #[test]
+    fn destructure_array_ok() {
+        assert!(codes("<?php $p = [1, 2]; [$a, $b] = $p;", run_array_destructuring).is_empty());
+    }
+
+    #[test]
+    fn destructure_unknown_ok() {
+        assert!(codes("<?php [$a, $b] = $p;", run_array_destructuring).is_empty());
+    }
+
+    #[test]
+    fn plain_assignment_not_flagged() {
+        // A non-destructuring assignment is irrelevant.
+        assert!(codes("<?php $n = 1; $a = $n;", run_array_destructuring).is_empty());
+    }
+
+    // --- array.invalidKey ---
+
+    #[test]
+    fn array_literal_array_key_flagged() {
+        assert_eq!(
+            codes("<?php $k = [1]; $a = [$k => 'v'];", run_invalid_key_in_array_item),
+            ["array.invalidKey"]
+        );
+    }
+
+    #[test]
+    fn array_literal_int_key_ok() {
+        assert!(codes("<?php $a = [1 => 'v', 'x' => 'y'];", run_invalid_key_in_array_item).is_empty());
+    }
+
+    #[test]
+    fn array_literal_object_key_flagged() {
+        let src = "<?php class Foo {} $k = new Foo(); $a = [$k => 'v'];";
+        assert_eq!(codes(src, run_invalid_key_in_array_item), ["array.invalidKey"]);
+    }
+
+    #[test]
+    fn array_literal_unknown_key_ok() {
+        assert!(codes("<?php $a = [$k => 'v'];", run_invalid_key_in_array_item).is_empty());
+    }
+
+    // --- offsetAccess.invalidOffset ---
+
+    #[test]
+    fn dim_fetch_array_key_flagged() {
+        assert_eq!(
+            codes("<?php $arr = [1, 2]; $k = ['x']; $v = $arr[$k];", run_invalid_key_in_dim_fetch),
+            ["offsetAccess.invalidOffset"]
+        );
+    }
+
+    #[test]
+    fn dim_fetch_int_key_ok() {
+        assert!(codes("<?php $arr = [1, 2]; $v = $arr[0];", run_invalid_key_in_dim_fetch).is_empty());
+    }
+
+    #[test]
+    fn dim_fetch_unknown_base_ok() {
+        // Base type unknown → not gated as an array → not flagged.
+        assert!(codes("<?php $k = [1]; $v = $arr[$k];", run_invalid_key_in_dim_fetch).is_empty());
     }
 }

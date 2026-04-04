@@ -145,6 +145,24 @@ DONE = {
     # Methods
     "CallToConstructorStatementWithoutSideEffectsRule", "NullsafeMethodCallRule",
     "CallPrivateMethodThroughStaticRule", "ConsistentConstructorDeclarationRule",
+    # --- Second parallel batch (Constants/Arrays/Exceptions/Traits/Comparison/
+    #     DeadCode/Generators/TooWideTypehints/Variables) ---
+    # Constants
+    "ClassAsClassConstantRule", "FinalPrivateConstantRule", "MagicConstantContextRule",
+    "OverridingConstantRule", "DynamicClassConstantFetchRule", "ValueAssignedToClassConstantRule",
+    # Arrays
+    "IterableInForeachRule", "UnpackIterableInArrayRule", "ArrayDestructuringRule",
+    "InvalidKeyInArrayItemRule", "InvalidKeyInArrayDimFetchRule",
+    # Exceptions / Traits
+    "ThrowExprTypeRule", "CaughtExceptionExistenceRule", "OverwrittenExitPointByFinallyRule",
+    "ConflictingTraitConstantsRule",
+    # Comparison / Generators
+    "MatchExpressionRule", "UsageOfVoidMatchExpressionRule", "YieldInGeneratorRule", "YieldFromTypeRule",
+    # TooWideTypehints
+    "TooWideFunctionReturnTypehintRule", "TooWideMethodReturnTypehintRule",
+    "TooWideArrowFunctionReturnTypehintRule", "TooWideClosureReturnTypehintRule",
+    # Variables
+    "CompactVariablesRule",
 }
 # Rules we can't implement yet, with the reason.
 _TYPES = "needs the type system (operand/value types)"

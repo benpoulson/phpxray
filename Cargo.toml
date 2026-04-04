@@ -22,8 +22,8 @@ members = [
 [workspace.package]
 version = "0.0.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/nexelity/php-analyzer"
+license = "MIT"
+repository = "https://github.com/benpoulson/phpxray"
 
 [workspace.dependencies]
 # Internal crates (dependency edges enforced per-crate; see plan).
@@ -53,24 +53,13 @@ regex = "1"
 clap = { version = "4", features = ["derive"] }
 
 [profile.release]
-# The whole point of the project is speed; optimise the corpus runner & lexer hard.
-lto = "thin"
 codegen-units = 1
+lto = "thin"
+opt-level = 3
 
-# Dev speed. The heavy dev tools (xtask corpus/astdiff/resolve/index/gen-stubs)
-# run via `cargo run` (the dev profile) over thousands of files, so a little
-# optimisation pays for itself many times over. opt-level=2 gives a big runtime
-# win; debug-assertions/overflow-checks stay on.
 [profile.dev]
 opt-level = 2
 
-# Dependencies are compiled once and cached, so optimise them fully regardless.
+# Dependencies are compiled once and cached, so optimize them fully regardless.
 [profile.dev.package."*"]
 opt-level = 3
-
-# `--profile quick`: fully optimised but fast to build (no LTO, parallel codegen)
-# — for the heaviest corpus sweeps without the slow release link.
-[profile.quick]
-inherits = "release"
-lto = false
-codegen-units = 256

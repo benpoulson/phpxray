@@ -37,14 +37,20 @@
 //!   `greater.*`/`smaller.*`/`greaterOrEqual.*`/`smallerOrEqual.*`
 //!   (`NumberComparisonOperatorsConstantConditionRule`) — constant operands folded.
 //!
+//! - `match.alwaysFalse` / `match.alwaysTrue` (`MatchExpressionRule`, partial) —
+//!   a `match` arm whose `subject === armCondition` folds to a compile-time
+//!   constant: a constant-false comparison is a dead arm (`match.alwaysFalse`);
+//!   a constant-true comparison with arms still following it makes those dead
+//!   (`match.alwaysTrue`). Both operands must fold via `eval_const` (FP-safe).
+//! - `match.void` (`UsageOfVoidMatchExpressionRule`) — a `match` expression whose
+//!   inferred type is `void` used in a value position (not a bare statement).
+//!
 //! Deferred (need machinery we don't have):
 //! - `ImpossibleCheckTypeFunctionCall/MethodCall/StaticMethodCallRule`
 //!   (`function.impossibleType`, …) — needs evaluating a type-predicate against
 //!   the (now narrowable) type map; a follow-up rule, not a capability gap.
-//! - `MatchExpressionRule` (`match.alwaysTrue`/`match.unhandled`) — needs
-//!   exhaustiveness + constant arm folding.
-//! - `UsageOfVoidMatchExpressionRule` (`match.void`) — needs first-level-statement
-//!   tracking + a void match-arm type.
+//! - `MatchExpressionRule`'s `match.unhandled` — needs enum-case exhaustiveness,
+//!   and enum cases are not yet reflected (`php-reflect` skips `EnumCase`).
 //! - `ConstantConditionInTraitRule` — trait-instantiation aware; out of scope.
 
 use crate::{walk, FileAnalysis, RuleEntry};
@@ -473,6 +479,118 @@ fn run_constant_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
 }
 
 // ---------------------------------------------------------------------------
+// Match arm constant conditions  (MatchExpressionRule, partial)
+// ---------------------------------------------------------------------------
+
+/// Report `match` arms whose `subject === armCondition` is a compile-time
+/// constant. Mirrors the constant-folding subset of phpstan's
+/// `MatchExpressionRule`: a constant-false arm is unreachable
+/// (`match.alwaysFalse`); a constant-true arm makes the arms below it
+/// unreachable (`match.alwaysTrue`, unless it's the last condition). We require
+/// both the subject and the arm condition to fold via `eval_const`, so we never
+/// flag anything whose runtime value we can't prove.
+fn run_match_arms(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Match { subject, arms } = &e.kind else { return };
+        let Some(subj) = eval_const(subject) else { return };
+
+        // Every condition must fold to a constant; otherwise we can't reason about
+        // any arm safely (a non-constant arm could match the subject).
+        let mut folded: Vec<Vec<(Span, ConstVal)>> = Vec::with_capacity(arms.len());
+        for arm in arms {
+            let mut arm_vals = Vec::new();
+            if let Some(arm_conds) = &arm.conds {
+                for c in arm_conds {
+                    let Some(v) = eval_const(c) else { return };
+                    arm_vals.push((c.span, v));
+                }
+            }
+            folded.push(arm_vals);
+        }
+
+        let arms_count = arms.len();
+        let mut already_matched = false;
+        for (arm_idx, arm_vals) in folded.iter().enumerate() {
+            for (span, v) in arm_vals {
+                if already_matched {
+                    // A prior arm already always-matched → this arm is dead.
+                    // phpstan reports the always-true arm once, not every dead
+                    // arm that follows, so we don't emit here.
+                    continue;
+                }
+                // PHP `match` uses `===`; `ConstVal`'s structural equality matches
+                // strict-identity for these literal kinds (int ≠ float ≠ string).
+                if *v == subj {
+                    // Always-true: dead arms follow only if this isn't the last arm.
+                    if arm_idx != arms_count - 1 {
+                        out.push(diag(
+                            *span,
+                            format!(
+                                "Match arm comparison between {} and {} is always true.",
+                                subj.describe(),
+                                v.describe()
+                            ),
+                            "match.alwaysTrue",
+                        ));
+                    }
+                    already_matched = true;
+                } else {
+                    out.push(diag(
+                        *span,
+                        format!(
+                            "Match arm comparison between {} and {} is always false.",
+                            subj.describe(),
+                            v.describe()
+                        ),
+                        "match.alwaysFalse",
+                    ));
+                }
+            }
+        }
+    });
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Void match used in a value position  (UsageOfVoidMatchExpressionRule)
+// ---------------------------------------------------------------------------
+
+/// Report a `match` expression whose inferred type is `void` used where a value
+/// is expected (anything other than a bare expression statement). Mirrors
+/// phpstan's `UsageOfVoidMatchExpressionRule` (`!isInFirstLevelStatement()`).
+fn run_void_match(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    // Spans of `match` expressions that ARE a bare statement (first-level) — those
+    // are allowed to be void.
+    let mut statement_matches = std::collections::HashSet::new();
+    walk::for_each_stmt(fa.program, &mut |s| {
+        if let StmtKind::Expr(e) = &s.kind {
+            if matches!(e.kind, ExprKind::Match { .. }) {
+                statement_matches.insert((e.span.start, e.span.end));
+            }
+        }
+    });
+
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e| {
+        if !matches!(e.kind, ExprKind::Match { .. }) {
+            return;
+        }
+        if statement_matches.contains(&(e.span.start, e.span.end)) {
+            return; // bare statement — its void result isn't "used"
+        }
+        if matches!(fa.type_of(e), Type::Void) {
+            out.push(diag(
+                e.span,
+                "Result of match expression (void) is used.",
+                "match.void",
+            ));
+        }
+    });
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
@@ -487,6 +605,8 @@ pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "comparison.logicalXor", level: 4, run: run_logical_xor },
     RuleEntry { name: "comparison.strict", level: 4, run: run_strict_comparison },
     RuleEntry { name: "comparison.constant", level: 4, run: run_constant_comparison },
+    RuleEntry { name: "comparison.matchArms", level: 4, run: run_match_arms },
+    RuleEntry { name: "comparison.voidMatch", level: 2, run: run_void_match },
 ];
 
 #[cfg(test)]
@@ -691,5 +811,86 @@ mod tests {
     #[test]
     fn loose_comparison_not_flagged_by_strict_rule() {
         assert!(codes("<?php $x = (1 == 'a');", run_strict_comparison).is_empty());
+    }
+
+    // --- match arm constant conditions ---
+
+    #[test]
+    fn match_arm_always_false_is_flagged() {
+        // Subject 1; arm `2` can never match.
+        let src = "<?php $x = match (1) { 2 => 'a', default => 'b' };";
+        assert_eq!(codes(src, run_match_arms), ["match.alwaysFalse"]);
+    }
+
+    #[test]
+    fn match_arm_always_true_with_following_arm_is_flagged() {
+        // Subject 1; arm `1` always matches and a later arm `2` is dead. phpstan
+        // reports the always-true arm once; the dead arm after it is not also
+        // flagged as alwaysFalse.
+        let src = "<?php $x = match (1) { 1 => 'a', 2 => 'b' };";
+        assert_eq!(codes(src, run_match_arms), ["match.alwaysTrue"]);
+    }
+
+    #[test]
+    fn match_earlier_false_arm_then_true_arm() {
+        // Subject 2; arm `1` is always false, arm `2` always true (last arm so
+        // no following dead arm) → only the false arm is reported.
+        let src = "<?php $x = match (2) { 1 => 'a', 2 => 'b' };";
+        assert_eq!(codes(src, run_match_arms), ["match.alwaysFalse"]);
+    }
+
+    #[test]
+    fn match_arm_always_true_before_default_is_flagged() {
+        // The `1` arm always matches; a trailing `default` arm is dead.
+        let src = "<?php $x = match (1) { 1 => 'a', default => 'b' };";
+        assert_eq!(codes(src, run_match_arms), ["match.alwaysTrue"]);
+    }
+
+    #[test]
+    fn match_arm_always_true_as_last_condition_is_clean() {
+        // Subject 1; the only/last condition is `1` → matches, but it's last so
+        // no following arm is dead → no alwaysTrue report.
+        let src = "<?php $x = match (1) { 1 => 'a' };";
+        assert!(codes(src, run_match_arms).is_empty());
+    }
+
+    #[test]
+    fn match_on_nonconstant_subject_is_clean() {
+        let src = "<?php function f($n) { return match ($n) { 1 => 'a', 2 => 'b' }; }";
+        assert!(codes(src, run_match_arms).is_empty());
+    }
+
+    #[test]
+    fn match_with_nonconstant_arm_is_clean() {
+        let src = "<?php function f($n) { return match (1) { $n => 'a', default => 'b' }; }";
+        assert!(codes(src, run_match_arms).is_empty());
+    }
+
+    #[test]
+    fn match_int_vs_string_arm_is_always_false() {
+        // `===` distinguishes 1 (int) from '1' (string).
+        let src = "<?php $x = match (1) { '1' => 'a', default => 'b' };";
+        assert_eq!(codes(src, run_match_arms), ["match.alwaysFalse"]);
+    }
+
+    // --- void match used in a value position ---
+
+    #[test]
+    fn void_match_assigned_is_flagged() {
+        let src = "<?php function v(): void {} $x = match (1) { default => v() };";
+        assert_eq!(codes(src, run_void_match), ["match.void"]);
+    }
+
+    #[test]
+    fn void_match_as_statement_is_clean() {
+        // A bare statement-level match is allowed to be void.
+        let src = "<?php function v(): void {} match (1) { default => v() };";
+        assert!(codes(src, run_void_match).is_empty());
+    }
+
+    #[test]
+    fn non_void_match_assigned_is_clean() {
+        let src = "<?php $x = match (1) { default => 'a' };";
+        assert!(codes(src, run_void_match).is_empty());
     }
 }

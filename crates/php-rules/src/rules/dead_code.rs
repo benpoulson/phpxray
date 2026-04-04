@@ -22,10 +22,15 @@
 //!   `logicalXor.resultUnused`/`ternary.resultUnused`) — a statement-level
 //!   expression whose result is discarded for these always-pure operator forms.
 //!
+//! - **NoopRule** (`expr.resultUnused` / `booleanAnd.resultUnused` /
+//!   `booleanOr.resultUnused`) — a statement-level expression whose result is
+//!   discarded *and* whose whole subtree is side-effect-free (no call, `new`,
+//!   assignment, `++`/`--`, `yield`, `throw`, `exit`, `print`, `include`, `eval`,
+//!   `match`, `@`, `clone`, shell-exec). The side-effect guard keeps this
+//!   FP-safe — the common `$cond && doThing()` idiom (where the right side has an
+//!   effect) is *not* flagged.
+//!
 //! Deferred:
-//! - The `expr.resultUnused` / `booleanAnd.resultUnused` / `booleanOr.resultUnused`
-//!   parts of `NoopRule` — need the inferred "has no side effect" / "hasAssign"
-//!   analysis to avoid flagging side-effecting subexpressions.
 //! - `CallTo*StatementWithoutImpurePointsRule` (and their purity collectors) —
 //!   need cross-function purity analysis (impure-point collection) we don't have.
 
@@ -450,10 +455,99 @@ fn run_noop(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 Diagnostic::error(e.span, "Unused result of ternary operator.")
                     .with_code("ternary.resultUnused"),
             ),
+            // `&&` / `||` whose result is discarded and which has no side effect
+            // (the short-circuit idiom `$x && f()` has an effect → not flagged).
+            ExprKind::Binary { op: BinOp::BoolAnd, .. } if !has_side_effect(e) => out.push(
+                Diagnostic::error(e.span, "Unused result of \"&&\" operator.")
+                    .with_code("booleanAnd.resultUnused"),
+            ),
+            ExprKind::Binary { op: BinOp::BoolOr, .. } if !has_side_effect(e) => out.push(
+                Diagnostic::error(e.span, "Unused result of \"||\" operator.")
+                    .with_code("booleanOr.resultUnused"),
+            ),
+            // Any other pure value expression on its own line does nothing.
+            _ if is_pure_value_noop(e) => out.push(
+                Diagnostic::error(e.span, "Expression on a separate line does not do anything.")
+                    .with_code("expr.resultUnused"),
+            ),
             _ => {}
         }
     });
     out
+}
+
+/// Whether a statement-level expression is a "pure value" with no effect — a
+/// candidate for `expr.resultUnused`. We *only* report a small, clearly-safe set
+/// of expression heads (variables, literals, names/const fetches, comparisons /
+/// arithmetic, property/array reads, coalesce, instanceof, isset/empty, casts),
+/// and only when nothing in the subtree has a side effect. This conservatism
+/// mirrors phpstan excluding calls / `new` / assignments / closures from the
+/// generic `expr.resultUnused` branch.
+fn is_pure_value_noop(e: &Expr) -> bool {
+    let head_ok = matches!(
+        &e.kind,
+        ExprKind::Variable(_)
+            | ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Str(_)
+            | ExprKind::Name(_)
+            | ExprKind::Binary { .. }
+            | ExprKind::Unary { .. }
+            | ExprKind::Index { .. }
+            | ExprKind::Prop { .. }
+            | ExprKind::StaticProp { .. }
+            | ExprKind::ClassConst { .. }
+            | ExprKind::Coalesce { .. }
+            | ExprKind::Instanceof { .. }
+            | ExprKind::Isset(_)
+            | ExprKind::Empty(_)
+            | ExprKind::Cast { .. }
+            | ExprKind::Array { .. }
+            | ExprKind::Paren(_)
+    );
+    head_ok && !has_side_effect(e)
+}
+
+/// Whether any node in the subtree of `e` is potentially side-effecting (so the
+/// statement isn't a pure no-op). Conservative: a call, instantiation,
+/// assignment, increment/decrement, `yield`, `throw`, `exit`, `print`, `clone`,
+/// `include`, `eval`, `match`, error-suppression, or shell-exec all count.
+fn has_side_effect(e: &Expr) -> bool {
+    let mut found = false;
+    walk::for_each_expr(
+        &php_ast::Program { stmts: vec![Stmt::new(php_span::Span::new(0, 0), StmtKind::Expr(e.clone()))] },
+        &mut |x| {
+            if matches!(
+                x.kind,
+                ExprKind::Call { .. }
+                    | ExprKind::MethodCall { .. }
+                    | ExprKind::StaticCall { .. }
+                    | ExprKind::New { .. }
+                    | ExprKind::NewAnon { .. }
+                    | ExprKind::Assign { .. }
+                    | ExprKind::AssignOp { .. }
+                    | ExprKind::AssignRef { .. }
+                    | ExprKind::PreInc(_)
+                    | ExprKind::PreDec(_)
+                    | ExprKind::PostInc(_)
+                    | ExprKind::PostDec(_)
+                    | ExprKind::Yield { .. }
+                    | ExprKind::YieldFrom(_)
+                    | ExprKind::Throw(_)
+                    | ExprKind::Exit(_)
+                    | ExprKind::Print(_)
+                    | ExprKind::Clone(_)
+                    | ExprKind::Include { .. }
+                    | ExprKind::Eval(_)
+                    | ExprKind::Match { .. }
+                    | ExprKind::ErrorSuppress(_)
+                    | ExprKind::ShellExec(_)
+            ) {
+                found = true;
+            }
+        },
+    );
+    found
 }
 
 /// Whether an expression subtree contains any assignment (mirrors phpstan's
@@ -640,5 +734,57 @@ mod tests {
     fn assignment_statement_is_clean() {
         let src = "<?php $a = $b;";
         assert!(codes(src, run_noop).is_empty());
+    }
+
+    // --- noop: expr.resultUnused / booleanAnd / booleanOr ---
+
+    #[test]
+    fn bare_variable_statement_is_flagged() {
+        assert_eq!(codes("<?php $a;", run_noop), ["expr.resultUnused"]);
+    }
+
+    #[test]
+    fn bare_comparison_statement_is_flagged() {
+        assert_eq!(codes("<?php $a > $b;", run_noop), ["expr.resultUnused"]);
+    }
+
+    #[test]
+    fn bare_property_fetch_statement_is_flagged() {
+        let src = "<?php class C { function f() { $this->x; } }";
+        assert_eq!(codes(src, run_noop), ["expr.resultUnused"]);
+    }
+
+    #[test]
+    fn function_call_statement_is_clean() {
+        // A call has effects; not flagged by this rule.
+        assert!(codes("<?php foo();", run_noop).is_empty());
+    }
+
+    #[test]
+    fn comparison_with_call_is_clean() {
+        // The call subexpression has an effect → not a pure no-op.
+        assert!(codes("<?php foo() > 1;", run_noop).is_empty());
+    }
+
+    #[test]
+    fn boolean_and_pure_statement_is_flagged() {
+        assert_eq!(codes("<?php $a && $b;", run_noop), ["booleanAnd.resultUnused"]);
+    }
+
+    #[test]
+    fn boolean_and_short_circuit_idiom_is_clean() {
+        // `$cond && doThing()` — the right side has an effect; not a no-op.
+        assert!(codes("<?php $cond && foo();", run_noop).is_empty());
+    }
+
+    #[test]
+    fn boolean_or_short_circuit_idiom_is_clean() {
+        assert!(codes("<?php $cond || foo();", run_noop).is_empty());
+    }
+
+    #[test]
+    fn new_statement_is_clean() {
+        // `new` may have constructor side effects; not flagged here.
+        assert!(codes("<?php new Foo();", run_noop).is_empty());
     }
 }
