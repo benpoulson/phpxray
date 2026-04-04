@@ -41,6 +41,32 @@ impl FileAnalysis<'_> {
         let r = e.span.range();
         self.types.get(&(r.start as u32, r.end as u32)).cloned().unwrap_or(Type::Mixed)
     }
+
+    /// Whether `fqn` and *every* class it transitively extends/implements/uses/
+    /// mixes-in is present in the reflection index. Member-existence rules MUST
+    /// gate on this: a class with an unindexed parent (a vendor class, or a
+    /// built-in like `ArrayObject` — built-in *classes* aren't reflected) may
+    /// inherit the member, so reporting it absent would be a false positive.
+    pub fn class_fully_known(&self, fqn: &str) -> bool {
+        fn known(fa: &FileAnalysis, fqn: &str, seen: &mut Vec<String>) -> bool {
+            let key = fqn.trim_start_matches('\\').to_ascii_lowercase();
+            if seen.contains(&key) {
+                return true;
+            }
+            seen.push(key);
+            let Some(c) = fa.reflection.class(fqn) else { return false };
+            c.parents
+                .iter()
+                .chain(&c.interfaces)
+                .chain(&c.traits)
+                .chain(&c.mixins)
+                .all(|t| match t {
+                    Type::Named { fqn, .. } => known(fa, fqn, seen),
+                    _ => true,
+                })
+        }
+        known(self, fqn, &mut Vec::new())
+    }
 }
 
 /// A registered rule: a name, the level at which it activates, and its check.

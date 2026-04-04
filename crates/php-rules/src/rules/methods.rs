@@ -42,15 +42,30 @@
 //!   with no native/PHPDoc return type.
 //! - `missingType.parameter` (`MissingMethodParameterTypehintRule`, level 6) — a
 //!   method parameter with no type.
+//! - `method.notFound` on a typed receiver (`CallMethodsRule`, level 0) —
+//!   `$expr->m()` where `$expr`'s inferred type resolves to a known class with no
+//!   such method (and no `__call`). Visibility (`method.private`/`.protected`) on a
+//!   typed receiver is deferred: it needs the calling class context to avoid false
+//!   positives on legal same-class cross-instance access.
+//! - `nullsafe.neverNull` (`NullsafeMethodCallRule`, level 4) — a `?->` method call
+//!   on a receiver that can never be null.
+//! - `new.resultUnused` (`CallToConstructorStatementWithoutSideEffectsRule`, level
+//!   4) — `new C();` as a statement whose constructor has no side effects.
+//! - `staticClassAccess.privateMethod` (`CallPrivateMethodThroughStaticRule`, level
+//!   2) — `static::m()` calling a private method (unsafe on non-final classes).
+//! - `consistentConstructor.private` (`ConsistentConstructorDeclarationRule`, level
+//!   0) — a private `__construct` in a class marked `@phpstan-consistent-constructor`.
 //!
 //! DEFERRED (need expression-type inference, not just the AST + reflection):
-//! - `CallMethodsRule` argument *type* matching, calls on an arbitrary
-//!   expression's type, named-argument resolution, `NullsafeMethodCallRule`,
-//!   `MethodCallableRule`/`StaticMethodCallableRule`,
+//! - `CallMethodsRule` argument *type* matching beyond positional, named-argument
+//!   resolution, `MethodCallableRule`/`StaticMethodCallableRule` (`callable.notSupported`
+//!   never fires on PHP 8.1+ — the only condition our target version triggers),
 //!   `IncompatibleDefaultParameterTypeRule`, `MethodSignatureRule` param/return
-//!   covariance, `Call*MethodStatementWithoutSideEffectsRule`,
-//!   `ExistingClassesInTypehintsRule` (overlaps class-existence rules),
-//!   `MissingMethodSelfOutTypeRule`, `MethodCallWithPossiblyRenamedNamedArgumentRule`.
+//!   covariance, `Call*MethodStatementWithNoDiscardRule` (needs `#[NoDiscard]`/void-cast
+//!   reflection), `ExistingClassesInTypehintsRule` (overlaps class-existence rules),
+//!   `MissingMethodSelfOutTypeRule`, `MethodCallWithPossiblyRenamedNamedArgumentRule`,
+//!   `ConsistentConstructorRule` (param/visibility comparison vs parent constructor —
+//!   the `consistentConstructor` *attribute* requires a custom PHPDoc tag we don't model).
 
 use crate::{FileAnalysis, RuleEntry};
 use php_ast::{
@@ -1097,6 +1112,365 @@ fn named_fqn(t: &Type) -> Option<String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// CallMethodsRule — existence + visibility on a typed receiver (`$expr->m()`)
+// ---------------------------------------------------------------------------
+
+/// `CallMethodsRule` (the existence part expressible from the type map) — an
+/// instance method call `$expr->m(...)` on a non-`$this` receiver whose inferred
+/// type resolves to a *known* class with no method `m` and no `__call`
+/// (`method.notFound`). `$this` receivers are handled by `run_call_existence`
+/// (which has the self-class context), so they're skipped here to avoid duplicate
+/// diagnostics. Visibility checks are deferred (need the calling class context).
+fn run_call_methods_typed(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    crate::walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::MethodCall { recv, method, .. } = &e.kind else { return };
+        let MemberName::Ident(name) = method else { return };
+        // `$this->m()` is handled by run_call_existence (with self-class context).
+        if is_this(recv, fa) {
+            return;
+        }
+        let Some(fqn) = named_fqn(&fa.type_of(recv)) else { return };
+        // The class must be known so absence/visibility is reliable.
+        if !fa.class_fully_known(&fqn) {
+            return;
+        }
+        let mname = fa.interner.resolve(*name);
+        let short = fqn.trim_start_matches('\\');
+        match fa.reflection.find_method(&fqn, mname) {
+            None => {
+                // __call accepts any method name.
+                if fa.reflection.find_method(&fqn, "__call").is_some() {
+                    return;
+                }
+                out.push(
+                    Diagnostic::error(
+                        e.span,
+                        format!("Call to an undefined method {short}::{mname}()."),
+                    )
+                    .with_code("method.notFound"),
+                );
+            }
+            Some(_) => {
+                // Visibility (`method.private`/`method.protected`) needs the
+                // calling class context to avoid false positives on legal
+                // same-class cross-instance access; deferred. Existence only here.
+            }
+        }
+    });
+    out
+}
+
+/// `CallStaticMethodsRule` (existence on an explicitly-named class) — a static
+/// call `Foo::m(...)` inside a method body where `Foo` is a *known* class
+/// (resolved through the namespace scope, not `self`/`static`/`parent`) with no
+/// static method `m` and no `__callStatic` (`staticMethod.notFound`).
+/// `self`/`static` calls are handled by `run_call_existence` with self-class
+/// context, so they're skipped here.
+fn run_static_call_named(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_class(fa, |scope, _, c| {
+        for m in methods(c) {
+            let Some(body) = &m.body else { continue };
+            let mut exprs: Vec<&Expr> = Vec::new();
+            for st in body {
+                collect_exprs_in_stmt(st, &mut exprs);
+            }
+            for e in exprs {
+                let ExprKind::StaticCall { class, method, .. } = &e.kind else { continue };
+                let MemberName::Ident(name) = method else { continue };
+                let ExprKind::Name(n) = &class.kind else { continue };
+                // Only explicitly-named classes (skip self/static/parent/builtins).
+                let fqn = match scope.resolve_class(n) {
+                    Resolution::LateStatic(_) | Resolution::BuiltinType(_) => continue,
+                    r => match r.fqn() {
+                        Some(f) => f.trim_start_matches('\\').to_string(),
+                        None => continue,
+                    },
+                };
+                if !fa.class_fully_known(&fqn) {
+                    continue;
+                }
+                let mname = fa.interner.resolve(*name);
+                if fa.reflection.find_method(&fqn, mname).is_some()
+                    || fa.reflection.find_method(&fqn, "__callStatic").is_some()
+                {
+                    continue;
+                }
+                out.push(
+                    Diagnostic::error(
+                        e.span,
+                        format!("Call to an undefined static method {fqn}::{mname}()."),
+                    )
+                    .with_code("staticMethod.notFound"),
+                );
+            }
+        }
+    });
+    out
+}
+
+// ---------------------------------------------------------------------------
+// NullsafeMethodCallRule (level 4)
+// ---------------------------------------------------------------------------
+
+/// `NullsafeMethodCallRule` — a `?->` method call on a receiver whose inferred
+/// type can never be null. Lenient: only fires when the receiver type is concrete
+/// and provably non-nullable (not `mixed`/`unknown`/a union containing null).
+fn run_nullsafe_never_null(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    crate::walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::MethodCall { recv, nullsafe: true, .. } = &e.kind else { return };
+        let ty = fa.type_of(recv);
+        if !type_is_definitely_non_null(&ty) {
+            return;
+        }
+        out.push(
+            Diagnostic::error(
+                e.span,
+                format!(
+                    "Using nullsafe method call on non-nullable type {ty}. Use -> instead."
+                ),
+            )
+            .with_code("nullsafe.neverNull"),
+        );
+    });
+    out
+}
+
+/// Whether a type provably excludes `null` (and is concrete enough to judge).
+/// `mixed`/`unknown`/`never`/`void`/template vars yield `false` (we stay silent).
+fn type_is_definitely_non_null(t: &Type) -> bool {
+    match t {
+        Type::Mixed
+        | Type::Unknown(_)
+        | Type::Null
+        | Type::Nullable(_)
+        | Type::Never
+        | Type::Void => false,
+        Type::TemplateVar(_) => false,
+        Type::Union(parts) => !parts.is_empty() && parts.iter().all(type_is_definitely_non_null),
+        // A concrete object/scalar that is not nullable.
+        Type::Named { .. }
+        | Type::SelfType
+        | Type::StaticType
+        | Type::Parent
+        | Type::Int
+        | Type::Float
+        | Type::String
+        | Type::Bool
+        | Type::True
+        | Type::False
+        | Type::Array(_)
+        | Type::List(_)
+        | Type::Iterable(_)
+        | Type::Callable(_)
+        | Type::Object => true,
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CallToConstructorStatementWithoutSideEffectsRule (level 4)
+// ---------------------------------------------------------------------------
+
+/// `CallToConstructorStatementWithoutSideEffectsRule` — a `new C();` used as a
+/// bare statement, where `C` is a known class with no constructor — the
+/// instantiation result is discarded so the statement has no effect.
+///
+/// phpstan reports both the no-constructor and the side-effect-free-constructor
+/// forms, but the latter relies on purity/`@phpstan-assert` reflection we don't
+/// model. To keep zero false positives we only flag the **no-constructor** case,
+/// which is unambiguous — a `new C()` whose `C` has no `__construct` truly does
+/// nothing.
+fn run_new_result_unused(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    crate::walk::for_each_stmt(fa.program, &mut |st| {
+        let StmtKind::Expr(e) = &st.kind else { return };
+        // Only the immediate `new C()` as a statement (not `$x = new C()`).
+        let ExprKind::New { class, .. } = &e.kind else { return };
+        let ExprKind::Name(_) = &class.kind else { return };
+        let Some(fqn) = named_fqn(&fa.type_of(e)) else { return };
+        let Some(cr) = fa.reflection.class(&fqn) else { return };
+        // Skip anything we can't be sure about; only flag when the class has no
+        // constructor at all (definitively side-effect-free instantiation).
+        if fa.reflection.find_method(&fqn, "__construct").is_some() {
+            return;
+        }
+        let short = cr.fqn.trim_start_matches('\\');
+        out.push(
+            Diagnostic::error(
+                e.span,
+                format!("Call to new {short}() on a separate line has no effect."),
+            )
+            .with_code("new.resultUnused"),
+        );
+    });
+    out
+}
+
+// ---------------------------------------------------------------------------
+// CallPrivateMethodThroughStaticRule (level 2)
+// ---------------------------------------------------------------------------
+
+/// `CallPrivateMethodThroughStaticRule` — `static::m()` where `m` is a private
+/// method. Because `static::` resolves to the runtime class, a subclass that
+/// redeclares `m` would shadow the private one, making the call unsafe. Skipped
+/// when the enclosing class is `final` (no subclasses possible).
+fn run_private_through_static(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_class(fa, |scope, fqn, c| {
+        // A final class has no subclasses, so `static::` is safe.
+        if c.modifiers.is_final {
+            return;
+        }
+        for m in methods(c) {
+            let Some(body) = &m.body else { continue };
+            let mut exprs: Vec<&Expr> = Vec::new();
+            for st in body {
+                collect_exprs_in_stmt(st, &mut exprs);
+            }
+            for e in exprs {
+                let ExprKind::StaticCall { class, method, .. } = &e.kind else { continue };
+                let MemberName::Ident(name) = method else { continue };
+                // Only `static::` (late static binding), spelled as a bare name.
+                let ExprKind::Name(n) = &class.kind else { continue };
+                if !matches!(scope.resolve_class(n), Resolution::LateStatic(ref w) if w == "static")
+                {
+                    continue;
+                }
+                let mname = fa.interner.resolve(*name);
+                let Some(found) = fa.reflection.find_method(fqn, mname) else { continue };
+                if found.member.magic || found.member.visibility != Visibility::Private {
+                    continue;
+                }
+                let here = found.declaring_class.trim_start_matches('\\');
+                out.push(
+                    Diagnostic::error(
+                        e.span,
+                        format!("Unsafe call to private method {here}::{mname}() through static::."),
+                    )
+                    .with_code("staticClassAccess.privateMethod"),
+                );
+            }
+        }
+    });
+    out
+}
+
+// ---------------------------------------------------------------------------
+// ConsistentConstructorDeclarationRule (level 0)
+// ---------------------------------------------------------------------------
+
+/// `ConsistentConstructorDeclarationRule` — a private `__construct` in a class
+/// declaring the `@consistent-constructor` (or phpstan/psalm-prefixed) PHPDoc tag.
+/// A private constructor cannot be enforced for child classes. Skipped for `final`
+/// classes (no children to enforce against).
+fn run_consistent_constructor_private(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_class(fa, |_, _, c| {
+        if c.modifiers.is_final || c.kind != ClassKind::Class {
+            return;
+        }
+        if !has_consistent_constructor_tag(fa, c) {
+            return;
+        }
+        for m in methods(c) {
+            if is_ctor(fa, m) && vis(m) == Visibility::Private {
+                out.push(
+                    Diagnostic::error(
+                        method_span(m),
+                        "Private constructor cannot be enforced as consistent for child classes."
+                            .to_string(),
+                    )
+                    .with_code("consistentConstructor.private"),
+                );
+            }
+        }
+    });
+    out
+}
+
+// ---------------------------------------------------------------------------
+// IncompatibleDefaultParameterTypeRule (level 2)
+// ---------------------------------------------------------------------------
+
+/// `IncompatibleDefaultParameterTypeRule` — a method parameter whose default
+/// value's type is not assignable to the parameter's declared type, e.g.
+/// `function f(int $x = 'str')`. Lenient: `null` defaults are always allowed (PHP
+/// makes the parameter implicitly nullable), and only definitively-incompatible
+/// concrete defaults are flagged (`is_assignable` is the same lenient relation the
+/// argument-type rules use).
+/// The type of a parameter's default-value expression (constant-folded). Param
+/// defaults aren't in the flow type-map, so we evaluate the literal directly;
+/// a non-constant default yields `mixed` (skipped, false-positive-safe).
+fn const_default_type(e: &php_ast::Expr) -> Type {
+    use php_infer::ConstVal;
+    match php_infer::eval_const(e) {
+        Some(ConstVal::Int(_)) => Type::Int,
+        Some(ConstVal::Float(_)) => Type::Float,
+        Some(ConstVal::Bool(_)) => Type::Bool,
+        Some(ConstVal::Str(_)) => Type::String,
+        Some(ConstVal::Null) => Type::Null,
+        None => match &e.kind {
+            ExprKind::Array { .. } => Type::Array(None),
+            _ => Type::Mixed,
+        },
+    }
+}
+
+fn run_incompatible_default_param(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_class(fa, |_, fqn, c| {
+        let Some(class) = fa.reflection.class(fqn) else { return };
+        let short = class.fqn.trim_start_matches('\\');
+        for (md, mr) in zip_methods(fa.interner, c, class) {
+            for (i, (p, pr)) in md.params.iter().zip(&mr.params).enumerate() {
+                let Some(default) = &p.default else { continue };
+                // A literal `null` default implicitly nullablizes the parameter.
+                if matches!(&default.kind, ExprKind::Name(n) if n.text.eq_ignore_ascii_case("null"))
+                {
+                    continue;
+                }
+                // No declared type → nothing to check.
+                if pr.ty == Type::Mixed {
+                    continue;
+                }
+                // Param defaults aren't in the body type-map; fold the literal.
+                let given = const_default_type(default);
+                if crate::is_assignable(fa.reflection, &given, &pr.ty) {
+                    continue;
+                }
+                out.push(
+                    Diagnostic::error(
+                        default.span,
+                        format!(
+                            "Default value of the parameter #{} ${} ({}) of method {short}::{}() is incompatible with type {}.",
+                            i + 1,
+                            fa.interner.resolve(p.name),
+                            given,
+                            fa.interner.resolve(md.name),
+                            pr.ty
+                        ),
+                    )
+                    .with_code("parameter.defaultValue"),
+                );
+            }
+        }
+    });
+    out
+}
+
+/// Whether the class docblock carries a `@consistent-constructor` tag (the marker
+/// phpstan honours; also accept the `@phpstan-`/`@psalm-` prefixed spellings).
+fn has_consistent_constructor_tag(_fa: &FileAnalysis, c: &ClassDecl) -> bool {
+    let Some(raw) = &c.doc else { return false };
+    raw.contains("@consistent-constructor")
+        || raw.contains("@phpstan-consistent-constructor")
+        || raw.contains("@psalm-consistent-constructor")
+}
+
 pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "method.abstract", level: 0, run: run_abstract_in_non_abstract },
     RuleEntry { name: "method.abstractPrivate", level: 0, run: run_abstract_private },
@@ -1111,6 +1485,13 @@ pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "method.attributeTarget", level: 0, run: run_method_attribute_target },
     RuleEntry { name: "method.overriding", level: 0, run: run_overriding_method },
     RuleEntry { name: "method.callExistence", level: 0, run: run_call_existence },
+    RuleEntry { name: "method.callTyped", level: 0, run: run_call_methods_typed },
+    RuleEntry { name: "staticMethod.callNamed", level: 0, run: run_static_call_named },
+    RuleEntry { name: "consistentConstructor.private", level: 0, run: run_consistent_constructor_private },
+    RuleEntry { name: "staticClassAccess.privateMethod", level: 2, run: run_private_through_static },
+    RuleEntry { name: "parameter.defaultValue", level: 2, run: run_incompatible_default_param },
+    RuleEntry { name: "nullsafe.neverNull", level: 4, run: run_nullsafe_never_null },
+    RuleEntry { name: "new.resultUnused", level: 4, run: run_new_result_unused },
     RuleEntry { name: "argument.type", level: 5, run: run_method_argument_types },
     RuleEntry { name: "missingType.return", level: 6, run: run_missing_return_type },
     RuleEntry { name: "missingType.parameter", level: 6, run: run_missing_param_type },
@@ -1421,5 +1802,199 @@ mod tests {
         // $x untyped -> mixed receiver -> no class -> no diagnostic.
         let src = "<?php function f($x): void { $x->set('s'); }";
         assert!(codes(src, run_method_argument_types).is_empty());
+    }
+
+    // --- CallMethodsRule on a typed receiver -----------------------------
+
+    #[test]
+    fn undefined_method_on_typed_local_flagged() {
+        let src = "<?php class C { public function a(): void {} } function f(): void { $c = new C(); $c->missing(); }";
+        assert!(codes(src, run_call_methods_typed).contains(&"method.notFound"));
+    }
+
+    #[test]
+    fn existing_method_on_typed_local_clean() {
+        let src = "<?php class C { public function a(): void {} } function f(): void { $c = new C(); $c->a(); }";
+        assert!(codes(src, run_call_methods_typed).is_empty());
+    }
+
+    #[test]
+    fn this_receiver_skipped_by_typed_rule() {
+        // $this is handled by run_call_existence; this rule must stay silent.
+        let src = "<?php class C { public function a(): void { $this->missing(); } }";
+        assert!(codes(src, run_call_methods_typed).is_empty());
+    }
+
+    #[test]
+    fn magic_call_receiver_is_lenient() {
+        let src = "<?php class C { public function __call($n, $a) {} } function f(): void { $c = new C(); $c->whatever(); }";
+        assert!(codes(src, run_call_methods_typed).is_empty());
+    }
+
+    // --- CallStaticMethodsRule (named class) -----------------------------
+
+    #[test]
+    fn undefined_static_method_on_named_class_flagged() {
+        let src = "<?php class D { public static function ok(): void {} } class C { public function a(): void { D::missing(); } }";
+        assert!(codes(src, run_static_call_named).contains(&"staticMethod.notFound"));
+    }
+
+    #[test]
+    fn existing_static_method_on_named_class_clean() {
+        let src = "<?php class D { public static function ok(): void {} } class C { public function a(): void { D::ok(); } }";
+        assert!(codes(src, run_static_call_named).is_empty());
+    }
+
+    #[test]
+    fn callstatic_magic_named_class_lenient() {
+        let src = "<?php class D { public static function __callStatic($n, $a) {} } class C { public function a(): void { D::whatever(); } }";
+        assert!(codes(src, run_static_call_named).is_empty());
+    }
+
+    #[test]
+    fn unknown_named_class_static_lenient() {
+        let src = "<?php class C { public function a(): void { Unknown::x(); } }";
+        assert!(codes(src, run_static_call_named).is_empty());
+    }
+
+    #[test]
+    fn self_static_call_skipped_by_named_rule() {
+        let src = "<?php class C { public function a(): void { self::missing(); } }";
+        assert!(codes(src, run_static_call_named).is_empty());
+    }
+
+    // --- NullsafeMethodCallRule -----------------------------------------
+
+    #[test]
+    fn nullsafe_on_non_nullable_flagged() {
+        let src = "<?php class C { public function a(): void {} } function f(): void { $c = new C(); $c?->a(); }";
+        assert!(codes(src, run_nullsafe_never_null).contains(&"nullsafe.neverNull"));
+    }
+
+    #[test]
+    fn nullsafe_on_nullable_clean() {
+        let src = "<?php class C { public function a(): void {} } function f(?C $c): void { $c?->a(); }";
+        assert!(codes(src, run_nullsafe_never_null).is_empty());
+    }
+
+    #[test]
+    fn nullsafe_on_unknown_is_lenient() {
+        let src = "<?php function f($x): void { $x?->a(); }";
+        assert!(codes(src, run_nullsafe_never_null).is_empty());
+    }
+
+    #[test]
+    fn plain_arrow_call_not_flagged() {
+        let src = "<?php class C { public function a(): void {} } function f(): void { $c = new C(); $c->a(); }";
+        assert!(codes(src, run_nullsafe_never_null).is_empty());
+    }
+
+    // --- CallToConstructorStatementWithoutSideEffectsRule ----------------
+
+    #[test]
+    fn new_without_constructor_as_statement_flagged() {
+        let src = "<?php class C {} function f(): void { new C(); }";
+        assert!(codes(src, run_new_result_unused).contains(&"new.resultUnused"));
+    }
+
+    #[test]
+    fn new_with_constructor_as_statement_clean() {
+        let src = "<?php class C { public function __construct() {} } function f(): void { new C(); }";
+        assert!(codes(src, run_new_result_unused).is_empty());
+    }
+
+    #[test]
+    fn assigned_new_clean() {
+        let src = "<?php class C {} function f(): void { $x = new C(); }";
+        assert!(codes(src, run_new_result_unused).is_empty());
+    }
+
+    #[test]
+    fn new_of_unknown_class_lenient() {
+        let src = "<?php function f(): void { new Unknown(); }";
+        assert!(codes(src, run_new_result_unused).is_empty());
+    }
+
+    // --- CallPrivateMethodThroughStaticRule ------------------------------
+
+    #[test]
+    fn static_call_to_private_flagged() {
+        let src =
+            "<?php class C { private function p(): void {} public function a(): void { static::p(); } }";
+        assert!(codes(src, run_private_through_static).contains(&"staticClassAccess.privateMethod"));
+    }
+
+    #[test]
+    fn static_call_to_public_clean() {
+        let src =
+            "<?php class C { public function p(): void {} public function a(): void { static::p(); } }";
+        assert!(codes(src, run_private_through_static).is_empty());
+    }
+
+    #[test]
+    fn static_call_to_private_in_final_class_clean() {
+        let src =
+            "<?php final class C { private function p(): void {} public function a(): void { static::p(); } }";
+        assert!(codes(src, run_private_through_static).is_empty());
+    }
+
+    #[test]
+    fn self_call_to_private_not_flagged_by_static_rule() {
+        let src =
+            "<?php class C { private function p(): void {} public function a(): void { self::p(); } }";
+        assert!(codes(src, run_private_through_static).is_empty());
+    }
+
+    // --- ConsistentConstructorDeclarationRule ----------------------------
+
+    #[test]
+    fn private_constructor_with_consistent_tag_flagged() {
+        let src = "<?php /** @consistent-constructor */ class C { private function __construct() {} }";
+        assert!(codes(src, run_consistent_constructor_private)
+            .contains(&"consistentConstructor.private"));
+    }
+
+    #[test]
+    fn public_constructor_with_consistent_tag_clean() {
+        let src = "<?php /** @consistent-constructor */ class C { public function __construct() {} }";
+        assert!(codes(src, run_consistent_constructor_private).is_empty());
+    }
+
+    #[test]
+    fn private_constructor_without_tag_clean() {
+        let src = "<?php class C { private function __construct() {} }";
+        assert!(codes(src, run_consistent_constructor_private).is_empty());
+    }
+
+    #[test]
+    fn private_constructor_in_final_with_tag_clean() {
+        let src = "<?php /** @consistent-constructor */ final class C { private function __construct() {} }";
+        assert!(codes(src, run_consistent_constructor_private).is_empty());
+    }
+
+    // --- IncompatibleDefaultParameterTypeRule ----------------------------
+
+    #[test]
+    fn incompatible_string_default_for_int_flagged() {
+        let src = "<?php class C { public function f(int $x = 'str'): void {} }";
+        assert!(codes(src, run_incompatible_default_param).contains(&"parameter.defaultValue"));
+    }
+
+    #[test]
+    fn compatible_int_default_clean() {
+        let src = "<?php class C { public function f(int $x = 5): void {} }";
+        assert!(codes(src, run_incompatible_default_param).is_empty());
+    }
+
+    #[test]
+    fn null_default_always_allowed() {
+        let src = "<?php class C { public function f(int $x = null): void {} }";
+        assert!(codes(src, run_incompatible_default_param).is_empty());
+    }
+
+    #[test]
+    fn untyped_param_default_clean() {
+        let src = "<?php class C { public function f($x = 'str'): void {} }";
+        assert!(codes(src, run_incompatible_default_param).is_empty());
     }
 }

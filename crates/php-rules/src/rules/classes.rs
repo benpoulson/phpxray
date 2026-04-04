@@ -30,27 +30,43 @@
 //!   `attribute.constructorNotPublic`) — `#[Attribute]` on a non-instantiable.
 //! - **InvalidPromotedPropertiesRule** (`property.invalidPromoted`) — promoted
 //!   properties outside a constructor / variadic promoted property.
+//! - **ExistingClassesInEnumImplementsRule** (`enumImplements.class`/`…trait`/
+//!   `…enum`) — an `enum` that `implements` a non-interface.
+//! - **ClassConstantRule** (`outOfClass.self`/`…static`/`…parent`,
+//!   `class.noParent`, `classConstant.onTrait`, `classConstant.notFound`,
+//!   `classConstant.private`/`…protected`) — `Class::CONST` access checks.
+//! - **AccessPrivateConstantThroughStaticRule**
+//!   (`staticClassAccess.privateConstant`) — `static::PRIVATE_CONST` in a
+//!   non-final class.
+//! - **MixinRule** (`mixin.nonObject`/`mixin.trait`) — a `@mixin` PHPDoc tag
+//!   naming a non-object / a trait.
+//! - **NewStaticInAbstractClassStaticMethodRule**
+//!   (`new.staticInAbstractClassStaticMethod`) — `new static()` in a static
+//!   method of an abstract class.
 //!
-//! Deferred (need expression type inference, not just the AST + name resolution):
+//! Deferred (need richer reflection / type-system bits we don't model yet):
 //! - `ImpossibleInstanceOfRule` — needs the inferred type of the operand.
 //! - `enum.caseType` / `enum.duplicateValue` — need constant-value evaluation of
 //!   case expressions.
-//! - `AllowedSubTypesRule`, `Mixin*`, `MethodTag*`, `PropertyTag*`,
-//!   `RequireExtends/Implements`, `LocalTypeAliases*`, `ConsistentConstructor`,
-//!   `UnusedConstructorParameters`, `AccessPrivateConstantThroughStatic`,
-//!   `ClassConstantRule`, `*AttributesRule` — need the type system / richer
-//!   reflection than the current names-only project index exposes.
+//! - `ReadOnlyClassRule` — purely a PHP-version gate (readonly classes need 8.2,
+//!   readonly anonymous classes 8.3); we target 8.6, so it is always clean.
+//! - `RequireExtendsRule` / `RequireImplementsRule` — need `@phpstan-require-*`
+//!   tag reflection, not modelled.
+//! - `AllowedSubTypesRule`, `MethodTag*`, `PropertyTag*`, `LocalTypeAliases*`,
+//!   `ConsistentConstructor`, `UnusedConstructorParameters` — need richer
+//!   reflection / type-alias / liveness analysis than is available here.
 
 use crate::{unknown_symbols, walk, FileAnalysis, RuleEntry};
 use php_ast::{
-    AttributeGroup, ClassDecl, ClassKind, Expr, ExprKind, Member, MethodDecl, Name, Param, Stmt,
-    StmtKind, Visibility,
+    AttributeGroup, ClassDecl, ClassKind, Expr, ExprKind, Member, MemberName, MethodDecl, Name,
+    Param, Stmt, StmtKind, Visibility,
 };
 use php_diagnostics::Diagnostic;
 use php_index::ProjectIndex;
 use php_intern::Interner;
 use php_reflect::attr_target;
 use php_resolve::{for_each_region, Resolution, Scope};
+use php_types::Type;
 use std::collections::{HashMap, HashSet};
 
 // Our consolidated existence check: emits `class.notFound` + `function.notFound`
@@ -295,8 +311,10 @@ fn run_inheritance_kinds(fa: &FileAnalysis) -> Vec<Diagnostic> {
             }
         }
 
-        // `implements` — classes and enums; each target must be an interface.
-        if matches!(c.kind, ClassKind::Class | ClassKind::Enum) {
+        // `implements` — classes; each target must be an interface. (Enum
+        // `implements` is owned by `run_enum_implements`, which uses phpstan's
+        // dedicated `enumImplements.*` identifiers.)
+        if c.kind == ClassKind::Class {
             for iface in &c.implements {
                 check_implements(fa, scope, &label, iface, &mut out);
             }
@@ -1031,6 +1049,521 @@ fn promoted_span(params: &[Param]) -> php_span::Span {
         .unwrap_or(php_span::Span::new(0, 0))
 }
 
+// ---------------------------------------------------------------------------
+// ExistingClassesInEnumImplementsRule — `enum E implements <non-interface>`
+// ---------------------------------------------------------------------------
+
+/// An `enum` that `implements` a class / trait / enum (only an interface is
+/// valid). Mirrors phpstan's `ExistingClassesInEnumImplementsRule`. Existence
+/// (`interface.notFound`) stays with the `unknown-symbol` rule; here we only
+/// classify a *known* implemented symbol by kind, using phpstan's dedicated
+/// `enumImplements.*` identifiers (distinct from a class's `classImplements.*`).
+fn run_enum_implements(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_class(fa.program, fa.interner, |scope, c| {
+        if c.kind != ClassKind::Enum {
+            return;
+        }
+        let enum_name = c.name.map(|n| scope.qualify(fa.interner.resolve(n))).unwrap_or_default();
+        for iface in &c.implements {
+            let Some(kind) = resolved_kind(fa.project, scope, iface) else { continue };
+            let res = scope.resolve_class(iface);
+            let display = res.fqn().unwrap_or(&iface.text).to_string();
+            let (code, word) = match kind {
+                ClassKind::Class => ("enumImplements.class", "class"),
+                ClassKind::Trait => ("enumImplements.trait", "trait"),
+                ClassKind::Enum => ("enumImplements.enum", "enum"),
+                ClassKind::Interface => continue,
+            };
+            out.push(
+                Diagnostic::error(
+                    iface.span,
+                    format!("Enum {enum_name} implements {word} {display}."),
+                )
+                .with_code(code),
+            );
+        }
+    });
+    out
+}
+
+// ---------------------------------------------------------------------------
+// ClassConstantRule — `Class::CONST` access (existence / visibility / scope)
+// ---------------------------------------------------------------------------
+
+/// What a class-const / static class operand resolves to inside a class body.
+enum ClassTarget {
+    /// A concrete class FQN (resolved via `self`/`static`/`parent` or a name).
+    Fqn(String),
+    /// `self`/`static`/`parent` used outside any class (phpstan `outOfClass.*`).
+    OutOfClass(&'static str),
+    /// `parent::` but the enclosing class has no parent (`class.noParent`).
+    NoParent,
+    /// Not statically resolvable (a variable/expression class operand, or a name
+    /// the project doesn't know) — skip to stay false-positive-free.
+    Unknown,
+}
+
+/// Resolve the class operand of a `::` access. `self_fqn`/`parent_fqn` describe
+/// the enclosing class (both `None` when not in a class body).
+fn resolve_class_target(
+    class: &Expr,
+    scope: &Scope,
+    self_fqn: Option<&str>,
+    parent_fqn: Option<&str>,
+) -> ClassTarget {
+    let ExprKind::Name(n) = &class.kind else { return ClassTarget::Unknown };
+    match scope.resolve_class(n) {
+        Resolution::LateStatic(which) => match which.as_str() {
+            "self" | "static" => match self_fqn {
+                Some(f) => ClassTarget::Fqn(f.to_string()),
+                None => ClassTarget::OutOfClass(if which == "self" { "self" } else { "static" }),
+            },
+            "parent" => {
+                if self_fqn.is_none() {
+                    ClassTarget::OutOfClass("parent")
+                } else {
+                    match parent_fqn {
+                        Some(p) => ClassTarget::Fqn(p.to_string()),
+                        None => ClassTarget::NoParent,
+                    }
+                }
+            }
+            _ => ClassTarget::Unknown,
+        },
+        r => match r.fqn() {
+            Some(f) => ClassTarget::Fqn(f.to_string()),
+            None => ClassTarget::Unknown,
+        },
+    }
+}
+
+/// `Class::CONST` checks: `self`/`static`/`parent` outside a class, `parent`
+/// without a parent class, accessing a constant on a trait, an undefined
+/// constant, and private/protected visibility violations.
+///
+/// Mirrors phpstan's `ClassConstantRule` for the statically-resolvable subset.
+/// `::class` is never flagged (it always exists). A constant on an unknown /
+/// unindexed / built-in class is left alone (existence is `class.notFound`'s
+/// job; built-ins lack full reflection) — keeping us false-positive-free.
+fn run_class_constant(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+
+    // (1) Class member bodies, with the enclosing class's `self`/`parent` context.
+    // `for_each_class` discovers classes through control-flow nesting too.
+    for_each_class(fa.program, fa.interner, |scope, c| {
+        let self_fqn = c.name.map(|n| scope.qualify(fa.interner.resolve(n)));
+        let parent_fqn = c.extends.first().map(|p| {
+            scope.resolve_class(p).fqn().map(str::to_string).unwrap_or_else(|| p.text.clone())
+        });
+        for m in &c.members {
+            let Member::Method(md) = m else { continue };
+            let Some(body) = &md.body else { continue };
+            for st in body {
+                scan_const_fetches(st, scope, fa, self_fqn.as_deref(), parent_fqn.as_deref(), &mut out);
+            }
+        }
+    });
+
+    // (2) Everything outside a class body — region top-level + named-function
+    // bodies — with no class context. `for_each_expr_in_scope` covers one scope's
+    // expressions (crossing control flow but stopping at every function/class
+    // boundary), so we scan each scope exactly once and descend separately to
+    // discover nested function bodies. No double-reporting.
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            scan_const_fetches(st, scope, fa, None, None, &mut out);
+            find_nested_function_bodies(st, scope, fa, &mut out);
+        }
+    });
+
+    out
+}
+
+/// Scan the const fetches *directly within one scope* of statement `st` (does
+/// not cross function/class boundaries), with the given class context.
+fn scan_const_fetches(
+    st: &Stmt,
+    scope: &Scope,
+    fa: &FileAnalysis,
+    self_fqn: Option<&str>,
+    parent_fqn: Option<&str>,
+    out: &mut Vec<Diagnostic>,
+) {
+    walk::for_each_expr_in_scope(st, &mut |e| {
+        if let ExprKind::ClassConst { class, name } = &e.kind {
+            check_one_class_const(e, class, name, scope, fa, self_fqn, parent_fqn, out);
+        }
+    });
+}
+
+/// Descend through control flow (without re-scanning expressions — the enclosing
+/// scope's [`scan_const_fetches`] already covered them) to find named-function
+/// declarations, and scan each function body as its own scope (no class context).
+/// Class declarations are skipped (their member bodies are handled separately).
+fn find_nested_function_bodies(st: &Stmt, scope: &Scope, fa: &FileAnalysis, out: &mut Vec<Diagnostic>) {
+    match &st.kind {
+        StmtKind::Function(f) => {
+            for s in &f.body {
+                scan_const_fetches(s, scope, fa, None, None, out);
+                find_nested_function_bodies(s, scope, fa, out);
+            }
+        }
+        StmtKind::Block(b) => b.iter().for_each(|s| find_nested_function_bodies(s, scope, fa, out)),
+        StmtKind::If { then, elseifs, els, .. } => {
+            find_nested_function_bodies(then, scope, fa, out);
+            for e in elseifs {
+                find_nested_function_bodies(&e.body, scope, fa, out);
+            }
+            if let Some(e) = els {
+                find_nested_function_bodies(e, scope, fa, out);
+            }
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::DoWhile { body, .. }
+        | StmtKind::For { body, .. }
+        | StmtKind::Foreach { body, .. } => find_nested_function_bodies(body, scope, fa, out),
+        StmtKind::Try { body, catches, finally } => {
+            body.iter().for_each(|s| find_nested_function_bodies(s, scope, fa, out));
+            for c in catches {
+                c.body.iter().for_each(|s| find_nested_function_bodies(s, scope, fa, out));
+            }
+            if let Some(fin) = finally {
+                fin.iter().for_each(|s| find_nested_function_bodies(s, scope, fa, out));
+            }
+        }
+        StmtKind::Switch { cases, .. } => {
+            for c in cases {
+                c.body.iter().for_each(|s| find_nested_function_bodies(s, scope, fa, out));
+            }
+        }
+        StmtKind::Declare { body: Some(b), .. } => find_nested_function_bodies(b, scope, fa, out),
+        _ => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_one_class_const(
+    e: &Expr,
+    class: &Expr,
+    name: &MemberName,
+    scope: &Scope,
+    fa: &FileAnalysis,
+    self_fqn: Option<&str>,
+    parent_fqn: Option<&str>,
+    out: &mut Vec<Diagnostic>,
+) {
+    // Only a literal `::IDENT` constant fetch (computed `::{expr}` / `::$var` are
+    // not constant fetches we can resolve statically).
+    let MemberName::Ident(const_sym) = name else { return };
+    let const_name = fa.interner.resolve(*const_sym);
+    // `::class` always exists; never flagged here.
+    if const_name.eq_ignore_ascii_case("class") {
+        return;
+    }
+    let fqn = match resolve_class_target(class, scope, self_fqn, parent_fqn) {
+        ClassTarget::Fqn(f) => f,
+        ClassTarget::OutOfClass(which) => {
+            out.push(
+                Diagnostic::error(class.span, format!("Using {which} outside of class scope."))
+                    .with_code(match which {
+                        "self" => "outOfClass.self",
+                        "static" => "outOfClass.static",
+                        _ => "outOfClass.parent",
+                    }),
+            );
+            return;
+        }
+        ClassTarget::NoParent => {
+            // Name the enclosing class (phpstan: "but %s does not extend any class").
+            let here = self_fqn.unwrap_or("").trim_start_matches('\\');
+            out.push(
+                Diagnostic::error(
+                    e.span,
+                    format!("Access to parent::{const_name} but {here} does not extend any class."),
+                )
+                .with_code("class.noParent"),
+            );
+            return;
+        }
+        ClassTarget::Unknown => return,
+    };
+
+    // The class must be a *known, indexed* class-like with full reflection.
+    let Some(cr) = fa.reflection.class(&fqn) else { return };
+    let display = cr.fqn.trim_start_matches('\\').to_string();
+
+    // Accessing a constant on a trait is invalid (other than `::class`).
+    if cr.kind == ClassKind::Trait {
+        out.push(
+            Diagnostic::error(
+                e.span,
+                format!("Cannot access constant {const_name} on trait {display}."),
+            )
+            .with_code("classConstant.onTrait"),
+        );
+        return;
+    }
+    // Enum cases are constants too; phpstan models them via reflection. If the
+    // class has a `__get`-less magic-const story we can't see, only flag when the
+    // hierarchy is fully indexed (no unknown parents) — otherwise skip.
+    if has_unknown_ancestor(fa, &fqn) {
+        return;
+    }
+    let found = fa.reflection.find_constant(&fqn, const_name);
+    // Enum cases resolve as constants in phpstan; our reflection stores enum
+    // cases separately, so treat a known enum case name as existing.
+    let is_enum_case = cr.kind == ClassKind::Enum && enum_has_case(fa, &fqn, const_name);
+    let Some(found) = found else {
+        if is_enum_case {
+            return;
+        }
+        out.push(
+            Diagnostic::error(
+                e.span,
+                format!("Access to undefined constant {display}::{const_name}."),
+            )
+            .with_code("classConstant.notFound"),
+        );
+        return;
+    };
+
+    // Visibility: a private/protected constant accessed from outside the allowed
+    // scope. We only emit a *confident* violation: a private constant accessed
+    // from a different class (or top-level), or a protected constant accessed
+    // from an unrelated class. Same-class / subclass access is allowed.
+    let decl = found.declaring_class.trim_start_matches('\\').to_string();
+    let accessible = match found.member.visibility {
+        Visibility::Public => true,
+        Visibility::Private => self_fqn.is_some_and(|s| {
+            s.trim_start_matches('\\').eq_ignore_ascii_case(&decl)
+        }),
+        Visibility::Protected => self_fqn.is_some_and(|s| {
+            let s = s.trim_start_matches('\\');
+            s.eq_ignore_ascii_case(&decl)
+                || fa.reflection.is_subclass_of(s, &decl)
+                || fa.reflection.is_subclass_of(&decl, s)
+        }),
+    };
+    if !accessible {
+        let (word, code) = match found.member.visibility {
+            Visibility::Private => ("private", "classConstant.private"),
+            _ => ("protected", "classConstant.protected"),
+        };
+        out.push(
+            Diagnostic::error(
+                e.span,
+                format!("Access to {word} constant {const_name} of class {decl}."),
+            )
+            .with_code(code),
+        );
+    }
+}
+
+/// Whether `fqn`'s ancestor chain references a class the reflection index does
+/// not know — in which case a constant could be inherited from it and we must
+/// not claim it's undefined.
+fn has_unknown_ancestor(fa: &FileAnalysis, fqn: &str) -> bool {
+    fn walk(fa: &FileAnalysis, fqn: &str, seen: &mut Vec<String>) -> bool {
+        let key = fqn.trim_start_matches('\\').to_ascii_lowercase();
+        if seen.contains(&key) {
+            return false;
+        }
+        seen.push(key);
+        let Some(cr) = fa.reflection.class(fqn) else { return true };
+        cr.parents.iter().chain(&cr.interfaces).chain(&cr.traits).any(|p| match p {
+            Type::Named { fqn, .. } => walk(fa, fqn, seen),
+            _ => false,
+        })
+    }
+    let mut seen = Vec::new();
+    // The class itself is known (checked by the caller); test only its ancestors.
+    let Some(cr) = fa.reflection.class(fqn) else { return true };
+    cr.parents
+        .iter()
+        .chain(&cr.interfaces)
+        .chain(&cr.traits)
+        .any(|p| matches!(p, Type::Named { fqn, .. } if walk(fa, fqn, &mut seen)))
+}
+
+/// Whether the enum at `fqn` declares a case named `name` (case-sensitive).
+fn enum_has_case(fa: &FileAnalysis, fqn: &str, name: &str) -> bool {
+    // Reflection doesn't expose enum cases directly; re-scan the declaration.
+    let mut found = false;
+    for_each_class(fa.program, fa.interner, |scope, c| {
+        if found || c.kind != ClassKind::Enum {
+            return;
+        }
+        let Some(n) = c.name else { return };
+        if !scope.qualify(fa.interner.resolve(n)).trim_start_matches('\\').eq_ignore_ascii_case(fqn.trim_start_matches('\\')) {
+            return;
+        }
+        for m in &c.members {
+            if let Member::EnumCase(ec) = m {
+                if fa.interner.resolve(ec.name) == name {
+                    found = true;
+                }
+            }
+        }
+    });
+    found
+}
+
+// ---------------------------------------------------------------------------
+// AccessPrivateConstantThroughStaticRule — `static::PRIVATE_CONST`
+// ---------------------------------------------------------------------------
+
+/// `static::PRIVATE_CONST` inside a non-final class — unsafe, because a subclass
+/// can't see the parent's private constant through late static binding.
+///
+/// Mirrors phpstan's `AccessPrivateConstantThroughStaticRule`. We only flag when
+/// the enclosing class is known, not final, and the named constant resolves to a
+/// private one on the class (or an ancestor).
+fn run_private_const_through_static(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_class(fa.program, fa.interner, |scope, c| {
+        if c.kind != ClassKind::Class || c.modifiers.is_final {
+            return;
+        }
+        let Some(n) = c.name else { return };
+        let self_fqn = scope.qualify(fa.interner.resolve(n));
+        for m in &c.members {
+            let Member::Method(md) = m else { continue };
+            let Some(body) = &md.body else { continue };
+            for st in body {
+                collect_exprs_in_stmt(st, &mut |e| {
+                    let ExprKind::ClassConst { class, name } = &e.kind else { return };
+                    let ExprKind::Name(cn) = &class.kind else { return };
+                    if !cn.text.eq_ignore_ascii_case("static") {
+                        return;
+                    }
+                    let MemberName::Ident(sym) = name else { return };
+                    let const_name = fa.interner.resolve(*sym);
+                    if const_name.eq_ignore_ascii_case("class") {
+                        return;
+                    }
+                    let Some(found) = fa.reflection.find_constant(&self_fqn, const_name) else {
+                        return;
+                    };
+                    if found.member.visibility != Visibility::Private {
+                        return;
+                    }
+                    let decl = found.declaring_class.trim_start_matches('\\');
+                    out.push(
+                        Diagnostic::error(
+                            e.span,
+                            format!(
+                                "Unsafe access to private constant {decl}::{const_name} through static::."
+                            ),
+                        )
+                        .with_code("staticClassAccess.privateConstant"),
+                    );
+                });
+            }
+        }
+    });
+    out
+}
+
+// ---------------------------------------------------------------------------
+// MixinRule — `@mixin` PHPDoc tag pointing at a non-object / a trait
+// ---------------------------------------------------------------------------
+
+/// A class `@mixin` PHPDoc tag whose type is a non-object (`mixin.nonObject`) or
+/// a trait (`mixin.trait`).
+///
+/// Mirrors the statically-checkable subset of phpstan's `MixinRule`/`MixinCheck`.
+/// An *unknown* mixin class is left to `class.notFound`; generics/typehint
+/// completeness checks are out of scope. The `@mixin` targets are taken from the
+/// reflection layer (which resolves the class docblock's `@mixin` tags).
+fn run_mixin(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_class(fa.program, fa.interner, |scope, c| {
+        let Some(n) = c.name else { return };
+        let fqn = scope.qualify(fa.interner.resolve(n));
+        let Some(cr) = fa.reflection.class(&fqn) else { return };
+        for mixin in &cr.mixins {
+            match mixin {
+                Type::Named { fqn: mfqn, .. } => {
+                    // A known trait is invalid; an unknown class is class.notFound's job.
+                    if let Some(mcr) = fa.reflection.class(mfqn) {
+                        if mcr.kind == ClassKind::Trait {
+                            out.push(
+                                Diagnostic::error(
+                                    enum_member_span(c),
+                                    format!(
+                                        "PHPDoc tag @mixin contains invalid type {}.",
+                                        mfqn.trim_start_matches('\\')
+                                    ),
+                                )
+                                .with_code("mixin.trait"),
+                            );
+                        }
+                    }
+                }
+                // `self`/`static`/`parent` are object types — valid.
+                Type::SelfType | Type::StaticType | Type::Parent => {}
+                // Anything else (scalars, arrays, callables, …) is a non-object.
+                other => out.push(
+                    Diagnostic::error(
+                        enum_member_span(c),
+                        format!("PHPDoc tag @mixin contains non-object type {other}."),
+                    )
+                    .with_code("mixin.nonObject"),
+                ),
+            }
+        }
+    });
+    out
+}
+
+// ---------------------------------------------------------------------------
+// NewStaticInAbstractClassStaticMethodRule
+// ---------------------------------------------------------------------------
+
+/// `new static()` inside a *static* method of an *abstract* class — a direct
+/// `Abstract::method()` call would crash (an abstract class can't be
+/// instantiated).
+///
+/// Mirrors phpstan's `NewStaticInAbstractClassStaticMethodRule`. (The broader
+/// `new static()`-in-non-final-class warning is `run_new_static`.)
+fn run_new_static_abstract(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_class(fa.program, fa.interner, |scope, c| {
+        if c.kind != ClassKind::Class || !c.modifiers.is_abstract {
+            return;
+        }
+        let display = c.name.map(|n| scope.qualify(fa.interner.resolve(n))).unwrap_or_default();
+        let display = display.trim_start_matches('\\').to_string();
+        for m in &c.members {
+            let Member::Method(md) = m else { continue };
+            if !md.modifiers.is_static {
+                continue;
+            }
+            let method = fa.interner.resolve(md.name).to_string();
+            let Some(body) = &md.body else { continue };
+            for st in body {
+                collect_exprs_in_stmt(st, &mut |e| {
+                    let ExprKind::New { class, .. } = &e.kind else { return };
+                    let ExprKind::Name(name) = &class.kind else { return };
+                    if name.text.eq_ignore_ascii_case("static") {
+                        out.push(
+                            Diagnostic::error(
+                                e.span,
+                                format!(
+                                    "Unsafe usage of new static() in abstract class {display} in static method {method}()."
+                                ),
+                            )
+                            .with_code("new.staticInAbstractClassStaticMethod"),
+                        );
+                    }
+                });
+            }
+        }
+    });
+    out
+}
+
 pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "unknown-symbol", level: 0, run: run_unknown_symbols },
     RuleEntry { name: "instantiation", level: 0, run: run_instantiation },
@@ -1044,6 +1577,19 @@ pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "attribute.class", level: 0, run: run_non_class_attribute },
     RuleEntry { name: "attribute.usage", level: 0, run: run_attribute_usages },
     RuleEntry { name: "property.invalidPromoted", level: 0, run: run_invalid_promoted },
+    RuleEntry { name: "enum.implements", level: 0, run: run_enum_implements },
+    RuleEntry { name: "class.constant", level: 0, run: run_class_constant },
+    RuleEntry {
+        name: "new.staticInAbstractClassStaticMethod",
+        level: 0,
+        run: run_new_static_abstract,
+    },
+    RuleEntry {
+        name: "staticClassAccess.privateConstant",
+        level: 2,
+        run: run_private_const_through_static,
+    },
+    RuleEntry { name: "mixin", level: 2, run: run_mixin },
 ];
 
 #[cfg(test)]
@@ -1391,5 +1937,225 @@ mod tests {
     fn normal_promoted_property_is_clean() {
         let src = "<?php class C { public function __construct(public int $x) {} }";
         assert!(codes(src, run_invalid_promoted).is_empty());
+    }
+
+    // --- enum implements -------------------------------------------------
+
+    #[test]
+    fn enum_implements_class_is_flagged() {
+        let src = "<?php class C {} enum E implements C {}";
+        assert_eq!(codes(src, run_enum_implements), ["enumImplements.class"]);
+    }
+
+    #[test]
+    fn enum_implements_trait_is_flagged() {
+        let src = "<?php trait T {} enum E implements T {}";
+        assert_eq!(codes(src, run_enum_implements), ["enumImplements.trait"]);
+    }
+
+    #[test]
+    fn enum_implements_enum_is_flagged() {
+        let src = "<?php enum F {} enum E implements F {}";
+        assert_eq!(codes(src, run_enum_implements), ["enumImplements.enum"]);
+    }
+
+    #[test]
+    fn enum_implements_interface_is_clean() {
+        let src = "<?php interface I {} enum E implements I {}";
+        assert!(codes(src, run_enum_implements).is_empty());
+    }
+
+    #[test]
+    fn enum_implements_unknown_is_left_to_existence_check() {
+        let src = "<?php enum E implements TotallyUnknown {}";
+        assert!(codes(src, run_enum_implements).is_empty());
+    }
+
+    // --- class constant access -------------------------------------------
+
+    #[test]
+    fn undefined_class_constant_is_flagged() {
+        let src = "<?php class C { const A = 1; } echo C::B;";
+        assert_eq!(codes(src, run_class_constant), ["classConstant.notFound"]);
+    }
+
+    #[test]
+    fn defined_class_constant_is_clean() {
+        let src = "<?php class C { const A = 1; } echo C::A;";
+        assert!(codes(src, run_class_constant).is_empty());
+    }
+
+    #[test]
+    fn inherited_class_constant_is_clean() {
+        let src = "<?php class B { const A = 1; } class C extends B {} echo C::A;";
+        assert!(codes(src, run_class_constant).is_empty());
+    }
+
+    #[test]
+    fn class_keyword_constant_is_never_flagged() {
+        let src = "<?php class C {} echo C::class;";
+        assert!(codes(src, run_class_constant).is_empty());
+    }
+
+    #[test]
+    fn self_outside_class_is_flagged() {
+        let src = "<?php echo self::FOO;";
+        assert_eq!(codes(src, run_class_constant), ["outOfClass.self"]);
+    }
+
+    #[test]
+    fn static_outside_class_is_flagged() {
+        let src = "<?php echo static::FOO;";
+        assert_eq!(codes(src, run_class_constant), ["outOfClass.static"]);
+    }
+
+    #[test]
+    fn parent_outside_class_is_flagged() {
+        let src = "<?php echo parent::FOO;";
+        assert_eq!(codes(src, run_class_constant), ["outOfClass.parent"]);
+    }
+
+    #[test]
+    fn parent_without_parent_class_is_flagged() {
+        let src = "<?php class C { const X = 1; function f() { return parent::X; } }";
+        assert_eq!(codes(src, run_class_constant), ["class.noParent"]);
+    }
+
+    #[test]
+    fn constant_on_trait_is_flagged() {
+        let src = "<?php trait T { const A = 1; } echo T::A;";
+        assert_eq!(codes(src, run_class_constant), ["classConstant.onTrait"]);
+    }
+
+    #[test]
+    fn private_constant_accessed_from_outside_is_flagged() {
+        let src = "<?php class C { private const A = 1; } echo C::A;";
+        assert_eq!(codes(src, run_class_constant), ["classConstant.private"]);
+    }
+
+    #[test]
+    fn protected_constant_accessed_from_outside_is_flagged() {
+        let src = "<?php class C { protected const A = 1; } echo C::A;";
+        assert_eq!(codes(src, run_class_constant), ["classConstant.protected"]);
+    }
+
+    #[test]
+    fn private_constant_accessed_from_same_class_is_clean() {
+        let src = "<?php class C { private const A = 1; function f() { return self::A; } }";
+        assert!(codes(src, run_class_constant).is_empty());
+    }
+
+    #[test]
+    fn protected_constant_accessed_from_subclass_is_clean() {
+        let src = "<?php class B { protected const A = 1; } \
+            class C extends B { function f() { return self::A; } }";
+        assert!(codes(src, run_class_constant).is_empty());
+    }
+
+    #[test]
+    fn enum_case_access_is_clean() {
+        let src = "<?php enum E { case A; } echo E::A->name;";
+        assert!(codes(src, run_class_constant).is_empty());
+    }
+
+    #[test]
+    fn class_constant_on_unknown_class_is_left_alone() {
+        // Existence is class.notFound's job, not this rule's.
+        let src = "<?php echo Unknown::FOO;";
+        assert!(codes(src, run_class_constant).is_empty());
+    }
+
+    #[test]
+    fn class_constant_with_unknown_parent_is_not_flagged() {
+        // The constant could be inherited from the unindexed parent.
+        let src = "<?php class C extends \\SomeBuiltinUnknown { } echo C::WHATEVER;";
+        assert!(codes(src, run_class_constant).is_empty());
+    }
+
+    // --- private constant through static ---------------------------------
+
+    #[test]
+    fn private_const_through_static_in_non_final_is_flagged() {
+        let src = "<?php class C { private const A = 1; \
+            function f() { return static::A; } }";
+        assert_eq!(
+            codes(src, run_private_const_through_static),
+            ["staticClassAccess.privateConstant"]
+        );
+    }
+
+    #[test]
+    fn private_const_through_static_in_final_is_clean() {
+        let src = "<?php final class C { private const A = 1; \
+            function f() { return static::A; } }";
+        assert!(codes(src, run_private_const_through_static).is_empty());
+    }
+
+    #[test]
+    fn public_const_through_static_is_clean() {
+        let src = "<?php class C { public const A = 1; \
+            function f() { return static::A; } }";
+        assert!(codes(src, run_private_const_through_static).is_empty());
+    }
+
+    #[test]
+    fn private_const_through_self_is_not_this_rule() {
+        // `self::` is fine — only `static::` is unsafe for private constants.
+        let src = "<?php class C { private const A = 1; \
+            function f() { return self::A; } }";
+        assert!(codes(src, run_private_const_through_static).is_empty());
+    }
+
+    // --- @mixin ----------------------------------------------------------
+
+    #[test]
+    fn mixin_non_object_is_flagged() {
+        let src = "<?php /** @mixin int */ class C {}";
+        assert_eq!(codes(src, run_mixin), ["mixin.nonObject"]);
+    }
+
+    #[test]
+    fn mixin_trait_is_flagged() {
+        let src = "<?php trait T {} /** @mixin T */ class C {}";
+        assert_eq!(codes(src, run_mixin), ["mixin.trait"]);
+    }
+
+    #[test]
+    fn mixin_class_is_clean() {
+        let src = "<?php class M {} /** @mixin M */ class C {}";
+        assert!(codes(src, run_mixin).is_empty());
+    }
+
+    #[test]
+    fn mixin_unknown_class_is_left_to_existence_check() {
+        let src = "<?php /** @mixin Unknown */ class C {}";
+        assert!(codes(src, run_mixin).is_empty());
+    }
+
+    // --- new static() in abstract static method --------------------------
+
+    #[test]
+    fn new_static_in_abstract_static_method_is_flagged() {
+        let src = "<?php abstract class C { \
+            public static function make() { return new static(); } }";
+        assert_eq!(
+            codes(src, run_new_static_abstract),
+            ["new.staticInAbstractClassStaticMethod"]
+        );
+    }
+
+    #[test]
+    fn new_static_in_abstract_instance_method_is_clean() {
+        // Only static methods of abstract classes are unsafe in this rule.
+        let src = "<?php abstract class C { \
+            public function make() { return new static(); } }";
+        assert!(codes(src, run_new_static_abstract).is_empty());
+    }
+
+    #[test]
+    fn new_static_in_concrete_static_method_is_clean() {
+        let src = "<?php class C { \
+            public static function make() { return new static(); } }";
+        assert!(codes(src, run_new_static_abstract).is_empty());
     }
 }

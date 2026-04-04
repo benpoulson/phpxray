@@ -120,6 +120,9 @@ DONE = {
     "PropertyAttributesRule", "TraitAttributesRule",
     # Cap #4: typed builtin stubs + castable-to-string predicate
     "ImplodeParameterCastableToStringRule",
+    "ParameterCastableToStringRule", "SortParameterCastableToStringRule",
+    "ParameterCastableToNumberRule", "ArrayValuesRule",
+    "IncompatibleDefaultParameterTypeRule", "FilterVarRule", "CallUserFuncRule",
     # Cap #5: definedness lattice
     "DefinedVariableRule",
     # Cap #8: callable-type resolution
@@ -127,6 +130,21 @@ DONE = {
     # Cap #6: by-ref / @param-out flow (parameter.notByRef is part of the
     # already-ticked IncompatiblePhpDocTypeRule; the foreach rule is toggle-gated)
     "AssignToByRefExprFromForeachRule",
+    # --- Parallel rule batch (member-existence + phpdoc-type + structural) ---
+    # Properties
+    "AccessPropertiesInAssignRule", "AccessStaticPropertiesRule", "NullsafePropertyFetchRule",
+    "ReadingWriteOnlyPropertiesRule", "WritingToReadOnlyPropertiesRule",
+    # Classes
+    "ClassConstantRule", "DuplicateTraitDeclarationRule", "ExistingClassesInEnumImplementsRule",
+    "TraitAttributeClassRule", "AccessPrivateConstantThroughStaticRule", "MixinRule",
+    "NewStaticInAbstractClassStaticMethodRule",
+    # PhpDoc
+    "IncompatiblePropertyPhpDocTypeRule", "IncompatibleClassConstantPhpDocTypeRule",
+    "InvalidThrowsPhpDocValueRule", "RequireExtendsDefinitionClassRule",
+    "RequireImplementsDefinitionClassRule",
+    # Methods
+    "CallToConstructorStatementWithoutSideEffectsRule", "NullsafeMethodCallRule",
+    "CallPrivateMethodThroughStaticRule", "ConsistentConstructorDeclarationRule",
 }
 # Rules we can't implement yet, with the reason.
 _TYPES = "needs the type system (operand/value types)"
@@ -144,6 +162,8 @@ DEFERRED = {
     "ArrayUnpackingRule": _TYPES,
     "UnpackIterableInArrayRule": _TYPES,
     "ArrayDestructuringRule": _TYPES,
+    "ArrayFilterRule": "needs falsy-value / non-emptiness type tracking (isIterableAtLeastOnce, falsey super-type) we don't model",
+    "RandomIntParametersRule": "needs literal-int range types (min > max comparison) we don't infer",
 }
 
 level_params = {

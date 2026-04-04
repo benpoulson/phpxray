@@ -42,13 +42,15 @@
 //!   property-hook get/set body rules — need expression-type inference of the
 //!   access receiver / value, or virtual-property hook semantics beyond the AST.
 
-use crate::{FileAnalysis, RuleEntry};
+use crate::{walk, FileAnalysis, RuleEntry};
 use php_ast::{
     AttributeGroup, ClassDecl, ClassKind, Expr, ExprKind, HookBody, Member, MemberName, Program,
     PropElem, PropertyDecl, Stmt, StmtKind, Visibility,
 };
 use php_diagnostics::Diagnostic;
+use php_phpdoc::PropertyAccess;
 use php_span::Span;
+use php_types::Type;
 
 // --- shared helpers --------------------------------------------------------
 
@@ -888,6 +890,348 @@ fn class_is_fully_known(fqn: &str, fa: &FileAnalysis) -> bool {
     known(fqn, fa, &mut Vec::new())
 }
 
+// --- type helpers (general property access) ---------------------------------
+
+/// If `ty` denotes a single, concrete object class (directly or under one level
+/// of nullable/parens), return its FQN (sans leading `\`). Returns `None` for
+/// unions of classes, `mixed`/`object`/unknown, scalars, generics-bound vars,
+/// `self`/`static`/`parent`, etc. — anything we cannot pin to one named class.
+/// This is what keeps the access rules false-positive-free: we only judge a
+/// receiver whose class is unambiguous.
+fn sole_class(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Named { fqn, .. } => Some(fqn.trim_start_matches('\\').to_string()),
+        // `?C` / `C|null`: the access itself is a *different* (nullable) problem;
+        // for member existence we still know the non-null part is exactly `C`.
+        Type::Nullable(inner) => sole_class(inner),
+        _ => None,
+    }
+}
+
+/// Conservative: the class and *every* ancestor it names are present in the
+/// reflection index (so no unknown parent/interface/trait/mixin can secretly
+/// declare the member). Shared with the `$this` rule's notion above.
+fn known_class_tree(fqn: &str, fa: &FileAnalysis) -> bool {
+    class_is_fully_known(fqn, fa)
+}
+
+/// Does `class_fqn` (or its hierarchy) declare a magic `__get`/`__set` that would
+/// make any property access legal? If so we never flag undefined properties.
+fn has_magic_accessor(fqn: &str, fa: &FileAnalysis, write: bool) -> bool {
+    let getset = if write { "__set" } else { "__get" };
+    fa.reflection.find_method(fqn, getset).is_some()
+}
+
+// --- AccessPropertiesRule (level 0, general receiver) ----------------------
+
+/// phpstan `AccessPropertiesRule` (`AccessPropertiesCheck`), the FP-safe subset
+/// for an *arbitrary* receiver `$obj->prop`: when `$obj` has a single, concrete,
+/// fully-known class and the property is absent from its hierarchy (and there is
+/// no `__get`), emit `property.notFound`.
+///
+/// This complements [`run_access_properties`] (which only covers `$this->p`) by
+/// using inferred receiver types. `$this` receivers are skipped here (handled by
+/// that rule) so we don't double-report. Visibility (`property.private`/
+/// `.protected`) is deferred — see [`check_property_access`].
+fn run_access_properties_general(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    // Property fetches that are assignment targets are checked (as writes) by
+    // run_access_properties_in_assign — exclude them here so we don't
+    // double-report (mirrors phpstan's `isInExpressionAssign` skip).
+    let assign_targets = assignment_target_spans(fa.program);
+    walk::for_each_expr(fa.program, &mut |e: &Expr| {
+        if let ExprKind::Prop { base, name, nullsafe } = &e.kind {
+            let r = e.span.range();
+            if assign_targets.contains(&(r.start as u32, r.end as u32)) {
+                return;
+            }
+            check_property_access(fa, e, base, name, *nullsafe, false, &mut out);
+        }
+    });
+    out
+}
+
+/// Spans of every property fetch used as a plain assignment / assign-ref target
+/// (these are pure writes, checked by run_access_properties_in_assign). Compound
+/// assignments (`+=`) are reads too, so they are NOT excluded here.
+fn assignment_target_spans(program: &Program) -> Vec<(u32, u32)> {
+    let mut spans = Vec::new();
+    walk::for_each_expr(program, &mut |e: &Expr| {
+        let (ExprKind::Assign { target, .. } | ExprKind::AssignRef { target, .. }) = &e.kind else {
+            return;
+        };
+        if matches!(&target.kind, ExprKind::Prop { .. }) {
+            let r = target.span.range();
+            spans.push((r.start as u32, r.end as u32));
+        }
+    });
+    spans
+}
+
+/// The write-side (`AccessPropertiesInAssignRule`): same check, but on the target
+/// of an assignment, judging *write* access (so a `private(set)`-ish member could
+/// differ — but our model has no asymmetric-visibility split, so for writes we
+/// only report `notFound`, never private/protected, to stay FP-safe).
+fn run_access_properties_in_assign(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    // Walk every assignment whose target is a (non-`$this`) property fetch.
+    walk::for_each_expr(fa.program, &mut |e: &Expr| {
+        let (ExprKind::Assign { target, .. } | ExprKind::AssignRef { target, .. }) = &e.kind else {
+            return;
+        };
+        if let ExprKind::Prop { base, name, nullsafe } = &target.kind {
+            check_property_access(fa, target, base, name, *nullsafe, true, &mut out);
+        }
+    });
+    out
+}
+
+/// The shared per-fetch check: when `base` has a single, fully-known concrete
+/// class and `prop` is absent from its hierarchy (and there is no `__get`/`__set`
+/// magic accessor for the access direction), emit `property.notFound`.
+///
+/// Visibility (`property.private`/`property.protected`) is intentionally NOT
+/// reported here: deciding it correctly needs the enclosing-class context to know
+/// whether the access is inside the hierarchy, and getting that wrong produces
+/// false positives. We only emit the unambiguous `notFound`. `$this->p` is
+/// handled by [`run_access_properties`] and skipped here to avoid duplicates.
+#[allow(clippy::too_many_arguments)]
+fn check_property_access(
+    fa: &FileAnalysis,
+    fetch: &Expr,
+    base: &Expr,
+    name: &MemberName,
+    _nullsafe: bool,
+    write: bool,
+    out: &mut Vec<Diagnostic>,
+) {
+    if matches!(&base.kind, ExprKind::Variable(v) if fa.interner.resolve(*v) == "this") {
+        return;
+    }
+    let MemberName::Ident(p) = name else { return }; // dynamic `$o->$x` — skip.
+    let prop = fa.interner.resolve(*p);
+
+    let Some(class) = sole_class(&fa.type_of(base)) else { return };
+    if !known_class_tree(&class, fa) {
+        return; // unresolved hierarchy → no judgement.
+    }
+    if fa.reflection.find_property(&class, prop).is_some() || has_magic_accessor(&class, fa, write) {
+        return;
+    }
+    out.push(
+        Diagnostic::error(
+            fetch.span,
+            format!("Access to an undefined property {}::${prop}.", class.trim_start_matches('\\')),
+        )
+        .with_code("property.notFound"),
+    );
+}
+
+// --- AccessStaticPropertiesRule (level 0) ----------------------------------
+
+/// phpstan `AccessStaticPropertiesRule` (`AccessStaticPropertiesCheck`), FP-safe
+/// subset: `Foo::$bar` where `Foo` resolves to a single, fully-known class and
+/// `$bar` is absent from its hierarchy → `staticProperty.notFound`. `self`/
+/// `static`/`parent` and dynamic names are skipped (they need richer scope).
+fn run_access_static_properties(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    use php_resolve::{for_each_region, Resolution};
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for s in region {
+            walk_region_exprs(s, &mut |e: &Expr| {
+                let ExprKind::StaticProp { class, name } = &e.kind else { return };
+                // `C::$b` — the static-property name is the `$b` variable token.
+                let MemberName::Var(p) = name else { return };
+                let ExprKind::Name(n) = &class.kind else { return };
+                // Skip self/static/parent — need enclosing-class context.
+                let fqn = match scope.resolve_class(n) {
+                    Resolution::Fqn(f) => f.trim_start_matches('\\').to_string(),
+                    _ => return,
+                };
+                if !known_class_tree(&fqn, fa) {
+                    return;
+                }
+                let prop = fa.interner.resolve(*p);
+                if fa.reflection.find_property(&fqn, prop).is_none() {
+                    out.push(
+                        Diagnostic::error(
+                            e.span,
+                            format!(
+                                "Access to an undefined static property {}::${prop}.",
+                                fqn.trim_start_matches('\\')
+                            ),
+                        )
+                        .with_code("staticProperty.notFound"),
+                    );
+                }
+            });
+        }
+    });
+    out
+}
+
+/// Walk every expression inside a statement (region-level), descending into all
+/// bodies via the shared cross-scope walker semantics. We only need expressions,
+/// so reuse `walk_expr_local`/`stmt_exprs` which already descend into closures.
+fn walk_region_exprs(s: &Stmt, on_expr: &mut impl FnMut(&Expr)) {
+    // Top-level declarations (class/function) hold their own bodies; descend.
+    match &s.kind {
+        StmtKind::Class(c) => {
+            for m in &c.members {
+                match m {
+                    Member::Method(md) => {
+                        if let Some(body) = &md.body {
+                            body.iter().for_each(|st| walk_region_exprs(st, on_expr));
+                        }
+                    }
+                    Member::Property(pd) => {
+                        for elem in &pd.props {
+                            if let Some(d) = &elem.default {
+                                walk_expr_local(d, on_expr);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        StmtKind::Function(fd) => fd.body.iter().for_each(|st| walk_region_exprs(st, on_expr)),
+        StmtKind::Namespace { body: Some(b), .. } => {
+            b.iter().for_each(|st| walk_region_exprs(st, on_expr))
+        }
+        _ => stmt_exprs(s, on_expr),
+    }
+}
+
+// --- NullsafePropertyFetchRule (level 4) -----------------------------------
+
+/// phpstan `NullsafePropertyFetchRule` (`nullsafe.neverNull`): using `?->` on a
+/// receiver whose type is never null is redundant — use `->`. FP-safe: only fires
+/// when the receiver's inferred type is a concrete, non-nullable object class
+/// (`Type::Named`). Unknown/mixed/nullable/union receivers are left alone.
+fn run_nullsafe_property_fetch(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e: &Expr| {
+        let ExprKind::Prop { base, nullsafe: true, .. } = &e.kind else { return };
+        let recv = fa.type_of(base);
+        // Only when we are SURE it's never null: a concrete named object type.
+        if matches!(recv, Type::Named { .. }) {
+            let desc = type_desc(&recv);
+            out.push(
+                Diagnostic::error(
+                    e.span,
+                    format!(
+                        "Using nullsafe property access on non-nullable type {desc}. Use -> instead."
+                    ),
+                )
+                .with_code("nullsafe.neverNull"),
+            );
+        }
+    });
+    out
+}
+
+fn type_desc(ty: &Type) -> String {
+    match ty {
+        Type::Named { fqn, .. } => fqn.trim_start_matches('\\').to_string(),
+        other => format!("{other}"),
+    }
+}
+
+// --- ReadingWriteOnlyPropertiesRule (level 0) ------------------------------
+
+/// phpstan `ReadingWriteOnlyPropertiesRule` (`property.writeOnly`): reading a
+/// magic property declared `@property-write` only. FP-safe: only fires on a
+/// concrete known class with a magic property whose access is `WriteOnly`, and
+/// only in a read position (not the LHS of an assignment).
+fn run_reading_write_only(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    // Collect spans of property fetches that are assignment *targets* (writes),
+    // so we can exclude them from the read check.
+    let mut write_targets: Vec<(u32, u32)> = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e: &Expr| {
+        if let ExprKind::Assign { target, .. } | ExprKind::AssignRef { target, .. } = &e.kind {
+            if matches!(&target.kind, ExprKind::Prop { .. }) {
+                let r = target.span.range();
+                write_targets.push((r.start as u32, r.end as u32));
+            }
+        }
+    });
+
+    walk::for_each_expr(fa.program, &mut |e: &Expr| {
+        let ExprKind::Prop { base, name, .. } = &e.kind else { return };
+        let MemberName::Ident(p) = name else { return };
+        let r = e.span.range();
+        if write_targets.contains(&(r.start as u32, r.end as u32)) {
+            return; // it's a write, not a read.
+        }
+        let Some(class) = receiver_class(fa, base) else { return };
+        if !known_class_tree(&class, fa) {
+            return;
+        }
+        let prop = fa.interner.resolve(*p);
+        if let Some(found) = fa.reflection.find_property(&class, prop) {
+            if found.member.magic && found.member.access == PropertyAccess::WriteOnly {
+                out.push(
+                    Diagnostic::error(
+                        e.span,
+                        format!(
+                            "Property {}::${prop} is not readable.",
+                            found.declaring_class.trim_start_matches('\\')
+                        ),
+                    )
+                    .with_code("property.writeOnly"),
+                );
+            }
+        }
+    });
+    out
+}
+
+// --- WritingToReadOnlyPropertiesRule (level 0) -----------------------------
+
+/// phpstan `WritingToReadOnlyPropertiesRule` (`assign.propertyReadOnly`): writing
+/// to a magic property declared `@property-read` only. FP-safe: concrete known
+/// class, magic property whose access is `ReadOnly`. (Distinct from native
+/// `readonly` properties — those are `ReadOnlyPropertyAssignRule`.)
+fn run_writing_to_read_only(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e: &Expr| {
+        let (ExprKind::Assign { target, .. } | ExprKind::AssignOp { target, .. }) = &e.kind else {
+            return;
+        };
+        let ExprKind::Prop { base, name, .. } = &target.kind else { return };
+        let MemberName::Ident(p) = name else { return };
+        let Some(class) = receiver_class(fa, base) else { return };
+        if !known_class_tree(&class, fa) {
+            return;
+        }
+        let prop = fa.interner.resolve(*p);
+        if let Some(found) = fa.reflection.find_property(&class, prop) {
+            if found.member.magic && found.member.access == PropertyAccess::ReadOnly {
+                out.push(
+                    Diagnostic::error(
+                        target.span,
+                        format!(
+                            "Property {}::${prop} is not writable.",
+                            found.declaring_class.trim_start_matches('\\')
+                        ),
+                    )
+                    .with_code("assign.propertyReadOnly"),
+                );
+            }
+        }
+    });
+    out
+}
+
+/// Resolve a property-fetch receiver expression to a single concrete class FQN,
+/// covering both `$this` (via the inferred type, which the type map seeds) and an
+/// arbitrary inferred object type.
+fn receiver_class(fa: &FileAnalysis, base: &Expr) -> Option<String> {
+    sole_class(&fa.type_of(base))
+}
+
 // --- registry --------------------------------------------------------------
 
 pub(crate) static RULES: &[RuleEntry] = &[
@@ -898,6 +1242,12 @@ pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "property.overriding", level: 0, run: run_overriding_property },
     RuleEntry { name: "property.accessUndefined", level: 0, run: run_access_properties },
     RuleEntry { name: "property.readOnlyAssign", level: 3, run: run_readonly_property_assign },
+    RuleEntry { name: "property.access", level: 0, run: run_access_properties_general },
+    RuleEntry { name: "property.accessInAssign", level: 0, run: run_access_properties_in_assign },
+    RuleEntry { name: "staticProperty.access", level: 0, run: run_access_static_properties },
+    RuleEntry { name: "property.nullsafeNeverNull", level: 4, run: run_nullsafe_property_fetch },
+    RuleEntry { name: "property.readingWriteOnly", level: 0, run: run_reading_write_only },
+    RuleEntry { name: "property.writingToReadOnly", level: 0, run: run_writing_to_read_only },
 ];
 
 #[cfg(test)]
@@ -1126,5 +1476,152 @@ mod tests {
     fn non_readonly_assign_outside_ctor_is_clean() {
         let src = "<?php class C { public int $x; function f() { $this->x = 1; } }";
         assert!(codes(src, run_readonly_property_assign).is_empty());
+    }
+
+    // --- AccessPropertiesRule (general receiver) ------------------------
+
+    #[test]
+    fn access_undefined_property_on_new_is_flagged() {
+        let src = "<?php class C { public int $a; } function f() { return (new C())->b; }";
+        assert_eq!(codes(src, run_access_properties_general), ["property.notFound"]);
+    }
+
+    #[test]
+    fn access_defined_property_on_new_is_clean() {
+        let src = "<?php class C { public int $a; } function f() { return (new C())->a; }";
+        assert!(codes(src, run_access_properties_general).is_empty());
+    }
+
+    #[test]
+    fn access_property_on_unknown_class_is_clean() {
+        // Receiver type unknown / not in index → conservative, no FP.
+        let src = "<?php function f($x) { return $x->b; }";
+        assert!(codes(src, run_access_properties_general).is_empty());
+    }
+
+    #[test]
+    fn access_property_on_new_with_magic_get_is_clean() {
+        let src = "<?php class C { function __get($n) { return 1; } } function f() { return (new C())->b; }";
+        assert!(codes(src, run_access_properties_general).is_empty());
+    }
+
+    #[test]
+    fn access_property_on_this_not_double_reported() {
+        // $this is handled by run_access_properties, not the general rule.
+        let src = "<?php class C { public int $a; function f() { return $this->b; } }";
+        assert!(codes(src, run_access_properties_general).is_empty());
+    }
+
+    #[test]
+    fn access_inherited_property_on_new_is_clean() {
+        let src = "<?php class B { public int $a; } class C extends B {} function f() { return (new C())->a; }";
+        assert!(codes(src, run_access_properties_general).is_empty());
+    }
+
+    // --- AccessPropertiesInAssignRule ----------------------------------
+
+    #[test]
+    fn assign_undefined_property_is_flagged() {
+        let src = "<?php class C { public int $a; } function f() { (new C())->b = 1; }";
+        assert_eq!(codes(src, run_access_properties_in_assign), ["property.notFound"]);
+    }
+
+    #[test]
+    fn assign_defined_property_is_clean() {
+        let src = "<?php class C { public int $a; } function f() { (new C())->a = 1; }";
+        assert!(codes(src, run_access_properties_in_assign).is_empty());
+    }
+
+    // --- AccessStaticPropertiesRule ------------------------------------
+
+    #[test]
+    fn access_undefined_static_property_is_flagged() {
+        let src = "<?php class C { public static int $a; } function f() { return C::$b; }";
+        assert_eq!(codes(src, run_access_static_properties), ["staticProperty.notFound"]);
+    }
+
+    #[test]
+    fn access_defined_static_property_is_clean() {
+        let src = "<?php class C { public static int $a; } function f() { return C::$a; }";
+        assert!(codes(src, run_access_static_properties).is_empty());
+    }
+
+    #[test]
+    fn access_static_property_on_unknown_class_is_clean() {
+        let src = "<?php function f() { return Unknown::$b; }";
+        assert!(codes(src, run_access_static_properties).is_empty());
+    }
+
+    #[test]
+    fn access_static_property_via_self_is_not_flagged() {
+        // self/static/parent are skipped (need enclosing-class scope).
+        let src = "<?php class C { public static int $a; function f() { return self::$b; } }";
+        assert!(codes(src, run_access_static_properties).is_empty());
+    }
+
+    // --- NullsafePropertyFetchRule -------------------------------------
+
+    #[test]
+    fn nullsafe_on_nonnull_object_is_flagged() {
+        let src = "<?php class C { public int $a; } function f() { return (new C())?->a; }";
+        assert_eq!(codes(src, run_nullsafe_property_fetch), ["nullsafe.neverNull"]);
+    }
+
+    #[test]
+    fn nullsafe_on_unknown_is_clean() {
+        let src = "<?php function f($x) { return $x?->a; }";
+        assert!(codes(src, run_nullsafe_property_fetch).is_empty());
+    }
+
+    #[test]
+    fn nullsafe_on_nullable_is_clean() {
+        let src = "<?php class C { public ?C $next; function f() { return $this->next?->next; } }";
+        assert!(codes(src, run_nullsafe_property_fetch).is_empty());
+    }
+
+    #[test]
+    fn plain_arrow_is_clean() {
+        let src = "<?php class C { public int $a; } function f() { return (new C())->a; }";
+        assert!(codes(src, run_nullsafe_property_fetch).is_empty());
+    }
+
+    // --- ReadingWriteOnlyPropertiesRule --------------------------------
+
+    #[test]
+    fn reading_write_only_magic_property_is_flagged() {
+        let src = "<?php /** @property-write int $w */ class C {} function f() { return (new C())->w; }";
+        assert_eq!(codes(src, run_reading_write_only), ["property.writeOnly"]);
+    }
+
+    #[test]
+    fn writing_write_only_magic_property_is_clean() {
+        let src = "<?php /** @property-write int $w */ class C {} function f() { (new C())->w = 1; }";
+        assert!(codes(src, run_reading_write_only).is_empty());
+    }
+
+    #[test]
+    fn reading_readwrite_magic_property_is_clean() {
+        let src = "<?php /** @property int $p */ class C {} function f() { return (new C())->p; }";
+        assert!(codes(src, run_reading_write_only).is_empty());
+    }
+
+    // --- WritingToReadOnlyPropertiesRule -------------------------------
+
+    #[test]
+    fn writing_read_only_magic_property_is_flagged() {
+        let src = "<?php /** @property-read int $r */ class C {} function f() { (new C())->r = 1; }";
+        assert_eq!(codes(src, run_writing_to_read_only), ["assign.propertyReadOnly"]);
+    }
+
+    #[test]
+    fn reading_read_only_magic_property_is_clean() {
+        let src = "<?php /** @property-read int $r */ class C {} function f() { return (new C())->r; }";
+        assert!(codes(src, run_writing_to_read_only).is_empty());
+    }
+
+    #[test]
+    fn writing_readwrite_magic_property_is_clean() {
+        let src = "<?php /** @property int $p */ class C {} function f() { (new C())->p = 1; }";
+        assert!(codes(src, run_writing_to_read_only).is_empty());
     }
 }

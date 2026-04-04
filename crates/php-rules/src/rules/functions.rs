@@ -1636,6 +1636,377 @@ fn is_literal_false(e: &Expr) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// array_values on a list (ArrayValuesRule, level 5)
+// ---------------------------------------------------------------------------
+
+/// `ArrayValuesRule` (the `arrayValues.list` half). `array_values($x)` where `$x`
+/// is *already* a list — the call has no effect. We only fire for a concretely
+/// inferred `list<…>` argument; the `arrayValues.empty` case needs non-emptiness
+/// tracking we don't model, so it is deferred.
+fn run_array_values(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let fmap = function_refs(fa.resolved_refs);
+    let mut out = Vec::new();
+    crate::walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Call { callee, args } = &e.kind else { return };
+        let Some(r) = resolved_callee(callee, &fmap) else { return };
+        if global_tail_lower(r).as_deref() != Some("array_values") || !is_global_function(r, "array_values") {
+            return;
+        }
+        if args.iter().any(|a| a.spread || a.placeholder || a.name.is_some()) {
+            return;
+        }
+        let Some(first) = args.first() else { return };
+        let arr_ty = fa.type_of(&first.value);
+        if matches!(arr_ty, php_types::Type::List(_)) {
+            out.push(
+                Diagnostic::error(
+                    e.span,
+                    format!(
+                        "Parameter #1 $array ({arr_ty}) of array_values is already a list, call has no effect."
+                    ),
+                )
+                .with_code("arrayValues.list"),
+            );
+        }
+    });
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Castable-to-string array arguments (ParameterCastableToStringRule, level 5)
+// ---------------------------------------------------------------------------
+
+/// The element type of a concretely-typed array/list expression, or `None` when
+/// the argument's element type is unknown (so we stay false-positive-free).
+fn array_element_type(t: &php_types::Type) -> Option<php_types::Type> {
+    match t {
+        php_types::Type::Array(Some(kv)) => Some(kv.1.clone()),
+        php_types::Type::List(v) => Some((**v).clone()),
+        _ => None,
+    }
+}
+
+/// `ParameterCastableToStringRule` — functions that compare/key array elements as
+/// strings require every element to be castable to string. The all-args functions
+/// (`array_diff`/`array_intersect`/…) check every array argument; the first-arg
+/// functions (`array_combine`/`natsort`/…) check only argument #1. Only fires when
+/// an array argument's element type is concrete and definitely not stringable.
+fn run_parameter_castable_to_string(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    const ALL_ARGS: &[&str] =
+        &["array_intersect", "array_intersect_assoc", "array_diff", "array_diff_assoc"];
+    const FIRST_ARG: &[&str] =
+        &["array_combine", "natcasesort", "natsort", "array_count_values", "array_fill_keys"];
+    let fmap = function_refs(fa.resolved_refs);
+    let mut out = Vec::new();
+    crate::walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Call { callee, args } = &e.kind else { return };
+        let Some(r) = resolved_callee(callee, &fmap) else { return };
+        let Some(tail) = global_tail_lower(r) else { return };
+        let name = tail.as_str();
+        let all_args = ALL_ARGS.contains(&name);
+        if (!all_args && !FIRST_ARG.contains(&name)) || !is_global_function(r, name) {
+            return;
+        }
+        if args.iter().any(|a| a.spread || a.placeholder || a.name.is_some()) {
+            return;
+        }
+        let indices: Vec<usize> = if all_args { (0..args.len()).collect() } else { vec![0] };
+        for idx in indices {
+            let Some(arg) = args.get(idx) else { continue };
+            let arr_ty = fa.type_of(&arg.value);
+            let Some(elem) = array_element_type(&arr_ty) else { continue };
+            if !crate::is_castable_to_string(fa.reflection, &elem) {
+                out.push(
+                    Diagnostic::error(
+                        arg.value.span,
+                        format!(
+                            "Parameter #{} $array of function {name} expects an array of values \
+                             castable to string, {arr_ty} given.",
+                            idx + 1
+                        ),
+                    )
+                    .with_code("argument.type"),
+                );
+            }
+        }
+    });
+    out
+}
+
+/// `SortParameterCastableToStringRule` (the no-flags `array_unique` subset).
+/// `array_unique($a)` defaults to `SORT_STRING`, so its elements must be castable
+/// to string. We only handle `array_unique` with a single argument (no explicit
+/// flags) to avoid resolving `SORT_*` flag constants we don't expose. Only fires
+/// for a concrete, definitely-non-stringable element type.
+fn run_sort_castable_to_string(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let fmap = function_refs(fa.resolved_refs);
+    let mut out = Vec::new();
+    crate::walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Call { callee, args } = &e.kind else { return };
+        let Some(r) = resolved_callee(callee, &fmap) else { return };
+        if global_tail_lower(r).as_deref() != Some("array_unique") || !is_global_function(r, "array_unique") {
+            return;
+        }
+        if args.iter().any(|a| a.spread || a.placeholder || a.name.is_some()) {
+            return;
+        }
+        // Only the implicit-SORT_STRING form (a single argument).
+        if args.len() != 1 {
+            return;
+        }
+        let arr_ty = fa.type_of(&args[0].value);
+        let Some(elem) = array_element_type(&arr_ty) else { return };
+        if !crate::is_castable_to_string(fa.reflection, &elem) {
+            out.push(
+                Diagnostic::error(
+                    args[0].value.span,
+                    format!(
+                        "Parameter #1 $array of function array_unique expects an array of values \
+                         castable to string, {arr_ty} given."
+                    ),
+                )
+                .with_code("argument.type"),
+            );
+        }
+    });
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Castable-to-number array arguments (ParameterCastableToNumberRule, level 5)
+// ---------------------------------------------------------------------------
+
+/// Whether a value of `ty` is definitely NOT castable to a number (`int`/`float`).
+/// Conservative inverse of PHP's `toNumber`: arrays/iterables/shapes/callables/
+/// `void` never cast; everything else (scalars/null/objects/mixed/templates/
+/// unknown) is treated as castable to stay false-positive-free.
+fn is_definitely_not_numeric(ty: &php_types::Type) -> bool {
+    use php_types::Type::*;
+    matches!(ty, Array(_) | List(_) | Iterable(_) | Shape { .. } | Callable(_) | Void)
+}
+
+/// `ParameterCastableToNumberRule` — `array_sum`/`array_product` reduce an array
+/// by numeric addition/multiplication, so every element must cast to a number.
+/// Only fires for a concrete element type that is definitely non-numeric.
+fn run_parameter_castable_to_number(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let fmap = function_refs(fa.resolved_refs);
+    let mut out = Vec::new();
+    crate::walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Call { callee, args } = &e.kind else { return };
+        let Some(r) = resolved_callee(callee, &fmap) else { return };
+        let Some(tail) = global_tail_lower(r) else { return };
+        let name = tail.as_str();
+        if !matches!(name, "array_sum" | "array_product") || !is_global_function(r, name) {
+            return;
+        }
+        if args.iter().any(|a| a.spread || a.placeholder || a.name.is_some()) {
+            return;
+        }
+        if args.len() != 1 {
+            return;
+        }
+        let arr_ty = fa.type_of(&args[0].value);
+        let Some(elem) = array_element_type(&arr_ty) else { return };
+        if is_definitely_not_numeric(&elem) {
+            out.push(
+                Diagnostic::error(
+                    args[0].value.span,
+                    format!(
+                        "Parameter #1 $array of function {name} expects an array of values castable \
+                         to number, {arr_ty} given."
+                    ),
+                )
+                .with_code("argument.type"),
+            );
+        }
+    });
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Incompatible default parameter value (IncompatibleDefaultParameterTypeRule, L2)
+// ---------------------------------------------------------------------------
+
+/// `IncompatibleDefaultParameterTypeRule` — a named function parameter whose
+/// default value's type is incompatible with its declared type
+/// (`function f(int $x = 'no')`). We type the default via the file's type map
+/// (`fa.type_of`) and check it against the *reflected* parameter type with
+/// assignability. Conservative: skips when the default type or the parameter type
+/// is unknown/mixed; the special PHP rule that allows `null` defaults to widen the
+/// type to nullable means we only flag a clearly-incompatible non-null default.
+fn run_incompatible_default_parameter(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    crate::walk::for_each_stmt(fa.program, &mut |s| {
+        let StmtKind::Function(fd) = &s.kind else { return };
+        let name = fa.interner.resolve(fd.name).to_string();
+        // Resolve the function's reflected signature for native parameter types.
+        // A bare name resolves global-namespace functions (reflection keys are
+        // case-folded with the leading `\` stripped); namespaced declarations are
+        // skipped here (conservative — no false positive).
+        let Some(func) = fa.reflection.function(&name) else { return };
+        for (i, p) in fd.params.iter().enumerate() {
+            let Some(default) = &p.default else { continue };
+            // Only check params with a native type hint (PHPDoc-only is M-T leniency).
+            if p.ty.is_none() {
+                continue;
+            }
+            let Some(param) = func.params.get(i) else { continue };
+            // The default's type. Param-list defaults aren't in the body type map,
+            // so fold the (constant) default directly; only a literal default
+            // gives a concrete type. A non-constant/array default is skipped.
+            let Some(dty) = const_default_type(default) else { continue };
+            // A literal `null` default is always allowed (it implicitly widens the
+            // type to nullable) — never flag it.
+            if dty == php_types::Type::Null {
+                continue;
+            }
+            if !crate::is_assignable(fa.reflection, &dty, &param.ty) {
+                out.push(
+                    Diagnostic::error(
+                        default.span,
+                        format!(
+                            "Default value of the parameter #{} ${} ({dty}) of function {name}() \
+                             is incompatible with type {}.",
+                            i + 1,
+                            param.name,
+                            param.ty
+                        ),
+                    )
+                    .with_code("parameter.defaultValue"),
+                );
+            }
+        }
+    });
+    out
+}
+
+/// The concrete type of a parameter *default value* iff it is a literal we can
+/// fold (scalars/`null` via `eval_const`, or an array literal → `array`).
+/// `None` for non-constant defaults (a constant reference, `new`, etc.), which we
+/// then skip to stay false-positive-free.
+fn const_default_type(e: &Expr) -> Option<php_types::Type> {
+    use php_types::Type;
+    if let ExprKind::Array { .. } = &e.kind {
+        return Some(Type::Array(None));
+    }
+    if let ExprKind::Paren(inner) = &e.kind {
+        return const_default_type(inner);
+    }
+    match php_infer::eval_const(e)? {
+        php_infer::ConstVal::Int(_) => Some(Type::Int),
+        php_infer::ConstVal::Float(_) => Some(Type::Float),
+        php_infer::ConstVal::Bool(b) => Some(if b { Type::True } else { Type::False }),
+        php_infer::ConstVal::Str(_) => Some(Type::String),
+        php_infer::ConstVal::Null => Some(Type::Null),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// filter_var conflicting flags (FilterVarRule, level 0)
+// ---------------------------------------------------------------------------
+
+/// `FilterVarRule` — `filter_var($v, $f, FILTER_NULL_ON_FAILURE | FILTER_THROW_ON_FAILURE)`
+/// passes two mutually-exclusive flags. Detected purely syntactically: the 3rd
+/// argument's expression mentions *both* constant names anywhere in a `|`/`+`
+/// flag composition. Conservative — only the literal constant-name form is flagged.
+fn run_filter_var(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let fmap = function_refs(fa.resolved_refs);
+    let mut out = Vec::new();
+    crate::walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Call { callee, args } = &e.kind else { return };
+        let Some(r) = resolved_callee(callee, &fmap) else { return };
+        if global_tail_lower(r).as_deref() != Some("filter_var") || !is_global_function(r, "filter_var") {
+            return;
+        }
+        if args.iter().any(|a| a.spread || a.placeholder || a.name.is_some()) {
+            return;
+        }
+        let Some(flags) = args.get(2) else { return };
+        let mut names: HashSet<String> = HashSet::new();
+        collect_const_names(&flags.value, &mut names);
+        if names.contains("FILTER_NULL_ON_FAILURE") && names.contains("FILTER_THROW_ON_FAILURE") {
+            out.push(
+                Diagnostic::error(
+                    e.span,
+                    "Cannot use both FILTER_NULL_ON_FAILURE and FILTER_THROW_ON_FAILURE.".to_string(),
+                )
+                .with_code("filterVar.nullOnFailureAndThrowOnFailure"),
+            );
+        }
+    });
+    out
+}
+
+/// Collect bare constant names mentioned in a (possibly `|`/`+`-composed) flag
+/// expression, so the filter_var rule can see both flag constants.
+fn collect_const_names(e: &Expr, out: &mut HashSet<String>) {
+    match &e.kind {
+        ExprKind::Name(n) => {
+            out.insert(n.text.trim_start_matches('\\').to_string());
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            collect_const_names(lhs, out);
+            collect_const_names(rhs, out);
+        }
+        ExprKind::Paren(inner) => collect_const_names(inner, out),
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// call_user_func with a non-callable first argument (CallUserFuncRule, level 5)
+// ---------------------------------------------------------------------------
+
+/// `CallUserFuncRule` (the non-callable subset). `call_user_func($x, …)` /
+/// `call_user_func_array($x, …)` where the first argument is definitely not a
+/// callable (a concrete non-callable scalar). Strings/arrays/objects can be
+/// callables, so they're never flagged; `mixed`/unknown is skipped.
+fn run_call_user_func(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let fmap = function_refs(fa.resolved_refs);
+    let mut out = Vec::new();
+    crate::walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Call { callee, args } = &e.kind else { return };
+        let Some(r) = resolved_callee(callee, &fmap) else { return };
+        let Some(tail) = global_tail_lower(r) else { return };
+        let name = match tail.as_str() {
+            "call_user_func" => "call_user_func",
+            "call_user_func_array" => "call_user_func_array",
+            _ => return,
+        };
+        if !is_global_function(r, name) {
+            return;
+        }
+        if args.iter().any(|a| a.spread || a.placeholder || a.name.is_some()) {
+            return;
+        }
+        let Some(first) = args.first() else { return };
+        let t = fa.type_of(&first.value);
+        if is_definitely_not_callable(&t) {
+            out.push(
+                Diagnostic::error(
+                    first.value.span,
+                    format!(
+                        "Parameter #1 $callback of function {name} expects callable, {t} given."
+                    ),
+                )
+                .with_code("argument.type"),
+            );
+        }
+    });
+    out
+}
+
+/// Whether a resolved call refers to the named *global* built-in (no namespaced
+/// user override). Shared by the call-site built-in rules above.
+fn is_global_function(r: &ResolvedRef, name: &str) -> bool {
+    match &r.resolution {
+        Resolution::Fqn(fqn) => fqn.eq_ignore_ascii_case(name),
+        Resolution::Fallback { global, .. } => global.eq_ignore_ascii_case(name),
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
@@ -1666,8 +2037,16 @@ pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "arguments.count", level: 5, run: run_argument_count },
     RuleEntry { name: "argument.type", level: 5, run: run_argument_types },
     RuleEntry { name: "argument.implodeCastable", level: 5, run: run_implode_castable },
-    // Level 2 — invoking a non-callable value.
+    RuleEntry { name: "arrayValues.list", level: 5, run: run_array_values },
+    RuleEntry { name: "argument.castableToString", level: 5, run: run_parameter_castable_to_string },
+    RuleEntry { name: "argument.sortCastableToString", level: 5, run: run_sort_castable_to_string },
+    RuleEntry { name: "argument.castableToNumber", level: 5, run: run_parameter_castable_to_number },
+    RuleEntry { name: "argument.callUserFunc", level: 5, run: run_call_user_func },
+    // Level 2 — invoking a non-callable value; incompatible default values.
     RuleEntry { name: "callable.nonCallable", level: 2, run: run_invoke_non_callable },
+    RuleEntry { name: "parameter.defaultValue", level: 2, run: run_incompatible_default_parameter },
+    // Level 0 — filter_var conflicting flags.
+    RuleEntry { name: "filterVar.flags", level: 0, run: run_filter_var },
     // Level 6 — missing typehints.
     RuleEntry { name: "missingType.return", level: 6, run: run_missing_function_return_type },
     RuleEntry { name: "missingType.parameter", level: 6, run: run_missing_function_parameter_type },
@@ -2272,5 +2651,209 @@ mod tests {
             codes("<?php $s = var_export($x);", run_useless_return_value),
             ["function.uselessReturnValue"]
         );
+    }
+
+    // --- array_values on a list ------------------------------------------
+
+    #[test]
+    fn array_values_of_list_is_flagged() {
+        // A `list<int>`-typed value: array_values() is a no-op. (An array literal
+        // infers as array<int,int>, not list, so we use a typed param.)
+        let src = "<?php /** @param list<int> $x */ function f(array $x) { array_values($x); }";
+        assert_eq!(codes(src, run_array_values), ["arrayValues.list"]);
+    }
+
+    #[test]
+    fn array_values_of_map_is_clean() {
+        // A keyed array is not a list -> array_values is meaningful.
+        let src = "<?php function f(array $a) { return array_values($a); }";
+        assert!(codes(src, run_array_values).is_empty());
+    }
+
+    #[test]
+    fn array_values_named_arg_is_skipped() {
+        let src = "<?php $x = [1, 2]; array_values(array: $x);";
+        assert!(codes(src, run_array_values).is_empty());
+    }
+
+    // --- castable to string array args -----------------------------------
+
+    #[test]
+    fn array_diff_of_arrays_is_flagged() {
+        let src = "<?php $a = [[1]]; $b = [[2]]; array_diff($a, $b);";
+        // Both args have non-stringable element types.
+        assert_eq!(
+            codes(src, run_parameter_castable_to_string),
+            ["argument.type", "argument.type"]
+        );
+    }
+
+    #[test]
+    fn array_combine_first_arg_of_arrays_is_flagged() {
+        let src = "<?php $a = [[1]]; $b = ['x']; array_combine($a, $b);";
+        // Only the first argument is checked for array_combine.
+        assert_eq!(codes(src, run_parameter_castable_to_string), ["argument.type"]);
+    }
+
+    #[test]
+    fn array_diff_of_strings_is_clean() {
+        let src = "<?php $a = ['x']; $b = ['y']; array_diff($a, $b);";
+        assert!(codes(src, run_parameter_castable_to_string).is_empty());
+    }
+
+    #[test]
+    fn array_diff_of_ints_is_clean() {
+        let src = "<?php $a = [1]; $b = [2]; array_diff($a, $b);";
+        assert!(codes(src, run_parameter_castable_to_string).is_empty());
+    }
+
+    #[test]
+    fn array_diff_untyped_is_clean() {
+        let src = "<?php function f(array $a, array $b) { return array_diff($a, $b); }";
+        assert!(codes(src, run_parameter_castable_to_string).is_empty());
+    }
+
+    // --- array_unique sort-castable --------------------------------------
+
+    #[test]
+    fn array_unique_of_arrays_is_flagged() {
+        let src = "<?php $a = [[1], [2]]; array_unique($a);";
+        assert_eq!(codes(src, run_sort_castable_to_string), ["argument.type"]);
+    }
+
+    #[test]
+    fn array_unique_of_strings_is_clean() {
+        let src = "<?php $a = ['x', 'y']; array_unique($a);";
+        assert!(codes(src, run_sort_castable_to_string).is_empty());
+    }
+
+    #[test]
+    fn array_unique_with_flags_is_skipped() {
+        // Two args -> explicit flags -> we don't resolve SORT_* -> skip.
+        let src = "<?php $a = [[1]]; array_unique($a, SORT_REGULAR);";
+        assert!(codes(src, run_sort_castable_to_string).is_empty());
+    }
+
+    // --- castable to number array args -----------------------------------
+
+    #[test]
+    fn array_sum_of_arrays_is_flagged() {
+        let src = "<?php $a = [[1], [2]]; array_sum($a);";
+        assert_eq!(codes(src, run_parameter_castable_to_number), ["argument.type"]);
+    }
+
+    #[test]
+    fn array_sum_of_ints_is_clean() {
+        let src = "<?php $a = [1, 2]; array_sum($a);";
+        assert!(codes(src, run_parameter_castable_to_number).is_empty());
+    }
+
+    #[test]
+    fn array_product_of_strings_is_clean() {
+        // strings cast to number (PHP coerces) -> not flagged.
+        let src = "<?php $a = ['1', '2']; array_product($a);";
+        assert!(codes(src, run_parameter_castable_to_number).is_empty());
+    }
+
+    #[test]
+    fn array_sum_untyped_is_clean() {
+        let src = "<?php function f(array $a) { return array_sum($a); }";
+        assert!(codes(src, run_parameter_castable_to_number).is_empty());
+    }
+
+    // --- incompatible default parameter type -----------------------------
+
+    #[test]
+    fn string_default_for_int_param_is_flagged() {
+        assert_eq!(
+            codes("<?php function f(int $x = 'no') {}", run_incompatible_default_parameter),
+            ["parameter.defaultValue"]
+        );
+    }
+
+    #[test]
+    fn int_default_for_int_param_is_clean() {
+        assert!(codes("<?php function f(int $x = 5) {}", run_incompatible_default_parameter).is_empty());
+    }
+
+    #[test]
+    fn null_default_is_always_clean() {
+        // A null default implicitly widens the type — never flagged.
+        assert!(codes("<?php function f(int $x = null) {}", run_incompatible_default_parameter).is_empty());
+    }
+
+    #[test]
+    fn int_default_for_float_param_widens() {
+        assert!(codes("<?php function f(float $x = 1) {}", run_incompatible_default_parameter).is_empty());
+    }
+
+    #[test]
+    fn int_default_for_bool_param_is_flagged() {
+        assert_eq!(
+            codes("<?php function f(bool $x = 1) {}", run_incompatible_default_parameter),
+            ["parameter.defaultValue"]
+        );
+    }
+
+    #[test]
+    fn untyped_param_default_is_clean() {
+        assert!(codes("<?php function f($x = 'whatever') {}", run_incompatible_default_parameter).is_empty());
+    }
+
+    #[test]
+    fn non_constant_default_is_skipped() {
+        // An array default for a string param: array literal -> array type ->
+        // is_assignable(array, string) is false BUT it is constant; check it.
+        // A constant-reference default cannot be folded -> skipped.
+        assert!(
+            codes("<?php function f(int $x = PHP_INT_MAX) {}", run_incompatible_default_parameter)
+                .is_empty()
+        );
+    }
+
+    // --- filter_var conflicting flags ------------------------------------
+
+    #[test]
+    fn filter_var_conflicting_flags_is_flagged() {
+        let src = "<?php filter_var($v, FILTER_VALIDATE_INT, FILTER_NULL_ON_FAILURE | FILTER_THROW_ON_FAILURE);";
+        assert_eq!(codes(src, run_filter_var), ["filterVar.nullOnFailureAndThrowOnFailure"]);
+    }
+
+    #[test]
+    fn filter_var_single_flag_is_clean() {
+        let src = "<?php filter_var($v, FILTER_VALIDATE_INT, FILTER_NULL_ON_FAILURE);";
+        assert!(codes(src, run_filter_var).is_empty());
+    }
+
+    #[test]
+    fn filter_var_two_args_is_clean() {
+        let src = "<?php filter_var($v, FILTER_VALIDATE_INT);";
+        assert!(codes(src, run_filter_var).is_empty());
+    }
+
+    // --- call_user_func non-callable -------------------------------------
+
+    #[test]
+    fn call_user_func_with_int_is_flagged() {
+        let src = "<?php $n = 5; call_user_func($n);";
+        assert_eq!(codes(src, run_call_user_func), ["argument.type"]);
+    }
+
+    #[test]
+    fn call_user_func_with_string_is_clean() {
+        let src = "<?php call_user_func('strlen', 'x');";
+        assert!(codes(src, run_call_user_func).is_empty());
+    }
+
+    #[test]
+    fn call_user_func_array_with_bool_is_flagged() {
+        let src = "<?php $b = true; call_user_func_array($b, []);";
+        assert_eq!(codes(src, run_call_user_func), ["argument.type"]);
+    }
+
+    #[test]
+    fn call_user_func_with_closure_is_clean() {
+        let src = "<?php $f = fn() => 1; call_user_func($f);";
+        assert!(codes(src, run_call_user_func).is_empty());
     }
 }

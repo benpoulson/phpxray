@@ -22,6 +22,23 @@
 //!   type that is not a subtype of the native type hint
 //!   (`IncompatiblePhpDocTypeRule`, via `resolve_doc_type`/`resolve_ast_type`/
 //!   `is_assignable`).
+//! - `property.phpDocType` — a `@var` PHPDoc type on a property that is not a
+//!   subtype of the property's native type (`IncompatiblePropertyPhpDocTypeRule`).
+//! - `classConstant.phpDocType` — a `@var` PHPDoc type on a class constant that
+//!   is not a subtype of the constant's native type
+//!   (`IncompatibleClassConstantPhpDocTypeRule`).
+//! - `throws.notThrowable` — a `@throws` type that is not a subtype of
+//!   `Throwable` (`InvalidThrowsPhpDocValueRule`); only flagged when the type is
+//!   a definite non-throwable (a scalar, or an *indexed* class that is provably
+//!   not a `Throwable`).
+//! - `varTag.trait` — a `@var` whose type references a (project-indexed) trait
+//!   (`InvalidPhpDocVarTagTypeRule`).
+//! - `selfOut.static` — `@phpstan-self-out` on a static method
+//!   (`IncompatibleSelfOutTypeRule`).
+//! - `requireExtends.on*` / `requireImplements.on*` — `@phpstan-require-extends`
+//!   on a non-interface/non-trait, `@phpstan-require-implements` on a non-trait
+//!   (`RequireExtendsDefinitionClassRule` / `RequireImplementsDefinitionClassRule`).
+//! - `sealed.onEnum` — `@phpstan-sealed` on an enum (`SealedDefinitionClassRule`).
 //!
 //! Deferred (need machinery our pipeline doesn't yet expose):
 //! - `InvalidPhpDocTagValueRule` (`phpDoc.parseError`): phpstan reports the
@@ -29,23 +46,28 @@
 //!   intentionally lenient (malformed operands yield `None`/empty rather than a
 //!   structured error with a message), so we cannot reproduce phpstan's
 //!   "has invalid value (...): <exception message>" wording faithfully.
-//! - `varTag.unknownClass` / `InvalidPhpDocVarTagTypeRule`: still need a
-//!   "does this class exist?" query at the `@var` doc/native boundary (the
-//!   `@param`/`@return` subtype check is now done — see above).
-//! - `InvalidThrowsPhpDocValueRule` (`throws.notThrowable`): needs to know
-//!   whether the `@throws` type is a `Throwable` subtype — a type/reflection
-//!   query, deferred to the type-rule wave.
-//! - `Require*`/`Sealed*` definition rules: depend on `@require-extends` /
-//!   `@sealed` tags our `php_phpdoc` model does not yet surface.
+//! - `InvalidPhpDocVarTagTypeRule` (`class.notFound`): we deliberately do NOT
+//!   flag unknown classes inside `@var` — our builtin/stub class coverage isn't
+//!   complete enough to avoid false positives on namespaced/relative names. The
+//!   `varTag.trait` half (a definite indexed trait) is done above.
+//! - `missingType.iterableValue` / `missingType.generics`: "missing value type"
+//!   checks are a separate strictness mode (level 6) — out of this category's
+//!   level-2 scope.
+//! - Conditional-return / assert rules (`FunctionAssertRule`,
+//!   `MethodConditionalReturnTypeRule`, …): need `@phpstan-assert` /
+//!   conditional-return semantic modelling our pipeline doesn't have yet.
 
 #![allow(unused_imports)]
 use crate::{walk, FileAnalysis, RuleEntry};
-use php_ast::{ClassDecl, FunctionDecl, Member, MethodDecl, Param, PropertyDecl, StmtKind};
+use php_ast::{
+    ClassDecl, ClassKind, FunctionDecl, Member, MethodDecl, Param, PropertyDecl, StmtKind,
+};
 use php_diagnostics::Diagnostic;
 use php_intern::Interner;
 use php_reflect::{resolve_ast_type, resolve_doc_type};
 use php_resolve::{for_each_region, Scope};
 use php_span::Span;
+use php_types::Type;
 use std::collections::HashSet;
 
 /// The set of `@phpstan-*` tags phpstan recognises (mirrors
@@ -477,6 +499,391 @@ fn check_incompat(
     }
 }
 
+// --- property.phpDocType (IncompatiblePropertyPhpDocTypeRule) ---------------
+
+/// A property's `@var` PHPDoc type must be a *subtype* of the property's native
+/// type hint. Mirrors phpstan's `IncompatiblePropertyPhpDocTypeRule`
+/// (`property.phpDocType`). Same machinery as the `@param`/`@return` check:
+/// resolve both sides and flag a definite incompatibility only.
+fn run_property_phpdoc_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            let StmtKind::Class(c) = &st.kind else { continue };
+            let class_name = c
+                .name
+                .map(|n| fa.interner.resolve(n).to_string())
+                .unwrap_or_else(|| "class@anonymous".to_string());
+            let class_templates = c.doc.as_deref().map(template_names).unwrap_or_default();
+            for m in &c.members {
+                let Member::Property(p) = m else { continue };
+                let Some(native_ast) = &p.ty else { continue }; // no native hint -> mixed.
+                let Some(doc_raw) = &p.doc else { continue };
+                let parsed = php_phpdoc::parse(doc_raw);
+                let Some(var) = parsed.vars.first() else { continue };
+                let Some(doc_ty) = &var.ty else { continue };
+                let native_t = resolve_ast_type(scope, native_ast);
+                let doc_t = resolve_doc_type(scope, &class_templates, doc_ty);
+                if !crate::is_assignable(fa.reflection, &doc_t, &native_t) {
+                    // Report against the first declared property name in the group.
+                    let pname = p
+                        .props
+                        .first()
+                        .map(|pe| fa.interner.resolve(pe.name).to_string())
+                        .unwrap_or_default();
+                    out.push(
+                        Diagnostic::error(
+                            st.span,
+                            format!(
+                                "PHPDoc tag @var for property {class_name}::${pname} \
+                                 with type {doc_t} is incompatible with native type {native_t}."
+                            ),
+                        )
+                        .with_code("property.phpDocType"),
+                    );
+                }
+            }
+        }
+    });
+    out
+}
+
+// --- classConstant.phpDocType (IncompatibleClassConstantPhpDocTypeRule) ------
+
+/// A class constant's `@var` PHPDoc type must be a *subtype* of the constant's
+/// native type hint (8.3 typed constants). Mirrors phpstan's
+/// `IncompatibleClassConstantPhpDocTypeRule` (`classConstant.phpDocType`).
+fn run_class_const_phpdoc_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            let StmtKind::Class(c) = &st.kind else { continue };
+            let class_name = c
+                .name
+                .map(|n| fa.interner.resolve(n).to_string())
+                .unwrap_or_else(|| "class@anonymous".to_string());
+            let class_templates = c.doc.as_deref().map(template_names).unwrap_or_default();
+            for m in &c.members {
+                let Member::ClassConst(cc) = m else { continue };
+                let Some(native_ast) = &cc.ty else { continue }; // untyped const -> mixed.
+                let Some(doc_raw) = &cc.doc else { continue };
+                let parsed = php_phpdoc::parse(doc_raw);
+                let Some(var) = parsed.vars.first() else { continue };
+                let Some(doc_ty) = &var.ty else { continue };
+                let native_t = resolve_ast_type(scope, native_ast);
+                let doc_t = resolve_doc_type(scope, &class_templates, doc_ty);
+                if !crate::is_assignable(fa.reflection, &doc_t, &native_t) {
+                    // A `@var` above a const group documents every constant; report
+                    // against the first declared name.
+                    let cname = cc
+                        .consts
+                        .first()
+                        .map(|ce| fa.interner.resolve(ce.name).to_string())
+                        .unwrap_or_default();
+                    out.push(
+                        Diagnostic::error(
+                            st.span,
+                            format!(
+                                "PHPDoc tag @var for constant {class_name}::{cname} \
+                                 with type {doc_t} is incompatible with native type {native_t}."
+                            ),
+                        )
+                        .with_code("classConstant.phpDocType"),
+                    );
+                }
+            }
+        }
+    });
+    out
+}
+
+// --- throws.notThrowable (InvalidThrowsPhpDocValueRule) ----------------------
+
+/// `@throws` must name a `Throwable` subtype. Mirrors phpstan's
+/// `InvalidThrowsPhpDocValueRule` (`throws.notThrowable`). We resolve the
+/// `@throws` type and flag it only when it is a **definite** non-throwable:
+/// a scalar/array/etc., or an *indexed* class that provably does not extend
+/// `Throwable`. Unknown/built-in classes, templates and `void` are left alone
+/// (lenient — no false positives).
+fn run_throws_not_throwable(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            match &st.kind {
+                StmtKind::Function(f) => {
+                    if let Some(doc) = &f.doc {
+                        check_throws(scope, doc, st.span, &mut out);
+                    }
+                }
+                StmtKind::Class(c) => {
+                    for m in &c.members {
+                        let Member::Method(mth) = m else { continue };
+                        if let Some(doc) = &mth.doc {
+                            check_throws(scope, doc, st.span, &mut out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+    out
+}
+
+fn check_throws(scope: &Scope, doc_raw: &str, span: Span, out: &mut Vec<Diagnostic>) {
+    let doc = php_phpdoc::parse(doc_raw);
+    for throws_ty in &doc.throws {
+        let t = resolve_doc_type(scope, &[], throws_ty);
+        // `@throws void` is explicitly allowed (phpstan: "this never throws").
+        if matches!(t, Type::Void | Type::Never) {
+            continue;
+        }
+        if !throws_is_valid(&t) {
+            out.push(
+                Diagnostic::error(
+                    span,
+                    format!("PHPDoc tag @throws with type {t} is not subtype of Throwable"),
+                )
+                .with_code("throws.notThrowable"),
+            );
+        }
+    }
+}
+
+/// Whether `t` is (conservatively) a valid `@throws` type — i.e. *not* a
+/// definite non-throwable. Returns `true` whenever we can't be sure, so we only
+/// report a guaranteed violation.
+///
+/// **Any class-like type is treated as valid.** A user class can extend a
+/// built-in `\Exception` whose hierarchy our reflection index doesn't carry, so
+/// `is_subclass_of(.., "Throwable")` would wrongly fail — we never flag a named
+/// class to stay false-positive-free. We only flag types that *cannot* be a
+/// `Throwable` under any circumstance: scalars, arrays, callables, shapes, etc.
+fn throws_is_valid(t: &Type) -> bool {
+    match t {
+        // A union/nullable @throws is valid iff every member is.
+        Type::Union(parts) => parts.iter().all(throws_is_valid),
+        Type::Nullable(inner) => throws_is_valid(inner),
+        // Anything that is (or could be) an object — leave alone.
+        Type::Named { .. }
+        | Type::SelfType
+        | Type::StaticType
+        | Type::Parent
+        | Type::Object
+        | Type::Mixed
+        | Type::TemplateVar(_)
+        | Type::Unknown(_)
+        | Type::Intersection(_) => true,
+        // Everything else (scalars, arrays, callables, shapes, …) is definitely
+        // not a Throwable.
+        _ => false,
+    }
+}
+
+// --- varTag.trait (InvalidPhpDocVarTagTypeRule) ------------------------------
+
+/// `@var` must not reference a trait (traits cannot be used as types). Mirrors
+/// the `varTag.trait` half of phpstan's `InvalidPhpDocVarTagTypeRule`. We only
+/// flag a class the project indexes *as a trait* — never an unknown name.
+fn run_var_tag_trait(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        let mut handle = |doc_raw: &str, templates: &[String], span: Span| {
+            let doc = php_phpdoc::parse(doc_raw);
+            for var in &doc.vars {
+                let Some(ty) = &var.ty else { continue };
+                let resolved = resolve_doc_type(scope, templates, ty);
+                for fqn in referenced_classes(&resolved) {
+                    if let Some(entry) = fa.project.class(&fqn) {
+                        if entry.kind == ClassKind::Trait {
+                            out.push(
+                                Diagnostic::error(
+                                    span,
+                                    format!(
+                                        "PHPDoc tag @var has invalid type {}.",
+                                        entry.fqn
+                                    ),
+                                )
+                                .with_code("varTag.trait"),
+                            );
+                        }
+                    }
+                }
+            }
+        };
+        for st in region {
+            match &st.kind {
+                StmtKind::Class(c) => {
+                    let class_templates = c.doc.as_deref().map(template_names).unwrap_or_default();
+                    for m in &c.members {
+                        if let Member::Property(p) = m {
+                            if let Some(doc) = &p.doc {
+                                handle(doc, &class_templates, st.span);
+                            }
+                        }
+                    }
+                }
+                StmtKind::Function(f) => {
+                    if let Some(doc) = &f.doc {
+                        handle(doc, &[], st.span);
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+    out
+}
+
+/// Collect the fully-qualified class names referenced (transitively) by `t`.
+fn referenced_classes(t: &Type) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_named(t, &mut out);
+    out
+}
+
+fn collect_named(t: &Type, out: &mut Vec<String>) {
+    match t {
+        Type::Named { fqn, args } => {
+            out.push(fqn.clone());
+            for a in args {
+                collect_named(a, out);
+            }
+        }
+        Type::Nullable(inner) | Type::List(inner) | Type::ClassString(Some(inner)) => {
+            collect_named(inner, out)
+        }
+        Type::Union(parts) | Type::Intersection(parts) => {
+            parts.iter().for_each(|p| collect_named(p, out))
+        }
+        Type::Array(Some(kv)) | Type::Iterable(Some(kv)) => {
+            collect_named(&kv.0, out);
+            collect_named(&kv.1, out);
+        }
+        _ => {}
+    }
+}
+
+// --- selfOut.static (IncompatibleSelfOutTypeRule) ---------------------------
+
+/// `@phpstan-self-out` (and `@psalm-self-out`) cannot be used on a static
+/// method. Mirrors the `selfOut.static` half of phpstan's
+/// `IncompatibleSelfOutTypeRule`. (The subtype half needs late-static binding
+/// to the receiver type — deferred.)
+fn run_self_out_static(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    walk::for_each_stmt(fa.program, &mut |s| {
+        let StmtKind::Class(c) = &s.kind else { return };
+        let class_name = c
+            .name
+            .map(|n| fa.interner.resolve(n).to_string())
+            .unwrap_or_else(|| "class@anonymous".to_string());
+        for m in &c.members {
+            let Member::Method(mth) = m else { continue };
+            if !mth.modifiers.is_static {
+                continue;
+            }
+            let Some(doc) = &mth.doc else { continue };
+            if !has_tag(doc, "self-out") {
+                continue;
+            }
+            let mname = fa.interner.resolve(mth.name);
+            out.push(
+                Diagnostic::error(
+                    s.span,
+                    format!(
+                        "PHPDoc tag @phpstan-self-out is not supported above static method \
+                         {class_name}::{mname}()."
+                    ),
+                )
+                .with_code("selfOut.static"),
+            );
+        }
+    });
+    out
+}
+
+// --- requireExtends.on* / requireImplements.on* / sealed.onEnum -------------
+
+/// `@phpstan-require-extends` is only valid on an interface or trait;
+/// `@phpstan-require-implements` only on a trait; `@phpstan-sealed` not on an
+/// enum. Mirrors `RequireExtendsDefinitionClassRule` (`requireExtends.onClass`/
+/// `onEnum`), `RequireImplementsDefinitionClassRule` (`requireImplements.on*`),
+/// and the `sealed.onEnum` half of `SealedDefinitionClassRule`.
+fn run_require_sealed_placement(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    walk::for_each_stmt(fa.program, &mut |s| {
+        let StmtKind::Class(c) = &s.kind else { return };
+        let Some(doc) = &c.doc else { return };
+
+        // `@require-extends`: valid on interface or trait only.
+        if has_tag(doc, "require-extends") && !matches!(c.kind, ClassKind::Interface | ClassKind::Trait) {
+            out.push(
+                Diagnostic::error(
+                    s.span,
+                    "PHPDoc tag @phpstan-require-extends is only valid on trait or interface."
+                        .to_string(),
+                )
+                .with_code(require_extends_id(c.kind)),
+            );
+        }
+
+        // `@require-implements`: valid on trait only.
+        if has_tag(doc, "require-implements") && c.kind != ClassKind::Trait {
+            out.push(
+                Diagnostic::error(
+                    s.span,
+                    "PHPDoc tag @phpstan-require-implements is only valid on trait."
+                        .to_string(),
+                )
+                .with_code(require_implements_id(c.kind)),
+            );
+        }
+
+        // `@sealed`: not valid on an enum.
+        if has_tag(doc, "sealed") && c.kind == ClassKind::Enum {
+            out.push(
+                Diagnostic::error(
+                    s.span,
+                    "PHPDoc tag @phpstan-sealed is not supported above an enum.".to_string(),
+                )
+                .with_code("sealed.onEnum"),
+            );
+        }
+    });
+    out
+}
+
+/// The `requireExtends.on{X}` identifier for a class kind (phpstan suffixes the
+/// `ClassReflection::getClassTypeDescription()` word). `@require-extends` is only
+/// emitted on class/enum (interface & trait are valid placements).
+fn require_extends_id(kind: ClassKind) -> &'static str {
+    match kind {
+        ClassKind::Enum => "requireExtends.onEnum",
+        _ => "requireExtends.onClass",
+    }
+}
+
+/// The `requireImplements.on{X}` identifier for a class kind. `@require-implements`
+/// is only valid on a trait; everything else is flagged.
+fn require_implements_id(kind: ClassKind) -> &'static str {
+    match kind {
+        ClassKind::Interface => "requireImplements.onInterface",
+        ClassKind::Enum => "requireImplements.onEnum",
+        _ => "requireImplements.onClass",
+    }
+}
+
+/// Whether the docblock carries `@base`, `@phpstan-base`, or `@psalm-base`
+/// (any prefix variant of the given base tag name).
+fn has_tag(doc_raw: &str, base: &str) -> bool {
+    let block = php_phpdoc::parse_block(doc_raw);
+    block.tags.iter().any(|t| {
+        let (b, _) = strip_doc_prefix(&t.name);
+        b == base
+    })
+}
+
 // --- shared helpers ---------------------------------------------------------
 
 /// Split a doc tag name into its base and an optional `phpstan`/`psalm` prefix.
@@ -497,6 +904,12 @@ pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "phpdoc.phpstanTag", level: 2, run: run_phpstan_tags },
     RuleEntry { name: "phpdoc.incompatibleType", level: 2, run: run_incompatible_types },
     RuleEntry { name: "phpdoc.paramOut", level: 2, run: run_param_out_tags },
+    RuleEntry { name: "phpdoc.propertyType", level: 2, run: run_property_phpdoc_type },
+    RuleEntry { name: "phpdoc.classConstType", level: 2, run: run_class_const_phpdoc_type },
+    RuleEntry { name: "phpdoc.throwsNotThrowable", level: 2, run: run_throws_not_throwable },
+    RuleEntry { name: "phpdoc.varTagTrait", level: 2, run: run_var_tag_trait },
+    RuleEntry { name: "phpdoc.selfOutStatic", level: 2, run: run_self_out_static },
+    RuleEntry { name: "phpdoc.requireSealedPlacement", level: 2, run: run_require_sealed_placement },
 ];
 
 #[cfg(test)]
@@ -707,5 +1120,163 @@ mod tests {
     fn param_out_on_method_is_checked() {
         let src = "<?php class C { /** @param-out int $x */ function m($x) {} }";
         assert_eq!(codes(src, run_param_out_tags), ["parameter.notByRef"]);
+    }
+
+    // --- property.phpDocType ---
+
+    #[test]
+    fn property_var_incompatible_with_native_is_flagged() {
+        let src = "<?php class C { /** @var string */ public int $x; }";
+        assert_eq!(codes(src, run_property_phpdoc_type), ["property.phpDocType"]);
+    }
+
+    #[test]
+    fn property_var_subtype_of_native_is_clean() {
+        // int is a subtype of native ?int.
+        let src = "<?php class C { /** @var int */ public ?int $x; }";
+        assert!(codes(src, run_property_phpdoc_type).is_empty());
+    }
+
+    #[test]
+    fn property_without_native_type_is_skipped() {
+        let src = "<?php class C { /** @var string */ public $x; }";
+        assert!(codes(src, run_property_phpdoc_type).is_empty());
+    }
+
+    #[test]
+    fn property_var_nullable_wider_than_native_is_flagged() {
+        let src = "<?php class C { /** @var int|null */ public int $x; }";
+        assert_eq!(codes(src, run_property_phpdoc_type), ["property.phpDocType"]);
+    }
+
+    // --- classConstant.phpDocType ---
+
+    #[test]
+    fn class_const_var_incompatible_with_native_is_flagged() {
+        let src = "<?php class C { /** @var string */ const int X = 1; }";
+        assert_eq!(codes(src, run_class_const_phpdoc_type), ["classConstant.phpDocType"]);
+    }
+
+    #[test]
+    fn class_const_var_subtype_is_clean() {
+        let src = "<?php class C { /** @var int */ const int X = 1; }";
+        assert!(codes(src, run_class_const_phpdoc_type).is_empty());
+    }
+
+    #[test]
+    fn untyped_class_const_is_skipped() {
+        let src = "<?php class C { /** @var string */ const X = 1; }";
+        assert!(codes(src, run_class_const_phpdoc_type).is_empty());
+    }
+
+    // --- throws.notThrowable ---
+
+    #[test]
+    fn throws_scalar_is_flagged() {
+        let src = "<?php /** @throws int */ function f() {}";
+        assert_eq!(codes(src, run_throws_not_throwable), ["throws.notThrowable"]);
+    }
+
+    #[test]
+    fn throws_array_is_flagged() {
+        let src = "<?php /** @throws string[] */ function f() {}";
+        assert_eq!(codes(src, run_throws_not_throwable), ["throws.notThrowable"]);
+    }
+
+    #[test]
+    fn throws_class_is_clean() {
+        // A class-like @throws is never flagged (could extend a built-in Throwable).
+        let src = "<?php /** @throws \\RuntimeException */ function f() {}";
+        assert!(codes(src, run_throws_not_throwable).is_empty());
+    }
+
+    #[test]
+    fn throws_void_is_clean() {
+        let src = "<?php /** @throws void */ function f() {}";
+        assert!(codes(src, run_throws_not_throwable).is_empty());
+    }
+
+    #[test]
+    fn throws_on_method_scalar_is_flagged() {
+        let src = "<?php class C { /** @throws bool */ function m() {} }";
+        assert_eq!(codes(src, run_throws_not_throwable), ["throws.notThrowable"]);
+    }
+
+    // --- varTag.trait ---
+
+    #[test]
+    fn var_tag_referencing_a_trait_is_flagged() {
+        let src = "<?php trait T {} class C { /** @var T */ public $x; }";
+        assert_eq!(codes(src, run_var_tag_trait), ["varTag.trait"]);
+    }
+
+    #[test]
+    fn var_tag_referencing_a_class_is_clean() {
+        let src = "<?php class T {} class C { /** @var T */ public $x; }";
+        assert!(codes(src, run_var_tag_trait).is_empty());
+    }
+
+    #[test]
+    fn var_tag_unknown_class_is_not_flagged_as_trait() {
+        let src = "<?php class C { /** @var \\Some\\Unknown */ public $x; }";
+        assert!(codes(src, run_var_tag_trait).is_empty());
+    }
+
+    // --- selfOut.static ---
+
+    #[test]
+    fn self_out_on_static_method_is_flagged() {
+        let src = "<?php class C { /** @phpstan-self-out static */ public static function m() {} }";
+        assert_eq!(codes(src, run_self_out_static), ["selfOut.static"]);
+    }
+
+    #[test]
+    fn self_out_on_instance_method_is_clean() {
+        let src = "<?php class C { /** @phpstan-self-out static */ public function m() {} }";
+        assert!(codes(src, run_self_out_static).is_empty());
+    }
+
+    // --- requireExtends / requireImplements / sealed placement ---
+
+    #[test]
+    fn require_extends_on_class_is_flagged() {
+        let src = "<?php /** @phpstan-require-extends \\Foo */ class C {}";
+        assert_eq!(codes(src, run_require_sealed_placement), ["requireExtends.onClass"]);
+    }
+
+    #[test]
+    fn require_extends_on_interface_is_clean() {
+        let src = "<?php /** @phpstan-require-extends \\Foo */ interface I {}";
+        assert!(codes(src, run_require_sealed_placement).is_empty());
+    }
+
+    #[test]
+    fn require_extends_on_trait_is_clean() {
+        let src = "<?php /** @phpstan-require-extends \\Foo */ trait T {}";
+        assert!(codes(src, run_require_sealed_placement).is_empty());
+    }
+
+    #[test]
+    fn require_implements_on_class_is_flagged() {
+        let src = "<?php /** @phpstan-require-implements \\Foo */ class C {}";
+        assert_eq!(codes(src, run_require_sealed_placement), ["requireImplements.onClass"]);
+    }
+
+    #[test]
+    fn require_implements_on_trait_is_clean() {
+        let src = "<?php /** @phpstan-require-implements \\Foo */ trait T {}";
+        assert!(codes(src, run_require_sealed_placement).is_empty());
+    }
+
+    #[test]
+    fn sealed_on_enum_is_flagged() {
+        let src = "<?php /** @phpstan-sealed A|B */ enum E {}";
+        assert_eq!(codes(src, run_require_sealed_placement), ["sealed.onEnum"]);
+    }
+
+    #[test]
+    fn sealed_on_class_is_clean() {
+        let src = "<?php /** @phpstan-sealed A|B */ class C {}";
+        assert!(codes(src, run_require_sealed_placement).is_empty());
     }
 }
