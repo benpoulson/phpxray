@@ -57,8 +57,10 @@ use crate::{walk, FileAnalysis, RuleEntry};
 use php_ast::{BinOp, ElseIf, Expr, ExprKind, StmtKind, UnOp};
 use php_diagnostics::Diagnostic;
 use php_infer::{eval_const, ConstVal};
+use php_resolve::{RefKind, Resolution, ResolvedRef};
 use php_span::Span;
 use php_types::Type;
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Provable truthiness
@@ -369,6 +371,119 @@ fn disjoint(a: &Type, b: &Type) -> bool {
     matches!((category(a), category(b)), (Some(ca), Some(cb)) if ca != cb)
 }
 
+// ---------------------------------------------------------------------------
+// ImpossibleInstanceOfRule — instanceof.alwaysTrue / instanceof.alwaysFalse
+// ---------------------------------------------------------------------------
+
+/// `$x instanceof Foo` whose result is statically known. FP-safe: we only judge
+/// when the tested class `Foo` and the value's class are fully indexed.
+/// - **alwaysTrue**: the value is a concrete (non-nullable) class that *is-a* `Foo`.
+/// - **alwaysFalse**: the value is a concrete **final** class that is not a `Foo`
+///   (a non-final class could have a subclass that implements `Foo`, so it's not
+///   provably false).
+fn run_impossible_instanceof(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let cmap: HashMap<(u32, u32), &ResolvedRef> = fa
+        .resolved_refs
+        .iter()
+        .filter(|r| r.kind == RefKind::Class)
+        .map(|r| ((r.span.start, r.span.end), r))
+        .collect();
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Instanceof { expr, class } = &e.kind else { return };
+        let ExprKind::Name(n) = &class.kind else { return };
+        let Some(r) = cmap.get(&(n.span.start, n.span.end)) else { return };
+        // Only an explicitly-named, fully-known class (skip self/static/parent/builtin).
+        let Resolution::Fqn(class_fqn) = &r.resolution else { return };
+        if !fa.class_fully_known(class_fqn) {
+            return;
+        }
+        let vt = fa.type_of(expr);
+        if let Some(result) = instanceof_result(fa, &vt, class_fqn) {
+            let (verb, code) =
+                if result { ("true", "instanceof.alwaysTrue") } else { ("false", "instanceof.alwaysFalse") };
+            out.push(diag(
+                e.span,
+                format!("Instanceof between {vt} and {class_fqn} will always evaluate to {verb}."),
+                code,
+            ));
+        }
+    });
+    out
+}
+
+fn instanceof_result(fa: &FileAnalysis, value: &Type, target: &str) -> Option<bool> {
+    let Type::Named { fqn, .. } = value else { return None };
+    if !fa.class_fully_known(fqn) {
+        return None;
+    }
+    if fa.reflection.is_subclass_of(fqn, target) {
+        return Some(true);
+    }
+    // Not a subtype: provably false only if the value class is final.
+    let is_final = fa.reflection.class(fqn).map(|c| c.is_final).unwrap_or(false);
+    is_final.then_some(false)
+}
+
+// ---------------------------------------------------------------------------
+// ImpossibleCheckTypeFunctionCallRule — function.impossibleType / .alreadyNarrowedType
+// ---------------------------------------------------------------------------
+
+/// `is_int($x)` / `is_string($x)` / … whose result is statically known from the
+/// argument's inferred type. **alreadyNarrowedType** (always true) when the value
+/// is exactly the predicate's category; **impossibleType** (always false) when
+/// the value is a concrete, disjoint category. Only the scalar/null predicates
+/// (whose category we can compare precisely) — FP-safe.
+fn run_impossible_check_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let fmap: HashMap<(u32, u32), &ResolvedRef> = fa
+        .resolved_refs
+        .iter()
+        .filter(|r| r.kind == RefKind::Function)
+        .map(|r| ((r.span.start, r.span.end), r))
+        .collect();
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Call { callee, args } = &e.kind else { return };
+        let ExprKind::Name(n) = &callee.kind else { return };
+        let Some(r) = fmap.get(&(n.span.start, n.span.end)) else { return };
+        let fname = match &r.resolution {
+            Resolution::Fqn(f) => f.trim_start_matches('\\').to_ascii_lowercase(),
+            Resolution::Fallback { global, .. } => global.trim_start_matches('\\').to_ascii_lowercase(),
+            _ => return,
+        };
+        let Some(pred) = predicate_cat(&fname) else { return };
+        let Some(arg0) = args.first() else { return };
+        if arg0.spread || arg0.placeholder || arg0.name.is_some() {
+            return;
+        }
+        let Some(vcat) = category(&fa.type_of(&arg0.value)) else { return };
+        let (verb, code) = if vcat == pred {
+            ("true", "function.alreadyNarrowedType")
+        } else {
+            ("false", "function.impossibleType")
+        };
+        out.push(diag(
+            e.span,
+            format!("Call to function {fname}() will always evaluate to {verb}."),
+            code,
+        ));
+    });
+    out
+}
+
+/// The category a scalar/null type-predicate built-in asserts (only those whose
+/// category we can compare precisely; `is_bool`/`is_array`/`is_object` span
+/// categories we don't model here, so they're skipped — false-negative-safe).
+fn predicate_cat(fname: &str) -> Option<Cat> {
+    Some(match fname {
+        "is_int" | "is_integer" | "is_long" => Cat::Int,
+        "is_string" => Cat::Str,
+        "is_float" | "is_double" => Cat::Float,
+        "is_null" => Cat::Null,
+        _ => return None,
+    })
+}
+
 fn run_strict_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     walk::for_each_expr(fa.program, &mut |e| {
@@ -605,6 +720,8 @@ pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "comparison.logicalXor", level: 4, run: run_logical_xor },
     RuleEntry { name: "comparison.strict", level: 4, run: run_strict_comparison },
     RuleEntry { name: "comparison.constant", level: 4, run: run_constant_comparison },
+    RuleEntry { name: "comparison.impossibleInstanceof", level: 4, run: run_impossible_instanceof },
+    RuleEntry { name: "comparison.impossibleCheckType", level: 4, run: run_impossible_check_type },
     RuleEntry { name: "comparison.matchArms", level: 4, run: run_match_arms },
     RuleEntry { name: "comparison.voidMatch", level: 2, run: run_void_match },
 ];
@@ -613,6 +730,59 @@ pub(crate) static RULES: &[RuleEntry] = &[
 mod tests {
     use super::*;
     use crate::testutil::codes;
+
+    // --- impossible instanceof ---
+
+    #[test]
+    fn instanceof_subclass_always_true() {
+        let src = "<?php class A {} class B extends A {} function f(B $b) { return $b instanceof A; }";
+        assert_eq!(codes(src, run_impossible_instanceof), ["instanceof.alwaysTrue"]);
+    }
+
+    #[test]
+    fn instanceof_same_class_always_true() {
+        let src = "<?php class A {} function f(A $a) { return $a instanceof A; }";
+        assert_eq!(codes(src, run_impossible_instanceof), ["instanceof.alwaysTrue"]);
+    }
+
+    #[test]
+    fn instanceof_final_unrelated_always_false() {
+        let src = "<?php final class C {} class D {} function f(C $c) { return $c instanceof D; }";
+        assert_eq!(codes(src, run_impossible_instanceof), ["instanceof.alwaysFalse"]);
+    }
+
+    #[test]
+    fn instanceof_nonfinal_unrelated_is_clean() {
+        // E could have a subclass that extends F -> not provably false.
+        let src = "<?php class E {} class F {} function f(E $e) { return $e instanceof F; }";
+        assert!(codes(src, run_impossible_instanceof).is_empty());
+    }
+
+    #[test]
+    fn instanceof_unknown_parent_is_clean() {
+        let src = "<?php class C extends \\Vendor { } function f(C $c) { return $c instanceof D; }";
+        assert!(codes(src, run_impossible_instanceof).is_empty());
+    }
+
+    // --- impossible is_* checks ---
+
+    #[test]
+    fn is_int_on_int_always_true() {
+        let src = "<?php function f(int $x) { return is_int($x); }";
+        assert_eq!(codes(src, run_impossible_check_type), ["function.alreadyNarrowedType"]);
+    }
+
+    #[test]
+    fn is_int_on_string_always_false() {
+        let src = "<?php function f(string $s) { return is_int($s); }";
+        assert_eq!(codes(src, run_impossible_check_type), ["function.impossibleType"]);
+    }
+
+    #[test]
+    fn is_string_on_mixed_is_clean() {
+        let src = "<?php function f($x) { return is_string($x); }";
+        assert!(codes(src, run_impossible_check_type).is_empty());
+    }
 
     // --- if / elseif ---
 

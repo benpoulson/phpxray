@@ -42,6 +42,14 @@ pub fn for_each_expr_in_scope<E: FnMut(&Expr)>(stmt: &Stmt, f: &mut E) {
     walk_stmt(stmt, &mut |_| {}, f, false);
 }
 
+/// Visit `e` and every sub-expression in its *own* scope (stops at nested
+/// closures / arrow-fn bodies). Used by flow-sensitive passes to record the
+/// expressions at a single flow point (one statement's environment), without
+/// descending into child-statement blocks the caller handles separately.
+pub fn for_each_subexpr<E: FnMut(&Expr)>(e: &Expr, f: &mut E) {
+    walk_expr(e, &mut |_| {}, f, false);
+}
+
 fn walk_stmt<S, E>(s: &Stmt, on_s: &mut S, on_e: &mut E, cross: bool)
 where
     S: FnMut(&Stmt),

@@ -19,6 +19,10 @@ use std::collections::HashMap;
 /// A variable environment: name (without `$`) → type.
 type Env = HashMap<String, Type>;
 
+/// The recording target for [`TypeCtx::record_block`]: a `span (start,end) → Type`
+/// map (the same shape as [`crate::TypeMap`]).
+type RecMap = HashMap<(u32, u32), Type>;
+
 /// A flow-narrowing fact about a single variable, deduced from a condition.
 /// Only *sound* refinements are produced (the branch guarantees them), so
 /// under-narrowing is safe and over-narrowing — which would cause false
@@ -335,6 +339,201 @@ impl TypeCtx<'_> {
         // The loop may not run, so merge with the pre-loop env.
         self.vars = merge(vec![base, after]);
     }
+
+    // -- Recording pass (builds the type map) ------------------------------
+    //
+    // These mirror the `exec_*` methods above but additionally record each
+    // expression's inferred type into `map` at its *current* (narrowed) flow
+    // point. Splitting it this way is what makes expressions inside
+    // `if`/`elseif`/`else`/loop bodies typed against the narrowed environment
+    // (e.g. `$node->name` after `if ($node instanceof Stmt\Namespace_)`), which a
+    // single up-front walk over the statement could not do. The environment
+    // transitions (narrowing, merging, termination) are identical to `exec_*`.
+
+    /// [`exec_block`], recording every expression's type into `map`.
+    pub fn record_block(&mut self, stmts: &[Stmt], map: &mut RecMap) {
+        for s in stmts {
+            self.record_stmt(s, map);
+        }
+    }
+
+    /// Record every sub-expression of `e` at the current environment.
+    fn rec_here(&self, e: &Expr, map: &mut RecMap) {
+        php_ast::walk::for_each_subexpr(e, &mut |x| {
+            map.insert(span_key(x), self.infer(x));
+        });
+    }
+
+    fn record_stmt(&mut self, s: &Stmt, map: &mut RecMap) {
+        match &s.kind {
+            StmtKind::Expr(e) => {
+                self.rec_here(e, map);
+                self.apply_expr(e);
+            }
+            StmtKind::Echo(es) => {
+                for e in es {
+                    self.rec_here(e, map);
+                    self.apply_expr(e);
+                }
+            }
+            StmtKind::Return(Some(e)) => {
+                self.rec_here(e, map);
+                self.apply_expr(e);
+            }
+            StmtKind::Block(b) => self.record_block(b, map),
+            StmtKind::If { cond, then, elseifs, els } => {
+                self.rec_here(cond, map);
+                self.apply_expr(cond);
+                self.record_if(cond, then, elseifs, els.as_deref(), map);
+            }
+            StmtKind::While { cond, body } => {
+                self.rec_here(cond, map);
+                self.apply_expr(cond);
+                self.record_maybe(body, map);
+            }
+            StmtKind::DoWhile { body, cond } => {
+                self.record_stmt(body, map);
+                self.rec_here(cond, map);
+                self.apply_expr(cond);
+            }
+            StmtKind::For { init, cond, update, body } => {
+                for e in init {
+                    self.rec_here(e, map);
+                    self.apply_expr(e);
+                }
+                for e in cond.iter().chain(update) {
+                    self.rec_here(e, map);
+                    self.apply_expr(e);
+                }
+                self.record_maybe(body, map);
+            }
+            StmtKind::Foreach { subject, key, value, body, .. } => {
+                self.record_foreach(subject, key.as_ref(), value, body, map);
+            }
+            StmtKind::Switch { subject, cases } => {
+                self.rec_here(subject, map);
+                self.apply_expr(subject);
+                let base = self.vars.clone();
+                let mut envs = vec![base.clone()];
+                for case in cases {
+                    self.vars = base.clone();
+                    if let Some(t) = &case.test {
+                        self.rec_here(t, map);
+                    }
+                    self.record_block(&case.body, map);
+                    envs.push(std::mem::take(&mut self.vars));
+                }
+                self.vars = merge(envs);
+            }
+            StmtKind::Try { body, catches, finally } => {
+                self.record_block(body, map);
+                for c in catches {
+                    self.record_block(&c.body, map);
+                }
+                if let Some(f) = finally {
+                    self.record_block(f, map);
+                }
+            }
+            // Other statements (global/unset/static/declare/const/…) carry no
+            // narrowing-sensitive branch bodies: record their expressions flatly
+            // and let `exec_stmt` advance the environment as before.
+            _ => {
+                php_ast::walk::for_each_expr_in_scope(s, &mut |e| {
+                    map.insert(span_key(e), self.infer(e));
+                });
+                self.exec_stmt(s);
+            }
+        }
+    }
+
+    fn record_if(
+        &mut self,
+        cond: &Expr,
+        then: &Stmt,
+        elseifs: &[php_ast::ElseIf],
+        els: Option<&Stmt>,
+        map: &mut RecMap,
+    ) {
+        let base = self.vars.clone();
+        let mut envs: Vec<Env> = Vec::new();
+
+        let then_facts = self.narrow_facts(cond, true);
+        self.vars = base.clone();
+        self.apply_facts(&then_facts);
+        self.record_stmt(then, map);
+        if !always_terminates(then) {
+            envs.push(std::mem::take(&mut self.vars));
+        }
+
+        let mut else_facts = self.narrow_facts(cond, false);
+        for ei in elseifs {
+            self.vars = base.clone();
+            self.apply_facts(&else_facts);
+            self.rec_here(&ei.cond, map);
+            self.apply_expr(&ei.cond);
+            let pos = self.narrow_facts(&ei.cond, true);
+            self.apply_facts(&pos);
+            self.record_stmt(&ei.body, map);
+            if !always_terminates(&ei.body) {
+                envs.push(std::mem::take(&mut self.vars));
+            }
+            else_facts.extend(self.narrow_facts(&ei.cond, false));
+        }
+
+        match els {
+            Some(e) => {
+                self.vars = base.clone();
+                self.apply_facts(&else_facts);
+                self.record_stmt(e, map);
+                if !always_terminates(e) {
+                    envs.push(std::mem::take(&mut self.vars));
+                }
+            }
+            None => {
+                let mut fall = base.clone();
+                apply_facts_to(&mut fall, &else_facts, self.index);
+                envs.push(fall);
+            }
+        }
+
+        self.vars = if envs.is_empty() { base } else { merge(envs) };
+    }
+
+    fn record_maybe(&mut self, body: &Stmt, map: &mut RecMap) {
+        let base = self.vars.clone();
+        self.record_stmt(body, map);
+        let after = std::mem::take(&mut self.vars);
+        self.vars = merge(vec![base, after]);
+    }
+
+    fn record_foreach(
+        &mut self,
+        subject: &Expr,
+        key: Option<&Expr>,
+        value: &Expr,
+        body: &Stmt,
+        map: &mut RecMap,
+    ) {
+        self.rec_here(subject, map);
+        let subj_ty = self.apply_expr(subject);
+        let (k, v) = iter_kv(&subj_ty);
+        let base = self.vars.clone();
+        if let Some(key) = key {
+            self.bind_target(key, &k);
+            self.rec_here(key, map);
+        }
+        self.bind_target(value, &v);
+        self.rec_here(value, map);
+        self.record_stmt(body, map);
+        let after = std::mem::take(&mut self.vars);
+        self.vars = merge(vec![base, after]);
+    }
+}
+
+/// Span key for the type map: an expression's `(start, end)` byte range.
+fn span_key(e: &Expr) -> (u32, u32) {
+    let r = e.span.range();
+    (r.start as u32, r.end as u32)
 }
 
 /// Apply narrowing facts to an environment in place.

@@ -176,6 +176,8 @@ DONE = {
     "ExistingClassesInTypehintsRule", "ExistingClassesInPropertiesRule",
     "ExistingClassesInClosureTypehintsRule", "ExistingClassesInArrowFunctionTypehintsRule",
     "ExistingClassesInPropertyHookTypehintsRule", "ConstantRule", "CallToFunctionParametersRule",
+    # D1: impossible-check rules (narrowing + is_subclass_of; no new engine)
+    "ImpossibleInstanceOfRule", "ImpossibleCheckTypeFunctionCallRule",
 }
 # Rules we can't implement yet, with the reason.
 _TYPES = "needs the type system (operand/value types)"
@@ -197,19 +199,15 @@ DEFERRED = {
     "RegularExpressionQuotingRule": "needs phpstan's delimiter-from-Concat helper to know the pattern delimiter; FP-risky without it",
     "AccessPrivatePropertyThroughStaticRule": "needs late-static-binding class resolution + property visibility + enclosing-final check",
     "EnumCaseAttributesRule": "thin wrapper over the shared attribute-target AttributesCheck; belongs with attribute rules",
-    "NonexistentOffsetInArrayDimFetchRule": _TYPES,
-    "InvalidKeyInArrayDimFetchRule": _TYPES,
-    "InvalidKeyInArrayItemRule": _TYPES,
-    "OffsetAccessAssignmentRule": _TYPES,
-    "OffsetAccessAssignOpRule": _TYPES,
-    "OffsetAccessValueAssignmentRule": _TYPES,
-    "IterableInForeachRule": _TYPES,
-    "DeadForeachRule": _TYPES,
-    "ArrayUnpackingRule": _TYPES,
-    "UnpackIterableInArrayRule": _TYPES,
-    "ArrayDestructuringRule": _TYPES,
-    "ArrayFilterRule": "needs falsy-value / non-emptiness type tracking (isIterableAtLeastOnce, falsey super-type) we don't model",
-    "RandomIntParametersRule": "needs literal-int range types (min > max comparison) we don't infer",
+    # --- Capability: array shape / offset tracking + non-emptiness ---
+    "NonexistentOffsetInArrayDimFetchRule": "needs array-shape/offset tracking (which keys exist)",
+    "OffsetAccessAssignmentRule": "needs array-shape/offset tracking",
+    "OffsetAccessAssignOpRule": "needs array-shape/offset tracking",
+    "OffsetAccessValueAssignmentRule": "needs array-shape/offset tracking",
+    "DeadForeachRule": "needs non-emptiness tracking (isIterableAtLeastOnce)",
+    "ArrayFilterRule": "needs falsy-value / non-emptiness type tracking",
+    # --- Capability: literal/value types ---
+    "RandomIntParametersRule": "needs literal-int range types (min > max comparison)",
 }
 
 level_params = {

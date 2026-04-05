@@ -21,6 +21,7 @@ use std::collections::HashMap;
 /// Inferred type of each expression, keyed by its span (start, end).
 pub type TypeMap = HashMap<(u32, u32), Type>;
 
+#[cfg(test)]
 fn key(span: php_span::Span) -> (u32, u32) {
     let r = span.range();
     (r.start as u32, r.end as u32)
@@ -84,13 +85,10 @@ fn record_scope(
     let mut ctx = TypeCtx::new(reflection, scope, interner);
     ctx.class = class;
     ctx.vars = init_vars;
-    for st in body {
-        walk::for_each_expr_in_scope(st, &mut |e| {
-            let t = ctx.infer(e);
-            map.insert(key(e.span), t);
-        });
-        ctx.exec_stmt(st);
-    }
+    // The recording pass flows the environment statement-by-statement *and*
+    // records each expression at its narrowed flow point, so expressions inside
+    // `if`/`else`/loop branches are typed against the narrowed environment.
+    ctx.record_block(body, map);
 }
 
 #[cfg(test)]
@@ -171,5 +169,37 @@ mod tests {
         // Args must be in the map (infer itself skips them) — the string literal arg.
         let src = "<?php function f(int $x) {} f('s');";
         assert_eq!(ty_of(src, |e| matches!(&e.kind, ExprKind::Str(_))), "string");
+    }
+
+    #[test]
+    fn instanceof_branch_narrows_receiver_in_type_map() {
+        // The receiver of a property fetch inside an `instanceof` branch must be
+        // recorded as the narrowed concrete class, not the bare interface — this
+        // is the type-map narrowing-into-branches fix.
+        let src = "<?php \
+            interface I {} \
+            class C implements I { public int $n = 0; } \
+            function f(I $o) { if ($o instanceof C) { $r = $o->n; } }";
+        // The `$o` receiver inside the branch is `C` (was `I` before the fix).
+        let (map, r) = build(src);
+        let mut found = None;
+        walk::for_each_expr(&r.program, &mut |e| {
+            if let ExprKind::Prop { base, .. } = &e.kind {
+                if found.is_none() {
+                    found = map.get(&key(base.span)).map(|t| t.to_string());
+                }
+            }
+        });
+        assert_eq!(found.as_deref(), Some("C"), "receiver should narrow to C");
+    }
+
+    #[test]
+    fn narrowed_property_type_is_recorded() {
+        // And the property fetch itself resolves through the narrowed class.
+        let src = "<?php \
+            interface I {} \
+            class C implements I { public int $n = 0; } \
+            function f(I $o) { if ($o instanceof C) { $r = $o->n; } }";
+        assert_eq!(ty_of(src, |e| matches!(&e.kind, ExprKind::Prop { .. })), "int");
     }
 }
