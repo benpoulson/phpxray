@@ -1827,6 +1827,68 @@ fn run_parameter_castable_to_number(fa: &FileAnalysis) -> Vec<Diagnostic> {
 // Incompatible default parameter value (IncompatibleDefaultParameterTypeRule, L2)
 // ---------------------------------------------------------------------------
 
+/// Map a parameter's native type hint to a semantic scalar type for the
+/// default-value check. Returns `None` for class/callable/object/union/etc. —
+/// those can't have a non-null constant default anyway, so skipping is safe.
+fn ast_default_target(ty: &php_ast::Type) -> Option<php_types::Type> {
+    use php_ast::TypeKind;
+    use php_types::Type;
+    match &ty.kind {
+        TypeKind::Simple(n) => {
+            let last = n.text.rsplit('\\').next().unwrap_or(&n.text).to_ascii_lowercase();
+            Some(match last.as_str() {
+                "int" => Type::Int,
+                "float" => Type::Float,
+                "string" => Type::String,
+                "bool" => Type::Bool,
+                "array" => Type::Array(None),
+                "iterable" => Type::Iterable(None),
+                _ => return None,
+            })
+        }
+        TypeKind::Nullable(inner) => ast_default_target(inner),
+        _ => None,
+    }
+}
+
+/// `IncompatibleClosure/ArrowFunctionDefaultParameterTypeRule` — a closure or
+/// arrow-fn parameter whose constant default value is incompatible with its
+/// native type hint. Closures aren't reflected, so we resolve the declared scalar
+/// type from the AST and fold the default value.
+fn run_incompatible_closure_default(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    crate::walk::for_each_expr(fa.program, &mut |e| {
+        let params = match &e.kind {
+            ExprKind::Closure(c) => &c.params,
+            ExprKind::ArrowFn(a) => &a.params,
+            _ => return,
+        };
+        for (i, p) in params.iter().enumerate() {
+            let Some(default) = &p.default else { continue };
+            let Some(ty) = &p.ty else { continue };
+            let Some(target) = ast_default_target(ty) else { continue };
+            let Some(dty) = const_default_type(default) else { continue };
+            if dty == php_types::Type::Null {
+                continue;
+            }
+            if !crate::is_assignable(fa.reflection, &dty, &target) {
+                out.push(
+                    Diagnostic::error(
+                        default.span,
+                        format!(
+                            "Default value of the parameter #{} ${} ({dty}) of anonymous function is incompatible with type {target}.",
+                            i + 1,
+                            fa.interner.resolve(p.name)
+                        ),
+                    )
+                    .with_code("parameter.defaultValue"),
+                );
+            }
+        }
+    });
+    out
+}
+
 /// `IncompatibleDefaultParameterTypeRule` — a named function parameter whose
 /// default value's type is incompatible with its declared type
 /// (`function f(int $x = 'no')`). We type the default via the file's type map
@@ -2045,6 +2107,7 @@ pub(crate) static RULES: &[RuleEntry] = &[
     // Level 2 — invoking a non-callable value; incompatible default values.
     RuleEntry { name: "callable.nonCallable", level: 2, run: run_invoke_non_callable },
     RuleEntry { name: "parameter.defaultValue", level: 2, run: run_incompatible_default_parameter },
+    RuleEntry { name: "closure.defaultValue", level: 2, run: run_incompatible_closure_default },
     // Level 0 — filter_var conflicting flags.
     RuleEntry { name: "filterVar.flags", level: 0, run: run_filter_var },
     // Level 6 — missing typehints.
@@ -2056,6 +2119,38 @@ pub(crate) static RULES: &[RuleEntry] = &[
 mod tests {
     use super::*;
     use crate::testutil::codes;
+
+    // --- closure/arrow default parameter type ----------------------------
+
+    #[test]
+    fn closure_bad_default_flagged() {
+        let src = "<?php $f = function (int $x = 'no') { return $x; };";
+        assert_eq!(codes(src, run_incompatible_closure_default), ["parameter.defaultValue"]);
+    }
+
+    #[test]
+    fn arrow_bad_default_flagged() {
+        let src = "<?php $f = fn (int $x = 'no') => $x;";
+        assert_eq!(codes(src, run_incompatible_closure_default), ["parameter.defaultValue"]);
+    }
+
+    #[test]
+    fn closure_good_default_clean() {
+        let src = "<?php $f = function (int $x = 5) { return $x; };";
+        assert!(codes(src, run_incompatible_closure_default).is_empty());
+    }
+
+    #[test]
+    fn closure_null_default_clean() {
+        let src = "<?php $f = function (int $x = null) { return $x; };";
+        assert!(codes(src, run_incompatible_closure_default).is_empty());
+    }
+
+    #[test]
+    fn closure_untyped_default_clean() {
+        let src = "<?php $f = function ($x = 'no') { return $x; };";
+        assert!(codes(src, run_incompatible_closure_default).is_empty());
+    }
 
     // --- callable.nonCallable --------------------------------------------
 

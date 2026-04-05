@@ -877,6 +877,17 @@ fn run_attribute_usages(fa: &FileAnalysis) -> Vec<Diagnostic> {
         for st in region {
             collect_attr_targets(scope, fa, st, &mut out);
         }
+        // Closures / arrow-fns (expression position) — their attributes target a
+        // function. Attribute names resolve in the lexical (namespace) scope.
+        let prog = php_ast::Program { stmts: region.to_vec() };
+        walk::for_each_expr(&prog, &mut |e| {
+            let attrs = match &e.kind {
+                ExprKind::Closure(c) => &c.attrs,
+                ExprKind::ArrowFn(a) => &a.attrs,
+                _ => return,
+            };
+            check_attr_usage(scope, fa, attrs, attr_target::FUNCTION, "function", &mut out);
+        });
     });
     out
 }
@@ -1606,6 +1617,22 @@ mod tests {
             #[\\Attribute(\\Attribute::TARGET_PROPERTY)] class A {} \
             #[A] class B {}";
         assert_eq!(codes(src, run_attribute_usages), ["attribute.target"]);
+    }
+
+    #[test]
+    fn attribute_on_closure_wrong_target_is_flagged() {
+        let src = "<?php \
+            #[\\Attribute(\\Attribute::TARGET_PROPERTY)] class A {} \
+            $f = #[A] function () {};";
+        assert_eq!(codes(src, run_attribute_usages), ["attribute.target"]);
+    }
+
+    #[test]
+    fn attribute_on_closure_function_target_is_clean() {
+        let src = "<?php \
+            #[\\Attribute(\\Attribute::TARGET_FUNCTION)] class A {} \
+            $f = #[A] fn () => 1;";
+        assert!(codes(src, run_attribute_usages).is_empty());
     }
 
     #[test]

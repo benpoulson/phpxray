@@ -180,6 +180,8 @@ DONE = {
     "ImpossibleInstanceOfRule", "ImpossibleCheckTypeFunctionCallRule",
     # D7: small one-off deferrals (type-rules the earlier batch wrongly punted)
     "TypesAssignedToPropertiesRule",
+    "IncompatibleClosureDefaultParameterTypeRule", "IncompatibleArrowFunctionDefaultParameterTypeRule",
+    "ClosureAttributesRule", "ArrowFunctionAttributesRule",
 }
 # Rules we can't implement yet, with the reason.
 _TYPES = "needs the type system (operand/value types)"
