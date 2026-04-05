@@ -44,8 +44,8 @@
 
 use crate::{walk, FileAnalysis, RuleEntry};
 use php_ast::{
-    AttributeGroup, ClassDecl, ClassKind, Expr, ExprKind, HookBody, Member, MemberName, Program,
-    PropElem, PropertyDecl, Stmt, StmtKind, Visibility,
+    AttributeGroup, ClassDecl, ClassKind, Expr, ExprKind, HookBody, Member, MemberName, Name,
+    Program, PropElem, PropertyDecl, Stmt, StmtKind, Visibility,
 };
 use php_diagnostics::Diagnostic;
 use php_phpdoc::PropertyAccess;
@@ -553,7 +553,7 @@ fn class_name(class: &ClassDecl, fa: &FileAnalysis) -> String {
 /// unresolved type never yields a false positive.
 fn run_access_properties(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk_scoped(&fa.program.stmts, None, fa, &mut out, &mut |class, e, fa, out| {
+    walk_scoped(&fa.program.stmts, None, "", fa, &mut out, &mut |class, e, fa, out| {
         if let ExprKind::Prop { base, name, .. } = &e.kind {
             if let (ExprKind::Variable(v), MemberName::Ident(p)) = (&base.kind, name) {
                 if fa.interner.resolve(*v) == "this" {
@@ -585,7 +585,7 @@ fn run_access_properties(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// reflection.
 fn run_readonly_property_assign(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk_scoped_methods(&fa.program.stmts, None, false, fa, &mut out, &mut |class, in_ctor, e, fa, out| {
+    walk_scoped_methods(&fa.program.stmts, None, false, "", fa, &mut out, &mut |class, in_ctor, e, fa, out| {
         if in_ctor {
             return;
         }
@@ -626,27 +626,49 @@ fn run_readonly_property_assign(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// invoke `on_expr(class, expr, fa, out)` for every expression inside a method
 /// body of a *named* class. Closures inherit `$this`; nested functions/classes
 /// reset the scope.
+/// Qualify a class's declared (unqualified) name with the current namespace to
+/// the FQN under which it is stored in the reflection index. Class *declarations*
+/// are unaffected by `use` imports, so this is a plain namespace prefix.
+fn qualify_fqn(ns: &str, name: &str) -> String {
+    if ns.is_empty() {
+        name.to_string()
+    } else {
+        format!("{ns}\\{name}")
+    }
+}
+
+/// The namespace name a `namespace` statement introduces (sans leading `\`).
+fn ns_of(name: &Option<Name>) -> String {
+    name.as_ref().map(|n| n.text.trim_start_matches('\\').to_string()).unwrap_or_default()
+}
+
 fn walk_scoped(
     stmts: &[Stmt],
     cur_class: Option<&str>,
+    ns: &str,
     fa: &FileAnalysis,
     out: &mut Vec<Diagnostic>,
     on_expr: &mut impl FnMut(&str, &Expr, &FileAnalysis, &mut Vec<Diagnostic>),
 ) {
+    // The unbraced `namespace Foo;` form applies to its following siblings.
+    let mut cur_ns = ns.to_string();
     for s in stmts {
         match &s.kind {
             StmtKind::Class(c) => {
-                let name = c.name.map(|n| fa.interner.resolve(n).to_string());
+                let fqn = c.name.map(|n| qualify_fqn(&cur_ns, fa.interner.resolve(n)));
                 for m in &c.members {
                     if let Member::Method(md) = m {
                         if let Some(body) = &md.body {
-                            walk_scoped(body, name.as_deref(), fa, out, on_expr);
+                            walk_scoped(body, fqn.as_deref(), &cur_ns, fa, out, on_expr);
                         }
                     }
                 }
             }
-            StmtKind::Namespace { body: Some(b), .. } => walk_scoped(b, cur_class, fa, out, on_expr),
-            StmtKind::Function(fd) => walk_scoped(&fd.body, None, fa, out, on_expr),
+            StmtKind::Namespace { name, body: Some(b) } => {
+                walk_scoped(b, None, &ns_of(name), fa, out, on_expr)
+            }
+            StmtKind::Namespace { name, body: None } => cur_ns = ns_of(name),
+            StmtKind::Function(fd) => walk_scoped(&fd.body, None, &cur_ns, fa, out, on_expr),
             _ => {
                 if let Some(class) = cur_class {
                     stmt_exprs(s, &mut |e| on_expr(class, e, fa, out));
@@ -662,29 +684,32 @@ fn walk_scoped_methods(
     stmts: &[Stmt],
     cur_class: Option<&str>,
     in_ctor: bool,
+    ns: &str,
     fa: &FileAnalysis,
     out: &mut Vec<Diagnostic>,
     on_expr: &mut impl FnMut(&str, bool, &Expr, &FileAnalysis, &mut Vec<Diagnostic>),
 ) {
+    let mut cur_ns = ns.to_string();
     for s in stmts {
         match &s.kind {
             StmtKind::Class(c) => {
-                let name = c.name.map(|n| fa.interner.resolve(n).to_string());
+                let fqn = c.name.map(|n| qualify_fqn(&cur_ns, fa.interner.resolve(n)));
                 for m in &c.members {
                     if let Member::Method(md) = m {
                         if let Some(body) = &md.body {
                             let is_ctor =
                                 fa.interner.resolve(md.name).eq_ignore_ascii_case("__construct");
-                            walk_scoped_methods(body, name.as_deref(), is_ctor, fa, out, on_expr);
+                            walk_scoped_methods(body, fqn.as_deref(), is_ctor, &cur_ns, fa, out, on_expr);
                         }
                     }
                 }
             }
-            StmtKind::Namespace { body: Some(b), .. } => {
-                walk_scoped_methods(b, cur_class, in_ctor, fa, out, on_expr)
+            StmtKind::Namespace { name, body: Some(b) } => {
+                walk_scoped_methods(b, None, in_ctor, &ns_of(name), fa, out, on_expr)
             }
+            StmtKind::Namespace { name, body: None } => cur_ns = ns_of(name),
             StmtKind::Function(fd) => {
-                walk_scoped_methods(&fd.body, None, false, fa, out, on_expr)
+                walk_scoped_methods(&fd.body, None, false, &cur_ns, fa, out, on_expr)
             }
             _ => {
                 if let Some(class) = cur_class {
@@ -1034,35 +1059,110 @@ fn check_property_access(
 /// `$bar` is absent from its hierarchy → `staticProperty.notFound`. `self`/
 /// `static`/`parent` and dynamic names are skipped (they need richer scope).
 fn run_access_static_properties(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    use php_resolve::{for_each_region, Resolution};
+    use php_resolve::for_each_region;
     let mut out = Vec::new();
+    // Static-property fetches that are plain assignment targets are checked (as
+    // writes) by run_access_static_properties_in_assign — exclude them here so we
+    // don't double-report (mirrors phpstan's read/assign rule split).
+    let assign_targets = static_assign_target_spans(fa.program);
     for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
         for s in region {
             walk_region_exprs(s, &mut |e: &Expr| {
-                let ExprKind::StaticProp { class, name } = &e.kind else { return };
-                // `C::$b` — the static-property name is the `$b` variable token.
-                let MemberName::Var(p) = name else { return };
-                let ExprKind::Name(n) = &class.kind else { return };
-                // Skip self/static/parent — need enclosing-class context.
-                let fqn = match scope.resolve_class(n) {
-                    Resolution::Fqn(f) => f.trim_start_matches('\\').to_string(),
-                    _ => return,
-                };
-                if !known_class_tree(&fqn, fa) {
+                let ExprKind::StaticProp { .. } = &e.kind else { return };
+                let r = e.span.range();
+                if assign_targets.contains(&(r.start as u32, r.end as u32)) {
                     return;
                 }
-                let prop = fa.interner.resolve(*p);
-                if fa.reflection.find_property(&fqn, prop).is_none() {
-                    out.push(
-                        Diagnostic::error(
-                            e.span,
-                            format!(
-                                "Access to an undefined static property {}::${prop}.",
-                                fqn.trim_start_matches('\\')
-                            ),
-                        )
-                        .with_code("staticProperty.notFound"),
-                    );
+                if let Some(d) = check_static_property(fa, scope, e) {
+                    out.push(d);
+                }
+            });
+        }
+    });
+    out
+}
+
+/// Spans of every static-property fetch used as a plain assignment / assign-ref
+/// target (pure writes, checked by run_access_static_properties_in_assign).
+/// Compound assignments (`+=`) are reads too, so they are NOT excluded.
+fn static_assign_target_spans(program: &Program) -> Vec<(u32, u32)> {
+    let mut spans = Vec::new();
+    walk::for_each_expr(program, &mut |e: &Expr| {
+        let (ExprKind::Assign { target, .. } | ExprKind::AssignRef { target, .. }) = &e.kind else {
+            return;
+        };
+        if matches!(&target.kind, ExprKind::StaticProp { .. }) {
+            let r = target.span.range();
+            spans.push((r.start as u32, r.end as u32));
+        }
+    });
+    spans
+}
+
+/// Shared per-fetch check for `C::$prop`: when `C` resolves to a single,
+/// fully-known class and `$prop` is absent from its hierarchy, return a
+/// `staticProperty.notFound` diagnostic. `self`/`static`/`parent` and dynamic
+/// names are skipped (they need richer enclosing-class scope).
+fn check_static_property(
+    fa: &FileAnalysis,
+    scope: &php_resolve::Scope,
+    e: &Expr,
+) -> Option<Diagnostic> {
+    use php_resolve::Resolution;
+    let ExprKind::StaticProp { class, name } = &e.kind else { return None };
+    // `C::$b` — the static-property name is the `$b` variable token.
+    let MemberName::Var(p) = name else { return None };
+    let ExprKind::Name(n) = &class.kind else { return None };
+    // Skip self/static/parent — need enclosing-class context.
+    let fqn = match scope.resolve_class(n) {
+        Resolution::Fqn(f) => f.trim_start_matches('\\').to_string(),
+        _ => return None,
+    };
+    if !known_class_tree(&fqn, fa) {
+        return None;
+    }
+    let prop = fa.interner.resolve(*p);
+    if fa.reflection.find_property(&fqn, prop).is_some() {
+        return None;
+    }
+    Some(
+        Diagnostic::error(
+            e.span,
+            format!(
+                "Access to an undefined static property {}::${prop}.",
+                fqn.trim_start_matches('\\')
+            ),
+        )
+        .with_code("staticProperty.notFound"),
+    )
+}
+
+// --- AccessStaticPropertiesInAssignRule (level 0) --------------------------
+
+/// phpstan `AccessStaticPropertiesInAssignRule` (`staticProperty.notFound`): the
+/// write-side counterpart of [`run_access_static_properties`]. A plain assignment
+/// `C::$bar = …` whose target static property is undefined on a fully-known class.
+/// Compound assignments (`+=`) are skipped (phpstan's `isAssignOp()` guard) — they
+/// are reads, already covered by the read rule. FP-safe via `known_class_tree`.
+fn run_access_static_properties_in_assign(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    use php_resolve::for_each_region;
+    let mut out = Vec::new();
+    // Collect the spans of static-prop assignment targets first; then judge each in
+    // its region scope (so `C` resolves with the file's imports).
+    let targets = static_assign_target_spans(fa.program);
+    if targets.is_empty() {
+        return out;
+    }
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for s in region {
+            walk_region_exprs(s, &mut |e: &Expr| {
+                let ExprKind::StaticProp { .. } = &e.kind else { return };
+                let r = e.span.range();
+                if !targets.contains(&(r.start as u32, r.end as u32)) {
+                    return;
+                }
+                if let Some(d) = check_static_property(fa, scope, e) {
+                    out.push(d);
                 }
             });
         }
@@ -1232,6 +1332,93 @@ fn receiver_class(fa: &FileAnalysis, base: &Expr) -> Option<String> {
     sole_class(&fa.type_of(base))
 }
 
+// --- InvalidCallablePropertyTypeRule (level 0) -----------------------------
+
+/// phpstan `InvalidCallablePropertyTypeRule` (`property.callableType`): PHP does
+/// not allow `callable` as a (native) property type. Fires when the property's
+/// native type mentions `callable` anywhere — directly, inside a union, or inside
+/// an intersection — matching phpstan's `TypeTraverser` over the native type.
+/// Purely syntactic over the AST (no reflection / inference). Promoted properties
+/// are ctor params, not `Member::Property`, so they're naturally excluded.
+fn run_invalid_callable_property_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_property(fa.program, &mut |class, pd| {
+        let Some(ty) = &pd.ty else { return };
+        if !type_mentions_callable(ty) {
+            return;
+        }
+        let cname = class_name(class, fa);
+        // One diagnostic per declared name (phpstan emits one per ClassPropertyNode,
+        // and a multi-property declaration `public callable $a, $b;` is several).
+        for elem in &pd.props {
+            let prop = fa.interner.resolve(elem.name);
+            out.push(
+                Diagnostic::error(
+                    ty.span,
+                    format!(
+                        "Property {cname}::${prop} cannot have callable in its type declaration."
+                    ),
+                )
+                .with_code("property.callableType"),
+            );
+        }
+    });
+    out
+}
+
+/// Does this native type (possibly under nullable / union / intersection) mention
+/// the reserved `callable` pseudo-type? (`Callable` is the only spelling PHP
+/// rejects as a property type; `Closure` is a real class and is allowed.)
+fn type_mentions_callable(ty: &php_ast::Type) -> bool {
+    match &ty.kind {
+        php_ast::TypeKind::Simple(n) => {
+            n.text.trim_start_matches('\\').eq_ignore_ascii_case("callable")
+        }
+        php_ast::TypeKind::Nullable(inner) => type_mentions_callable(inner),
+        php_ast::TypeKind::Union(parts) | php_ast::TypeKind::Intersection(parts) => {
+            parts.iter().any(type_mentions_callable)
+        }
+    }
+}
+
+// --- MissingPropertyTypehintRule (level 6) ---------------------------------
+
+/// phpstan `MissingPropertyTypehintRule` (`missingType.property`): a property with
+/// neither a native type nor a `@var` PHPDoc type. Mirrors
+/// `MissingFunctionParameterTypehintRule`: native type absent AND the docblock has
+/// no `@var` tag. Conservative `@var` scan (any occurrence suppresses) keeps us
+/// false-positive-free. Promoted properties (ctor params) are excluded by virtue
+/// of not being `Member::Property`.
+fn run_missing_property_typehint(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_property(fa.program, &mut |class, pd| {
+        if pd.ty.is_some() {
+            return; // has a native type.
+        }
+        if doc_has_var(pd.doc.as_deref()) {
+            return; // an `@var` PHPDoc type counts as "specified".
+        }
+        let cname = class_name(class, fa);
+        for elem in &pd.props {
+            let prop = fa.interner.resolve(elem.name);
+            out.push(
+                Diagnostic::error(
+                    span_of(elem),
+                    format!("Property {cname}::${prop} has no type specified."),
+                )
+                .with_code("missingType.property"),
+            );
+        }
+    });
+    out
+}
+
+/// Conservative scan of a raw docblock for an `@var` tag. Any occurrence — even
+/// partial — counts as "type specified", to avoid false positives.
+fn doc_has_var(doc: Option<&str>) -> bool {
+    doc.is_some_and(|d| d.contains("@var"))
+}
+
 // --- registry --------------------------------------------------------------
 
 pub(crate) static RULES: &[RuleEntry] = &[
@@ -1245,9 +1432,16 @@ pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "property.access", level: 0, run: run_access_properties_general },
     RuleEntry { name: "property.accessInAssign", level: 0, run: run_access_properties_in_assign },
     RuleEntry { name: "staticProperty.access", level: 0, run: run_access_static_properties },
+    RuleEntry {
+        name: "staticProperty.accessInAssign",
+        level: 0,
+        run: run_access_static_properties_in_assign,
+    },
     RuleEntry { name: "property.nullsafeNeverNull", level: 4, run: run_nullsafe_property_fetch },
     RuleEntry { name: "property.readingWriteOnly", level: 0, run: run_reading_write_only },
     RuleEntry { name: "property.writingToReadOnly", level: 0, run: run_writing_to_read_only },
+    RuleEntry { name: "property.callableType", level: 0, run: run_invalid_callable_property_type },
+    RuleEntry { name: "property.missingType", level: 6, run: run_missing_property_typehint },
 ];
 
 #[cfg(test)]
@@ -1623,5 +1817,132 @@ mod tests {
     fn writing_readwrite_magic_property_is_clean() {
         let src = "<?php /** @property int $p */ class C {} function f() { (new C())->p = 1; }";
         assert!(codes(src, run_writing_to_read_only).is_empty());
+    }
+
+    // --- AccessStaticPropertiesInAssignRule ----------------------------
+
+    #[test]
+    fn assign_undefined_static_property_is_flagged() {
+        let src = "<?php class C { public static int $a; } function f() { C::$b = 1; }";
+        assert_eq!(codes(src, run_access_static_properties_in_assign), ["staticProperty.notFound"]);
+    }
+
+    #[test]
+    fn assign_defined_static_property_is_clean() {
+        let src = "<?php class C { public static int $a; } function f() { C::$a = 1; }";
+        assert!(codes(src, run_access_static_properties_in_assign).is_empty());
+    }
+
+    #[test]
+    fn assign_static_property_on_unknown_class_is_clean() {
+        let src = "<?php function f() { Unknown::$b = 1; }";
+        assert!(codes(src, run_access_static_properties_in_assign).is_empty());
+    }
+
+    #[test]
+    fn assign_static_property_via_self_is_not_flagged() {
+        let src = "<?php class C { public static int $a; function f() { self::$b = 1; } }";
+        assert!(codes(src, run_access_static_properties_in_assign).is_empty());
+    }
+
+    #[test]
+    fn compound_assign_static_property_not_flagged_by_assign_rule() {
+        // `+=` is a read+write; the read rule handles it, not the assign rule.
+        let src = "<?php class C { public static int $b; } function f() { C::$b += 1; }";
+        assert!(codes(src, run_access_static_properties_in_assign).is_empty());
+    }
+
+    #[test]
+    fn assign_target_not_double_reported_by_read_rule() {
+        // A plain `C::$b = 1` is reported only by the assign rule, not the read rule.
+        let src = "<?php class C { public static int $a; } function f() { C::$b = 1; }";
+        assert!(codes(src, run_access_static_properties).is_empty());
+    }
+
+    #[test]
+    fn read_static_property_still_flagged_after_split() {
+        let src = "<?php class C { public static int $a; } function f() { return C::$b; }";
+        assert_eq!(codes(src, run_access_static_properties), ["staticProperty.notFound"]);
+    }
+
+    // --- InvalidCallablePropertyTypeRule -------------------------------
+
+    #[test]
+    fn callable_property_type_is_flagged() {
+        let src = "<?php class C { public callable $cb; }";
+        assert_eq!(codes(src, run_invalid_callable_property_type), ["property.callableType"]);
+    }
+
+    #[test]
+    fn nullable_callable_property_type_is_flagged() {
+        let src = "<?php class C { public ?callable $cb; }";
+        assert_eq!(codes(src, run_invalid_callable_property_type), ["property.callableType"]);
+    }
+
+    #[test]
+    fn callable_in_union_property_type_is_flagged() {
+        let src = "<?php class C { public int|callable $cb; }";
+        assert_eq!(codes(src, run_invalid_callable_property_type), ["property.callableType"]);
+    }
+
+    #[test]
+    fn closure_property_type_is_clean() {
+        // `Closure` is a real class — allowed as a property type.
+        let src = "<?php class C { public \\Closure $cb; }";
+        assert!(codes(src, run_invalid_callable_property_type).is_empty());
+    }
+
+    #[test]
+    fn plain_typed_property_is_clean_of_callable_rule() {
+        let src = "<?php class C { public int $x; public ?string $y; }";
+        assert!(codes(src, run_invalid_callable_property_type).is_empty());
+    }
+
+    #[test]
+    fn callable_multi_property_flags_each() {
+        let src = "<?php class C { public callable $a, $b; }";
+        assert_eq!(
+            codes(src, run_invalid_callable_property_type),
+            ["property.callableType", "property.callableType"]
+        );
+    }
+
+    // --- MissingPropertyTypehintRule -----------------------------------
+
+    #[test]
+    fn untyped_property_is_flagged() {
+        let src = "<?php class C { public $x; }";
+        assert_eq!(codes(src, run_missing_property_typehint), ["missingType.property"]);
+    }
+
+    #[test]
+    fn native_typed_property_is_clean() {
+        let src = "<?php class C { public int $x; }";
+        assert!(codes(src, run_missing_property_typehint).is_empty());
+    }
+
+    #[test]
+    fn var_documented_property_is_clean() {
+        let src = "<?php class C { /** @var int */ public $x; }";
+        assert!(codes(src, run_missing_property_typehint).is_empty());
+    }
+
+    #[test]
+    fn untyped_undocumented_property_in_interface_unaffected() {
+        // for_each_property visits interface props too; an untyped (non-hooked)
+        // interface property still has no type → flagged (phpstan reports it on the
+        // ClassPropertyNode regardless of container; the interface-shape rule is
+        // separate).
+        let src = "<?php class C { /** something */ public $x; }";
+        assert_eq!(codes(src, run_missing_property_typehint), ["missingType.property"]);
+    }
+
+    #[test]
+    fn untyped_multi_property_flags_each() {
+        let src = "<?php class C { public $a, $b; }";
+        assert_eq!(
+            codes(src, run_missing_property_typehint),
+            ["missingType.property", "missingType.property"]
+        );
     }
 }

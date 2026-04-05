@@ -163,12 +163,40 @@ DONE = {
     "TooWideArrowFunctionReturnTypehintRule", "TooWideClosureReturnTypehintRule",
     # Variables
     "CompactVariablesRule",
+    # --- "Easy/structural" batch ---
+    # Namespaces / Types / Missing / EnumCases / Whitespace / Regexp / Properties
+    "ExistingNamesInUseRule", "ExistingNamesInGroupUseRule",
+    "InvalidTypesInUnionRule", "MissingReturnRule",
+    "InvalidCallablePropertyTypeRule", "MissingPropertyTypehintRule",
+    "AccessStaticPropertiesInAssignRule",
+    "EnumCaseOutsideEnumRule", "FileWhitespaceRule", "RegularExpressionPatternRule",
+    # Covered with zero code by our consolidated unknown-symbol resolution, which
+    # already resolves class names in ALL typehint positions (params/returns/
+    # properties/closure/arrow) -> class.notFound. Verified.
+    "ExistingClassesInTypehintsRule", "ExistingClassesInPropertiesRule",
+    "ExistingClassesInClosureTypehintsRule", "ExistingClassesInArrowFunctionTypehintsRule",
+    "ExistingClassesInPropertyHookTypehintsRule", "ConstantRule", "CallToFunctionParametersRule",
 }
 # Rules we can't implement yet, with the reason.
 _TYPES = "needs the type system (operand/value types)"
+_VGATE = "PHP-version gate: feature requires PHP < our 8.6 target, so the rule can never fire"
 DEFERRED = {
     "DeprecatedCastRule": "lexer normalizes cast spelling; AST lacks (integer)/(boolean)/(double)/(binary) distinction",
     "RequireFileExistsRule": "needs the type system (const-string operand) + filesystem access",
+    # Version-gated: cannot fire at PHP 8.6 (the feature is already supported / the
+    # deprecation predates 8.6). Implemented as no-ops would never report.
+    "FinalConstantRule": _VGATE,
+    "NativeTypedClassConstantRule": _VGATE,
+    "ConstantAttributesRule": _VGATE,
+    "ReadOnlyClassRule": _VGATE,
+    "NoncapturingCatchRule": _VGATE,
+    "ThrowExpressionRule": _VGATE,
+    "ConstantsInTraitsRule": _VGATE,
+    "ArrayUnpackingRule": _VGATE + " (string-keyed unpacking allowed since 8.1)",
+    # This batch's deferrals (not capability gaps unless noted):
+    "RegularExpressionQuotingRule": "needs phpstan's delimiter-from-Concat helper to know the pattern delimiter; FP-risky without it",
+    "AccessPrivatePropertyThroughStaticRule": "needs late-static-binding class resolution + property visibility + enclosing-final check",
+    "EnumCaseAttributesRule": "thin wrapper over the shared attribute-target AttributesCheck; belongs with attribute rules",
     "NonexistentOffsetInArrayDimFetchRule": _TYPES,
     "InvalidKeyInArrayDimFetchRule": _TYPES,
     "InvalidKeyInArrayItemRule": _TYPES,
