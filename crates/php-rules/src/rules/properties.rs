@@ -1421,6 +1421,42 @@ fn doc_has_var(doc: Option<&str>) -> bool {
 
 // --- registry --------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// TypesAssignedToPropertiesRule — assign.propertyType
+// ---------------------------------------------------------------------------
+
+/// `$obj->prop = $value` where `$value`'s type is not assignable to the
+/// property's declared type. Uses `fa.type_of` + `find_property` + `is_assignable`
+/// (lenient: mixed/unknown never flag), gated on `class_fully_known`.
+fn run_types_assigned_to_properties(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Assign { target, rhs } = &e.kind else { return };
+        let ExprKind::Prop { base, name: MemberName::Ident(psym), .. } = &target.kind else {
+            return;
+        };
+        let recv = fa.type_of(base);
+        let Some(fqn) = sole_class(&recv) else { return };
+        if !fa.class_fully_known(&fqn) {
+            return;
+        }
+        let pname = fa.interner.resolve(*psym);
+        let Some(found) = fa.reflection.find_property(&fqn, pname) else { return };
+        let decl = found.member.ty.clone();
+        let val = fa.type_of(rhs);
+        if !crate::is_assignable(fa.reflection, &val, &decl) {
+            out.push(
+                Diagnostic::error(
+                    rhs.span,
+                    format!("Property {fqn}::${pname} ({decl}) does not accept {val}."),
+                )
+                .with_code("assign.propertyType"),
+            );
+        }
+    });
+    out
+}
+
 pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "property.readOnly", level: 0, run: run_readonly_property },
     RuleEntry { name: "property.inClass", level: 0, run: run_property_in_class },
@@ -1442,12 +1478,45 @@ pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "property.writingToReadOnly", level: 0, run: run_writing_to_read_only },
     RuleEntry { name: "property.callableType", level: 0, run: run_invalid_callable_property_type },
     RuleEntry { name: "property.missingType", level: 6, run: run_missing_property_typehint },
+    RuleEntry { name: "assign.propertyType", level: 3, run: run_types_assigned_to_properties },
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::codes;
+
+    // --- TypesAssignedToPropertiesRule ----------------------------------
+
+    #[test]
+    fn wrong_typed_property_assignment_flagged() {
+        let src = "<?php class C { public int $n; function f() { $this->n = 'x'; } }";
+        assert_eq!(codes(src, run_types_assigned_to_properties), ["assign.propertyType"]);
+    }
+
+    #[test]
+    fn correct_typed_property_assignment_clean() {
+        let src = "<?php class C { public int $n; function f() { $this->n = 5; } }";
+        assert!(codes(src, run_types_assigned_to_properties).is_empty());
+    }
+
+    #[test]
+    fn untyped_property_assignment_clean() {
+        let src = "<?php class C { public $n; function f() { $this->n = 'x'; } }";
+        assert!(codes(src, run_types_assigned_to_properties).is_empty());
+    }
+
+    #[test]
+    fn mixed_value_to_typed_property_clean() {
+        let src = "<?php class C { public int $n; function f($x) { $this->n = $x; } }";
+        assert!(codes(src, run_types_assigned_to_properties).is_empty());
+    }
+
+    #[test]
+    fn assignment_on_external_object_flagged() {
+        let src = "<?php class C { public int $n; } function f() { $c = new C(); $c->n = 'x'; }";
+        assert_eq!(codes(src, run_types_assigned_to_properties), ["assign.propertyType"]);
+    }
 
     // --- ReadOnlyPropertyRule -------------------------------------------
 

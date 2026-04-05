@@ -178,6 +178,8 @@ DONE = {
     "ExistingClassesInPropertyHookTypehintsRule", "ConstantRule", "CallToFunctionParametersRule",
     # D1: impossible-check rules (narrowing + is_subclass_of; no new engine)
     "ImpossibleInstanceOfRule", "ImpossibleCheckTypeFunctionCallRule",
+    # D7: small one-off deferrals (type-rules the earlier batch wrongly punted)
+    "TypesAssignedToPropertiesRule",
 }
 # Rules we can't implement yet, with the reason.
 _TYPES = "needs the type system (operand/value types)"
