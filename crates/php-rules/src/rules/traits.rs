@@ -87,6 +87,33 @@ fn for_each_class(
 // TraitAttributesRule — `#[AllowDynamicProperties]` on a trait
 // ---------------------------------------------------------------------------
 
+/// `ConstantsInTraitsRule` — a constant declared in a trait on a target PHP
+/// version that doesn't support them (< 8.2). Version-gated on `fa.php_version`.
+fn run_constants_in_traits(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    if fa.php_version.at_least(80200) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for_each_class(fa.program, fa.interner, |_scope, c| {
+        if c.kind != ClassKind::Trait {
+            return;
+        }
+        for m in &c.members {
+            let Member::ClassConst(cd) = m else { continue };
+            if let Some(ce) = cd.consts.first() {
+                out.push(
+                    Diagnostic::error(
+                        ce.value.span,
+                        "Constant is declared inside a trait but is only supported on PHP 8.2 and later.",
+                    )
+                    .with_code("classConstant.inTrait"),
+                );
+            }
+        }
+    });
+    out
+}
+
 fn run_trait_attributes(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for_each_class(fa.program, fa.interner, |_scope, c| {
@@ -257,13 +284,35 @@ pub(crate) static RULES: &[RuleEntry] = &[
         level: 0,
         run: run_conflicting_trait_constants,
     },
+    RuleEntry { name: "classConstant.inTrait", level: 0, run: run_constants_in_traits },
 ];
 
 #[cfg(test)]
 mod tests {
-    use crate::testutil::codes;
+    use crate::testutil::{codes, codes_version};
+    use crate::PhpVersion;
 
     use super::*;
+
+    #[test]
+    fn const_in_trait_flagged_below_82() {
+        let src = "<?php trait T { const X = 1; }";
+        let v81 = PhpVersion::parse("8.1").unwrap();
+        assert_eq!(codes_version(src, run_constants_in_traits, v81), ["classConstant.inTrait"]);
+    }
+
+    #[test]
+    fn const_in_trait_clean_at_default() {
+        let src = "<?php trait T { const X = 1; }";
+        assert!(codes(src, run_constants_in_traits).is_empty());
+    }
+
+    #[test]
+    fn const_in_class_below_82_clean() {
+        let src = "<?php class C { const X = 1; }";
+        let v81 = PhpVersion::parse("8.1").unwrap();
+        assert!(codes_version(src, run_constants_in_traits, v81).is_empty());
+    }
 
     // --- TraitAttributesRule ---
 

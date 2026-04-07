@@ -147,6 +147,58 @@ fn run_class_as_class_constant(fa: &FileAnalysis) -> Vec<Diagnostic> {
 // FinalPrivateConstantRule — `classConstant.finalPrivate` (level 0)
 // ---------------------------------------------------------------------------
 
+/// `FinalConstantRule` — a `final` class constant on a target PHP version that
+/// doesn't support them (< 8.1). Gates on `fa.php_version` (default 8.4 → silent).
+fn run_final_constant_version(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    if fa.php_version.at_least(80100) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for_each_class(fa.program, fa.interner, |_scope, c| {
+        for m in &c.members {
+            let Member::ClassConst(cd) = m else { continue };
+            if cd.modifiers.is_final {
+                if let Some(ce) = cd.consts.first() {
+                    out.push(
+                        Diagnostic::error(
+                            ce.value.span,
+                            "Final class constants are supported only on PHP 8.1 and later.",
+                        )
+                        .with_code("classConstant.finalNotSupported"),
+                    );
+                }
+            }
+        }
+    });
+    out
+}
+
+/// `NativeTypedClassConstantRule` — a class constant with a native type on a
+/// target PHP version that doesn't support them (< 8.3).
+fn run_native_typed_constant_version(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    if fa.php_version.at_least(80300) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for_each_class(fa.program, fa.interner, |_scope, c| {
+        for m in &c.members {
+            let Member::ClassConst(cd) = m else { continue };
+            if cd.ty.is_some() {
+                if let Some(ce) = cd.consts.first() {
+                    out.push(
+                        Diagnostic::error(
+                            ce.value.span,
+                            "Class constants with native types are supported only on PHP 8.3 and later.",
+                        )
+                        .with_code("classConstant.nativeTypeNotSupported"),
+                    );
+                }
+            }
+        }
+    });
+    out
+}
+
 /// A `final private` class constant: final is meaningless because private
 /// constants are never inherited and so can never be overridden.
 fn run_final_private_constant(fa: &FileAnalysis) -> Vec<Diagnostic> {
@@ -757,12 +809,47 @@ pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "classConstant.overriding", level: 0, run: run_overriding_constant },
     RuleEntry { name: "classConstant.nameType", level: 0, run: run_dynamic_class_constant_fetch },
     RuleEntry { name: "classConstant.value", level: 2, run: run_value_assigned_to_class_constant },
+    RuleEntry { name: "classConstant.finalNotSupported", level: 0, run: run_final_constant_version },
+    RuleEntry { name: "classConstant.nativeTypeNotSupported", level: 0, run: run_native_typed_constant_version },
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::codes;
+    use crate::testutil::{codes, codes_version};
+    use crate::PhpVersion;
+
+    // --- version-gated: final / native-typed class constants -------------
+
+    #[test]
+    fn final_const_flagged_below_81() {
+        let src = "<?php class C { final const X = 1; }";
+        let v80 = PhpVersion::parse("8.0").unwrap();
+        assert_eq!(codes_version(src, run_final_constant_version, v80), ["classConstant.finalNotSupported"]);
+    }
+
+    #[test]
+    fn final_const_clean_at_default() {
+        // Default target (8.4) supports final constants -> silent.
+        let src = "<?php class C { final const X = 1; }";
+        assert!(codes(src, run_final_constant_version).is_empty());
+    }
+
+    #[test]
+    fn native_typed_const_flagged_below_83() {
+        let src = "<?php class C { const int X = 1; }";
+        let v82 = PhpVersion::parse("8.2").unwrap();
+        assert_eq!(
+            codes_version(src, run_native_typed_constant_version, v82),
+            ["classConstant.nativeTypeNotSupported"]
+        );
+    }
+
+    #[test]
+    fn native_typed_const_clean_at_default() {
+        let src = "<?php class C { const int X = 1; }";
+        assert!(codes(src, run_native_typed_constant_version).is_empty());
+    }
 
     // --- ClassAsClassConstantRule --------------------------------------------
 
