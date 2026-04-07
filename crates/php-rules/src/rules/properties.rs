@@ -430,7 +430,10 @@ fn run_overriding_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
             };
             let parent = &proto.declaring_class;
 
-            if has_override_should_be_present(class, has_override) {
+            // `#[\Override]` on a *property* only exists in PHP ≥ 8.5, so phpstan
+            // gates `property.missingOverride` on `supportsOverrideAttributeOnProperty()`
+            // (versionId ≥ 80500). Below that target it reports nothing.
+            if fa.php_version.at_least(80500) && has_override_should_be_present(class, has_override) {
                 out.push(
                     Diagnostic::error(
                         span,
@@ -1665,9 +1668,23 @@ mod tests {
 
     #[test]
     fn override_missing_attribute_is_flagged() {
+        // `#[\Override]` on properties is a PHP 8.5+ feature, so the rule only
+        // fires when the target version supports it.
+        let src = "<?php class B { public int $x = 0; } class C extends B { public int $x = 0; }";
+        let got = crate::testutil::codes_version(
+            src,
+            run_overriding_property,
+            crate::PhpVersion::parse("8.5").unwrap(),
+        );
+        assert!(got.contains(&"property.missingOverride"), "{got:?}");
+    }
+
+    #[test]
+    fn override_missing_attribute_below_85_is_clean() {
+        // Default target (8.4) must NOT report it.
         let src = "<?php class B { public int $x = 0; } class C extends B { public int $x = 0; }";
         let got = codes(src, run_overriding_property);
-        assert!(got.contains(&"property.missingOverride"), "{got:?}");
+        assert!(!got.contains(&"property.missingOverride"), "{got:?}");
     }
 
     #[test]

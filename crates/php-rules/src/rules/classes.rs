@@ -251,12 +251,21 @@ fn run_instantiation_callable(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// refinement phpstan applies needs richer reflection and is omitted.
 fn run_new_static(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    for_each_class(fa.program, fa.interner, |_scope, c| {
-        if c.modifiers.is_final {
+    for_each_class(fa.program, fa.interner, |scope, c| {
+        // Only non-final classes can host an *unsafe* `new static()`.
+        if c.modifiers.is_final || c.kind != ClassKind::Class {
             return;
         }
-        // Only classes (not interfaces/traits/enums) can host `new static()`.
-        if c.kind != ClassKind::Class {
+        let Some(name) = c.name else { return };
+        let fqn = scope.qualify(fa.interner.resolve(name));
+
+        // phpstan's `NewStaticRule` treats `new static()` as *safe* when the
+        // constructor can't be overridden incompatibly: a `@phpstan-consistent-
+        // constructor` on the class/hierarchy, or a `final`/`abstract` constructor.
+        // A class with *no* constructor is unsafe (a subclass may add one) — phpstan
+        // reports it. We mirror those gates so well-typed code (e.g. php-parser's
+        // `final` node constructors) isn't flagged.
+        if constructor_makes_new_static_safe(fa, &fqn) {
             return;
         }
         for m in &c.members {
@@ -268,6 +277,36 @@ fn run_new_static(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
     });
     out
+}
+
+/// Whether `new static()` in class `fqn` is safe per phpstan's gates: a consistent
+/// constructor anywhere in the hierarchy, or a `final`/`abstract` constructor.
+fn constructor_makes_new_static_safe(fa: &FileAnalysis, fqn: &str) -> bool {
+    if has_consistent_constructor(fa, fqn, &mut Vec::new()) {
+        return true;
+    }
+    match fa.reflection.find_method(fqn, "__construct") {
+        Some(found) => found.member.is_final || found.member.is_abstract,
+        // No constructor at all → a subclass may introduce an incompatible one;
+        // phpstan reports this case, so we do not treat it as safe.
+        None => false,
+    }
+}
+
+fn has_consistent_constructor(fa: &FileAnalysis, fqn: &str, seen: &mut Vec<String>) -> bool {
+    let key = fqn.trim_start_matches('\\').to_ascii_lowercase();
+    if seen.contains(&key) {
+        return false;
+    }
+    seen.push(key);
+    let Some(cls) = fa.reflection.class(fqn) else { return false };
+    if cls.consistent_constructor {
+        return true;
+    }
+    cls.parents.iter().any(|p| match p {
+        Type::Named { fqn, .. } => has_consistent_constructor(fa, fqn, seen),
+        _ => false,
+    })
 }
 
 fn find_new_static(st: &Stmt, out: &mut Vec<Diagnostic>) {
@@ -737,9 +776,13 @@ fn dup_code(kind: ClassKind, what: &str) -> &'static str {
 /// Mirrors phpstan's `DuplicateClassDeclarationRule` at the per-file scope (the
 /// project index also exposes cross-file duplicates via `duplicate_classes`).
 fn run_duplicate_class(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    // Record each declaration: lowercased FQN key, original-case display, kind, span.
+    // Record each *unconditional* declaration: lowercased FQN key, original-case
+    // display, kind, span. Classes declared inside control flow (e.g. a
+    // `if (PHP_VERSION_ID >= 80000) { class … }` polyfill guard) are conditional —
+    // only one branch ever loads — so they are not redeclarations. phpstan models
+    // this via reachability; we exclude conditionally-declared classes entirely.
     let mut order: Vec<(String, String, ClassKind, php_span::Span)> = Vec::new();
-    for_each_class(fa.program, fa.interner, |scope, c| {
+    for_each_unconditional_class(fa.program, fa.interner, |scope, c| {
         let Some(n) = c.name else { return };
         let display = scope.qualify(fa.interner.resolve(n));
         order.push((display.to_ascii_lowercase(), display, c.kind, enum_member_span(c)));
@@ -766,6 +809,29 @@ fn run_duplicate_class(fa: &FileAnalysis) -> Vec<Diagnostic> {
         );
     }
     out
+}
+
+/// Visit every class-like declared **unconditionally** — at a region's top level
+/// or inside a plain block / nested namespace, but NOT inside control flow
+/// (if/loop/try/switch), which makes the declaration conditional.
+fn for_each_unconditional_class(
+    program: &php_ast::Program,
+    interner: &Interner,
+    mut f: impl FnMut(&Scope, &ClassDecl),
+) {
+    fn visit(scope: &Scope, st: &Stmt, f: &mut impl FnMut(&Scope, &ClassDecl)) {
+        match &st.kind {
+            StmtKind::Class(c) => f(scope, c),
+            StmtKind::Block(b) => b.iter().for_each(|s| visit(scope, s, f)),
+            StmtKind::Namespace { body: Some(b), .. } => b.iter().for_each(|s| visit(scope, s, f)),
+            _ => {} // control flow → conditional declaration, not a redeclaration
+        }
+    }
+    for_each_region(&program.stmts, interner, |scope, region| {
+        for st in region {
+            visit(scope, st, &mut f);
+        }
+    });
 }
 
 /// Title-cased class-like kind for messages (`Class`/`Interface`/`Trait`/`Enum`).
@@ -1747,6 +1813,38 @@ mod tests {
         assert!(codes(src, run_new_static).is_empty());
     }
 
+    #[test]
+    fn new_static_with_final_constructor_is_clean() {
+        // A final constructor can't be overridden incompatibly -> safe (phpstan).
+        let src = "<?php class C { final public function __construct() {} public function make() { return new static(); } }";
+        assert!(codes(src, run_new_static).is_empty());
+    }
+
+    #[test]
+    fn new_static_with_abstract_constructor_is_clean() {
+        let src = "<?php abstract class C { abstract public function __construct(); public function make() { return new static(); } }";
+        assert!(codes(src, run_new_static).is_empty());
+    }
+
+    #[test]
+    fn new_static_with_consistent_constructor_is_clean() {
+        let src = "<?php /** @phpstan-consistent-constructor */ class C { public function __construct() {} public function make() { return new static(); } }";
+        assert!(codes(src, run_new_static).is_empty());
+    }
+
+    #[test]
+    fn new_static_with_inherited_final_constructor_is_clean() {
+        let src = "<?php class B { final public function __construct() {} } class C extends B { public function make() { return new static(); } }";
+        assert!(codes(src, run_new_static).is_empty());
+    }
+
+    #[test]
+    fn new_static_with_plain_constructor_is_flagged() {
+        // Non-final, non-abstract, non-consistent constructor -> still unsafe.
+        let src = "<?php class C { public function __construct() {} public function make() { return new static(); } }";
+        assert_eq!(codes(src, run_new_static), ["new.static"]);
+    }
+
     // --- extends / implements / use --------------------------------------
 
     #[test]
@@ -1917,6 +2015,21 @@ mod tests {
     #[test]
     fn single_class_is_clean() {
         let src = "<?php class C {} class D {}";
+        assert!(codes(src, run_duplicate_class).is_empty());
+    }
+
+    #[test]
+    fn version_guarded_class_is_not_duplicate() {
+        // The php-parser TokenPolyfill pattern: same name in mutually-exclusive
+        // conditional branches is not a redeclaration.
+        let src = "<?php if (\\PHP_VERSION_ID >= 80000) { class C extends \\PhpToken {} } else { class C {} }";
+        assert!(codes(src, run_duplicate_class).is_empty());
+    }
+
+    #[test]
+    fn conditional_plus_unconditional_is_not_flagged() {
+        // One conditional + one unconditional: not counted as a duplicate pair.
+        let src = "<?php if (true) { class C {} } class C {}";
         assert!(codes(src, run_duplicate_class).is_empty());
     }
 

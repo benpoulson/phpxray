@@ -242,6 +242,27 @@ impl TypeCtx<'_> {
                     self.collect_facts(lhs, false, out);
                     self.collect_facts(rhs, false, out);
                 }
+                // `a || b` true ⇒ at least one holds. A variable can only be
+                // asserted if *both* operands constrain it — then it is the *union*
+                // of the two narrowings (`$n instanceof A || $n instanceof B`
+                // ⇒ `$n: A|B`). Variables constrained by only one side are dropped.
+                BinOp::BoolOr | BinOp::LogicalOr if truthy => {
+                    let l = self.narrow_facts(lhs, true);
+                    let r = self.narrow_facts(rhs, true);
+                    for (name, ln) in &l {
+                        let Some((_, rn)) = r.iter().find(|(n, _)| n == name) else { continue };
+                        match (ln, rn) {
+                            (Narrow::To(lt), Narrow::To(rt)) => out.push((
+                                name.clone(),
+                                Narrow::To(Type::union(vec![lt.clone(), rt.clone()])),
+                            )),
+                            (Narrow::StripNull, Narrow::StripNull) => {
+                                out.push((name.clone(), Narrow::StripNull))
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 // `$x === null` true ⇒ $x is null; false ⇒ null stripped.
                 BinOp::Identical | BinOp::Eq => self.null_cmp(lhs, rhs, truthy, out),
                 BinOp::NotIdentical | BinOp::NotEq => self.null_cmp(lhs, rhs, !truthy, out),
@@ -762,6 +783,14 @@ mod tests {
         let src = "function f($x) { $y = 0; if ($x instanceof Foo) { $y = $x; } }";
         // then: $y = Foo; fall-through: $y = int(0). Merged.
         assert_eq!(var_after(src, "y"), "Foo|int");
+    }
+
+    #[test]
+    fn or_instanceof_chain_narrows_to_union() {
+        // `$x instanceof A || $x instanceof B` ⇒ $x is A|B in the guarded body.
+        let src = "function f($x) { if (!($x instanceof A || $x instanceof B)) { return; } $y = $x; }";
+        let got = var_after(src, "y");
+        assert!(got == "A|B" || got == "B|A", "expected A|B union, got {got}");
     }
 
     #[test]

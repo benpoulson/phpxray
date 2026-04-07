@@ -127,6 +127,9 @@ pub struct ClassReflection {
     /// If this class is itself an attribute (`#[Attribute]`), its target/repeatable
     /// flags — what the *AttributesRule family checks usages against.
     pub attribute: Option<AttributeSpec>,
+    /// The class (or a parent) declares `@phpstan-consistent-constructor`, which
+    /// makes `new static()` safe (subclasses can't change the constructor).
+    pub consistent_constructor: bool,
 }
 
 /// `#[Attribute(...)]` metadata on an attribute class: which targets it may be
@@ -276,6 +279,10 @@ pub fn reflect_class(scope: &Scope, interner: &Interner, fqn: &str, c: &ClassDec
         constants,
         deprecated: doc.deprecated,
         attribute: attribute_spec(scope, interner, &c.attrs),
+        consistent_constructor: c
+            .doc
+            .as_deref()
+            .is_some_and(|d| d.contains("consistent-constructor")),
     }
 }
 

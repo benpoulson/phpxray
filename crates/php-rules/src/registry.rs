@@ -17,6 +17,51 @@ use php_reflect::ReflectionIndex;
 use php_resolve::ResolvedRef;
 use php_types::Type;
 
+/// The target PHP version of the analyzed project, as a phpstan-style version id
+/// (`8.4` → `80400`). Rules whose applicability depends on a language version
+/// gate on this (the analogue of phpstan's `PhpVersion` dependency), e.g.
+/// `#[\Override]` on properties exists only in PHP ≥ 8.5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PhpVersion(u32);
+
+impl PhpVersion {
+    /// Build from a `major.minor[.patch]` string (e.g. `"8.4"`, `"8.4.1"`) or a
+    /// raw version id (`"80400"`). Returns `None` if it can't be parsed.
+    pub fn parse(s: &str) -> Option<PhpVersion> {
+        let s = s.trim();
+        // Raw version id form (e.g. "80400").
+        if let Ok(id) = s.parse::<u32>() {
+            if id >= 10_000 {
+                return Some(PhpVersion(id));
+            }
+        }
+        let mut parts = s.split('.');
+        let major: u32 = parts.next()?.trim().parse().ok()?;
+        let minor: u32 = parts.next().map_or(Ok(0), |p| p.trim().parse()).ok()?;
+        let patch: u32 = parts.next().map_or(Ok(0), |p| p.trim().parse()).ok()?;
+        Some(PhpVersion(major * 10_000 + minor * 100 + patch))
+    }
+
+    /// The phpstan-style numeric version id.
+    pub fn id(self) -> u32 {
+        self.0
+    }
+
+    /// Whether this version is at least `id` (a raw version id, e.g. `80500`).
+    pub fn at_least(self, id: u32) -> bool {
+        self.0 >= id
+    }
+}
+
+impl Default for PhpVersion {
+    /// When the project doesn't pin a `phpVersion`, assume a current-stable PHP
+    /// (8.4). This keeps 8.5-only checks (e.g. property `#[\Override]`) off unless
+    /// the project opts in — matching how most real projects are analyzed.
+    fn default() -> Self {
+        PhpVersion(80400)
+    }
+}
+
 /// The read-only inputs a rule reads about one file. The shared project/reflection
 /// indexes are borrowed (built once for the whole run).
 pub struct FileAnalysis<'a> {
@@ -32,6 +77,8 @@ pub struct FileAnalysis<'a> {
     pub resolved_refs: &'a [ResolvedRef],
     /// Inferred type of every expression in the file, keyed by span.
     pub types: &'a TypeMap,
+    /// Target PHP version of the analyzed project (gates version-dependent rules).
+    pub php_version: PhpVersion,
 }
 
 impl FileAnalysis<'_> {
@@ -144,6 +191,7 @@ mod tests {
             reflection: &reflection,
             resolved_refs: &refs,
             types: &types,
+            php_version: PhpVersion::default(),
         };
 
         // Level 0: only the unknown-symbol rule fires.

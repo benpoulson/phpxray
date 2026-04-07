@@ -279,16 +279,44 @@ fn byref_seq(stmts: &[Stmt], fa: &FileAnalysis, dangling: &mut HashSet<String>, 
     }
 }
 
+/// Process one branch of a conditional from a clone of the entry dangling set,
+/// then shrink `keep` to the variables this branch left dangling (so a variable
+/// survives past the conditional only if *no* branch cleared it).
+fn byref_branch(
+    body: &Stmt,
+    fa: &FileAnalysis,
+    entry: &HashSet<String>,
+    keep: &mut HashSet<String>,
+    out: &mut Vec<Diagnostic>,
+) {
+    let mut d = entry.clone();
+    byref_stmt(body, fa, &mut d, out);
+    keep.retain(|v| d.contains(v));
+}
+
 fn byref_stmt(s: &Stmt, fa: &FileAnalysis, dangling: &mut HashSet<String>, out: &mut Vec<Diagnostic>) {
     let var_name = |e: &Expr| match &e.kind {
         ExprKind::Variable(sym) => Some(fa.interner.resolve(*sym).to_string()),
         _ => None,
     };
     match &s.kind {
-        StmtKind::Foreach { value, by_ref, body, .. } => {
-            byref_stmt(body, fa, dangling, out);
+        StmtKind::Foreach { key, value, by_ref, body, .. } => {
+            // The foreach *header* rebinds key/value to fresh references at the
+            // start of the loop, so any prior dangling status for them is cleared
+            // before the body runs — assigning to the by-ref variable *inside* its
+            // own loop is the legitimate in-place-edit idiom, never a dangling write.
             if let Some(name) = var_name(value) {
-                // by-ref arms the variable; by-value rebinds (clears) it.
+                dangling.remove(&name);
+            }
+            if let Some(k) = key {
+                if let Some(name) = var_name(k) {
+                    dangling.remove(&name);
+                }
+            }
+            byref_stmt(body, fa, dangling, out);
+            // After the loop, a by-ref value variable dangles (it still references
+            // the last element); a by-value foreach leaves it rebound (cleared).
+            if let Some(name) = var_name(value) {
                 if *by_ref {
                     dangling.insert(name);
                 } else {
@@ -320,21 +348,33 @@ fn byref_stmt(s: &Stmt, fa: &FileAnalysis, dangling: &mut HashSet<String>, out: 
         }
         StmtKind::Block(b) => byref_seq(b, fa, dangling, out),
         StmtKind::If { then, elseifs, els, .. } => {
-            byref_stmt(then, fa, dangling, out);
+            // Branches are mutually-exclusive paths: process each from a *clone* of
+            // the entry set so a foreach arming a variable in one branch doesn't
+            // leak into a sibling branch. A variable stays dangling after the `if`
+            // only if no branch cleared it (FP-safe).
+            let entry = dangling.clone();
+            let mut keep = entry.clone();
+            byref_branch(then, fa, &entry, &mut keep, out);
             for ei in elseifs {
-                byref_stmt(&ei.body, fa, dangling, out);
+                byref_branch(&ei.body, fa, &entry, &mut keep, out);
             }
             if let Some(e) = els {
-                byref_stmt(e, fa, dangling, out);
+                byref_branch(e, fa, &entry, &mut keep, out);
             }
+            *dangling = keep;
         }
         StmtKind::While { body, .. } | StmtKind::DoWhile { body, .. } | StmtKind::For { body, .. } => {
             byref_stmt(body, fa, dangling, out);
         }
         StmtKind::Switch { cases, .. } => {
+            let entry = dangling.clone();
+            let mut keep = entry.clone();
             for c in cases {
-                byref_seq(&c.body, fa, dangling, out);
+                let mut d = entry.clone();
+                byref_seq(&c.body, fa, &mut d, out);
+                keep.retain(|v| d.contains(v));
             }
+            *dangling = keep;
         }
         StmtKind::Try { body, catches, finally } => {
             byref_seq(body, fa, dangling, out);
@@ -854,6 +894,24 @@ mod tests {
     #[test]
     fn assign_inside_foreach_body_is_clean() {
         let src = "<?php function f(array $a) { foreach ($a as &$v) { $v = 1; } }";
+        assert!(codes(src, run_byref_foreach).is_empty());
+    }
+
+    #[test]
+    fn sibling_branch_foreaches_do_not_leak() {
+        // The php-parser NameResolver pattern: separate `foreach (… as &$x) { $x = … }`
+        // in mutually-exclusive branches must not flag (each header rebinds $x).
+        let src = "<?php function f($n, array $a, array $b) { \
+            if ($n === 1) { foreach ($a as &$x) { $x = 1; } } \
+            elseif ($n === 2) { foreach ($b as &$x) { $x = 2; } } }";
+        assert!(codes(src, run_byref_foreach).is_empty());
+    }
+
+    #[test]
+    fn reuse_of_byref_var_in_second_foreach_is_clean() {
+        // A second `foreach (… as &$v)` rebinds $v; its in-body assign isn't dangling.
+        let src = "<?php function f(array $a, array $b) { \
+            foreach ($a as &$v) {} foreach ($b as &$v) { $v = 1; } }";
         assert!(codes(src, run_byref_foreach).is_empty());
     }
 
