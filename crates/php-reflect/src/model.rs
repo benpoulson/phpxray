@@ -238,7 +238,21 @@ pub fn reflect_class(scope: &Scope, interner: &Interner, fqn: &str, c: &ClassDec
     let mut constants = Vec::new();
     for m in &c.members {
         match m {
-            Member::Method(md) => methods.push(reflect_method(scope, interner, &class_templates, md)),
+            Member::Method(md) => {
+                methods.push(reflect_method(scope, interner, &class_templates, md));
+                // Constructor property promotion: a `__construct` parameter with a
+                // visibility modifier is *also* a property of the class.
+                if interner.resolve(md.name).eq_ignore_ascii_case("__construct") {
+                    promoted_properties(
+                        scope,
+                        interner,
+                        &class_templates,
+                        md,
+                        c.modifiers.is_readonly,
+                        &mut properties,
+                    );
+                }
+            }
             Member::Property(pd) => {
                 reflect_properties(scope, interner, &class_templates, pd, &mut properties)
             }
@@ -283,6 +297,40 @@ pub fn reflect_class(scope: &Scope, interner: &Interner, fqn: &str, c: &ClassDec
             .doc
             .as_deref()
             .is_some_and(|d| d.contains("consistent-constructor")),
+    }
+}
+
+/// Append the constructor's promoted parameters as class properties. A parameter
+/// is promoted iff it carries a visibility modifier (PHP requires one); its type
+/// is the native hint refined by a matching `@param` on the constructor docblock.
+fn promoted_properties(
+    scope: &Scope,
+    interner: &Interner,
+    class_templates: &[String],
+    ctor: &MethodDecl,
+    class_readonly: bool,
+    out: &mut Vec<PropertyReflection>,
+) {
+    let doc = parse_doc(ctor.doc.as_deref());
+    let templates = combine_templates(class_templates, &doc);
+    for p in &ctor.params {
+        let Some(visibility) = p.modifiers.visibility else { continue };
+        let pname = interner.resolve(p.name);
+        let doc_ty = doc
+            .params
+            .iter()
+            .find(|dp| dp.name.as_deref() == Some(pname))
+            .and_then(|dp| dp.ty.as_ref());
+        out.push(PropertyReflection {
+            name: pname.to_string(),
+            visibility,
+            is_static: false,
+            is_readonly: p.modifiers.is_readonly || class_readonly,
+            ty: merge_type(scope, &templates, p.ty.as_ref(), doc_ty),
+            has_default: p.default.is_some(),
+            access: PropertyAccess::ReadWrite,
+            magic: false,
+        });
     }
 }
 
@@ -495,6 +543,30 @@ mod tests {
         });
         let refl = reflect_function(&scope, &r.interner, f.expect("a function"));
         (refl, r.interner)
+    }
+
+    #[test]
+    fn constructor_promoted_params_are_properties() {
+        let (c, _) = reflect_first_class(
+            r#"<?php class Cursor {
+                public function __construct(private \Foo\Bar $output, public int $count = 0) {}
+            }"#,
+        );
+        let out = c.properties.iter().find(|p| p.name == "output").expect("$output property");
+        assert_eq!(out.visibility, Visibility::Private);
+        assert_eq!(out.ty.to_string(), "Foo\\Bar");
+        let count = c.properties.iter().find(|p| p.name == "count").expect("$count property");
+        assert_eq!(count.visibility, Visibility::Public);
+        assert_eq!(count.ty, Type::Int);
+        assert!(count.has_default);
+    }
+
+    #[test]
+    fn non_promoted_constructor_param_is_not_a_property() {
+        let (c, _) = reflect_first_class(
+            r#"<?php class C { public function __construct(int $x) {} }"#,
+        );
+        assert!(c.properties.iter().all(|p| p.name != "x"));
     }
 
     #[test]

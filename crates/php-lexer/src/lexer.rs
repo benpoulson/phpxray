@@ -680,8 +680,12 @@ impl<'a> Lexer<'a> {
             i += 1;
         }
         let end = i + label.len();
+        // Compare bytes, not a `&str` slice: `i`/`end` are byte offsets that can
+        // land inside a multibyte UTF-8 character in the body (e.g. box-drawing
+        // chars in heredoc text), and slicing `self.text` there would panic.
+        // Heredoc labels are ASCII identifiers, so a byte comparison is exact.
         if end <= b.len()
-            && &self.text[i..end] == label
+            && &b[i..end] == label.as_bytes()
             && (end == b.len() || !is_label_cont(b[end]))
         {
             return Some(end);
@@ -1294,5 +1298,32 @@ fn int_literal_overflows_i64(text: &str) -> bool {
     match u128::from_str_radix(digits, radix) {
         Ok(v) => v > i64::MAX as u128,
         Err(_) => true, // too large even for u128 → certainly a float
+    }
+}
+
+#[cfg(test)]
+mod heredoc_utf8_tests {
+    use super::tokenize;
+
+    /// A multibyte UTF-8 character in a heredoc body must not panic the
+    /// closing-marker scan (it used to slice `&str` at a non-char boundary).
+    #[test]
+    fn heredoc_body_with_utf8_does_not_panic() {
+        // Box-drawing char `─` is 3 bytes; the closing-marker probe lands inside it.
+        let src = "<?php $x = <<<EOT\n─────────────\nEOT;\n";
+        let (_tokens, _diags) = tokenize(src);
+    }
+
+    #[test]
+    fn nowdoc_body_with_utf8_does_not_panic() {
+        let src = "<?php $x = <<<'EOT'\nhelp: ─ café ☃\nEOT;\n";
+        let (_tokens, _diags) = tokenize(src);
+    }
+
+    #[test]
+    fn utf8_just_before_close_marker_does_not_panic() {
+        // Indented body line with a multibyte char right where the label would sit.
+        let src = "<?php $x = <<<EOT\n  ─\nEOT;\n";
+        let (_tokens, _diags) = tokenize(src);
     }
 }
