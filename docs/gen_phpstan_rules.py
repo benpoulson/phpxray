@@ -185,6 +185,8 @@ DONE = {
     # D8: version-gated rules, now implemented properly (gate on fa.php_version;
     # silent at the default 8.4 target, fire when the project pins an older version)
     "FinalConstantRule", "NativeTypedClassConstantRule", "ConstantsInTraitsRule",
+    # D2: magic-tag validation (@mixin) — phpdoc.rs run_mixin
+    "MixinRule", "MixinTraitRule",
 }
 # Rules we can't implement yet, with the reason.
 _TYPES = "needs the type system (operand/value types)"

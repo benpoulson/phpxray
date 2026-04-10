@@ -60,7 +60,7 @@
 #![allow(unused_imports)]
 use crate::{walk, FileAnalysis, RuleEntry};
 use php_ast::{
-    ClassDecl, ClassKind, FunctionDecl, Member, MethodDecl, Param, PropertyDecl, StmtKind,
+    ClassDecl, ClassKind, FunctionDecl, Member, MethodDecl, Param, PropertyDecl, Stmt, StmtKind,
 };
 use php_diagnostics::Diagnostic;
 use php_intern::Interner;
@@ -898,7 +898,90 @@ fn strip_doc_prefix(name: &str) -> (&str, Option<&str>) {
     }
 }
 
+// --- @mixin validation (MixinRule / MixinTraitRule / MixinTraitUseRule) -----
+
+/// A `@mixin T` tag whose `T` is a non-object (`mixin.nonObject`), an unknown
+/// class (`class.notFound`), or a trait (`mixin.trait`). Reuses the resolved
+/// `@mixin` types via `resolve_doc_type`; FP-safe (skips mixed/object/templates
+/// and known/built-in classes).
+fn run_mixin(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            collect_mixin(st, fa, scope, &mut out);
+        }
+    });
+    out
+}
+
+fn collect_mixin(st: &Stmt, fa: &FileAnalysis, scope: &Scope, out: &mut Vec<Diagnostic>) {
+    use php_ast::ClassKind;
+    match &st.kind {
+        StmtKind::Class(c) => {
+            let Some(doc_raw) = &c.doc else { return };
+            let doc = php_phpdoc::parse(doc_raw);
+            if doc.mixins.is_empty() {
+                return;
+            }
+            let templates = template_names(doc_raw);
+            for mixin in &doc.mixins {
+                let ty = resolve_doc_type(scope, &templates, mixin);
+                match &ty {
+                    php_types::Type::Named { fqn, .. } => {
+                        if let Some(cr) = fa.reflection.class(fqn) {
+                            if cr.kind == ClassKind::Trait {
+                                out.push(
+                                    Diagnostic::error(
+                                        st.span,
+                                        format!("PHPDoc tag @mixin contains invalid type {ty}."),
+                                    )
+                                    .with_code("mixin.trait"),
+                                );
+                            }
+                        } else if !fa.project.has_class(fqn) {
+                            out.push(
+                                Diagnostic::error(
+                                    st.span,
+                                    format!("PHPDoc tag @mixin contains unknown class {ty}."),
+                                )
+                                .with_code("class.notFound"),
+                            );
+                        }
+                    }
+                    // Lenient: anything we can't pin to a concrete non-object.
+                    php_types::Type::Mixed
+                    | php_types::Type::Unknown(_)
+                    | php_types::Type::Object
+                    | php_types::Type::SelfType
+                    | php_types::Type::StaticType
+                    | php_types::Type::Parent
+                    | php_types::Type::TemplateVar(_)
+                    | php_types::Type::Nullable(_)
+                    | php_types::Type::Union(_)
+                    | php_types::Type::Intersection(_)
+                    | php_types::Type::Iterable(_) => {}
+                    // A concrete non-object (scalar/array/callable/…).
+                    _ => out.push(
+                        Diagnostic::error(
+                            st.span,
+                            format!("PHPDoc tag @mixin contains non-object type {ty}."),
+                        )
+                        .with_code("mixin.nonObject"),
+                    ),
+                }
+            }
+        }
+        StmtKind::Namespace { body: Some(b), .. } => {
+            for s in b {
+                collect_mixin(s, fa, scope, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(crate) static RULES: &[RuleEntry] = &[
+    RuleEntry { name: "phpdoc.mixin", level: 2, run: run_mixin },
     RuleEntry { name: "phpdoc.paramTags", level: 2, run: run_param_tags },
     RuleEntry { name: "phpdoc.varTags", level: 2, run: run_var_tags },
     RuleEntry { name: "phpdoc.phpstanTag", level: 2, run: run_phpstan_tags },
@@ -916,6 +999,32 @@ pub(crate) static RULES: &[RuleEntry] = &[
 mod tests {
     use super::*;
     use crate::testutil::codes;
+
+    // --- @mixin ---
+
+    #[test]
+    fn mixin_unknown_class_flagged() {
+        let src = "<?php /** @mixin Nonexistent */ class C {}";
+        assert_eq!(codes(src, run_mixin), ["class.notFound"]);
+    }
+
+    #[test]
+    fn mixin_known_class_clean() {
+        let src = "<?php class Helper {} /** @mixin Helper */ class C {}";
+        assert!(codes(src, run_mixin).is_empty());
+    }
+
+    #[test]
+    fn mixin_trait_flagged() {
+        let src = "<?php trait T {} /** @mixin T */ class C {}";
+        assert_eq!(codes(src, run_mixin), ["mixin.trait"]);
+    }
+
+    #[test]
+    fn mixin_scalar_flagged() {
+        let src = "<?php /** @mixin int */ class C {}";
+        assert_eq!(codes(src, run_mixin), ["mixin.nonObject"]);
+    }
 
     // --- parameter.notFound ---
 
