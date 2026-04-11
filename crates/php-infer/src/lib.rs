@@ -74,7 +74,14 @@ impl<'a> TypeCtx<'a> {
             ExprKind::StaticCall { class, method, .. } => self.static_call_type(class, method),
             ExprKind::New { class, .. } => self.class_type(class).unwrap_or(Type::Object),
             ExprKind::NewAnon { .. } => Type::Object,
-            ExprKind::Prop { base, nullsafe, name } => self.prop_type(base, *nullsafe, name),
+            ExprKind::Prop { base, nullsafe, name } => {
+                // A flow-narrowed property place (`$this->prop` after a guard) wins
+                // over the declared property type.
+                if let Some(t) = self.place_key(e).and_then(|k| self.vars.get(&k).cloned()) {
+                    return t;
+                }
+                self.prop_type(base, *nullsafe, name)
+            }
             ExprKind::StaticProp { class, name } => self.static_prop_type(class, name),
             ExprKind::ClassConst { class, name } => self.class_const_type(class, name),
             ExprKind::Index { base, .. } => self.index_type(base),

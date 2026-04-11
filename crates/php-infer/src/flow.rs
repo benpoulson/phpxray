@@ -23,18 +23,14 @@ type Env = HashMap<String, Type>;
 /// map (the same shape as [`crate::TypeMap`]).
 type RecMap = HashMap<(u32, u32), Type>;
 
-/// A flow-narrowing fact about a single variable, deduced from a condition.
-/// Only *sound* refinements are produced (the branch guarantees them), so
-/// under-narrowing is safe and over-narrowing — which would cause false
-/// positives in rules reading the type map — never happens.
-enum Narrow {
-    /// The variable definitely has this type in the branch (e.g. `instanceof`,
-    /// `is_int($x)`, `$x === null`).
-    To(Type),
-    /// `null` is removed from the variable's type (e.g. `$x !== null`, a truthy
-    /// `if ($x)`, `!is_null($x)`).
-    StripNull,
-}
+/// A flow-narrowing fact: a "place" (a variable, or `$this->prop`/`$v->prop`)
+/// and the type it definitely has in the branch. Only *sound* refinements are
+/// produced (the branch guarantees them) — under-narrowing is safe; over-narrowing
+/// (which would cause false positives) never happens. Strip-style narrowings
+/// (`$x !== null`, truthy `if ($x)`) are resolved to a concrete type at collection
+/// time against the place's current type, so a property's declared type (not
+/// `mixed`) is the baseline.
+type Fact = (String, Type);
 
 impl TypeCtx<'_> {
     /// Seed parameters from a function/method's reflected signature, then analyse
@@ -172,8 +168,13 @@ impl TypeCtx<'_> {
         let base = self.vars.clone();
         let mut envs: Vec<Env> = Vec::new();
 
-        // then-branch: the condition is truthy here.
+        // Narrowing facts are resolved (including their strip baselines) against
+        // the *branch-entry* environment, so they must be computed while
+        // `self.vars` holds that env — `base` for the then/else of this `if`.
         let then_facts = self.narrow_facts(cond, true);
+        let mut else_facts = self.narrow_facts(cond, false);
+
+        // then-branch: the condition is truthy here.
         self.vars = base.clone();
         self.apply_facts(&then_facts);
         self.exec_stmt(then);
@@ -181,21 +182,21 @@ impl TypeCtx<'_> {
             envs.push(std::mem::take(&mut self.vars));
         }
 
-        // Facts that hold once every preceding condition is false.
-        let mut else_facts = self.narrow_facts(cond, false);
-
         for ei in elseifs {
+            // Entry env for this elseif: base with every preceding condition false.
             self.vars = base.clone();
             self.apply_facts(&else_facts);
-            self.apply_expr(&ei.cond);
+            // Both this elseif's positive facts and its negative facts (for later
+            // branches) are relative to this entry env — compute before the body.
             let pos = self.narrow_facts(&ei.cond, true);
+            let neg = self.narrow_facts(&ei.cond, false);
             self.apply_facts(&pos);
+            self.apply_expr(&ei.cond);
             self.exec_stmt(&ei.body);
             if !always_terminates(&ei.body) {
                 envs.push(std::mem::take(&mut self.vars));
             }
-            // Subsequent branches additionally know this elseif was false.
-            else_facts.extend(self.narrow_facts(&ei.cond, false));
+            else_facts.extend(neg);
         }
 
         match els {
@@ -222,13 +223,13 @@ impl TypeCtx<'_> {
     }
 
     /// Collect the narrowing facts implied by `cond` evaluating to `truthy`.
-    fn narrow_facts(&self, cond: &Expr, truthy: bool) -> Vec<(String, Narrow)> {
+    fn narrow_facts(&self, cond: &Expr, truthy: bool) -> Vec<Fact> {
         let mut out = Vec::new();
         self.collect_facts(cond, truthy, &mut out);
         out
     }
 
-    fn collect_facts(&self, cond: &Expr, truthy: bool, out: &mut Vec<(String, Narrow)>) {
+    fn collect_facts(&self, cond: &Expr, truthy: bool, out: &mut Vec<Fact>) {
         match &cond.kind {
             ExprKind::Paren(inner) => self.collect_facts(inner, truthy, out),
             ExprKind::Unary { op: UnOp::Not, expr } => self.collect_facts(expr, !truthy, out),
@@ -242,24 +243,16 @@ impl TypeCtx<'_> {
                     self.collect_facts(lhs, false, out);
                     self.collect_facts(rhs, false, out);
                 }
-                // `a || b` true ⇒ at least one holds. A variable can only be
-                // asserted if *both* operands constrain it — then it is the *union*
-                // of the two narrowings (`$n instanceof A || $n instanceof B`
-                // ⇒ `$n: A|B`). Variables constrained by only one side are dropped.
+                // `a || b` true ⇒ at least one holds. A place can only be asserted
+                // if *both* operands constrain it — then it is the *union* of the
+                // two narrowings (`$n instanceof A || $n instanceof B` ⇒ `$n: A|B`).
+                // Places constrained by only one side are dropped.
                 BinOp::BoolOr | BinOp::LogicalOr if truthy => {
                     let l = self.narrow_facts(lhs, true);
                     let r = self.narrow_facts(rhs, true);
-                    for (name, ln) in &l {
-                        let Some((_, rn)) = r.iter().find(|(n, _)| n == name) else { continue };
-                        match (ln, rn) {
-                            (Narrow::To(lt), Narrow::To(rt)) => out.push((
-                                name.clone(),
-                                Narrow::To(Type::union(vec![lt.clone(), rt.clone()])),
-                            )),
-                            (Narrow::StripNull, Narrow::StripNull) => {
-                                out.push((name.clone(), Narrow::StripNull))
-                            }
-                            _ => {}
+                    for (place, lt) in &l {
+                        if let Some((_, rt)) = r.iter().find(|(p, _)| p == place) {
+                            out.push((place.clone(), Type::union(vec![lt.clone(), rt.clone()])));
                         }
                     }
                 }
@@ -269,30 +262,32 @@ impl TypeCtx<'_> {
                 _ => {}
             },
             ExprKind::Instanceof { expr, class } if truthy => {
-                if let (Some(name), Some(t)) = (self.var_name(expr), self.class_type(class)) {
-                    out.push((name, Narrow::To(t)));
+                if let (Some(place), Some(t)) = (self.place_key(expr), self.class_type(class)) {
+                    out.push((place, t));
                 }
             }
             ExprKind::Call { callee, args } => {
                 if let ExprKind::Name(n) = &callee.kind {
                     let fname = last_segment(&n.text).to_ascii_lowercase();
                     if let Some(arg0) = args.first() {
-                        if let Some(name) = self.var_name(&arg0.value) {
+                        if let Some(place) = self.place_key(&arg0.value) {
                             if truthy {
                                 if let Some(t) = predicate_type(&fname) {
-                                    out.push((name, Narrow::To(t)));
+                                    out.push((place, t));
                                 }
                             } else if fname == "is_null" {
-                                out.push((name, Narrow::StripNull));
+                                // `!is_null($x)` ⇒ null stripped from $x's type.
+                                out.push((place, strip_null(&self.infer(&arg0.value))));
                             }
                         }
                     }
                 }
             }
-            // A bare truthy variable (`if ($x)`) is non-null in the then-branch.
+            // A bare truthy place (`if ($x)`, `if ($this->x)`) is non-null *and*
+            // non-false in the then-branch.
             _ if truthy => {
-                if let Some(name) = self.var_name(cond) {
-                    out.push((name, Narrow::StripNull));
+                if let Some(place) = self.place_key(cond) {
+                    out.push((place, strip_falsy(&self.infer(cond))));
                 }
             }
             _ => {}
@@ -300,34 +295,42 @@ impl TypeCtx<'_> {
     }
 
     /// `$x <cmp> null` / `null <cmp> $x`. `is_null` = whether the comparison
-    /// asserts the variable *is* null in this branch.
-    fn null_cmp(&self, lhs: &Expr, rhs: &Expr, is_null: bool, out: &mut Vec<(String, Narrow)>) {
-        let var = if self.is_null_lit(rhs) {
-            self.var_name(lhs)
+    /// asserts the place *is* null in this branch.
+    fn null_cmp(&self, lhs: &Expr, rhs: &Expr, is_null: bool, out: &mut Vec<Fact>) {
+        let operand = if self.is_null_lit(rhs) {
+            Some(lhs)
         } else if self.is_null_lit(lhs) {
-            self.var_name(rhs)
+            Some(rhs)
         } else {
             None
         };
-        if let Some(name) = var {
-            out.push((name, if is_null { Narrow::To(Type::Null) } else { Narrow::StripNull }));
-        }
+        let Some(operand) = operand else { return };
+        let Some(place) = self.place_key(operand) else { return };
+        let t = if is_null { Type::Null } else { strip_null(&self.infer(operand)) };
+        out.push((place, t));
     }
 
-    fn apply_facts(&mut self, facts: &[(String, Narrow)]) {
+    fn apply_facts(&mut self, facts: &[Fact]) {
         let idx = self.index;
         let mut vars = std::mem::take(&mut self.vars);
         apply_facts_to(&mut vars, facts, idx);
         self.vars = vars;
     }
 
-    /// The simple variable name (without `$`) of `e`, or `None` (`$this` is never
-    /// narrowed).
-    fn var_name(&self, e: &Expr) -> Option<String> {
+    /// The narrowable "place" key of `e`: a simple variable (`x`), or a property
+    /// fetch on a simple variable / `$this` (`this->prop`, `obj->prop`). `$this`
+    /// itself is not a place. Property places let guards on object state narrow
+    /// (`if ($this->c instanceof X)`, `if (!$this->c) return`), which OO code
+    /// relies on pervasively.
+    pub(crate) fn place_key(&self, e: &Expr) -> Option<String> {
         match &e.kind {
             ExprKind::Variable(sym) => {
                 let n = self.interner.resolve(*sym);
                 (n != "this").then(|| n.to_string())
+            }
+            ExprKind::Prop { base, name: php_ast::MemberName::Ident(p), nullsafe: false } => {
+                let ExprKind::Variable(b) = &base.kind else { return None };
+                Some(format!("{}->{}", self.interner.resolve(*b), self.interner.resolve(*p)))
             }
             _ => None,
         }
@@ -478,7 +481,11 @@ impl TypeCtx<'_> {
         let base = self.vars.clone();
         let mut envs: Vec<Env> = Vec::new();
 
+        // Facts resolve against the branch-entry env (`base`); compute before the
+        // then-branch mutates `self.vars`. (Mirrors `exec_if`.)
         let then_facts = self.narrow_facts(cond, true);
+        let mut else_facts = self.narrow_facts(cond, false);
+
         self.vars = base.clone();
         self.apply_facts(&then_facts);
         self.record_stmt(then, map);
@@ -486,19 +493,19 @@ impl TypeCtx<'_> {
             envs.push(std::mem::take(&mut self.vars));
         }
 
-        let mut else_facts = self.narrow_facts(cond, false);
         for ei in elseifs {
             self.vars = base.clone();
             self.apply_facts(&else_facts);
-            self.rec_here(&ei.cond, map);
-            self.apply_expr(&ei.cond);
             let pos = self.narrow_facts(&ei.cond, true);
+            let neg = self.narrow_facts(&ei.cond, false);
+            self.rec_here(&ei.cond, map);
             self.apply_facts(&pos);
+            self.apply_expr(&ei.cond);
             self.record_stmt(&ei.body, map);
             if !always_terminates(&ei.body) {
                 envs.push(std::mem::take(&mut self.vars));
             }
-            else_facts.extend(self.narrow_facts(&ei.cond, false));
+            else_facts.extend(neg);
         }
 
         match els {
@@ -558,14 +565,10 @@ fn span_key(e: &Expr) -> (u32, u32) {
 }
 
 /// Apply narrowing facts to an environment in place.
-fn apply_facts_to(vars: &mut Env, facts: &[(String, Narrow)], index: &php_reflect::ReflectionIndex) {
-    for (name, n) in facts {
-        let cur = vars.get(name).cloned().unwrap_or(Type::Mixed);
-        let nt = match n {
-            Narrow::To(t) => narrow_to(&cur, t, index),
-            Narrow::StripNull => strip_null(&cur),
-        };
-        vars.insert(name.clone(), nt);
+fn apply_facts_to(vars: &mut Env, facts: &[Fact], index: &php_reflect::ReflectionIndex) {
+    for (place, t) in facts {
+        let cur = vars.get(place).cloned().unwrap_or(Type::Mixed);
+        vars.insert(place.clone(), narrow_to(&cur, t, index));
     }
 }
 
@@ -588,6 +591,27 @@ fn strip_null(t: &Type) -> Type {
         Type::Null => Type::Never,
         Type::Union(parts) => {
             let kept: Vec<Type> = parts.iter().filter(|p| !matches!(p, Type::Null)).cloned().collect();
+            Type::union(kept)
+        }
+        other => other.clone(),
+    }
+}
+
+/// Remove the always-falsy members (`null`, `false`) from a type — the refinement
+/// a truthy `if ($x)` guarantees. `string|false` → `string`, `?T` → `T`,
+/// `bool` → `true`. Conservative: other types keep their value (a truthy `int`
+/// is still `int`; we don't introduce non-zero-int types).
+fn strip_falsy(t: &Type) -> Type {
+    match t {
+        Type::Nullable(inner) => strip_falsy(inner),
+        Type::Null | Type::False => Type::Never,
+        Type::Bool => Type::True,
+        Type::Union(parts) => {
+            let kept: Vec<Type> = parts
+                .iter()
+                .filter(|p| !matches!(p, Type::Null | Type::False))
+                .cloned()
+                .collect();
             Type::union(kept)
         }
         other => other.clone(),
@@ -783,6 +807,19 @@ mod tests {
         let src = "function f($x) { $y = 0; if ($x instanceof Foo) { $y = $x; } }";
         // then: $y = Foo; fall-through: $y = int(0). Merged.
         assert_eq!(var_after(src, "y"), "Foo|int");
+    }
+
+    #[test]
+    fn truthy_guard_strips_false_from_union() {
+        // `int|false` after `if (!$x) return;` is `int` (truthy strips false too).
+        let src = "function f(int|false $x) { if (!$x) { return; } $y = $x; }";
+        assert_eq!(var_after(src, "y"), "int");
+    }
+
+    #[test]
+    fn truthy_guard_strips_false_and_null() {
+        let src = "function f(string|false|null $x) { if (!$x) { return; } $y = $x; }";
+        assert_eq!(var_after(src, "y"), "string");
     }
 
     #[test]

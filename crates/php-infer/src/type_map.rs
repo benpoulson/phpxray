@@ -194,6 +194,35 @@ mod tests {
     }
 
     #[test]
+    fn property_receiver_narrows_after_guard() {
+        // `$this->x` narrows after a null guard (property-place narrowing), so the
+        // post-guard use is the non-null type, not `?Foo`.
+        let src = "<?php class Foo { public function f(): void {} } \
+            class C { private ?Foo $x = null; \
+                public function m() { if ($this->x === null) { return; } $r = $this->x; } }";
+        // The `$this->x` in `$r = $this->x;` is `Foo` (null stripped).
+        let (map, r) = build(src);
+        let mut tys = Vec::new();
+        walk::for_each_expr(&r.program, &mut |e| {
+            if let ExprKind::Prop { base, name: php_ast::MemberName::Ident(_), .. } = &e.kind {
+                if matches!(&base.kind, ExprKind::Variable(_)) {
+                    tys.push(map.get(&key(e.span)).map(|t| t.to_string()).unwrap_or_default());
+                }
+            }
+        });
+        // The last `$this->x` (the read in `$r = $this->x`) is narrowed to Foo.
+        assert_eq!(tys.last().map(String::as_str), Some("Foo"), "got {tys:?}");
+    }
+
+    #[test]
+    fn property_instanceof_narrows_in_branch() {
+        let src = "<?php interface I {} class A implements I { public int $n = 0; } \
+            class C { private I $dep; \
+                public function m() { if ($this->dep instanceof A) { $r = $this->dep->n; } } }";
+        assert_eq!(ty_of(src, |e| matches!(&e.kind, ExprKind::Prop { name: php_ast::MemberName::Ident(_), base, .. } if matches!(&base.kind, ExprKind::Prop{..}))), "int");
+    }
+
+    #[test]
     fn narrowed_property_type_is_recorded() {
         // And the property fetch itself resolves through the narrowed class.
         let src = "<?php \

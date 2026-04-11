@@ -980,8 +980,85 @@ fn collect_mixin(st: &Stmt, fa: &FileAnalysis, scope: &Scope, out: &mut Vec<Diag
     }
 }
 
+// --- @property / @method tag type validation (PropertyTag/MethodTagRule) -----
+
+
+/// Emit `class.notFound` / `<trait_code>` for each unknown class / trait named in
+/// a doc-tag type. FP-safe: known + built-in classes are fine; templates/scalars
+/// are ignored (only `Named` is collected).
+fn check_tag_classes(
+    fa: &FileAnalysis,
+    ty: &php_types::Type,
+    span: Span,
+    trait_code: &'static str,
+    msg: impl Fn(&str, &'static str) -> String,
+    out: &mut Vec<Diagnostic>,
+) {
+    let mut named = Vec::new();
+    collect_named(ty, &mut named);
+    for fqn in named {
+        if let Some(cr) = fa.reflection.class(&fqn) {
+            if cr.kind == ClassKind::Trait {
+                out.push(Diagnostic::error(span, msg(&fqn, "invalid")).with_code(trait_code));
+            }
+        } else if !fa.project.has_class(&fqn) {
+            out.push(Diagnostic::error(span, msg(&fqn, "unknown")).with_code("class.notFound"));
+        }
+    }
+}
+
+/// `@property*`/`@method` tag types referencing an unknown class or a trait.
+fn run_tag_class_refs(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            collect_tag_refs(st, fa, scope, &mut out);
+        }
+    });
+    out
+}
+
+fn collect_tag_refs(st: &Stmt, fa: &FileAnalysis, scope: &Scope, out: &mut Vec<Diagnostic>) {
+    match &st.kind {
+        StmtKind::Class(c) => {
+            let Some(doc_raw) = &c.doc else { return };
+            let doc = php_phpdoc::parse(doc_raw);
+            if doc.properties.is_empty() && doc.methods.is_empty() {
+                return;
+            }
+            let templates = template_names(doc_raw);
+            let display = c.name.map(|n| scope.qualify(fa.interner.resolve(n))).unwrap_or_default();
+            for p in &doc.properties {
+                let Some(dt) = &p.ty else { continue };
+                let ty = resolve_doc_type(scope, &templates, dt);
+                let pname = p.name.clone().unwrap_or_default();
+                let d2 = display.clone();
+                check_tag_classes(fa, &ty, st.span, "propertyTag.trait", move |c, kind| {
+                    format!("PHPDoc tag @property for property {d2}::${pname} contains {kind} class {c}.")
+                }, out);
+            }
+            for m in &doc.methods {
+                let Some(rt) = &m.return_type else { continue };
+                let ty = resolve_doc_type(scope, &templates, rt);
+                let mname = m.name.clone();
+                let d2 = display.clone();
+                check_tag_classes(fa, &ty, st.span, "methodTag.trait", move |c, kind| {
+                    format!("PHPDoc tag @method for method {d2}::{mname}() contains {kind} class {c}.")
+                }, out);
+            }
+        }
+        StmtKind::Namespace { body: Some(b), .. } => {
+            for s in b {
+                collect_tag_refs(s, fa, scope, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "phpdoc.mixin", level: 2, run: run_mixin },
+    RuleEntry { name: "phpdoc.tagClassRefs", level: 2, run: run_tag_class_refs },
     RuleEntry { name: "phpdoc.paramTags", level: 2, run: run_param_tags },
     RuleEntry { name: "phpdoc.varTags", level: 2, run: run_var_tags },
     RuleEntry { name: "phpdoc.phpstanTag", level: 2, run: run_phpstan_tags },
@@ -999,6 +1076,32 @@ pub(crate) static RULES: &[RuleEntry] = &[
 mod tests {
     use super::*;
     use crate::testutil::codes;
+
+    // --- @property / @method tag class refs ---
+
+    #[test]
+    fn property_tag_unknown_class_flagged() {
+        let src = "<?php /** @property Nope $x */ class C {}";
+        assert_eq!(codes(src, run_tag_class_refs), ["class.notFound"]);
+    }
+
+    #[test]
+    fn property_tag_known_class_clean() {
+        let src = "<?php class T {} /** @property T $x */ class C {}";
+        assert!(codes(src, run_tag_class_refs).is_empty());
+    }
+
+    #[test]
+    fn method_tag_unknown_return_flagged() {
+        let src = "<?php /** @method Nope getThing() */ class C {}";
+        assert_eq!(codes(src, run_tag_class_refs), ["class.notFound"]);
+    }
+
+    #[test]
+    fn property_tag_scalar_clean() {
+        let src = "<?php /** @property int $x */ class C {}";
+        assert!(codes(src, run_tag_class_refs).is_empty());
+    }
 
     // --- @mixin ---
 
