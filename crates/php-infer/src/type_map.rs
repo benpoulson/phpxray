@@ -215,6 +215,33 @@ mod tests {
     }
 
     #[test]
+    fn intra_and_narrows_right_operand() {
+        // `$x instanceof A && $x->n` — the right operand sees $x narrowed to A.
+        let src = "<?php interface I {} class A implements I { public int $n = 0; } \
+            function f(I $x): bool { return $x instanceof A && $x->n > 0; }";
+        assert_eq!(ty_of(src, |e| matches!(&e.kind, ExprKind::Prop { .. })), "int");
+    }
+
+    #[test]
+    fn intra_and_narrows_property_receiver() {
+        // The symfony pattern: `$this->dep instanceof A && $this->dep->n`.
+        let src = "<?php interface I {} class A implements I { public int $n = 0; } \
+            class C { private I $dep; \
+                public function m(): bool { return $this->dep instanceof A && $this->dep->n > 0; } }";
+        // The inner `$this->dep` receiver (base of `->n`) narrows to A.
+        let (map, r) = build(src);
+        let mut found = None;
+        walk::for_each_expr(&r.program, &mut |e| {
+            if let ExprKind::Prop { base, name: php_ast::MemberName::Ident(_), .. } = &e.kind {
+                if matches!(&base.kind, ExprKind::Prop { .. }) && found.is_none() {
+                    found = map.get(&key(base.span)).map(|t| t.to_string());
+                }
+            }
+        });
+        assert_eq!(found.as_deref(), Some("A"), "inner $this->dep should narrow to A");
+    }
+
+    #[test]
     fn property_instanceof_narrows_in_branch() {
         let src = "<?php interface I {} class A implements I { public int $n = 0; } \
             class C { private I $dep; \

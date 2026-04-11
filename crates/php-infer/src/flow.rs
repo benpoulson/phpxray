@@ -381,11 +381,46 @@ impl TypeCtx<'_> {
         }
     }
 
-    /// Record every sub-expression of `e` at the current environment.
-    fn rec_here(&self, e: &Expr, map: &mut RecMap) {
-        php_ast::walk::for_each_subexpr(e, &mut |x| {
-            map.insert(span_key(x), self.infer(x));
-        });
+    /// Record every sub-expression of `e` at the current environment, applying
+    /// **intra-expression narrowing** through `&&`/`||`: the right operand of
+    /// `a && b` is recorded under `a`'s truthy facts, and of `a || b` under `a`'s
+    /// false facts (PHP short-circuits, so the right side is reached only then).
+    /// This is what types `$x->m()` correctly in `$x instanceof Y && $x->m()`.
+    fn rec_here(&mut self, e: &Expr, map: &mut RecMap) {
+        match &e.kind {
+            ExprKind::Paren(inner) => {
+                map.insert(span_key(e), self.infer(e));
+                self.rec_here(inner, map);
+            }
+            ExprKind::Unary { op: UnOp::Not, expr } => {
+                map.insert(span_key(e), self.infer(e));
+                self.rec_here(expr, map);
+            }
+            ExprKind::Binary { op: BinOp::BoolAnd | BinOp::LogicalAnd, lhs, rhs } => {
+                map.insert(span_key(e), self.infer(e));
+                self.rec_here(lhs, map);
+                self.rec_under(lhs, true, rhs, map);
+            }
+            ExprKind::Binary { op: BinOp::BoolOr | BinOp::LogicalOr, lhs, rhs } => {
+                map.insert(span_key(e), self.infer(e));
+                self.rec_here(lhs, map);
+                self.rec_under(lhs, false, rhs, map);
+            }
+            // A leaf (for narrowing purposes): record the whole subtree flatly.
+            _ => php_ast::walk::for_each_subexpr(e, &mut |x| {
+                map.insert(span_key(x), self.infer(x));
+            }),
+        }
+    }
+
+    /// Record `rhs` with the facts implied by `gate` evaluating to `truthy`
+    /// temporarily applied, then restore the environment.
+    fn rec_under(&mut self, gate: &Expr, truthy: bool, rhs: &Expr, map: &mut RecMap) {
+        let facts = self.narrow_facts(gate, truthy);
+        let saved = self.vars.clone();
+        self.apply_facts(&facts);
+        self.rec_here(rhs, map);
+        self.vars = saved;
     }
 
     fn record_stmt(&mut self, s: &Stmt, map: &mut RecMap) {
