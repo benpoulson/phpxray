@@ -215,6 +215,12 @@ mod tests {
     }
 
     #[test]
+    fn array_values_preserves_element_type() {
+        let src = "<?php /** @param array<int, string> $a */ function f(array $a): bool { return array_values($a) === []; }";
+        assert_eq!(ty_of(src, |e| matches!(&e.kind, ExprKind::Call { .. })), "list<string>");
+    }
+
+    #[test]
     fn str_replace_returns_string_for_string_subject() {
         // The stub says `string|array`; a string subject yields `string`.
         let src = "<?php function f(string $s): bool { return str_replace('a', 'b', $s) === 'x'; }";

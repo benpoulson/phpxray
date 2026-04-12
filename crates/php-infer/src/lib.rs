@@ -187,15 +187,43 @@ impl<'a> TypeCtx<'a> {
         // The string-replace family returns the *subject*'s shape: a string
         // subject yields a string, an array subject an array. The stub can only
         // say `string|array`, which then poisons every downstream string use.
-        let subject_idx = match fname {
+        if let Some(idx) = match fname {
             "str_replace" | "str_ireplace" | "preg_replace" | "preg_replace_callback"
-            | "preg_replace_callback_array" => 2,
-            "substr_replace" => 0,
-            _ => return None,
-        };
-        match self.infer(&args.get(subject_idx)?.value) {
-            Type::String | Type::LiteralString(_) => Some(Type::String),
-            Type::Array(_) | Type::List(_) => Some(Type::Array(None)),
+            | "preg_replace_callback_array" => Some(2),
+            "substr_replace" => Some(0),
+            _ => None,
+        } {
+            return match self.infer(&args.get(idx)?.value) {
+                Type::String | Type::LiteralString(_) => Some(Type::String),
+                Type::Array(_) | Type::List(_) => Some(Type::Array(None)),
+                _ => None,
+            };
+        }
+
+        // Array functions that preserve their first argument's element type — the
+        // stubs return a bare `array`, losing the value type and cascading into
+        // downstream `array<K,V>` argument/return mismatches.
+        match fname {
+            // `array_values(array<K,V>)` → `list<V>`.
+            "array_values" => Some(Type::List(Box::new(self.array_value_type(args.first()?)?))),
+            // These keep the value type (keys may change, but value type holds);
+            // returning the input array type is correct and false-positive-safe.
+            "array_filter" | "array_reverse" | "array_unique" | "array_slice" | "array_splice"
+            | "array_pad" | "array_diff" | "array_intersect" => {
+                match self.infer(&args.first()?.value) {
+                    t @ (Type::Array(_) | Type::List(_)) => Some(t),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The value (element) type of an array/list argument, if known.
+    fn array_value_type(&self, arg: &php_ast::Arg) -> Option<Type> {
+        match self.infer(&arg.value) {
+            Type::Array(Some(kv)) => Some(kv.1.clone()),
+            Type::List(v) => Some(*v),
             _ => None,
         }
     }
