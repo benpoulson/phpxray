@@ -682,12 +682,20 @@ fn run_missing_return_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for_each_class(fa, |_, fqn, c| {
         let Some(class) = fa.reflection.class(fqn) else { return };
-        for (md, mr) in zip_methods(fa.interner, c, class) {
-            if md.return_type.is_some() || mr.return_type != Type::Mixed {
+        for (md, _mr) in zip_methods(fa.interner, c, class) {
+            // "Specified" = a native return type OR a `@return` tag in the method's
+            // docblock. We key off the tag's *presence* (like phpstan), not the
+            // resolved type — a `@return $this`/exotic type that resolves to `mixed`
+            // still counts as documented.
+            if md.return_type.is_some() || doc_has_return(md.doc.as_deref()) {
                 continue;
             }
             let name = fa.interner.resolve(md.name);
             if name.eq_ignore_ascii_case("__construct") || name.eq_ignore_ascii_case("__destruct") {
+                continue;
+            }
+            // An override inherits the prototype's return typehint.
+            if inherited_return_typed(fa, class, name) {
                 continue;
             }
             out.push(
@@ -702,27 +710,92 @@ fn run_missing_return_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
+/// Whether a docblock declares a `@return` (incl. `@phpstan-`/`@psalm-return`).
+fn doc_has_return(doc: Option<&str>) -> bool {
+    doc.is_some_and(|d| d.contains("@return") || d.contains("-return"))
+}
+
+/// Whether an overridden prototype (a parent class or interface method of the
+/// same name) declares a non-`mixed` return type. phpstan inherits the prototype's
+/// native/`@return` typehint, so an override needn't repeat it.
+fn inherited_return_typed(fa: &FileAnalysis, class: &php_reflect::ClassReflection, name: &str) -> bool {
+    class.parents.iter().chain(&class.interfaces).any(|t| match t {
+        Type::Named { fqn, .. } => fa
+            .reflection
+            .find_method(fqn, name)
+            .is_some_and(|m| m.member.return_type != Type::Mixed),
+        _ => false,
+    })
+}
+
+/// Whether an overridden prototype types the parameter at `idx`.
+fn inherited_param_typed(
+    fa: &FileAnalysis,
+    class: &php_reflect::ClassReflection,
+    name: &str,
+    idx: usize,
+) -> bool {
+    class.parents.iter().chain(&class.interfaces).any(|t| match t {
+        Type::Named { fqn, .. } => fa
+            .reflection
+            .find_method(fqn, name)
+            .and_then(|m| m.member.params.get(idx).map(|p| p.ty != Type::Mixed))
+            .unwrap_or(false),
+        _ => false,
+    })
+}
+
+/// Whether a docblock declares a `@param … $name` (any `@param*` prefix), with
+/// `$name` matched as a whole variable token. Mirrors the function-rule helper.
+fn doc_has_param(doc: Option<&str>, name: &str) -> bool {
+    let Some(d) = doc else { return false };
+    let needle = format!("${name}");
+    let mut search = d;
+    while let Some(off) = search.find("@param") {
+        let after = &search[off + "@param".len()..];
+        let seg = after.split('@').next().unwrap_or(after);
+        if let Some(p) = seg.find(&needle) {
+            let end = p + needle.len();
+            let b = seg.as_bytes();
+            if end >= b.len() || !(b[end].is_ascii_alphanumeric() || b[end] == b'_') {
+                return true;
+            }
+        }
+        search = after;
+    }
+    false
+}
+
 /// `MissingMethodParameterTypehintRule` — a method parameter with no type.
 fn run_missing_param_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for_each_class(fa, |_, fqn, c| {
         let Some(class) = fa.reflection.class(fqn) else { return };
-        for (md, mr) in zip_methods(fa.interner, c, class) {
-            for (p, pr) in md.params.iter().zip(&mr.params) {
-                if p.ty.is_none() && pr.ty == Type::Mixed {
-                    out.push(
-                        Diagnostic::error(
-                            method_span(md),
-                            format!(
-                                "Method {}::{}() has parameter ${} with no type specified.",
-                                display(fa, c),
-                                fa.interner.resolve(md.name),
-                                fa.interner.resolve(p.name)
-                            ),
-                        )
-                        .with_code("missingType.parameter"),
-                    );
+        for (md, _mr) in zip_methods(fa.interner, c, class) {
+            let mname = fa.interner.resolve(md.name);
+            for (idx, p) in md.params.iter().enumerate() {
+                if p.ty.is_some() {
+                    continue; // native type hint present
                 }
+                let pname = fa.interner.resolve(p.name);
+                if doc_has_param(md.doc.as_deref(), pname) {
+                    continue; // documented via @param
+                }
+                if inherited_param_typed(fa, class, mname, idx) {
+                    continue; // inherited from an overridden prototype
+                }
+                out.push(
+                    Diagnostic::error(
+                        method_span(md),
+                        format!(
+                            "Method {}::{}() has parameter ${} with no type specified.",
+                            display(fa, c),
+                            fa.interner.resolve(md.name),
+                            pname
+                        ),
+                    )
+                    .with_code("missingType.parameter"),
+                );
             }
         }
     });
@@ -1405,6 +1478,15 @@ fn run_consistent_constructor_private(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// The type of a parameter's default-value expression (constant-folded). Param
 /// defaults aren't in the flow type-map, so we evaluate the literal directly;
 /// a non-constant default yields `mixed` (skipped, false-positive-safe).
+/// Whether `t` (under one level of nullable) is array/iterable-like.
+fn is_array_or_iterable(t: &Type) -> bool {
+    match t {
+        Type::Array(_) | Type::Iterable(_) | Type::List(_) | Type::Shape { .. } => true,
+        Type::Nullable(inner) => is_array_or_iterable(inner),
+        _ => false,
+    }
+}
+
 fn const_default_type(e: &php_ast::Expr) -> Type {
     use php_infer::ConstVal;
     match php_infer::eval_const(e) {
@@ -1439,6 +1521,12 @@ fn run_incompatible_default_param(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 }
                 // Param defaults aren't in the body type-map; fold the literal.
                 let given = const_default_type(default);
+                // An array-literal default is compatible with any array/iterable
+                // parameter (empty `[]` fits any `array<K,V>`; element precision is
+                // intentionally under-reported rather than false-flagged).
+                if matches!(given, Type::Array(_)) && is_array_or_iterable(&pr.ty) {
+                    continue;
+                }
                 if crate::is_assignable(fa.reflection, &given, &pr.ty) {
                     continue;
                 }
@@ -1722,6 +1810,49 @@ mod tests {
     fn phpdoc_return_type_clean() {
         let src = "<?php class C { /** @return int */ public function f() { return 1; } }";
         assert!(codes(src, run_missing_return_type).is_empty());
+    }
+
+    #[test]
+    fn phpdoc_return_this_clean() {
+        // `@return $this` resolves to a type our reflection may render as exotic,
+        // but the *tag* is present — so it's documented, not "missing".
+        let src = "<?php class C { /** @return $this */ public function chain() { return $this; } }";
+        assert!(codes(src, run_missing_return_type).is_empty());
+    }
+
+    #[test]
+    fn override_inherits_return_typehint() {
+        // The implementing method has no own return type, but the interface
+        // prototype declares `@return`, which phpstan (and we) inherit.
+        let src = "<?php interface I { /** @return int */ public function v(); } \
+            class C implements I { public function v() { return 1; } }";
+        assert!(codes(src, run_missing_return_type).is_empty());
+    }
+
+    #[test]
+    fn override_inherits_param_typehint() {
+        let src = "<?php interface I { public function v(int $x); } \
+            class C implements I { public function v($x): void {} }";
+        assert!(codes(src, run_missing_param_type).is_empty());
+    }
+
+    #[test]
+    fn untyped_method_with_no_prototype_still_flagged() {
+        let src = "<?php class C { public function v() { return 1; } }";
+        assert_eq!(codes(src, run_missing_return_type), ["missingType.return"]);
+    }
+
+    #[test]
+    fn phpdoc_param_clean_for_method() {
+        let src = "<?php class C { /** @param int $x */ public function f($x): void {} }";
+        assert!(codes(src, run_missing_param_type).is_empty());
+    }
+
+    #[test]
+    fn array_literal_default_for_typed_array_param_clean() {
+        // `array<string,mixed> $o = []` — an empty array fits any array<K,V>.
+        let src = "<?php class C { /** @param array<string,mixed> $o */ public function __construct(array $o = []) {} }";
+        assert!(codes(src, run_incompatible_default_param).is_empty());
     }
 
     #[test]

@@ -1922,6 +1922,12 @@ fn run_incompatible_default_parameter(fa: &FileAnalysis) -> Vec<Diagnostic> {
             if dty == php_types::Type::Null {
                 continue;
             }
+            // An array-literal default (`[]`, `[…]`) is compatible with any
+            // array/iterable parameter — an empty array fits any `array<K,V>`, and
+            // we don't type literal elements here (under-report, never false-flag).
+            if matches!(dty, php_types::Type::Array(_)) && is_array_or_iterable(&param.ty) {
+                continue;
+            }
             if !crate::is_assignable(fa.reflection, &dty, &param.ty) {
                 out.push(
                     Diagnostic::error(
@@ -1946,6 +1952,17 @@ fn run_incompatible_default_parameter(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// fold (scalars/`null` via `eval_const`, or an array literal → `array`).
 /// `None` for non-constant defaults (a constant reference, `new`, etc.), which we
 /// then skip to stay false-positive-free.
+/// Whether `t` (under one level of nullable) is an array/iterable-like type — an
+/// array-literal default is always compatible with such a parameter.
+fn is_array_or_iterable(t: &php_types::Type) -> bool {
+    use php_types::Type;
+    match t {
+        Type::Array(_) | Type::Iterable(_) | Type::List(_) | Type::Shape { .. } => true,
+        Type::Nullable(inner) => is_array_or_iterable(inner),
+        _ => false,
+    }
+}
+
 fn const_default_type(e: &Expr) -> Option<php_types::Type> {
     use php_types::Type;
     if let ExprKind::Array { .. } = &e.kind {
