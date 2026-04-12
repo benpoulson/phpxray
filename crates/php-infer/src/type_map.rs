@@ -215,6 +215,13 @@ mod tests {
     }
 
     #[test]
+    fn str_replace_returns_string_for_string_subject() {
+        // The stub says `string|array`; a string subject yields `string`.
+        let src = "<?php function f(string $s): bool { return str_replace('a', 'b', $s) === 'x'; }";
+        assert_eq!(ty_of(src, |e| matches!(&e.kind, ExprKind::Call { .. })), "string");
+    }
+
+    #[test]
     fn intra_and_narrows_right_operand() {
         // `$x instanceof A && $x->n` — the right operand sees $x narrowed to A.
         let src = "<?php interface I {} class A implements I { public int $n = 0; } \

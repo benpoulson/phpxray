@@ -67,7 +67,7 @@ impl<'a> TypeCtx<'a> {
 
             // --- composite ---
             ExprKind::Array { items, .. } => self.array_type(items),
-            ExprKind::Call { callee, .. } => self.call_type(callee),
+            ExprKind::Call { callee, args } => self.call_type(callee, args),
             ExprKind::MethodCall { recv, nullsafe, method, .. } => {
                 self.method_type(recv, *nullsafe, method)
             }
@@ -166,11 +166,37 @@ impl<'a> TypeCtx<'a> {
     }
 
     /// Return type of a free function call `f(...)`.
-    fn call_type(&self, callee: &Expr) -> Type {
+    fn call_type(&self, callee: &Expr, args: &[php_ast::Arg]) -> Type {
         let ExprKind::Name(n) = &callee.kind else { return Type::Mixed };
+        // A few built-ins have argument-dependent return types that a static stub
+        // can't express (it gives the worst-case union); model the common ones so
+        // their result doesn't poison downstream type checks.
+        let fname = n.text.trim_start_matches('\\').rsplit('\\').next().unwrap_or(&n.text).to_ascii_lowercase();
+        if let Some(t) = self.dynamic_return(&fname, args) {
+            return t;
+        }
         match self.function_reflection(n) {
             Some(f) => f.return_type.clone(),
             None => Type::Mixed,
+        }
+    }
+
+    /// Argument-dependent return types for selected built-ins. Returns `None` to
+    /// fall back to the stub signature.
+    fn dynamic_return(&self, fname: &str, args: &[php_ast::Arg]) -> Option<Type> {
+        // The string-replace family returns the *subject*'s shape: a string
+        // subject yields a string, an array subject an array. The stub can only
+        // say `string|array`, which then poisons every downstream string use.
+        let subject_idx = match fname {
+            "str_replace" | "str_ireplace" | "preg_replace" | "preg_replace_callback"
+            | "preg_replace_callback_array" => 2,
+            "substr_replace" => 0,
+            _ => return None,
+        };
+        match self.infer(&args.get(subject_idx)?.value) {
+            Type::String | Type::LiteralString(_) => Some(Type::String),
+            Type::Array(_) | Type::List(_) => Some(Type::Array(None)),
+            _ => None,
         }
     }
 
