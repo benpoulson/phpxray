@@ -42,6 +42,9 @@ pub enum DocType {
     ConstString(String),
     /// A literal integer type (`0`, `-1`).
     ConstInt(String),
+    /// A class-constant (mask) type: `Foo::BAR`, `Foo::BAR_*`. Stores the class
+    /// name; the constant selector is not modelled (resolved leniently).
+    ClassConst(String),
     /// A conditional type `($subject is [not] target ? then : else)`.
     Conditional {
         /// The tested template name or `$param`.
@@ -316,6 +319,19 @@ impl Parser {
                 self.bump();
                 self.callable(name.clone())
             }
+            // `Foo::BAR` / `Foo::BAR_*` — a class-constant (mask) type. The `*`
+            // stops the tokenizer (unknown byte), so we just consume `:: ident?`.
+            Tk::Colon => {
+                self.bump();
+                if self.eat(Tk::Colon) {
+                    if matches!(self.peek(), Tk::Ident(_)) {
+                        self.bump();
+                    }
+                    return Some(DocType::ClassConst(name));
+                }
+                self.pos = start;
+                return Some(DocType::Named(name));
+            }
             _ => return Some(DocType::Named(name)),
         };
         attempted.or_else(|| {
@@ -459,6 +475,17 @@ mod tests {
         assert_eq!(p("Foo\\Bar"), named("Foo\\Bar"));
         assert_eq!(p("$this"), named("$this"));
         assert_eq!(p("class-string"), named("class-string"));
+    }
+
+    #[test]
+    fn class_constant_types() {
+        assert_eq!(p("Foo\\Bar::BAZ"), ClassConst("Foo\\Bar".to_string()));
+        assert_eq!(p("Stmt\\Use_::TYPE_*"), ClassConst("Stmt\\Use_".to_string()));
+        // A union with a class-constant still parses.
+        assert_eq!(
+            p("int|Foo::BAR"),
+            Union(vec![named("int"), ClassConst("Foo".to_string())])
+        );
     }
 
     #[test]

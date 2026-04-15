@@ -83,6 +83,9 @@ pub fn resolve_doc_type(scope: &Scope, templates: &[String], t: &DocType) -> Typ
             Ok(n) => Type::LiteralInt(n),
             Err(_) => Type::Int,
         },
+        // `Foo::BAR`/`Foo::BAR_*` — we don't resolve the constant's value type;
+        // `mixed` is the lenient, false-positive-safe choice.
+        DocType::ClassConst(_) => Type::Mixed,
         DocType::Conditional { subject, negated, target, then, els } => Type::Conditional {
             subject: subject.clone(),
             negated: *negated,
