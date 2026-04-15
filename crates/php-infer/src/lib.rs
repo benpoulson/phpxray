@@ -215,6 +215,22 @@ impl<'a> TypeCtx<'a> {
                     _ => None,
                 }
             }
+            // `max`/`min`: a single iterable arg yields its value type; otherwise
+            // the union of the argument types. The stub's `int|float` otherwise
+            // poisons `int`-typed uses (e.g. `str_repeat(' ', max(0, $n - $w))`).
+            "max" | "min" => {
+                if args.len() == 1 {
+                    return self.array_value_type(args.first()?);
+                }
+                let tys: Vec<Type> = args.iter().map(|a| self.infer(&a.value)).collect();
+                Some(Type::union(tys))
+            }
+            // `abs` preserves int/float.
+            "abs" => match self.infer(&args.first()?.value) {
+                Type::Int | Type::LiteralInt(_) => Some(Type::Int),
+                Type::Float => Some(Type::Float),
+                _ => None,
+            },
             _ => None,
         }
     }

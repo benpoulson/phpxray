@@ -113,8 +113,11 @@ fn assignable_atom(index: &ReflectionIndex, value: &Type, target: &Type) -> bool
             }
         }
         (Named { .. } | Object, Object) => true,
-        // Closures and (leniently) any object can be callable.
-        (Callable(_) | Named { .. }, Callable(_)) => true,
+        // A callable may be a Closure, an object (`__invoke`), a function-name
+        // string, or an `[$obj, 'method']` array — all accepted leniently (PHP's
+        // `callable` is structural; rejecting a `string`/`array` would false-flag
+        // `array_map('trim', …)` and `[$this, 'm']`).
+        (Callable(_) | Named { .. } | Object | String | LiteralString(_) | Array(_) | List(_), Callable(_)) => true,
 
         _ => false,
     }
@@ -152,6 +155,13 @@ mod tests {
         assert!(ok(Type::Int, Type::Mixed));
         assert!(ok(Type::Never, Type::Int));
         assert!(ok(Type::Mixed, Type::Int)); // lenient
+    }
+
+    #[test]
+    fn string_and_array_are_callable() {
+        assert!(ok(Type::String, Type::Callable(None)));
+        assert!(ok(Type::Array(None), Type::Callable(None)));
+        assert!(ok(Type::List(Box::new(Type::Mixed)), Type::Callable(None)));
     }
 
     #[test]

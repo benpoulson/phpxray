@@ -215,6 +215,12 @@ mod tests {
     }
 
     #[test]
+    fn max_of_ints_is_int() {
+        let src = "<?php function f(int $a, int $b): bool { return max($a, $b) === 0; }";
+        assert_eq!(ty_of(src, |e| matches!(&e.kind, ExprKind::Call { .. })), "int");
+    }
+
+    #[test]
     fn array_values_preserves_element_type() {
         let src = "<?php /** @param array<int, string> $a */ function f(array $a): bool { return array_values($a) === []; }";
         assert_eq!(ty_of(src, |e| matches!(&e.kind, ExprKind::Call { .. })), "list<string>");

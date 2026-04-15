@@ -294,20 +294,34 @@ impl TypeCtx<'_> {
         }
     }
 
-    /// `$x <cmp> null` / `null <cmp> $x`. `is_null` = whether the comparison
-    /// asserts the place *is* null in this branch.
-    fn null_cmp(&self, lhs: &Expr, rhs: &Expr, is_null: bool, out: &mut Vec<Fact>) {
-        let operand = if self.is_null_lit(rhs) {
-            Some(lhs)
-        } else if self.is_null_lit(lhs) {
-            Some(rhs)
+    /// `$x <cmp> null|false` / `null|false <cmp> $x`. `eq` = whether the
+    /// comparison asserts equality (so the place *is* that literal) in this branch.
+    fn null_cmp(&self, lhs: &Expr, rhs: &Expr, eq: bool, out: &mut Vec<Fact>) {
+        let (operand, lit) = if let Some(l) = self.cmp_lit(rhs) {
+            (lhs, l)
+        } else if let Some(l) = self.cmp_lit(lhs) {
+            (rhs, l)
         } else {
-            None
+            return;
         };
-        let Some(operand) = operand else { return };
         let Some(place) = self.place_key(operand) else { return };
-        let t = if is_null { Type::Null } else { strip_null(&self.infer(operand)) };
+        let t = match (lit, eq) {
+            (Type::Null, true) => Type::Null,
+            (Type::Null, false) => strip_null(&self.infer(operand)),
+            (Type::False, true) => Type::False,
+            (Type::False, false) => strip_false(&self.infer(operand)),
+            _ => return,
+        };
         out.push((place, t));
+    }
+
+    /// If `e` is a `null` or `false` literal, the corresponding [`Type`].
+    fn cmp_lit(&self, e: &Expr) -> Option<Type> {
+        match &e.kind {
+            ExprKind::Name(n) if n.text.eq_ignore_ascii_case("null") => Some(Type::Null),
+            ExprKind::Name(n) if n.text.eq_ignore_ascii_case("false") => Some(Type::False),
+            _ => None,
+        }
     }
 
     fn apply_facts(&mut self, facts: &[Fact]) {
@@ -336,9 +350,6 @@ impl TypeCtx<'_> {
         }
     }
 
-    fn is_null_lit(&self, e: &Expr) -> bool {
-        matches!(&e.kind, ExprKind::Name(n) if n.text.eq_ignore_ascii_case("null"))
-    }
 
     /// Analyse a body that may or may not run (a loop), merging with the env from
     /// before it.
@@ -653,6 +664,21 @@ fn strip_falsy(t: &Type) -> Type {
     }
 }
 
+/// Remove `false` from a type (a `$x !== false` guard). `bool` → `true`; a union
+/// drops its `false` arm; bare `false` → `never`. `null` is preserved.
+fn strip_false(t: &Type) -> Type {
+    match t {
+        Type::False => Type::Never,
+        Type::Bool => Type::True,
+        Type::Union(parts) => {
+            let kept: Vec<Type> = parts.iter().filter(|p| !matches!(p, Type::False)).cloned().collect();
+            Type::union(kept)
+        }
+        Type::Nullable(inner) => Type::Nullable(Box::new(strip_false(inner))),
+        other => other.clone(),
+    }
+}
+
 /// The narrowed type asserted by a `is_*($x)` type-predicate built-in, if known.
 fn predicate_type(fname: &str) -> Option<Type> {
     Some(match fname {
@@ -849,6 +875,13 @@ mod tests {
         // `int|false` after `if (!$x) return;` is `int` (truthy strips false too).
         let src = "function f(int|false $x) { if (!$x) { return; } $y = $x; }";
         assert_eq!(var_after(src, "y"), "int");
+    }
+
+    #[test]
+    fn false_identity_guard_strips_false() {
+        // `string|false` after `if (false === $x) return;` is `string`.
+        let src = "function f(string|false $x) { if (false === $x) { return; } $y = $x; }";
+        assert_eq!(var_after(src, "y"), "string");
     }
 
     #[test]
