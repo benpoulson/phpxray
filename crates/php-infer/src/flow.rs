@@ -618,12 +618,17 @@ fn apply_facts_to(vars: &mut Env, facts: &[Fact], index: &php_reflect::Reflectio
     }
 }
 
-/// Refine `cur` to `t`, keeping `cur` when it is already a (more precise) subtype
-/// of `t`. `mixed`/`Unknown` always adopt `t` (that's the point of `instanceof`/
-/// `is_*` narrowing). Sound: the branch guarantees the value is a `t`.
+/// Refine `cur` with the branch fact `t`, choosing the *narrower* of the two
+/// (their intersection, approximated): if `t ⊑ cur` use `t` (the case for
+/// `instanceof`/`is_*`/strip facts, where `t` is the computed narrowing — e.g.
+/// `mixed|null` stripped to `mixed`, or `Node` narrowed to `ClassMethod`); if
+/// instead `cur ⊑ t` keep `cur` (it's already more precise, e.g. an
+/// `array<int,string>` past an `is_array` check); otherwise the branch fact wins.
+/// Sound either way — both `cur` and `t` hold in the branch.
 fn narrow_to(cur: &Type, t: &Type, index: &php_reflect::ReflectionIndex) -> Type {
     match cur {
         Type::Mixed | Type::Unknown(_) => t.clone(),
+        _ if crate::is_assignable(index, t, cur) => t.clone(),
         _ if crate::is_assignable(index, cur, t) => cur.clone(),
         _ => t.clone(),
     }
