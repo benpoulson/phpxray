@@ -95,16 +95,15 @@ impl Type {
         }
     }
 
-    /// Build a union, flattening nested unions and dropping duplicates
-    /// (order-preserving); a single member collapses to itself, an empty one to
-    /// `never`.
+    /// Build a union, flattening nested unions *and* `Nullable` members (`?T`
+    /// becomes `T | null`) and dropping duplicates (order-preserving); a single
+    /// member collapses to itself, an empty one to `never`. Decomposing nullable
+    /// members keeps unions normalized so a contained `null` can be narrowed away
+    /// (otherwise `string | ?string` hides its `null` from strip-null/falsy).
     pub fn union(parts: Vec<Type>) -> Type {
         let mut flat = Vec::new();
         for p in parts {
-            match p {
-                Type::Union(inner) => flat.extend(inner),
-                other => flat.push(other),
-            }
+            collect_union_members(p, &mut flat);
         }
         dedup(&mut flat);
         match flat.len() {
@@ -128,6 +127,19 @@ impl Type {
             1 => flat.pop().unwrap(),
             _ => Type::Intersection(flat),
         }
+    }
+}
+
+/// Flatten a type into atomic union members: nested unions are spread, and a
+/// `Nullable(X)` contributes `X`'s members plus `null`.
+fn collect_union_members(t: Type, out: &mut Vec<Type>) {
+    match t {
+        Type::Union(inner) => inner.into_iter().for_each(|q| collect_union_members(q, out)),
+        Type::Nullable(inner) => {
+            collect_union_members(*inner, out);
+            out.push(Type::Null);
+        }
+        other => out.push(other),
     }
 }
 
