@@ -355,6 +355,12 @@ impl<'a> TypeCtx<'a> {
         if matches!(op, BinOp::Add) && is_array(&l) && is_array(&r) {
             return Type::Array(None);
         }
+        // With an unknown operand we can't know the result — stay `mixed`
+        // (lenient) rather than guessing `int|float`, which would false-flag an
+        // `int`/`float` use of e.g. `$untyped - 1`.
+        if matches!(l, Type::Mixed | Type::Unknown(_)) || matches!(r, Type::Mixed | Type::Unknown(_)) {
+            return Type::Mixed;
+        }
         // `/` and `**` may produce a float even from two ints.
         let may_float = matches!(op, BinOp::Div | BinOp::Pow);
         if is_float(&l) || is_float(&r) {
