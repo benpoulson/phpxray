@@ -715,34 +715,52 @@ fn doc_has_return(doc: Option<&str>) -> bool {
     doc.is_some_and(|d| d.contains("@return") || d.contains("-return"))
 }
 
-/// Whether an overridden prototype (a parent class or interface method of the
-/// same name) declares a non-`mixed` return type. phpstan inherits the prototype's
-/// native/`@return` typehint, so an override needn't repeat it.
-fn inherited_return_typed(fa: &FileAnalysis, class: &php_reflect::ClassReflection, name: &str) -> bool {
-    class.parents.iter().chain(&class.interfaces).any(|t| match t {
-        Type::Named { fqn, .. } => fa
-            .reflection
-            .find_method(fqn, name)
-            .is_some_and(|m| m.member.return_type != Type::Mixed),
-        _ => false,
-    })
+/// Walk the transitive supertypes of `class` (parents, interfaces, traits — and
+/// their supertypes), invoking `check` on each ancestor's *own* declaration of the
+/// method `name`. Returns true as soon as `check` does. phpstan considers a method
+/// "typed" if *any* prototype anywhere up the hierarchy supplies the type — e.g. an
+/// interface's `@return` flows down through an abstract base to a concrete override.
+fn hierarchy_method<F>(fa: &FileAnalysis, class: &php_reflect::ClassReflection, name: &str, mut check: F) -> bool
+where
+    F: FnMut(&MethodReflection) -> bool,
+{
+    let mut seen = std::collections::HashSet::new();
+    let mut stack: Vec<String> = class
+        .parents
+        .iter()
+        .chain(&class.interfaces)
+        .chain(&class.traits)
+        .filter_map(named_fqn)
+        .collect();
+    while let Some(fqn) = stack.pop() {
+        if !seen.insert(fqn.clone()) {
+            continue;
+        }
+        let Some(anc) = fa.reflection.class(&fqn) else { continue };
+        if let Some(m) = anc.methods.iter().find(|m| !m.magic && m.name.eq_ignore_ascii_case(name)) {
+            if check(m) {
+                return true;
+            }
+        }
+        stack.extend(anc.parents.iter().chain(&anc.interfaces).chain(&anc.traits).filter_map(named_fqn));
+    }
+    false
 }
 
-/// Whether an overridden prototype types the parameter at `idx`.
+/// Whether an overridden prototype anywhere up the hierarchy declares a non-`mixed`
+/// return type (native or `@return`). phpstan inherits it, so the override needn't repeat.
+fn inherited_return_typed(fa: &FileAnalysis, class: &php_reflect::ClassReflection, name: &str) -> bool {
+    hierarchy_method(fa, class, name, |m| m.explicit_return)
+}
+
+/// Whether an overridden prototype anywhere up the hierarchy types the parameter at `idx`.
 fn inherited_param_typed(
     fa: &FileAnalysis,
     class: &php_reflect::ClassReflection,
     name: &str,
     idx: usize,
 ) -> bool {
-    class.parents.iter().chain(&class.interfaces).any(|t| match t {
-        Type::Named { fqn, .. } => fa
-            .reflection
-            .find_method(fqn, name)
-            .and_then(|m| m.member.params.get(idx).map(|p| p.ty != Type::Mixed))
-            .unwrap_or(false),
-        _ => false,
-    })
+    hierarchy_method(fa, class, name, |m| m.params.get(idx).is_some_and(|p| p.explicit))
 }
 
 /// Whether a docblock declares a `@param … $name` (any `@param*` prefix), with

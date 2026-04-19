@@ -155,12 +155,21 @@ impl<'a> TypeCtx<'a> {
         }
         let mut keys = Vec::new();
         let mut vals = Vec::new();
+        let mut all_keyless = true;
         for it in items {
             match &it.key {
-                Some(k) => keys.push(self.infer(k)),
+                Some(k) => {
+                    all_keyless = false;
+                    keys.push(self.infer(k));
+                }
                 None => keys.push(Type::Int), // list-style integer key
             }
             vals.push(it.value.as_ref().map(|v| self.infer(v)).unwrap_or(Type::Mixed));
+        }
+        // A literal with only positional (keyless) items is a `list<V>` — matches
+        // phpstan, and is what user code assigns to `list<…>`-typed properties.
+        if all_keyless {
+            return Type::List(Box::new(Type::union(vals)));
         }
         Type::Array(Some(Box::new((Type::union(keys), Type::union(vals)))))
     }
@@ -585,9 +594,10 @@ mod tests {
     #[test]
     fn arrays() {
         assert_eq!(infer("[];"), "array");
-        assert_eq!(infer("[1, 2, 3];"), "array<int, int>");
+        // Keyless literals are lists (matching phpstan).
+        assert_eq!(infer("[1, 2, 3];"), "list<int>");
         assert_eq!(infer("['a' => 1, 'b' => 2];"), "array<string, int>");
-        assert_eq!(infer("[1, 'x'];"), "array<int, int|string>");
+        assert_eq!(infer("[1, 'x'];"), "list<int|string>");
     }
 
     #[test]

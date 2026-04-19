@@ -38,7 +38,7 @@ impl TypeCtx<'_> {
     pub fn analyze_function_body(&mut self, f: &FunctionDecl) {
         let refl = php_reflect::reflect_function(self.scope, self.interner, f);
         for p in &refl.params {
-            self.vars.insert(p.name.clone(), p.ty.clone());
+            self.vars.insert(p.name.clone(), p.local_type());
         }
         self.exec_block(&f.body);
     }

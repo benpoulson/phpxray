@@ -89,12 +89,18 @@ fn assignable_atom(index: &ReflectionIndex, value: &Type, target: &Type) -> bool
 
         // --- arrays / iterables (covariant; lenient on bare forms) ---
         (Array(_) | List(_) | Shape { .. }, Array(None)) => true,
+        // A bare `array` value (no element info — e.g. `[]` or an untyped array)
+        // carries nothing to disprove against, so accept any array-shaped target
+        // leniently (phpstan treats `[]` as assignable to every array type).
+        (Array(None), Array(_) | List(_) | Iterable(_) | Shape { .. }) => true,
         (Array(Some(a)), Array(Some(b))) => {
             is_assignable(index, &a.0, &b.0) && is_assignable(index, &a.1, &b.1)
         }
         (List(v), Array(Some(b))) => is_assignable(index, &Int, &b.0) && is_assignable(index, v, &b.1),
         (List(a), List(b)) => is_assignable(index, a, b),
-        (Shape { .. }, Array(Some(_))) => true,
+        // An int-keyed array may be a list — lenient (only the value type matters).
+        (Array(Some(a)), List(b)) => is_assignable(index, &a.1, b),
+        (Shape { .. }, Array(Some(_)) | List(_)) => true,
         (Array(_) | List(_) | Iterable(_) | Shape { .. }, Iterable(None)) => true,
         (Iterable(Some(a)), Iterable(Some(b))) => {
             is_assignable(index, &a.0, &b.0) && is_assignable(index, &a.1, &b.1)

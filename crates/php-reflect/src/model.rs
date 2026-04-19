@@ -38,6 +38,24 @@ pub struct ParamReflection {
     pub optional: bool,
     /// Declared via constructor property promotion (`public int $x`).
     pub promoted: bool,
+    /// A type was *explicitly* written (native hint or `@param`), even if it is
+    /// `mixed`. Distinguishes an explicit `@param mixed` (not a missing typehint)
+    /// from a defaulted-to-`mixed` untyped parameter — used by the inherited-
+    /// prototype check in the missing-typehint rules.
+    pub explicit: bool,
+}
+
+impl ParamReflection {
+    /// The type of the *local variable* bound to this parameter inside the body.
+    /// For a variadic `...$xs` this is `list<ty>` (PHP collects the rest into a
+    /// positional array), not the per-argument element type `ty`.
+    pub fn local_type(&self) -> Type {
+        if self.variadic {
+            Type::List(Box::new(self.ty.clone()))
+        } else {
+            self.ty.clone()
+        }
+    }
 }
 
 /// A reflected free function.
@@ -67,6 +85,9 @@ pub struct MethodReflection {
     pub is_final: bool,
     pub params: Vec<ParamReflection>,
     pub return_type: Type,
+    /// A return type was *explicitly* written (native hint or `@return`), even if
+    /// `mixed`. See [`ParamReflection::explicit`].
+    pub explicit_return: bool,
     /// `@template` names in scope (class templates plus the method's own).
     pub templates: Vec<String>,
     pub deprecated: bool,
@@ -345,6 +366,7 @@ fn reflect_method(scope: &Scope, interner: &Interner, class_templates: &[String]
         is_final: m.modifiers.is_final,
         params: reflect_params(scope, interner, &templates, &m.params, &doc),
         return_type: merge_type(scope, &templates, m.return_type.as_ref(), doc.returns.as_ref()),
+        explicit_return: m.return_type.is_some() || doc.returns.is_some(),
         templates,
         deprecated: doc.deprecated,
         magic: false,
@@ -404,6 +426,7 @@ fn magic_method(scope: &Scope, class_templates: &[String], m: &php_phpdoc::Metho
             .as_ref()
             .map(|t| resolve_doc_type(scope, &templates, t))
             .unwrap_or(Type::Mixed),
+        explicit_return: m.return_type.is_some(),
         templates,
         deprecated: false,
         magic: true,
@@ -418,6 +441,7 @@ fn magic_param(scope: &Scope, templates: &[String], p: &MethodParam) -> ParamRef
         variadic: p.variadic,
         optional: p.default.is_some() || p.variadic,
         promoted: false,
+        explicit: p.ty.is_some(),
     }
 }
 
@@ -460,6 +484,7 @@ fn reflect_params(
                 variadic: p.variadic,
                 optional: p.default.is_some() || p.variadic,
                 promoted: !p.modifiers.is_empty(),
+                explicit: p.ty.is_some() || doc_ty.is_some(),
             }
         })
         .collect()

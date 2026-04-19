@@ -48,7 +48,7 @@ fn collect_scope(reflection: &ReflectionIndex, scope: &Scope, interner: &Interne
     match &s.kind {
         StmtKind::Function(f) => {
             let refl = reflect_function(scope, interner, f);
-            let vars = refl.params.iter().map(|p| (p.name.clone(), p.ty.clone())).collect();
+            let vars = refl.params.iter().map(|p| (p.name.clone(), p.local_type())).collect();
             record_scope(reflection, scope, interner, None, vars, &f.body, map);
         }
         StmtKind::Class(c) => {
@@ -62,7 +62,7 @@ fn collect_scope(reflection: &ReflectionIndex, scope: &Scope, interner: &Interne
                 let Some(mr) = cls.methods.iter().find(|x| !x.magic && x.name.eq_ignore_ascii_case(mname)) else {
                     continue;
                 };
-                let mut vars: HashMap<String, Type> = mr.params.iter().map(|p| (p.name.clone(), p.ty.clone())).collect();
+                let mut vars: HashMap<String, Type> = mr.params.iter().map(|p| (p.name.clone(), p.local_type())).collect();
                 vars.insert("this".to_string(), Type::Named { fqn: fqn.clone(), args: Vec::new() });
                 record_scope(reflection, scope, interner, Some(fqn.clone()), vars, body, map);
             }

@@ -56,6 +56,7 @@ fn parse_param(s: &str, scope: &Scope) -> Option<ParamReflection> {
         variadic: flags.contains('v'),
         optional: flags.contains('o'),
         promoted: false,
+        explicit: true,
     })
 }
 
