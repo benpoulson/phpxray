@@ -215,6 +215,27 @@ mod tests {
     }
 
     #[test]
+    fn ternary_branch_narrows_even_when_nested() {
+        // `null !== $x->d ? f($x->d) : ''` inside a concat — the then-branch sees
+        // `$x->d` non-null. Tests both ternary narrowing and that it applies to a
+        // ternary nested inside another expression (the recursion in rec_here).
+        let src = "<?php class N { public ?N $d = null; } \
+            class P { public function p(N $n): string { return ''; } \
+                public function f(N $x): string { return 'a' . (null !== $x->d ? $this->p($x->d) : ''); } }";
+        // The `$x->d` argument to p() is narrowed to N (non-null).
+        let (map, r) = build(src);
+        let mut last = None;
+        walk::for_each_expr(&r.program, &mut |e| {
+            if let ExprKind::MethodCall { args, .. } = &e.kind {
+                if let Some(a) = args.first() {
+                    last = map.get(&key(a.value.span)).map(|t| t.to_string());
+                }
+            }
+        });
+        assert_eq!(last.as_deref(), Some("N"), "ternary arg should narrow to N");
+    }
+
+    #[test]
     fn max_of_ints_is_int() {
         let src = "<?php function f(int $a, int $b): bool { return max($a, $b) === 0; }";
         assert_eq!(ty_of(src, |e| matches!(&e.kind, ExprKind::Call { .. })), "int");

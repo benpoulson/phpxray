@@ -398,29 +398,123 @@ impl TypeCtx<'_> {
     /// false facts (PHP short-circuits, so the right side is reached only then).
     /// This is what types `$x->m()` correctly in `$x instanceof Y && $x->m()`.
     fn rec_here(&mut self, e: &Expr, map: &mut RecMap) {
+        map.insert(span_key(e), self.infer(e));
         match &e.kind {
-            ExprKind::Paren(inner) => {
-                map.insert(span_key(e), self.infer(e));
-                self.rec_here(inner, map);
+            ExprKind::Paren(inner) => self.rec_here(inner, map),
+            ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => self.rec_here(expr, map),
+            ExprKind::Clone(x) | ExprKind::Print(x) | ExprKind::Throw(x) | ExprKind::ErrorSuppress(x)
+            | ExprKind::YieldFrom(x) | ExprKind::Eval(x) | ExprKind::Empty(x)
+            | ExprKind::PreInc(x) | ExprKind::PreDec(x) | ExprKind::PostInc(x) | ExprKind::PostDec(x) => {
+                self.rec_here(x, map)
             }
-            ExprKind::Unary { op: UnOp::Not, expr } => {
-                map.insert(span_key(e), self.infer(e));
-                self.rec_here(expr, map);
+            ExprKind::Prop { base, name, .. } => {
+                self.rec_here(base, map);
+                self.rec_member(name, map);
             }
+            ExprKind::StaticProp { class, name } | ExprKind::ClassConst { class, name } => {
+                self.rec_here(class, map);
+                self.rec_member(name, map);
+            }
+            ExprKind::Index { base, index } => {
+                self.rec_here(base, map);
+                if let Some(i) = index {
+                    self.rec_here(i, map);
+                }
+            }
+            ExprKind::Instanceof { expr, .. } => self.rec_here(expr, map),
+            // `a && b` records `b` under `a`'s truthy facts (short-circuit); `a || b`
+            // under `a`'s false facts. Other binary ops just recurse both sides.
             ExprKind::Binary { op: BinOp::BoolAnd | BinOp::LogicalAnd, lhs, rhs } => {
-                map.insert(span_key(e), self.infer(e));
                 self.rec_here(lhs, map);
                 self.rec_under(lhs, true, rhs, map);
             }
             ExprKind::Binary { op: BinOp::BoolOr | BinOp::LogicalOr, lhs, rhs } => {
-                map.insert(span_key(e), self.infer(e));
                 self.rec_here(lhs, map);
                 self.rec_under(lhs, false, rhs, map);
             }
-            // A leaf (for narrowing purposes): record the whole subtree flatly.
-            _ => php_ast::walk::for_each_subexpr(e, &mut |x| {
-                map.insert(span_key(x), self.infer(x));
-            }),
+            ExprKind::Binary { lhs, rhs, .. }
+            | ExprKind::Assign { target: lhs, rhs }
+            | ExprKind::AssignOp { target: lhs, rhs, .. }
+            | ExprKind::AssignRef { target: lhs, rhs }
+            | ExprKind::Coalesce { lhs, rhs } => {
+                self.rec_here(lhs, map);
+                self.rec_here(rhs, map);
+            }
+            // `cond ? then : els` — `then` sees `cond`'s truthy facts, `els` its
+            // false facts (`$x->p ? f($x->p) : ''`, `null !== $x->d ? f($x->d) : ''`).
+            ExprKind::Ternary { cond, then, els } => {
+                self.rec_here(cond, map);
+                if let Some(t) = then {
+                    self.rec_under(cond, true, t, map);
+                }
+                self.rec_under(cond, false, els, map);
+            }
+            ExprKind::Call { callee, args } => {
+                self.rec_here(callee, map);
+                self.rec_args(args, map);
+            }
+            ExprKind::MethodCall { recv, method, args, .. } => {
+                self.rec_here(recv, map);
+                self.rec_member(method, map);
+                self.rec_args(args, map);
+            }
+            ExprKind::StaticCall { class, method, args } => {
+                self.rec_here(class, map);
+                self.rec_member(method, map);
+                self.rec_args(args, map);
+            }
+            ExprKind::New { class, args } => {
+                self.rec_here(class, map);
+                self.rec_args(args, map);
+            }
+            ExprKind::NewAnon { args, .. } => self.rec_args(args, map),
+            ExprKind::Array { items, .. } => {
+                for it in items {
+                    if let Some(k) = &it.key {
+                        self.rec_here(k, map);
+                    }
+                    if let Some(v) = &it.value {
+                        self.rec_here(v, map);
+                    }
+                }
+            }
+            ExprKind::Match { subject, arms } => {
+                self.rec_here(subject, map);
+                for arm in arms {
+                    if let Some(conds) = &arm.conds {
+                        for c in conds {
+                            self.rec_here(c, map);
+                        }
+                    }
+                    self.rec_here(&arm.body, map);
+                }
+            }
+            ExprKind::Isset(es) => {
+                for x in es {
+                    self.rec_here(x, map);
+                }
+            }
+            ExprKind::Interpolated(parts) | ExprKind::ShellExec(parts) => {
+                for p in parts {
+                    self.rec_here(p, map);
+                }
+            }
+            // Leaves and own-scope forms (closures/arrow-fns/yield) — nothing more
+            // to record at this scope (`e` itself is already recorded above).
+            _ => {}
+        }
+    }
+
+    fn rec_args(&mut self, args: &[php_ast::Arg], map: &mut RecMap) {
+        for a in args {
+            self.rec_here(&a.value, map);
+        }
+    }
+
+    /// Record a dynamic member name expression (`$o->{$x}`, `A::{$x}`).
+    fn rec_member(&mut self, m: &php_ast::MemberName, map: &mut RecMap) {
+        if let php_ast::MemberName::Expr(e) = m {
+            self.rec_here(e, map);
         }
     }
 
