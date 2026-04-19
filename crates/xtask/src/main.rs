@@ -630,6 +630,7 @@ fn cmd_check(dir: Option<PathBuf>) -> ExitCode {
                 resolved_refs: &refs,
                 types: &types,
                 php_version: php_rules::PhpVersion::default(),
+                treat_phpdoc_types_as_certain: true,
             };
             analyze_file(&fa, 10)
                 .into_iter()

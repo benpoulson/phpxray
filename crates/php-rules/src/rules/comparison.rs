@@ -382,6 +382,10 @@ fn disjoint(a: &Type, b: &Type) -> bool {
 ///   (a non-final class could have a subclass that implements `Foo`, so it's not
 ///   provably false).
 fn run_impossible_instanceof(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    // phpstan suppresses these when PHPDoc types aren't trusted as certain.
+    if !fa.treat_phpdoc_types_as_certain {
+        return Vec::new();
+    }
     let cmap: HashMap<(u32, u32), &ResolvedRef> = fa
         .resolved_refs
         .iter()
@@ -435,6 +439,9 @@ fn instanceof_result(fa: &FileAnalysis, value: &Type, target: &str) -> Option<bo
 /// the value is a concrete, disjoint category. Only the scalar/null predicates
 /// (whose category we can compare precisely) — FP-safe.
 fn run_impossible_check_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    if !fa.treat_phpdoc_types_as_certain {
+        return Vec::new();
+    }
     let fmap: HashMap<(u32, u32), &ResolvedRef> = fa
         .resolved_refs
         .iter()

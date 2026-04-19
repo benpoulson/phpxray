@@ -261,9 +261,20 @@ impl TypeCtx<'_> {
                 BinOp::NotIdentical | BinOp::NotEq => self.null_cmp(lhs, rhs, !truthy, out),
                 _ => {}
             },
-            ExprKind::Instanceof { expr, class } if truthy => {
+            ExprKind::Instanceof { expr, class } => {
                 if let (Some(place), Some(t)) = (self.place_key(expr), self.class_type(class)) {
-                    out.push((place, t));
+                    if truthy {
+                        out.push((place, t));
+                    } else {
+                        // `!($x instanceof C)` ⇒ drop the union members that are
+                        // *confidently* subclasses of C (both indexed). Unknown
+                        // members are kept (sound under-narrowing).
+                        let cur = self.infer(expr);
+                        let narrowed = subtract_union(&cur, |m| confident_subclass(m, &t, self.index));
+                        if narrowed != cur {
+                            out.push((place, narrowed));
+                        }
+                    }
                 }
             }
             ExprKind::Call { callee, args } => {
@@ -278,6 +289,15 @@ impl TypeCtx<'_> {
                             } else if fname == "is_null" {
                                 // `!is_null($x)` ⇒ null stripped from $x's type.
                                 out.push((place, strip_null(&self.infer(&arg0.value))));
+                            } else if let Some(t) = predicate_type(&fname) {
+                                // `!is_string($x)` etc. ⇒ drop the union members of
+                                // that kind (`string|array` → `array`). Only narrows a
+                                // union, never to empty (sound under-narrowing).
+                                let cur = self.infer(&arg0.value);
+                                let narrowed = subtract_union(&cur, |m| predicate_matches(m, &t));
+                                if narrowed != cur {
+                                    out.push((place, narrowed));
+                                }
                             }
                         }
                     }
@@ -794,6 +814,49 @@ fn predicate_type(fname: &str) -> Option<Type> {
     })
 }
 
+/// Remove from a *union* the members for which `remove` returns true, used for the
+/// negative branch of `is_*`/`instanceof`. Only narrows a union and never to empty:
+/// if `cur` is not a union, or removal would drop every member, returns `cur`
+/// unchanged (sound under-narrowing — we never assert a place is `never`).
+fn subtract_union(cur: &Type, mut remove: impl FnMut(&Type) -> bool) -> Type {
+    let Type::Union(parts) = cur else { return cur.clone() };
+    let kept: Vec<Type> = parts.iter().filter(|p| !remove(p)).cloned().collect();
+    if kept.is_empty() || kept.len() == parts.len() {
+        cur.clone()
+    } else {
+        Type::union(kept)
+    }
+}
+
+/// Whether union member `m` is *definitely* of the kind asserted by a type
+/// predicate `t` (from [`predicate_type`]) — so `!is_<kind>` removes it. Matches
+/// on concrete kind, not lenient assignability, to avoid over-removing.
+fn predicate_matches(m: &Type, t: &Type) -> bool {
+    use Type::*;
+    match t {
+        String => matches!(m, String | LiteralString(_) | ClassString(_)),
+        Int => matches!(m, Int | LiteralInt(_)),
+        Float => matches!(m, Float),
+        Bool => matches!(m, Bool | True | False),
+        Array(_) => matches!(m, Array(_) | List(_) | Shape { .. }),
+        Object => matches!(m, Object | Named { .. } | SelfType | StaticType),
+        Iterable(_) => matches!(m, Iterable(_) | Array(_) | List(_) | Shape { .. }),
+        Callable(_) => matches!(m, Callable(_)),
+        Null => matches!(m, Null),
+        _ => false,
+    }
+}
+
+/// Whether union member `m` is a *confident* subclass of class type `t` — both are
+/// indexed classes and the subtype relation holds. Used for `!($x instanceof C)`.
+fn confident_subclass(m: &Type, t: &Type, index: &php_reflect::ReflectionIndex) -> bool {
+    let (Type::Named { fqn: mf, .. }, Type::Named { fqn: tf, .. }) = (m, t) else { return false };
+    if mf.eq_ignore_ascii_case(tf) {
+        return true;
+    }
+    index.class(mf).is_some() && index.class(tf).is_some() && index.is_subclass_of(mf, tf)
+}
+
 /// The last `\`-separated segment of a (possibly-qualified) name.
 fn last_segment(name: &str) -> &str {
     name.rsplit('\\').next().unwrap_or(name)
@@ -967,6 +1030,26 @@ mod tests {
         let src = "function f($x) { $y = 0; if ($x instanceof Foo) { $y = $x; } }";
         // then: $y = Foo; fall-through: $y = int(0). Merged.
         assert_eq!(var_after(src, "y"), "Foo|int");
+    }
+
+    #[test]
+    fn negative_is_string_subtracts_from_union() {
+        // The else-branch of `is_string($x)` removes the `string` arm of a union.
+        let src = "function f(string|int $x) { if (is_string($x)) { return; } $y = $x; }";
+        assert_eq!(var_after(src, "y"), "int");
+    }
+
+    #[test]
+    fn negative_is_array_subtracts_from_union() {
+        let src = "function f(string|array $x) { if (is_array($x)) { return; } $y = $x; }";
+        assert_eq!(var_after(src, "y"), "string");
+    }
+
+    #[test]
+    fn negative_instanceof_subtracts_indexed_member() {
+        // `A|B` minus `A` (both indexed) ⇒ `B` in the else branch.
+        let src = "class A {} class B {} function f(A|B $x) { if ($x instanceof A) { return; } $y = $x; }";
+        assert_eq!(var_after(src, "y"), "B");
     }
 
     #[test]

@@ -79,6 +79,10 @@ pub struct FileAnalysis<'a> {
     pub types: &'a TypeMap,
     /// Target PHP version of the analyzed project (gates version-dependent rules).
     pub php_version: PhpVersion,
+    /// phpstan's `treatPhpDocTypesAsCertain` (default `true`). When `false`, the
+    /// always-true / impossible-type narrowing rules don't fire on redundancies
+    /// only provable via PHPDoc-derived types.
+    pub treat_phpdoc_types_as_certain: bool,
 }
 
 impl FileAnalysis<'_> {
@@ -192,6 +196,7 @@ mod tests {
             resolved_refs: &refs,
             types: &types,
             php_version: PhpVersion::default(),
+            treat_phpdoc_types_as_certain: true,
         };
 
         // Level 0: only the unknown-symbol rule fires.

@@ -87,7 +87,8 @@ pub fn run(config: &Config, root: &Path) -> Report {
         .as_deref()
         .and_then(php_rules::PhpVersion::parse)
         .unwrap_or_default();
-    let report = analyze_parsed(&parsed, config.level.value(), php_version);
+    let report =
+        analyze_parsed(&parsed, config.level.value(), php_version, config.treat_phpdoc_types_as_certain);
     let sources: HashMap<&str, &str> =
         parsed.iter().map(|f| (f.path.as_str(), f.source.as_str())).collect();
     suppress::apply(report, &config.ignore, config.report_unmatched_ignored, &sources)
@@ -95,7 +96,12 @@ pub fn run(config: &Config, root: &Path) -> Report {
 
 /// Analyze already-parsed files at `level`. Pure over its inputs (no disk I/O) —
 /// the testable core of [`run`], and the Phase-2 parallelism/caching boundary.
-pub fn analyze_parsed(parsed: &[ParsedFile], level: u8, php_version: php_rules::PhpVersion) -> Report {
+pub fn analyze_parsed(
+    parsed: &[ParsedFile],
+    level: u8,
+    php_version: php_rules::PhpVersion,
+    treat_phpdoc_types_as_certain: bool,
+) -> Report {
     // Build the shared immutable indexes once.
     let mut project = ProjectIndex::with_builtins();
     let mut reflection = ReflectionIndex::with_builtins();
@@ -119,6 +125,7 @@ pub fn analyze_parsed(parsed: &[ParsedFile], level: u8, php_version: php_rules::
             resolved_refs: &refs,
             types: &types,
             php_version,
+            treat_phpdoc_types_as_certain,
         };
         let line_index = LineIndex::new(&f.source);
         for d in analyze_file(&fa, level) {
@@ -184,7 +191,7 @@ mod tests {
             "src/Bad.php",
             "<?php\nfunction f(): int { return 'nope'; }\nnew TotallyMadeUp();\n",
         )];
-        let report = analyze_parsed(&files, 9, php_rules::PhpVersion::default());
+        let report = analyze_parsed(&files, 9, php_rules::PhpVersion::default(), true);
         assert_eq!(report.files_analyzed, 1);
 
         let ids: Vec<_> = report.findings.iter().filter_map(|f| f.identifier).collect();
@@ -202,8 +209,8 @@ mod tests {
     fn level_gates_rules() {
         let files = vec![file("a.php", "<?php\nfunction f(): int { return 'x'; }\n")];
         // Below level 3 the return-type rule is inactive.
-        assert!(analyze_parsed(&files, 0, php_rules::PhpVersion::default()).findings.iter().all(|f| f.identifier != Some("return.type")));
-        assert!(analyze_parsed(&files, 3, php_rules::PhpVersion::default()).findings.iter().any(|f| f.identifier == Some("return.type")));
+        assert!(analyze_parsed(&files, 0, php_rules::PhpVersion::default(), true).findings.iter().all(|f| f.identifier != Some("return.type")));
+        assert!(analyze_parsed(&files, 3, php_rules::PhpVersion::default(), true).findings.iter().any(|f| f.identifier == Some("return.type")));
     }
 
     #[test]
@@ -213,7 +220,7 @@ mod tests {
             file("Animal.php", "<?php class Animal {}"),
             file("use.php", "<?php $a = new Animal();"),
         ];
-        let report = analyze_parsed(&files, 9, php_rules::PhpVersion::default());
+        let report = analyze_parsed(&files, 9, php_rules::PhpVersion::default(), true);
         assert!(
             !report.findings.iter().any(|f| f.identifier == Some("class.notFound")),
             "{:?}",

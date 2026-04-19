@@ -37,6 +37,7 @@ pub(crate) fn run_version(
         resolved_refs: &refs,
         types: &types,
         php_version,
+        treat_phpdoc_types_as_certain: true,
     };
     rule(&fa)
 }

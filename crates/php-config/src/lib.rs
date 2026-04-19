@@ -28,6 +28,12 @@ pub struct Config {
     pub baseline: Option<String>,
     /// Report `ignore` entries that matched nothing (default: true).
     pub report_unmatched_ignored: bool,
+    /// Treat PHPDoc types as certain for the always-true/impossible-type rules
+    /// (phpstan's `treatPhpDocTypesAsCertain`; default `true`). When `false`, those
+    /// rules don't fire on redundancies that are only provable via PHPDoc-derived
+    /// types — matching projects that opt out (e.g. nikic/PHP-Parser).
+    #[serde(rename = "treatPhpDocTypesAsCertain")]
+    pub treat_phpdoc_types_as_certain: bool,
     /// Suppression entries.
     pub ignore: Vec<IgnoreEntry>,
 }
@@ -42,6 +48,7 @@ impl Default for Config {
             php_version: None,
             baseline: None,
             report_unmatched_ignored: true,
+            treat_phpdoc_types_as_certain: true,
             ignore: Vec::new(),
         }
     }
