@@ -1043,6 +1043,12 @@ fn check_property_access(
     if !known_class_tree(&class, fa) {
         return; // unresolved hierarchy → no judgement.
     }
+    // An interface declares no instance properties, so a property access on an
+    // interface-typed value always lands on the concrete runtime implementor (which
+    // may well define it). Reporting it absent would be a false positive.
+    if fa.reflection.class(&class).map(|c| c.kind) == Some(ClassKind::Interface) {
+        return;
+    }
     if fa.reflection.find_property(&class, prop).is_some() || has_magic_accessor(&class, fa, write) {
         return;
     }

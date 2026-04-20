@@ -1388,6 +1388,13 @@ fn check_one_class_const(
         return;
     }
     let found = fa.reflection.find_constant(&fqn, const_name);
+    // `static::CONST` on an abstract class / interface late-binds to a concrete
+    // subclass at runtime, which may define the constant (e.g. `static::T_ECHO` in
+    // an abstract parser base whose generated subclasses declare it). Don't flag.
+    let is_static_access = matches!(&class.kind, ExprKind::Name(n) if n.text.eq_ignore_ascii_case("static"));
+    if found.is_none() && is_static_access && (cr.is_abstract || cr.kind == ClassKind::Interface) {
+        return;
+    }
     // Enum cases resolve as constants in phpstan; our reflection stores enum
     // cases separately, so treat a known enum case name as existing.
     let is_enum_case = cr.kind == ClassKind::Enum && enum_has_case(fa, &fqn, const_name);
