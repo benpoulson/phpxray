@@ -688,10 +688,41 @@ impl TypeCtx<'_> {
     }
 
     fn record_maybe(&mut self, body: &Stmt, map: &mut RecMap) {
+        self.widen_loop_assignments(body);
         let base = self.vars.clone();
         self.record_stmt(body, map);
         let after = std::mem::take(&mut self.vars);
         self.vars = merge(vec![base, after]);
+    }
+
+    /// Before recording a loop body, generalize the *literal* type of any simple
+    /// variable assigned inside it. A flag set `false` before the loop and `true`
+    /// (or vice-versa) within it is loop-carried, so a use earlier in source order
+    /// may see either value across iterations — treating it as the constant literal
+    /// `false` would yield spurious `if.alwaysFalse`. We don't iterate to fixpoint,
+    /// so this single widening stands in for it (only literal scalars are touched).
+    fn widen_loop_assignments(&mut self, body: &Stmt) {
+        let interner = self.interner;
+        let mut assigned: std::collections::HashSet<String> = std::collections::HashSet::new();
+        php_ast::walk::for_each_expr_in_scope(body, &mut |e: &Expr| {
+            let target = match &e.kind {
+                ExprKind::Assign { target, .. }
+                | ExprKind::AssignRef { target, .. }
+                | ExprKind::AssignOp { target, .. } => target,
+                _ => return,
+            };
+            if let ExprKind::Variable(sym) = &target.kind {
+                assigned.insert(interner.resolve(*sym).to_string());
+            }
+        });
+        for name in assigned {
+            if let Some(t) = self.vars.get(&name) {
+                let g = generalize_literal(t);
+                if &g != t {
+                    self.vars.insert(name, g);
+                }
+            }
+        }
     }
 
     fn record_foreach(
@@ -705,6 +736,7 @@ impl TypeCtx<'_> {
         self.rec_here(subject, map);
         let subj_ty = self.apply_expr(subject);
         let (k, v) = iter_kv(&subj_ty);
+        self.widen_loop_assignments(body);
         let base = self.vars.clone();
         if let Some(key) = key {
             self.bind_target(key, &k);
@@ -855,6 +887,18 @@ fn confident_subclass(m: &Type, t: &Type, index: &php_reflect::ReflectionIndex) 
         return true;
     }
     index.class(mf).is_some() && index.class(tf).is_some() && index.is_subclass_of(mf, tf)
+}
+
+/// Generalize a *literal* scalar type to its base, used to widen a loop-carried
+/// variable so it isn't mistaken for a compile-time constant. Non-literal types
+/// pass through unchanged.
+fn generalize_literal(t: &Type) -> Type {
+    match t {
+        Type::False | Type::True => Type::Bool,
+        Type::LiteralInt(_) => Type::Int,
+        Type::LiteralString(_) => Type::String,
+        _ => t.clone(),
+    }
 }
 
 /// The last `\`-separated segment of a (possibly-qualified) name.
