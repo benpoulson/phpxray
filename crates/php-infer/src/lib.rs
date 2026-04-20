@@ -401,8 +401,10 @@ impl<'a> TypeCtx<'a> {
                 },
                 Resolution::BuiltinType(_) | Resolution::Fallback { .. } => return None,
             }),
-            // `new $class` / `$obj::method()` — fall back to the value's type.
-            _ => Some(self.infer(e)),
+            // `new $class` / `$obj::method()` — fall back to the value's type. A
+            // `class-string<C>` operand yields an *instance* of `C` (`new $cs` is a
+            // `C`, not the class-string); other strings yield a bare object.
+            _ => Some(instance_of(self.infer(e))),
         }
     }
 
@@ -525,6 +527,18 @@ fn inc_dec_type(t: Type) -> Type {
         t
     } else {
         Type::union(vec![Type::Int, Type::Float])
+    }
+}
+
+/// The *instance* type produced by `new <expr>` from the expression's value type:
+/// a `class-string<C>` constructs a `C`; a `class-string`/plain string constructs a
+/// bare `object`; a union maps member-wise; anything else is returned unchanged.
+fn instance_of(t: Type) -> Type {
+    match t {
+        Type::ClassString(Some(inner)) => *inner,
+        Type::ClassString(None) | Type::String | Type::LiteralString(_) => Type::Object,
+        Type::Union(parts) => Type::union(parts.into_iter().map(instance_of).collect()),
+        other => other,
     }
 }
 

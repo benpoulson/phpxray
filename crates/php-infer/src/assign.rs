@@ -84,7 +84,10 @@ fn assignable_atom(index: &ReflectionIndex, value: &Type, target: &Type) -> bool
         (LiteralInt(a), LiteralInt(b)) => a == b,
         (String | LiteralString(_) | ClassString(_), String) => true,
         (LiteralString(a), LiteralString(b)) => a == b,
-        (ClassString(_), ClassString(_)) => true,
+        // A plain string may hold a class name — lenient toward `class-string`
+        // (phpstan allows `string`/literal → `class-string`, e.g. a name built by
+        // concatenation returned where `class-string` is declared).
+        (String | LiteralString(_) | ClassString(_), ClassString(_)) => true,
         (Null, Null) => true,
 
         // --- arrays / iterables (covariant; lenient on bare forms) ---

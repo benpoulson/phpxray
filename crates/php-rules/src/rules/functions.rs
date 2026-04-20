@@ -1004,6 +1004,13 @@ fn run_argument_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
             _ => return,
         };
         let Some(func) = fa.reflection.function(&fqn) else { return };
+        // Built-in stubs carry only one signature; a call with more positional args
+        // than the stub declares (and no variadic) is an *overload* the stub doesn't
+        // capture (`strtr($s, $from, $to)` vs `strtr(string, array)`). Don't trust
+        // the stub's parameter types for such a call (avoids false `argument.type`).
+        if func.builtin && !func.params.iter().any(|p| p.variadic) && args.len() > func.params.len() {
+            return;
+        }
         let display = primary_name(r);
         for (i, arg) in args.iter().enumerate() {
             let Some(param) = func.params.get(i) else { break };
