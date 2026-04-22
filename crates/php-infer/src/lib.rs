@@ -366,8 +366,10 @@ impl<'a> TypeCtx<'a> {
         }
         // With an unknown operand we can't know the result — stay `mixed`
         // (lenient) rather than guessing `int|float`, which would false-flag an
-        // `int`/`float` use of e.g. `$untyped - 1`.
-        if matches!(l, Type::Mixed | Type::Unknown(_)) || matches!(r, Type::Mixed | Type::Unknown(_)) {
+        // `int`/`float` use of e.g. `$untyped - 1`. This also covers a *union* that
+        // contains `mixed` (`int|mixed`, common when a dynamic property feeds the
+        // arithmetic), which otherwise fell through to the `int|float` arm below.
+        if contains_mixed(&l) || contains_mixed(&r) {
             return Type::Mixed;
         }
         // `/` and `**` may produce a float even from two ints.
@@ -539,6 +541,16 @@ fn instance_of(t: Type) -> Type {
         Type::ClassString(None) | Type::String | Type::LiteralString(_) => Type::Object,
         Type::Union(parts) => Type::union(parts.into_iter().map(instance_of).collect()),
         other => other,
+    }
+}
+
+/// Whether `t` is, or contains (within a union/nullable), `mixed`/`unknown`.
+fn contains_mixed(t: &Type) -> bool {
+    match t {
+        Type::Mixed | Type::Unknown(_) => true,
+        Type::Union(parts) => parts.iter().any(contains_mixed),
+        Type::Nullable(inner) => contains_mixed(inner),
+        _ => false,
     }
 }
 
