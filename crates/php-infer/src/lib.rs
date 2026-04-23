@@ -93,7 +93,12 @@ impl<'a> TypeCtx<'a> {
             ExprKind::AssignOp { op, target, rhs } => self.binary_type(*op, target, rhs),
             ExprKind::Cast { kind, .. } => cast_type(*kind),
             ExprKind::Ternary { then, els, cond } => {
-                let then_ty = then.as_ref().map(|t| self.infer(t)).unwrap_or_else(|| self.infer(cond));
+                // Short ternary `a ?: b` yields `a` only when `a` is truthy, so the
+                // then-value is `a` with its falsy members (`null`/`false`) stripped.
+                let then_ty = match then {
+                    Some(t) => self.infer(t),
+                    None => strip_falsy(self.infer(cond)),
+                };
                 Type::union(vec![then_ty, self.infer(els)])
             }
             ExprKind::Coalesce { lhs, rhs } => Type::union(vec![strip_null(self.infer(lhs)), self.infer(rhs)]),
@@ -556,6 +561,20 @@ fn strip_null(t: Type) -> Type {
     }
 }
 
+/// Drop the always-falsy members (`null`, `false`) from a type — the value the
+/// truthy branch of `a ?: b` (short ternary) yields when `a` is taken.
+fn strip_falsy(t: Type) -> Type {
+    match t {
+        Type::Null | Type::False => Type::Never,
+        Type::Bool => Type::True,
+        Type::Nullable(inner) => strip_falsy(*inner),
+        Type::Union(parts) => {
+            Type::union(parts.into_iter().filter(|p| !matches!(p, Type::Null | Type::False)).map(strip_falsy).collect())
+        }
+        other => other,
+    }
+}
+
 /// `+$x` / `-$x`: numeric, preserving int vs float when known.
 fn numeric_unary(t: Type) -> Type {
     if is_float(&t) {
@@ -694,6 +713,12 @@ mod tests {
         assert_eq!(infer("[1, 'x'];"), "list<int|string>");
         // A dynamic key drops shape precision back to `array<K, V>`.
         assert_eq!(infer_with("[$k => 1, 'b' => 2];", &[("k", Type::String)], None), "array<string, int>");
+    }
+
+    #[test]
+    fn short_ternary_strips_falsy() {
+        // `$x ?: 5` where `$x: ?int` yields `int` (falsy `null` stripped), not `?int`.
+        assert_eq!(infer_with("$x ?: 5;", &[("x", Type::Nullable(Box::new(Type::Int)))], None), "int");
     }
 
     #[test]
