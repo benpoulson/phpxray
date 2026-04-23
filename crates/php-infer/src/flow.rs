@@ -43,78 +43,20 @@ impl TypeCtx<'_> {
         self.exec_block(&f.body);
     }
 
-    /// Analyse a sequence of statements, updating `self.vars`.
+    /// Analyse a sequence of statements, advancing `self.vars` (without retaining
+    /// the per-expression type map). A thin wrapper over the single flow engine
+    /// ([`record_block`]) with a throw-away recording sink — used by consumers that
+    /// only need the end-of-block environment (definedness-adjacent rules, sweeps).
     pub fn exec_block(&mut self, stmts: &[Stmt]) {
-        for s in stmts {
-            self.exec_stmt(s);
-        }
+        let mut scratch = RecMap::new();
+        self.record_block(stmts, &mut scratch);
     }
 
-    /// Analyse one statement, updating `self.vars`.
+    /// Analyse one statement, advancing `self.vars`. Like [`exec_block`], a wrapper
+    /// over [`record_stmt`] that discards the recording.
     pub fn exec_stmt(&mut self, s: &Stmt) {
-        match &s.kind {
-            StmtKind::Expr(e) => {
-                self.apply_expr(e);
-            }
-            StmtKind::Echo(es) => {
-                for e in es {
-                    self.apply_expr(e);
-                }
-            }
-            StmtKind::Return(Some(e)) => {
-                self.apply_expr(e);
-            }
-            StmtKind::Block(b) => self.exec_block(b),
-            StmtKind::If { cond, then, elseifs, els } => {
-                self.apply_expr(cond);
-                self.exec_if(cond, then, elseifs, els.as_deref());
-            }
-            // A loop body may run zero or more times: merge the pre-loop env with
-            // the post-body env.
-            StmtKind::While { cond, body } => {
-                self.apply_expr(cond);
-                self.exec_maybe(body);
-            }
-            StmtKind::DoWhile { body, cond } => {
-                // The body always runs at least once.
-                self.exec_stmt(body);
-                self.apply_expr(cond);
-            }
-            StmtKind::For { init, cond, update, body } => {
-                for e in init {
-                    self.apply_expr(e);
-                }
-                for e in cond.iter().chain(update) {
-                    self.apply_expr(e);
-                }
-                self.exec_maybe(body);
-            }
-            StmtKind::Foreach { subject, key, value, body, .. } => {
-                self.exec_foreach(subject, key.as_ref(), value, body);
-            }
-            StmtKind::Switch { subject, cases } => {
-                self.apply_expr(subject);
-                let base = self.vars.clone();
-                let mut envs = vec![base.clone()];
-                for case in cases {
-                    self.vars = base.clone();
-                    self.exec_block(&case.body);
-                    envs.push(std::mem::take(&mut self.vars));
-                }
-                self.vars = merge(envs);
-            }
-            StmtKind::Try { body, catches, finally } => {
-                self.exec_block(body);
-                for c in catches {
-                    self.exec_block(&c.body);
-                }
-                if let Some(f) = finally {
-                    self.exec_block(f);
-                }
-            }
-            // Declarations / non-binding statements: nothing to record here.
-            _ => {}
-        }
+        let mut scratch = RecMap::new();
+        self.record_stmt(s, &mut scratch);
     }
 
     /// Analyse `e` for its effect on the environment (recording assignments to
@@ -155,71 +97,6 @@ impl TypeCtx<'_> {
             }
             _ => {}
         }
-    }
-
-    /// Analyse an `if`/`elseif`/`else` chain, applying condition **narrowing** to
-    /// each branch's entry environment and merging the branch exits.
-    ///
-    /// Only the environments of branches that can *fall through* (don't
-    /// unconditionally `return`/`throw`/`break`/…) flow past the `if`. This is
-    /// what makes a guard clause narrow: after `if ($x === null) { return; }` the
-    /// continuation sees `$x` with `null` stripped.
-    fn exec_if(&mut self, cond: &Expr, then: &Stmt, elseifs: &[php_ast::ElseIf], els: Option<&Stmt>) {
-        let base = self.vars.clone();
-        let mut envs: Vec<Env> = Vec::new();
-
-        // Narrowing facts are resolved (including their strip baselines) against
-        // the *branch-entry* environment, so they must be computed while
-        // `self.vars` holds that env — `base` for the then/else of this `if`.
-        let then_facts = self.narrow_facts(cond, true);
-        let mut else_facts = self.narrow_facts(cond, false);
-
-        // then-branch: the condition is truthy here.
-        self.vars = base.clone();
-        self.apply_facts(&then_facts);
-        self.exec_stmt(then);
-        if !always_terminates(then) {
-            envs.push(std::mem::take(&mut self.vars));
-        }
-
-        for ei in elseifs {
-            // Entry env for this elseif: base with every preceding condition false.
-            self.vars = base.clone();
-            self.apply_facts(&else_facts);
-            // Both this elseif's positive facts and its negative facts (for later
-            // branches) are relative to this entry env — compute before the body.
-            let pos = self.narrow_facts(&ei.cond, true);
-            let neg = self.narrow_facts(&ei.cond, false);
-            self.apply_facts(&pos);
-            self.apply_expr(&ei.cond);
-            self.exec_stmt(&ei.body);
-            if !always_terminates(&ei.body) {
-                envs.push(std::mem::take(&mut self.vars));
-            }
-            else_facts.extend(neg);
-        }
-
-        match els {
-            Some(e) => {
-                self.vars = base.clone();
-                self.apply_facts(&else_facts);
-                self.exec_stmt(e);
-                if !always_terminates(e) {
-                    envs.push(std::mem::take(&mut self.vars));
-                }
-            }
-            // No `else`: the fall-through path took no branch, so every condition
-            // is false there — apply the accumulated negative facts.
-            None => {
-                let mut fall = base.clone();
-                apply_facts_to(&mut fall, &else_facts, self.index);
-                envs.push(fall);
-            }
-        }
-
-        // If every branch terminated (and there was an `else`), code after the
-        // `if` is unreachable; keep the base env rather than panicking on empty.
-        self.vars = if envs.is_empty() { base } else { merge(envs) };
     }
 
     /// Collect the narrowing facts implied by `cond` evaluating to `truthy`.
@@ -370,42 +247,18 @@ impl TypeCtx<'_> {
         }
     }
 
-
-    /// Analyse a body that may or may not run (a loop), merging with the env from
-    /// before it.
-    fn exec_maybe(&mut self, body: &Stmt) {
-        let base = self.vars.clone();
-        self.exec_stmt(body);
-        let after = std::mem::take(&mut self.vars);
-        self.vars = merge(vec![base, after]);
-    }
-
-    fn exec_foreach(&mut self, subject: &Expr, key: Option<&Expr>, value: &Expr, body: &Stmt) {
-        let subj_ty = self.apply_expr(subject);
-        let (k, v) = iter_kv(&subj_ty);
-        let base = self.vars.clone();
-        // Bind key/value for the body's scope.
-        if let Some(key) = key {
-            self.bind_target(key, &k);
-        }
-        self.bind_target(value, &v);
-        self.exec_stmt(body);
-        let after = std::mem::take(&mut self.vars);
-        // The loop may not run, so merge with the pre-loop env.
-        self.vars = merge(vec![base, after]);
-    }
-
-    // -- Recording pass (builds the type map) ------------------------------
+    // -- The flow engine (advance env + record per-expression types) -------
     //
-    // These mirror the `exec_*` methods above but additionally record each
-    // expression's inferred type into `map` at its *current* (narrowed) flow
-    // point. Splitting it this way is what makes expressions inside
-    // `if`/`elseif`/`else`/loop bodies typed against the narrowed environment
+    // This is the single statement walker. It advances `self.vars` AND records
+    // each expression's inferred type into `map` at its *current* (narrowed) flow
+    // point — recording each node as flow reaches it is what types expressions
+    // inside `if`/`elseif`/`else`/loop bodies against the narrowed environment
     // (e.g. `$node->name` after `if ($node instanceof Stmt\Namespace_)`), which a
-    // single up-front walk over the statement could not do. The environment
-    // transitions (narrowing, merging, termination) are identical to `exec_*`.
+    // single up-front walk could not do. The `exec_*` methods above are thin
+    // wrappers that run this engine with a throw-away map when only the resulting
+    // environment is wanted.
 
-    /// [`exec_block`], recording every expression's type into `map`.
+    /// Record (and flow through) every statement in `stmts`.
     pub fn record_block(&mut self, stmts: &[Stmt], map: &mut RecMap) {
         for s in stmts {
             self.record_stmt(s, map);
@@ -618,14 +471,14 @@ impl TypeCtx<'_> {
                     self.record_block(f, map);
                 }
             }
-            // Other statements (global/unset/static/declare/const/…) carry no
-            // narrowing-sensitive branch bodies: record their expressions flatly
-            // and let `exec_stmt` advance the environment as before.
+            // Other statements (global/unset/static/declare/const/return;/…) carry
+            // no narrowing-sensitive branch bodies and bind no simple-variable types
+            // the flow tracks, so just record their expressions flatly at the
+            // current environment (no environment transition to apply).
             _ => {
                 php_ast::walk::for_each_expr_in_scope(s, &mut |e| {
                     map.insert(span_key(e), self.infer(e));
                 });
-                self.exec_stmt(s);
             }
         }
     }
