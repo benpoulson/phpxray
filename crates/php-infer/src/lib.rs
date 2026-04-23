@@ -84,7 +84,7 @@ impl<'a> TypeCtx<'a> {
             }
             ExprKind::StaticProp { class, name } => self.static_prop_type(class, name),
             ExprKind::ClassConst { class, name } => self.class_const_type(class, name),
-            ExprKind::Index { base, .. } => self.index_type(base),
+            ExprKind::Index { base, index } => self.index_type(base, index.as_deref()),
 
             // --- operators ---
             ExprKind::Unary { op, expr } => self.unary_type(*op, expr),
@@ -153,6 +153,16 @@ impl<'a> TypeCtx<'a> {
         if items.is_empty() || items.iter().any(|i| i.spread) {
             return Type::Array(None);
         }
+        // A literal whose every entry has a *constant* key (`['a' => …, 5 => …]`)
+        // is an array shape `array{a: …, 5: …}` — the precision phpstan tracks and
+        // the form user code assigns to `array{…}`-typed slots. Capped to keep
+        // shapes (and their Display) bounded; beyond it, fall back to `array<K,V>`.
+        const MAX_SHAPE_FIELDS: usize = 64;
+        if items.len() <= MAX_SHAPE_FIELDS {
+            if let Some(fields) = self.shape_fields(items) {
+                return Type::Shape { fields, sealed: true };
+            }
+        }
         let mut keys = Vec::new();
         let mut vals = Vec::new();
         let mut all_keyless = true;
@@ -172,6 +182,22 @@ impl<'a> TypeCtx<'a> {
             return Type::List(Box::new(Type::union(vals)));
         }
         Type::Array(Some(Box::new((Type::union(keys), Type::union(vals)))))
+    }
+
+    /// If *every* item of an array literal has a constant (literal string/int) key
+    /// with no duplicates, return the array-shape fields. `None` otherwise (a
+    /// keyless, dynamic-keyed, or duplicate-keyed literal isn't a shape).
+    fn shape_fields(&self, items: &[php_ast::ArrayItem]) -> Option<Vec<php_types::ShapeField>> {
+        let mut fields: Vec<php_types::ShapeField> = Vec::with_capacity(items.len());
+        for it in items {
+            let key = const_key(it.key.as_ref()?)?;
+            if fields.iter().any(|f| f.key.as_deref() == Some(key.as_str())) {
+                return None; // duplicate key — not a well-formed shape
+            }
+            let ty = it.value.as_ref().map(|v| self.infer(v)).unwrap_or(Type::Mixed);
+            fields.push(php_types::ShapeField { key: Some(key), optional: false, ty });
+        }
+        Some(fields)
     }
 
     /// Return type of a free function call `f(...)`.
@@ -327,11 +353,29 @@ impl<'a> TypeCtx<'a> {
     }
 
     /// Type of `$base[$i]`: the value type of an array/iterable base, else mixed.
-    fn index_type(&self, base: &Expr) -> Type {
+    fn index_type(&self, base: &Expr, index: Option<&Expr>) -> Type {
         match self.infer(base) {
             Type::Array(Some(kv)) | Type::Iterable(Some(kv)) => kv.1.clone(),
             Type::List(v) => *v,
             Type::String => Type::String, // string offset is a 1-char string
+            Type::Shape { fields, sealed } => {
+                // A constant offset reads that field's type; otherwise the union of
+                // all field types (any of them could be selected).
+                match index.and_then(const_key) {
+                    Some(k) => fields
+                        .iter()
+                        .find(|f| f.key.as_deref() == Some(k.as_str()))
+                        .map(|f| f.ty.clone())
+                        .unwrap_or(Type::Mixed),
+                    None => {
+                        let mut vals: Vec<Type> = fields.into_iter().map(|f| f.ty).collect();
+                        if !sealed {
+                            vals.push(Type::Mixed);
+                        }
+                        Type::union(vals)
+                    }
+                }
+            }
             _ => Type::Mixed,
         }
     }
@@ -544,6 +588,18 @@ fn instance_of(t: Type) -> Type {
     }
 }
 
+/// The constant array-key spelled by an expression, if it is a literal string or
+/// integer (`'foo'` → `foo`, `5` → `5`). Used for array-shape keys and constant
+/// shape-offset reads. Non-literal keys yield `None`.
+fn const_key(e: &Expr) -> Option<String> {
+    match &e.kind {
+        ExprKind::Str(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+        ExprKind::Int(n) => Some(n.to_string()),
+        ExprKind::Paren(inner) => const_key(inner),
+        _ => None,
+    }
+}
+
 /// Whether `t` is, or contains (within a union/nullable), `mixed`/`unknown`.
 fn contains_mixed(t: &Type) -> bool {
     match t {
@@ -597,6 +653,17 @@ mod tests {
         infer_with(src, &[], None)
     }
 
+    /// `array{a: int, b: string}` — a test shape.
+    fn shape() -> Type {
+        Type::Shape {
+            fields: vec![
+                php_types::ShapeField { key: Some("a".into()), optional: false, ty: Type::Int },
+                php_types::ShapeField { key: Some("b".into()), optional: false, ty: Type::String },
+            ],
+            sealed: true,
+        }
+    }
+
     fn last_expr(p: &Program) -> Option<&Expr> {
         p.stmts.iter().rev().find_map(|s| match &s.kind {
             StmtKind::Expr(e) => Some(e),
@@ -622,8 +689,18 @@ mod tests {
         assert_eq!(infer("[];"), "array");
         // Keyless literals are lists (matching phpstan).
         assert_eq!(infer("[1, 2, 3];"), "list<int>");
-        assert_eq!(infer("['a' => 1, 'b' => 2];"), "array<string, int>");
+        // Constant-keyed literals are array shapes.
+        assert_eq!(infer("['a' => 1, 'b' => 2];"), "array{a: int, b: int}");
         assert_eq!(infer("[1, 'x'];"), "list<int|string>");
+        // A dynamic key drops shape precision back to `array<K, V>`.
+        assert_eq!(infer_with("[$k => 1, 'b' => 2];", &[("k", Type::String)], None), "array<string, int>");
+    }
+
+    #[test]
+    fn shape_field_read() {
+        // Reading a constant offset of a shape yields that field's type.
+        assert_eq!(infer_with("$a['b'];", &[("a", shape())], None), "string");
+        assert_eq!(infer_with("$a['z'];", &[("a", shape())], None), "mixed");
     }
 
     #[test]

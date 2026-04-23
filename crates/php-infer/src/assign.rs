@@ -9,7 +9,17 @@
 //! (e.g. `string` where `int` is wanted, or two unrelated *known* classes).
 
 use php_reflect::ReflectionIndex;
-use php_types::Type;
+use php_types::{ShapeField, Type};
+
+/// The key type of a shape field: an integer-valued literal key is `int`,
+/// otherwise `string` (a positional field, no key, is treated as `int`).
+fn shape_key_type(f: &ShapeField) -> Type {
+    match &f.key {
+        Some(k) if k.parse::<i64>().is_ok() => Type::Int,
+        Some(_) => Type::String,
+        None => Type::Int,
+    }
+}
 
 /// Whether every value of `ty` can be coerced to a string — PHP's `(string)` /
 /// string-interpolation / `implode` element rules. Lenient like [`is_assignable`]:
@@ -103,7 +113,26 @@ fn assignable_atom(index: &ReflectionIndex, value: &Type, target: &Type) -> bool
         (List(a), List(b)) => is_assignable(index, a, b),
         // An int-keyed array may be a list — lenient (only the value type matters).
         (Array(Some(a)), List(b)) => is_assignable(index, &a.1, b),
-        (Shape { .. }, Array(Some(_)) | List(_)) => true,
+
+        // --- array shapes ---
+        // shape ⊑ shape: every field the target *requires* must be present and
+        // assignable; a target-optional field is checked only when the value
+        // supplies it. Extra value fields are tolerated (lenient — avoids false
+        // positives against sealed targets, where phpstan would be stricter).
+        (Shape { fields: av, .. }, Shape { fields: bv, .. }) => bv.iter().all(|bf| {
+            match av.iter().find(|af| af.key == bf.key) {
+                Some(af) => is_assignable(index, &af.ty, &bf.ty),
+                None => bf.optional,
+            }
+        }),
+        // shape ⊑ array<K,V>: each field's key and value must fit the element types.
+        (Shape { fields, .. }, Array(Some(kv))) => fields.iter().all(|f| {
+            is_assignable(index, &shape_key_type(f), &kv.0) && is_assignable(index, &f.ty, &kv.1)
+        }),
+        // shape ⊑ list<V>: lenient on key/order, check the value types.
+        (Shape { fields, .. }, List(v)) => fields.iter().all(|f| is_assignable(index, &f.ty, v)),
+        // A coarse array (no per-field info) ⊑ shape: can't disprove → lenient.
+        (Array(_) | List(_), Shape { .. }) => true,
         (Array(_) | List(_) | Iterable(_) | Shape { .. }, Iterable(None)) => true,
         (Iterable(Some(a)), Iterable(Some(b))) => {
             is_assignable(index, &a.0, &b.0) && is_assignable(index, &a.1, &b.1)
@@ -192,6 +221,34 @@ mod tests {
         assert!(ok(Type::Int, int_or_str.clone()));
         assert!(ok(Type::String, int_or_str.clone()));
         assert!(!ok(Type::Float, int_or_str));
+    }
+
+    fn field(key: &str, optional: bool, ty: Type) -> ShapeField {
+        ShapeField { key: Some(key.into()), optional, ty }
+    }
+    fn shape(fields: Vec<ShapeField>) -> Type {
+        Type::Shape { fields, sealed: true }
+    }
+
+    #[test]
+    fn shape_assignability() {
+        // shape ⊑ shape: required field present & assignable.
+        let v = shape(vec![field("id", false, Type::Int), field("name", false, Type::String)]);
+        let t = shape(vec![field("id", false, Type::Int)]);
+        assert!(ok(v.clone(), t)); // extra value field tolerated
+        // a wrong field type is rejected (capability preserved).
+        let bad = shape(vec![field("id", false, Type::String)]);
+        assert!(!ok(v.clone(), bad));
+        // a missing *required* target field is rejected; optional is fine.
+        let needs_extra = shape(vec![field("id", false, Type::Int), field("x", false, Type::Bool)]);
+        assert!(!ok(v.clone(), needs_extra));
+        let opt_extra = shape(vec![field("id", false, Type::Int), field("x", true, Type::Bool)]);
+        assert!(ok(v.clone(), opt_extra));
+        // shape ⊑ array<string, int|string>.
+        assert!(ok(v.clone(), Type::Array(Some(Box::new((Type::String, Type::union(vec![Type::Int, Type::String])))))));
+        // a coarse array ⊑ shape is lenient (can't disprove).
+        assert!(ok(Type::Array(None), shape(vec![field("id", false, Type::Int)])));
+        assert!(ok(Type::Array(Some(Box::new((Type::String, Type::Mixed)))), shape(vec![field("id", false, Type::Int)])));
     }
 
     #[test]
