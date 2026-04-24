@@ -6,7 +6,6 @@ use php_intern::{Interner, Symbol};
 use php_lexer::{Kw, Token, TokenKind as T};
 use php_span::Span;
 
-use crate::ParseResult;
 
 /// Recursion-depth cap for expression and block nesting. A hand-written
 /// recursive-descent parser recurses once per nesting level, so adversarial or
@@ -20,7 +19,9 @@ pub struct Parser<'a> {
     src: &'a str,
     tokens: Vec<Token>,
     pos: usize,
-    interner: Interner,
+    /// Borrowed so several files can share one project-wide interner (symbols are
+    /// then comparable/resolvable across files — required for cross-file analysis).
+    interner: &'a mut Interner,
     diags: Vec<Diagnostic>,
     depth: u32,
     /// Doc-comments are kept out of the parse stream (so they never disrupt
@@ -30,7 +31,7 @@ pub struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    pub fn new(source: &'a str) -> Parser<'a> {
+    pub fn new(source: &'a str, interner: &'a mut Interner) -> Parser<'a> {
         let (lexed, diags) = php_lexer::tokenize(source);
         let mut docs = Vec::new();
         let mut tokens = Vec::with_capacity(lexed.len());
@@ -41,7 +42,7 @@ impl<'a> Parser<'a> {
                 tokens.push(t);
             }
         }
-        Parser { src: source, tokens, pos: 0, interner: Interner::new(), diags, depth: 0, docs }
+        Parser { src: source, tokens, pos: 0, interner, diags, depth: 0, docs }
     }
 
     /// The doc-comment immediately preceding `offset` (only whitespace between),
@@ -56,7 +57,10 @@ impl<'a> Parser<'a> {
         None
     }
 
-    pub fn parse(mut self) -> ParseResult {
+    /// Parse the token stream into a program + diagnostics. The interner is the
+    /// borrowed one passed to [`Parser::new`] (the caller owns it), so this no
+    /// longer returns it.
+    pub fn parse(mut self) -> (Program, Vec<Diagnostic>) {
         let mut stmts = Vec::new();
         while !self.at_eof() {
             let before = self.pos;
@@ -65,11 +69,7 @@ impl<'a> Parser<'a> {
             }
             self.ensure_progress(before);
         }
-        ParseResult {
-            program: Program { stmts },
-            diagnostics: self.diags,
-            interner: self.interner,
-        }
+        (Program { stmts }, self.diags)
     }
 
     // --- cursor -----------------------------------------------------------

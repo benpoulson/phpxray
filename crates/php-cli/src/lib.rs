@@ -23,21 +23,32 @@ pub mod suppress;
 
 use std::collections::HashMap;
 
-/// One parsed source file kept alive for analysis.
+/// One parsed source file kept alive for analysis. The AST's symbols are interned
+/// into a **shared, project-wide** interner (see [`parse_files`]) so they resolve
+/// across files — the prerequisite for cross-file / interprocedural analysis.
 pub struct ParsedFile {
     /// Display path (relative to the project root, forward slashes).
     pub path: String,
     pub source: String,
-    pub parse: php_parser::ParseResult,
+    pub program: php_ast::Program,
+    pub diagnostics: Vec<php_diagnostics::Diagnostic>,
 }
 
-impl ParsedFile {
-    /// Parse `source` under display `path`.
-    pub fn new(path: impl Into<String>, source: impl Into<String>) -> ParsedFile {
-        let source = source.into();
-        let parse = php_parser::parse(&source);
-        ParsedFile { path: path.into(), source, parse }
-    }
+/// Parse `(path, source)` inputs into a single shared interner, returned alongside
+/// the parsed files. Every file's symbols live in this one interner, so a symbol
+/// from any file is resolvable while analyzing any other.
+pub fn parse_files(
+    inputs: impl IntoIterator<Item = (String, String)>,
+) -> (Vec<ParsedFile>, php_intern::Interner) {
+    let mut interner = php_intern::Interner::new();
+    let parsed = inputs
+        .into_iter()
+        .map(|(path, source)| {
+            let (program, diagnostics) = php_parser::parse_into(&source, &mut interner);
+            ParsedFile { path, source, program, diagnostics }
+        })
+        .collect();
+    (parsed, interner)
 }
 
 /// A single reported problem, located by line/column for display.
@@ -74,21 +85,23 @@ impl Report {
 /// Run analysis described by `config`, resolving `paths` relative to `root`.
 pub fn run(config: &Config, root: &Path) -> Report {
     let files = discover_files(config, root);
-    let parsed: Vec<ParsedFile> = files
+    let inputs: Vec<(String, String)> = files
         .iter()
-        .map(|abs| {
-            let source = std::fs::read_to_string(abs).unwrap_or_default();
-            let display = rel_path(abs, root);
-            ParsedFile::new(display, source)
-        })
+        .map(|abs| (rel_path(abs, root), std::fs::read_to_string(abs).unwrap_or_default()))
         .collect();
+    let (parsed, interner) = parse_files(inputs);
     let php_version = config
         .php_version
         .as_deref()
         .and_then(php_rules::PhpVersion::parse)
         .unwrap_or_default();
-    let report =
-        analyze_parsed(&parsed, config.level.value(), php_version, config.treat_phpdoc_types_as_certain);
+    let report = analyze_parsed(
+        &parsed,
+        &interner,
+        config.level.value(),
+        php_version,
+        config.treat_phpdoc_types_as_certain,
+    );
     let sources: HashMap<&str, &str> =
         parsed.iter().map(|f| (f.path.as_str(), f.source.as_str())).collect();
     suppress::apply(report, &config.ignore, config.report_unmatched_ignored, &sources)
@@ -98,28 +111,29 @@ pub fn run(config: &Config, root: &Path) -> Report {
 /// the testable core of [`run`], and the Phase-2 parallelism/caching boundary.
 pub fn analyze_parsed(
     parsed: &[ParsedFile],
+    interner: &php_intern::Interner,
     level: u8,
     php_version: php_rules::PhpVersion,
     treat_phpdoc_types_as_certain: bool,
 ) -> Report {
-    // Build the shared immutable indexes once.
+    // Build the shared immutable indexes once, over the one shared interner.
     let mut project = ProjectIndex::with_builtins();
     let mut reflection = ReflectionIndex::with_builtins();
     for f in parsed {
-        project.add_file(&f.path, &index_file(&f.parse.program, &f.parse.interner));
-        reflection.add_file(&f.parse.program, &f.parse.interner);
+        project.add_file(&f.path, &index_file(&f.program, interner));
+        reflection.add_file(&f.program, interner);
     }
 
     // Per-file analysis (the parallelizable map in Phase 2).
     let mut findings = Vec::new();
     for f in parsed {
-        let refs = resolve_references(&f.parse.program, &f.parse.interner);
-        let types = php_rules::type_map(&reflection, &f.parse.program, &f.parse.interner);
+        let refs = resolve_references(&f.program, interner);
+        let types = php_rules::type_map(&reflection, &f.program, interner);
         let fa = FileAnalysis {
             path: &f.path,
             source: &f.source,
-            program: &f.parse.program,
-            interner: &f.parse.interner,
+            program: &f.program,
+            interner,
             project: &project,
             reflection: &reflection,
             resolved_refs: &refs,
@@ -181,17 +195,19 @@ fn rel_path(path: &Path, root: &Path) -> String {
 mod tests {
     use super::*;
 
-    fn file(path: &str, src: &str) -> ParsedFile {
-        ParsedFile::new(path, src)
+    /// Analyze `(path, src)` files at `level` over one shared interner.
+    fn analyze(files: &[(&str, &str)], level: u8) -> Report {
+        let (parsed, interner) =
+            parse_files(files.iter().map(|(p, s)| (p.to_string(), s.to_string())));
+        analyze_parsed(&parsed, &interner, level, php_rules::PhpVersion::default(), true)
     }
 
     #[test]
     fn reports_findings_with_locations_and_identifiers() {
-        let files = vec![file(
-            "src/Bad.php",
-            "<?php\nfunction f(): int { return 'nope'; }\nnew TotallyMadeUp();\n",
-        )];
-        let report = analyze_parsed(&files, 9, php_rules::PhpVersion::default(), true);
+        let report = analyze(
+            &[("src/Bad.php", "<?php\nfunction f(): int { return 'nope'; }\nnew TotallyMadeUp();\n")],
+            9,
+        );
         assert_eq!(report.files_analyzed, 1);
 
         let ids: Vec<_> = report.findings.iter().filter_map(|f| f.identifier).collect();
@@ -207,20 +223,19 @@ mod tests {
 
     #[test]
     fn level_gates_rules() {
-        let files = vec![file("a.php", "<?php\nfunction f(): int { return 'x'; }\n")];
+        let files = [("a.php", "<?php\nfunction f(): int { return 'x'; }\n")];
         // Below level 3 the return-type rule is inactive.
-        assert!(analyze_parsed(&files, 0, php_rules::PhpVersion::default(), true).findings.iter().all(|f| f.identifier != Some("return.type")));
-        assert!(analyze_parsed(&files, 3, php_rules::PhpVersion::default(), true).findings.iter().any(|f| f.identifier == Some("return.type")));
+        assert!(analyze(&files, 0).findings.iter().all(|f| f.identifier != Some("return.type")));
+        assert!(analyze(&files, 3).findings.iter().any(|f| f.identifier == Some("return.type")));
     }
 
     #[test]
     fn cross_file_class_resolution() {
         // A class defined in one file is known to another — no false unknown.
-        let files = vec![
-            file("Animal.php", "<?php class Animal {}"),
-            file("use.php", "<?php $a = new Animal();"),
-        ];
-        let report = analyze_parsed(&files, 9, php_rules::PhpVersion::default(), true);
+        let report = analyze(
+            &[("Animal.php", "<?php class Animal {}"), ("use.php", "<?php $a = new Animal();")],
+            9,
+        );
         assert!(
             !report.findings.iter().any(|f| f.identifier == Some("class.notFound")),
             "{:?}",

@@ -594,10 +594,12 @@ fn cmd_check(dir: Option<PathBuf>) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Pass 1: build the project symbol + reflection indexes (keep sources).
+    // Pass 1: parse every file into ONE shared interner (so cross-file symbols
+    // resolve) and build the project symbol + reflection indexes over it.
+    let mut interner = php_intern::Interner::new();
     let mut project = ProjectIndex::with_builtins();
     let mut reflection = ReflectionIndex::with_builtins();
-    let mut sources: Vec<(String, String)> = Vec::new();
+    let mut files_data: Vec<(String, String, php_ast::Program)> = Vec::new();
     for entry in WalkDir::new(&dir).into_iter().filter_map(Result::ok) {
         if entry.path().extension().and_then(|e| e.to_str()) != Some("phpt") {
             continue;
@@ -605,26 +607,25 @@ fn cmd_check(dir: Option<PathBuf>) -> ExitCode {
         let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
         let Some(source) = phpt::extract_file_section(&text) else { continue };
         let label = entry.path().display().to_string();
-        let r = php_parser::parse(&source);
-        project.add_file(&label, &index_file(&r.program, &r.interner));
-        reflection.add_file(&r.program, &r.interner);
-        sources.push((label, source));
+        let (program, _diags) = php_parser::parse_into(&source, &mut interner);
+        project.add_file(&label, &index_file(&program, &interner));
+        reflection.add_file(&program, &interner);
+        files_data.push((label, source, program));
     }
 
     // Pass 2: run ALL rules at level max, isolating panics per file.
     let (mut files, mut diags, mut panics) = (0u64, 0u64, 0u64);
     let mut by_code: BTreeMap<String, u64> = BTreeMap::new();
-    for (label, source) in &sources {
+    for (label, source, program) in &files_data {
         files += 1;
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            let r = php_parser::parse(source);
-            let refs = resolve_references(&r.program, &r.interner);
-            let types = php_rules::type_map(&reflection, &r.program, &r.interner);
+            let refs = resolve_references(program, &interner);
+            let types = php_rules::type_map(&reflection, program, &interner);
             let fa = FileAnalysis {
                 path: label,
                 source,
-                program: &r.program,
-                interner: &r.interner,
+                program,
+                interner: &interner,
                 project: &project,
                 reflection: &reflection,
                 resolved_refs: &refs,
