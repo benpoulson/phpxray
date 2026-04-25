@@ -121,6 +121,11 @@ pub struct ConstReflection {
     /// later milestone.
     pub ty: Type,
     pub is_final: bool,
+    /// The constant's integer value when the initializer is a plain int literal
+    /// (`const TYPE_NORMAL = 1`). Lets inference treat `Foo::BAR` as a literal-int
+    /// type, which drives constant-comparison dead-branch pruning. `None` for
+    /// non-int / non-trivial initializers.
+    pub int_value: Option<i64>,
 }
 
 /// The semantic view of a class/interface/trait/enum declaration.
@@ -407,7 +412,21 @@ fn reflect_consts(scope: &Scope, cd: &php_ast::ClassConstDecl, interner: &Intern
             visibility: cd.modifiers.visibility.unwrap_or(Visibility::Public),
             ty: ty.clone(),
             is_final: cd.modifiers.is_final,
+            int_value: const_int_value(&c.value),
         });
+    }
+}
+
+/// The integer value of a constant initializer when it is a plain int literal
+/// (through parentheses and a unary sign). Conservative: anything else → `None`.
+fn const_int_value(e: &php_ast::Expr) -> Option<i64> {
+    use php_ast::ExprKind as E;
+    match &e.kind {
+        E::Int(n) => Some(*n),
+        E::Paren(inner) => const_int_value(inner),
+        E::Unary { op: php_ast::UnOp::Minus, expr } => const_int_value(expr).map(|n| n.wrapping_neg()),
+        E::Unary { op: php_ast::UnOp::Plus, expr } => const_int_value(expr),
+        _ => None,
     }
 }
 

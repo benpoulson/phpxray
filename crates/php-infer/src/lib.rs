@@ -250,7 +250,10 @@ impl<'a> TypeCtx<'a> {
         // guarded `return null` actually tightens the type. Bare `mixed` is left be.
         let refinable = matches!(declared, Type::Nullable(_))
             || matches!(declared, Type::Union(parts) if parts.contains(&Type::Null));
-        if self.depth >= 1 || !refinable {
+        // Allow two interprocedural levels: a helper that returns `f(...)` whose own
+        // nullability depends on *its* arguments (e.g. `getResolvedName` ending in
+        // `FullyQualified::concat($ns, $name)`) needs the inner call refined too.
+        if self.depth >= 2 || !refinable {
             return declared.clone();
         }
         let mut sub = TypeCtx {
@@ -367,15 +370,19 @@ impl<'a> TypeCtx<'a> {
                 }
             }
             ExprKind::Binary { op: op @ (BinOp::Identical | BinOp::Eq | BinOp::NotIdentical | BinOp::NotEq), lhs, rhs } => {
-                let other = if is_null_literal(lhs) {
-                    rhs
-                } else if is_null_literal(rhs) {
-                    lhs
-                } else {
-                    return None;
-                };
                 let eq = matches!(op, BinOp::Identical | BinOp::Eq);
-                null_truth(&self.infer(other)).map(|n| if eq { n } else { !n })
+                // `$x === null` / `null === $x`: decided by whether the operand can be null.
+                if is_null_literal(lhs) || is_null_literal(rhs) {
+                    let other = if is_null_literal(lhs) { rhs } else { lhs };
+                    return null_truth(&self.infer(other)).map(|n| if eq { n } else { !n });
+                }
+                // `$type === Foo::BAR` between two known literal ints (e.g. an enum-like
+                // class constant passed as an argument): compare the values.
+                if let (Type::LiteralInt(a), Type::LiteralInt(b)) = (self.infer(lhs), self.infer(rhs)) {
+                    let same = a == b;
+                    return Some(if eq { same } else { !same });
+                }
+                None
             }
             ExprKind::Call { callee, args } => {
                 let ExprKind::Name(n) = &callee.kind else { return None };
@@ -527,7 +534,12 @@ impl<'a> TypeCtx<'a> {
             }
             if let Some(fqn) = class_ty.and_then(|t| self.type_class_fqn(&t)) {
                 if let Some(found) = self.index.find_constant(&fqn, &ident) {
-                    return found.member.ty;
+                    // A known int-valued constant is a literal-int type, so constant
+                    // comparisons against it (`$x === Foo::BAR`) can be decided.
+                    return match found.member.int_value {
+                        Some(v) => Type::LiteralInt(v),
+                        None => found.member.ty,
+                    };
                 }
             }
         }
@@ -942,6 +954,31 @@ mod tests {
         let nn = Type::Nullable(Box::new(Type::Named { fqn: "Name".into(), args: vec![] }));
         let got = infer_with(src, &[("x", nn.clone()), ("y", nn)], None);
         assert!(got.contains("null"), "expected nullable, got {got}");
+    }
+
+    #[test]
+    fn interprocedural_return_prunes_on_int_constant_guard() {
+        // A `?Name` helper that returns null only when `$type !== TYPE_NORMAL`.
+        // Called with `$type = TYPE_NORMAL`, that guard is statically false → the
+        // null path is pruned → the call's type is `Name`.
+        let src = "class C {
+            const TYPE_NORMAL = 1;
+            const TYPE_FUNCTION = 2;
+            public function resolve(Name $name, int $type): ?Name {
+                if ($type !== C::TYPE_NORMAL) { return null; }
+                return $name;
+            }
+            public function resolveClass(Name $name): ?Name {
+                return $this->resolve($name, C::TYPE_NORMAL);
+            }
+        }
+        class Name {}
+        $c->resolve($n, C::TYPE_NORMAL);";
+        let vars = &[
+            ("c", Type::Named { fqn: "C".into(), args: vec![] }),
+            ("n", Type::Named { fqn: "Name".into(), args: vec![] }),
+        ];
+        assert_eq!(infer_with(src, vars, None), "Name");
     }
 
     #[test]
