@@ -42,12 +42,16 @@ pub struct TypeCtx<'a> {
     pub class: Option<String>,
     /// Known local variable types, keyed by name (without `$`).
     pub vars: HashMap<String, Type>,
+    /// Interprocedural recursion depth for per-call return inference. 0 at the top
+    /// level; a callee's body is analysed at depth+1. Bounded to one level so
+    /// inference can't recurse without limit (mutual recursion, deep chains).
+    pub depth: u32,
 }
 
 impl<'a> TypeCtx<'a> {
     /// A context with no class and no known variables.
     pub fn new(index: &'a ReflectionIndex, scope: &'a Scope, interner: &'a Interner) -> Self {
-        TypeCtx { index, scope, interner, class: None, vars: HashMap::new() }
+        TypeCtx { index, scope, interner, class: None, vars: HashMap::new(), depth: 0 }
     }
 
     /// Infer the type of `e`.
@@ -68,10 +72,10 @@ impl<'a> TypeCtx<'a> {
             // --- composite ---
             ExprKind::Array { items, .. } => self.array_type(items),
             ExprKind::Call { callee, args } => self.call_type(callee, args),
-            ExprKind::MethodCall { recv, nullsafe, method, .. } => {
-                self.method_type(recv, *nullsafe, method)
+            ExprKind::MethodCall { recv, nullsafe, method, args, .. } => {
+                self.method_type(recv, *nullsafe, method, args)
             }
-            ExprKind::StaticCall { class, method, .. } => self.static_call_type(class, method),
+            ExprKind::StaticCall { class, method, args } => self.static_call_type(class, method, args),
             ExprKind::New { class, .. } => self.class_type(class).unwrap_or(Type::Object),
             ExprKind::NewAnon { .. } => Type::Object,
             ExprKind::Prop { base, nullsafe, name } => {
@@ -216,8 +220,171 @@ impl<'a> TypeCtx<'a> {
             return t;
         }
         match self.function_reflection(n) {
-            Some(f) => f.return_type.clone(),
+            Some(f) => {
+                let params: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
+                let body = self.index.function_body(&f.fqn);
+                self.refine_return(&f.return_type, body, &params, args, None)
+            }
             None => Type::Mixed,
+        }
+    }
+
+    /// Interprocedural per-call return refinement. When a callee has a body and a
+    /// declared return that still admits `null`, re-derive the return type for
+    /// *this* call by binding parameters to the argument types and walking the body
+    /// with statically-dead branches pruned (a `?T`-returning helper that only
+    /// returns null under a guard the arguments rule out yields `T` here). The body
+    /// is analysed in *its own* scope (kept with it in the index) over the shared
+    /// interner. Used only when the result is a sound refinement (assignable to the
+    /// declared type); bounded to one interprocedural level via `depth`.
+    fn refine_return(
+        &self,
+        declared: &Type,
+        body: Option<(&[php_ast::Stmt], &Scope)>,
+        params: &[String],
+        args: &[php_ast::Arg],
+        callee_class: Option<String>,
+    ) -> Type {
+        let Some((body, callee_scope)) = body else { return declared.clone() };
+        // Only refine a *concrete* nullable (`?T` / `T|null`) — where pruning a
+        // guarded `return null` actually tightens the type. Bare `mixed` is left be.
+        let refinable = matches!(declared, Type::Nullable(_))
+            || matches!(declared, Type::Union(parts) if parts.contains(&Type::Null));
+        if self.depth >= 1 || !refinable {
+            return declared.clone();
+        }
+        let mut sub = TypeCtx {
+            index: self.index,
+            scope: callee_scope,
+            interner: self.interner,
+            class: callee_class,
+            vars: HashMap::new(),
+            depth: self.depth + 1,
+        };
+        for (name, arg) in params.iter().zip(args) {
+            sub.vars.insert(name.clone(), self.infer(&arg.value));
+        }
+        let mut returns = Vec::new();
+        sub.collect_returns(body, &mut returns);
+        let collected = Type::union(returns);
+        if collected != Type::Never && crate::is_assignable(self.index, &collected, declared) {
+            collected
+        } else {
+            declared.clone()
+        }
+    }
+
+    /// Collect the types of the `return <expr>` statements reachable in `stmts`,
+    /// pruning `if` branches whose condition is statically known from the bound
+    /// **parameter** types (so a guarded `return null` the arguments rule out is
+    /// not collected). Deliberately does **not** track local assignments: a local
+    /// is only ever conditionally/loop-assigned in general, and treating such an
+    /// assignment as definite would unsoundly drop `null` from a `return $local`
+    /// (a real false-positive source). Unknown locals infer as `mixed`, which
+    /// keeps the refinement conservative — it can tighten returns built from
+    /// params/`new`/literals, never from flow-dependent locals.
+    fn collect_returns(&mut self, stmts: &[php_ast::Stmt], out: &mut Vec<Type>) {
+        use php_ast::StmtKind as S;
+        for s in stmts {
+            match &s.kind {
+                S::Return(Some(e)) => out.push(self.infer(e)),
+                S::Block(b) => self.collect_returns(b, out),
+                S::If { cond, then, elseifs, els } => {
+                    self.collect_if_returns(cond, then, elseifs, els.as_deref(), out)
+                }
+                S::While { body, .. } | S::DoWhile { body, .. } | S::For { body, .. } | S::Foreach { body, .. } => {
+                    self.collect_returns(std::slice::from_ref(body), out)
+                }
+                S::Switch { cases, .. } => {
+                    for c in cases {
+                        self.collect_returns(&c.body, out);
+                    }
+                }
+                S::Try { body, catches, finally } => {
+                    self.collect_returns(body, out);
+                    for c in catches {
+                        self.collect_returns(&c.body, out);
+                    }
+                    if let Some(f) = finally {
+                        self.collect_returns(f, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Collect returns from an `if` chain, pruning statically-dead branches.
+    fn collect_if_returns(
+        &mut self,
+        cond: &Expr,
+        then: &php_ast::Stmt,
+        elseifs: &[php_ast::ElseIf],
+        els: Option<&php_ast::Stmt>,
+        out: &mut Vec<Type>,
+    ) {
+        match self.static_truth(cond) {
+            Some(true) => self.collect_returns(std::slice::from_ref(then), out),
+            Some(false) => {
+                if let Some((first, rest)) = elseifs.split_first() {
+                    self.collect_if_returns(&first.cond, &first.body, rest, els, out)
+                } else if let Some(e) = els {
+                    self.collect_returns(std::slice::from_ref(e), out)
+                }
+            }
+            None => {
+                self.collect_returns(std::slice::from_ref(then), out);
+                for ei in elseifs {
+                    self.collect_returns(std::slice::from_ref(&ei.body), out);
+                }
+                if let Some(e) = els {
+                    self.collect_returns(std::slice::from_ref(e), out);
+                }
+            }
+        }
+    }
+
+    /// Statically evaluate a condition's truth under the current environment, for
+    /// dead-branch pruning in [`collect_returns`]. Only **sound** verdicts: a
+    /// `null`-comparison whose operand can't be null, `is_null`, and the boolean
+    /// connectives composed from them. `None` = unknown (no pruning).
+    fn static_truth(&self, cond: &Expr) -> Option<bool> {
+        match &cond.kind {
+            ExprKind::Paren(inner) => self.static_truth(inner),
+            ExprKind::Unary { op: UnOp::Not, expr } => self.static_truth(expr).map(|b| !b),
+            ExprKind::Binary { op: BinOp::BoolAnd | BinOp::LogicalAnd, lhs, rhs } => {
+                match (self.static_truth(lhs), self.static_truth(rhs)) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                }
+            }
+            ExprKind::Binary { op: BinOp::BoolOr | BinOp::LogicalOr, lhs, rhs } => {
+                match (self.static_truth(lhs), self.static_truth(rhs)) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                }
+            }
+            ExprKind::Binary { op: op @ (BinOp::Identical | BinOp::Eq | BinOp::NotIdentical | BinOp::NotEq), lhs, rhs } => {
+                let other = if is_null_literal(lhs) {
+                    rhs
+                } else if is_null_literal(rhs) {
+                    lhs
+                } else {
+                    return None;
+                };
+                let eq = matches!(op, BinOp::Identical | BinOp::Eq);
+                null_truth(&self.infer(other)).map(|n| if eq { n } else { !n })
+            }
+            ExprKind::Call { callee, args } => {
+                let ExprKind::Name(n) = &callee.kind else { return None };
+                if !n.text.trim_start_matches('\\').eq_ignore_ascii_case("is_null") {
+                    return None;
+                }
+                null_truth(&self.infer(&args.first()?.value))
+            }
+            _ => None,
         }
     }
 
@@ -285,12 +452,17 @@ impl<'a> TypeCtx<'a> {
     }
 
     /// Return type of `$recv->method(...)`.
-    fn method_type(&self, recv: &Expr, nullsafe: bool, method: &MemberName) -> Type {
+    fn method_type(&self, recv: &Expr, nullsafe: bool, method: &MemberName, args: &[php_ast::Arg]) -> Type {
         let recv_ty = self.infer(recv);
         let Some(name) = self.member_ident(method) else { return Type::Mixed };
         let Some(fqn) = self.type_class_fqn(&recv_ty) else { return Type::Mixed };
         let ret = match self.index.find_method(&fqn, &name) {
-            Some(found) => self.bind_relative(found.member.return_type, &fqn),
+            Some(found) => {
+                let params: Vec<String> = found.member.params.iter().map(|p| p.name.clone()).collect();
+                let body = self.index.method_body(&found.declaring_class, &name);
+                let refined = self.refine_return(&found.member.return_type, body, &params, args, Some(fqn.clone()));
+                self.bind_relative(refined, &fqn)
+            }
             None => Type::Mixed,
         };
         if nullsafe {
@@ -301,13 +473,18 @@ impl<'a> TypeCtx<'a> {
     }
 
     /// Return type of `Class::method(...)`.
-    fn static_call_type(&self, class: &Expr, method: &MemberName) -> Type {
+    fn static_call_type(&self, class: &Expr, method: &MemberName, args: &[php_ast::Arg]) -> Type {
         let Some(name) = self.member_ident(method) else { return Type::Mixed };
         let Some(fqn) = self.class_type(class).and_then(|t| self.type_class_fqn(&t)) else {
             return Type::Mixed;
         };
         match self.index.find_method(&fqn, &name) {
-            Some(found) => self.bind_relative(found.member.return_type, &fqn),
+            Some(found) => {
+                let params: Vec<String> = found.member.params.iter().map(|p| p.name.clone()).collect();
+                let body = self.index.method_body(&found.declaring_class, &name);
+                let refined = self.refine_return(&found.member.return_type, body, &params, args, Some(fqn.clone()));
+                self.bind_relative(refined, &fqn)
+            }
             None => Type::Mixed,
         }
     }
@@ -619,6 +796,27 @@ fn const_key(e: &Expr) -> Option<String> {
     }
 }
 
+/// Static verdict for "is this type `null`?": `Some(true)` if it is exactly null,
+/// `Some(false)` if it cannot be null, `None` if it might be (union with null,
+/// `mixed`). Drives `=== null` / `is_null` dead-branch pruning.
+fn null_truth(t: &Type) -> Option<bool> {
+    match t {
+        Type::Null => Some(true),
+        Type::Nullable(_) | Type::Mixed | Type::Unknown(_) => None,
+        Type::Union(parts) if parts.contains(&Type::Null) => None,
+        _ => Some(false),
+    }
+}
+
+/// Whether `e` is the `null` literal (through parentheses).
+fn is_null_literal(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Name(n) => n.text.eq_ignore_ascii_case("null"),
+        ExprKind::Paren(inner) => is_null_literal(inner),
+        _ => false,
+    }
+}
+
 /// Whether `t` is, or contains (within a union/nullable), `mixed`/`unknown`.
 fn contains_mixed(t: &Type) -> bool {
     match t {
@@ -713,6 +911,37 @@ mod tests {
         assert_eq!(infer("[1, 'x'];"), "list<int|string>");
         // A dynamic key drops shape precision back to `array<K, V>`.
         assert_eq!(infer_with("[$k => 1, 'b' => 2];", &[("k", Type::String)], None), "array<string, int>");
+    }
+
+    #[test]
+    fn interprocedural_return_drops_null_when_guard_unreachable() {
+        // A `?Name`-returning helper that returns null only when *both* args are
+        // null. Called with non-null args, the guarded `return null` is pruned, so
+        // the call's type is `Name`, not `?Name`.
+        let src = "class Name {
+            public static function concat(?Name $a, ?Name $b): ?Name {
+                if ($a === null && $b === null) { return null; }
+                return new Name();
+            }
+        }
+        Name::concat($x, $y);";
+        let named = Type::Named { fqn: "Name".into(), args: vec![] };
+        assert_eq!(infer_with(src, &[("x", named.clone()), ("y", named)], None), "Name");
+    }
+
+    #[test]
+    fn interprocedural_return_keeps_null_when_guard_reachable() {
+        // Called with possibly-null args, the null path is live → stays nullable.
+        let src = "class Name {
+            public static function concat(?Name $a, ?Name $b): ?Name {
+                if ($a === null && $b === null) { return null; }
+                return new Name();
+            }
+        }
+        Name::concat($x, $y);";
+        let nn = Type::Nullable(Box::new(Type::Named { fqn: "Name".into(), args: vec![] }));
+        let got = infer_with(src, &[("x", nn.clone()), ("y", nn)], None);
+        assert!(got.contains("null"), "expected nullable, got {got}");
     }
 
     #[test]

@@ -13,7 +13,7 @@ use crate::{
     reflect_class, reflect_function, ClassReflection, ConstReflection, FunctionReflection, MethodReflection,
     PropertyReflection,
 };
-use php_ast::{ClassDecl, Program, StmtKind};
+use php_ast::{ClassDecl, Member, Program, Stmt, StmtKind};
 use php_intern::Interner;
 use php_resolve::{for_each_region, Scope};
 use php_types::{CallableSig, ShapeField, Type};
@@ -38,6 +38,12 @@ pub struct ReflectionIndex {
     classes: HashMap<String, ClassReflection>,
     /// Lowercased FQN → function reflection.
     functions: HashMap<String, FunctionReflection>,
+    /// Callable bodies + their declaring [`Scope`] for interprocedural per-call
+    /// return inference. Keyed by `key(fqn)` for free functions and
+    /// `key(declaring_class)::name_lower` for methods. The scope is kept so the
+    /// body's name references resolve in *their* namespace, not the caller's; this
+    /// is sound only because all files share one interner (symbols are global).
+    bodies: HashMap<String, (Vec<Stmt>, Scope)>,
 }
 
 impl ReflectionIndex {
@@ -199,6 +205,7 @@ impl ReflectionIndex {
             StmtKind::Class(c) => self.add_class(scope, interner, c),
             StmtKind::Function(f) => {
                 let r = reflect_function(scope, interner, f);
+                self.bodies.insert(key(&r.fqn), (f.body.clone(), scope.clone()));
                 self.functions.insert(key(&r.fqn), r);
             }
             // Descend into nested/conditional declarations, mirroring the symbol
@@ -247,7 +254,30 @@ impl ReflectionIndex {
         let Some(name) = c.name else { return };
         let fqn = scope.qualify(interner.resolve(name));
         let r = reflect_class(scope, interner, &fqn, c);
+        // Store method bodies (+ the class's scope) for interprocedural inference.
+        for m in &c.members {
+            if let Member::Method(md) = m {
+                if let Some(body) = &md.body {
+                    let mname = interner.resolve(md.name).to_ascii_lowercase();
+                    self.bodies.insert(format!("{}::{}", key(&fqn), mname), (body.clone(), scope.clone()));
+                }
+            }
+        }
         self.classes.insert(key(&fqn), r);
+    }
+
+    /// The body + declaring scope of a free function, by FQN (for interprocedural
+    /// return inference).
+    pub fn function_body(&self, fqn: &str) -> Option<(&[Stmt], &Scope)> {
+        self.bodies.get(&key(fqn)).map(|(b, s)| (b.as_slice(), s))
+    }
+
+    /// The body + declaring scope of a method on `declaring_class` (use the
+    /// `declaring_class` from [`find_method`](Self::find_method), not the receiver).
+    pub fn method_body(&self, declaring_class: &str, name: &str) -> Option<(&[Stmt], &Scope)> {
+        self.bodies
+            .get(&format!("{}::{}", key(declaring_class), name.to_ascii_lowercase()))
+            .map(|(b, s)| (b.as_slice(), s))
     }
 }
 
