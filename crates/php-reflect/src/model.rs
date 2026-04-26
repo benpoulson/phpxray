@@ -283,9 +283,19 @@ pub fn reflect_class(scope: &Scope, interner: &Interner, fqn: &str, c: &ClassDec
                 reflect_properties(scope, interner, &class_templates, pd, &mut properties)
             }
             Member::ClassConst(cd) => reflect_consts(scope, cd, interner, &mut constants),
-            // Enum cases and trait-use adaptations aren't members the type query
-            // layer needs yet; traits are surfaced via `traits` below.
-            Member::EnumCase(_) | Member::TraitUse(_) => {}
+            // An enum case (`RoundingMode::Up`) is accessed like a class constant and
+            // its value is an instance of the enum — reflect it as a constant so
+            // cross-file `Enum::Case` access resolves through the index.
+            Member::EnumCase(ec) => constants.push(ConstReflection {
+                name: interner.resolve(ec.name).to_string(),
+                visibility: Visibility::Public,
+                ty: Type::Named { fqn: fqn.to_string(), args: Vec::new() },
+                is_final: true,
+                int_value: None,
+            }),
+            // Trait-use adaptations aren't members the type query layer needs yet;
+            // traits are surfaced via `traits` below.
+            Member::TraitUse(_) => {}
         }
     }
 
