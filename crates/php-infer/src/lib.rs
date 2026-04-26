@@ -620,7 +620,9 @@ impl<'a> TypeCtx<'a> {
             BitOr | BitAnd | BitXor | Shl | Shr | Mod => Type::Int,
             Eq | NotEq | Identical | NotIdentical | Lt | LtEq | Gt | GtEq | BoolAnd | BoolOr
             | LogicalAnd | LogicalOr | LogicalXor => Type::Bool,
-            Spaceship => Type::Int,
+            // The spaceship operator yields exactly `-1|0|1` (phpstan models it so,
+            // which is why `@return -1|0|1` comparison methods type-check).
+            Spaceship => Type::union(vec![Type::LiteralInt(-1), Type::LiteralInt(0), Type::LiteralInt(1)]),
             Coalesce => Type::union(vec![strip_null(self.infer(lhs)), self.infer(rhs)]),
             Add | Sub | Mul | Div | Pow => self.arith(op, self.infer(lhs), self.infer(rhs)),
             Pipe => Type::Mixed,
@@ -797,7 +799,9 @@ fn strip_falsy(t: Type) -> Type {
 
 /// `+$x` / `-$x`: numeric, preserving int vs float when known.
 fn numeric_unary(t: Type) -> Type {
-    if is_float(&t) {
+    if contains_mixed(&t) {
+        Type::Mixed // unknown operand → don't guess `int|float` (would false-flag)
+    } else if is_float(&t) {
         Type::Float
     } else if is_int(&t) {
         Type::Int
@@ -1034,7 +1038,7 @@ mod tests {
         assert_eq!(infer("7 % 3;"), "int");
         assert_eq!(infer("'a' . 'b';"), "string");
         assert_eq!(infer("[1] + [2];"), "array");
-        assert_eq!(infer("1 <=> 2;"), "int");
+        assert_eq!(infer("1 <=> 2;"), "-1|0|1");
     }
 
     #[test]
