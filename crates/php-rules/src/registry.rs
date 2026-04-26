@@ -93,6 +93,15 @@ impl FileAnalysis<'_> {
         self.types.get(&(r.start as u32, r.end as u32)).cloned().unwrap_or(Type::Mixed)
     }
 
+    /// Whether a value of type `value` may be assigned/passed/returned where
+    /// `target` is expected, honouring this run's `treatPhpDocTypesAsCertain`. Use
+    /// this (not bare `is_assignable`) in the type-compatibility rules — when the
+    /// flag is off, mismatches that exist only at the PHPDoc-refined level (array
+    /// element types, generics, literals) are not reported.
+    pub fn accepts(&self, value: &Type, target: &Type) -> bool {
+        php_infer::assignable_certain(self.reflection, value, target, self.treat_phpdoc_types_as_certain)
+    }
+
     /// Whether `fqn` and *every* class it transitively extends/implements/uses/
     /// mixes-in is present in the reflection index. Member-existence rules MUST
     /// gate on this: a class with an unindexed parent (a vendor class, or a

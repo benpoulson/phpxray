@@ -13,7 +13,7 @@
 
 use php_ast::{ClassDecl, Expr, FunctionDecl, Member, Program, Stmt, StmtKind};
 use php_diagnostics::Diagnostic;
-use php_infer::{is_assignable, TypeMap};
+use php_infer::{assignable_certain, TypeMap};
 use php_intern::Interner;
 use php_reflect::{reflect_class, reflect_function, ReflectionIndex};
 use php_resolve::{for_each_region, Scope};
@@ -43,139 +43,153 @@ pub fn return_type_errors(
     program: &Program,
     interner: &Interner,
     types: &TypeMap,
+    treat_phpdoc_certain: bool,
 ) -> Vec<Diagnostic> {
+    let cx = Cx { index, interner, types, treat_phpdoc_certain };
     let mut out = Vec::new();
     for_each_region(&program.stmts, interner, |scope, region| {
-        collect(index, scope, interner, types, region, &mut out);
+        cx.collect(scope, region, &mut out);
     });
     out
 }
 
-/// Walk statements for function/class declarations (including nested/conditional
-/// ones) and check each.
-fn collect(index: &ReflectionIndex, scope: &Scope, interner: &Interner, types: &TypeMap, stmts: &[Stmt], out: &mut Vec<Diagnostic>) {
-    for st in stmts {
-        match &st.kind {
-            StmtKind::Function(f) => check_function(index, scope, interner, types, f, out),
-            StmtKind::Class(c) => check_class(index, scope, interner, types, c, out),
-            StmtKind::Block(b) => collect(index, scope, interner, types, b, out),
-            StmtKind::If { then, elseifs, els, .. } => {
-                collect(index, scope, interner, types, std::slice::from_ref(then), out);
-                for e in elseifs {
-                    collect(index, scope, interner, types, std::slice::from_ref(&e.body), out);
+/// The constant context for a return-type check pass (everything but the
+/// per-region `scope`, which varies). Bundled so the recursive walk isn't threaded
+/// through five parameters.
+struct Cx<'a> {
+    index: &'a ReflectionIndex,
+    interner: &'a Interner,
+    types: &'a TypeMap,
+    treat_phpdoc_certain: bool,
+}
+
+impl Cx<'_> {
+    /// Walk statements for function/class declarations (including nested/conditional
+    /// ones) and check each.
+    fn collect(&self, scope: &Scope, stmts: &[Stmt], out: &mut Vec<Diagnostic>) {
+        for st in stmts {
+            match &st.kind {
+                StmtKind::Function(f) => self.check_function(scope, f, out),
+                StmtKind::Class(c) => self.check_class(scope, c, out),
+                StmtKind::Block(b) => self.collect(scope, b, out),
+                StmtKind::If { then, elseifs, els, .. } => {
+                    self.collect(scope, std::slice::from_ref(then), out);
+                    for e in elseifs {
+                        self.collect(scope, std::slice::from_ref(&e.body), out);
+                    }
+                    if let Some(e) = els {
+                        self.collect(scope, std::slice::from_ref(e), out);
+                    }
                 }
-                if let Some(e) = els {
-                    collect(index, scope, interner, types, std::slice::from_ref(e), out);
+                StmtKind::While { body, .. }
+                | StmtKind::DoWhile { body, .. }
+                | StmtKind::For { body, .. }
+                | StmtKind::Foreach { body, .. } => self.collect(scope, std::slice::from_ref(body), out),
+                StmtKind::Try { body, catches, finally } => {
+                    self.collect(scope, body, out);
+                    for c in catches {
+                        self.collect(scope, &c.body, out);
+                    }
+                    if let Some(f) = finally {
+                        self.collect(scope, f, out);
+                    }
                 }
+                StmtKind::Switch { cases, .. } => {
+                    for case in cases {
+                        self.collect(scope, &case.body, out);
+                    }
+                }
+                StmtKind::Declare { body: Some(b), .. } => self.collect(scope, std::slice::from_ref(b), out),
+                _ => {}
             }
-            StmtKind::While { body, .. }
-            | StmtKind::DoWhile { body, .. }
-            | StmtKind::For { body, .. }
-            | StmtKind::Foreach { body, .. } => collect(index, scope, interner, types, std::slice::from_ref(body), out),
-            StmtKind::Try { body, catches, finally } => {
-                collect(index, scope, interner, types, body, out);
-                for c in catches {
-                    collect(index, scope, interner, types, &c.body, out);
-                }
-                if let Some(f) = finally {
-                    collect(index, scope, interner, types, f, out);
-                }
-            }
-            StmtKind::Switch { cases, .. } => {
-                for case in cases {
-                    collect(index, scope, interner, types, &case.body, out);
-                }
-            }
-            StmtKind::Declare { body: Some(b), .. } => collect(index, scope, interner, types, std::slice::from_ref(b), out),
-            _ => {}
         }
     }
-}
 
-fn check_function(index: &ReflectionIndex, scope: &Scope, interner: &Interner, types: &TypeMap, f: &FunctionDecl, out: &mut Vec<Diagnostic>) {
-    let refl = reflect_function(scope, interner, f);
-    if !skip_return(&refl.return_type) {
-        let ret = Ret { declared: refl.return_type.clone(), label: format!("function {}()", refl.fqn) };
-        check_returns_in(index, types, &f.body, &ret, out);
-    }
-    // Nested declarations inside the body.
-    collect(index, scope, interner, types, &f.body, out);
-}
-
-fn check_class(index: &ReflectionIndex, scope: &Scope, interner: &Interner, types: &TypeMap, c: &ClassDecl, out: &mut Vec<Diagnostic>) {
-    let Some(name) = c.name else { return }; // anonymous classes carry no FQN
-    let fqn = scope.qualify(interner.resolve(name));
-    let refl = reflect_class(scope, interner, &fqn, c);
-    for m in &c.members {
-        let Member::Method(md) = m else { continue };
-        let Some(body) = &md.body else { continue };
-        let mname = interner.resolve(md.name);
-        let Some(mr) = refl.methods.iter().find(|x| !x.magic && x.name.eq_ignore_ascii_case(mname)) else {
-            continue;
-        };
-        if !skip_return(&mr.return_type) {
-            let ret = Ret { declared: mr.return_type.clone(), label: format!("{}::{}()", fqn, mr.name) };
-            check_returns_in(index, types, body, &ret, out);
+    fn check_function(&self, scope: &Scope, f: &FunctionDecl, out: &mut Vec<Diagnostic>) {
+        let refl = reflect_function(scope, self.interner, f);
+        if !skip_return(&refl.return_type) {
+            let ret = Ret { declared: refl.return_type.clone(), label: format!("function {}()", refl.fqn) };
+            self.check_returns_in(&f.body, &ret, out);
         }
-        collect(index, scope, interner, types, body, out);
+        // Nested declarations inside the body.
+        self.collect(scope, &f.body, out);
     }
-}
 
-/// Find every `return <expr>;` in `stmts` — descending control flow but NOT into
-/// nested function/class declarations or closures, which carry their own return
-/// types — and check each against `ret` using the flow-narrowed type map.
-fn check_returns_in(index: &ReflectionIndex, types: &TypeMap, stmts: &[Stmt], ret: &Ret, out: &mut Vec<Diagnostic>) {
-    for st in stmts {
-        match &st.kind {
-            StmtKind::Return(Some(e)) => check_return_expr(index, types, e, ret, out),
-            StmtKind::Return(None) => {} // bare `return;` — needs generator awareness.
-            StmtKind::Block(b) => check_returns_in(index, types, b, ret, out),
-            StmtKind::If { then, elseifs, els, .. } => {
-                check_returns_in(index, types, std::slice::from_ref(then), ret, out);
-                for ei in elseifs {
-                    check_returns_in(index, types, std::slice::from_ref(&ei.body), ret, out);
-                }
-                if let Some(e) = els {
-                    check_returns_in(index, types, std::slice::from_ref(e), ret, out);
-                }
+    fn check_class(&self, scope: &Scope, c: &ClassDecl, out: &mut Vec<Diagnostic>) {
+        let Some(name) = c.name else { return }; // anonymous classes carry no FQN
+        let fqn = scope.qualify(self.interner.resolve(name));
+        let refl = reflect_class(scope, self.interner, &fqn, c);
+        for m in &c.members {
+            let Member::Method(md) = m else { continue };
+            let Some(body) = &md.body else { continue };
+            let mname = self.interner.resolve(md.name);
+            let Some(mr) = refl.methods.iter().find(|x| !x.magic && x.name.eq_ignore_ascii_case(mname)) else {
+                continue;
+            };
+            if !skip_return(&mr.return_type) {
+                let ret = Ret { declared: mr.return_type.clone(), label: format!("{}::{}()", fqn, mr.name) };
+                self.check_returns_in(body, &ret, out);
             }
-            StmtKind::While { body, .. }
-            | StmtKind::DoWhile { body, .. }
-            | StmtKind::For { body, .. }
-            | StmtKind::Foreach { body, .. } => check_returns_in(index, types, std::slice::from_ref(body), ret, out),
-            StmtKind::Switch { cases, .. } => {
-                for c in cases {
-                    check_returns_in(index, types, &c.body, ret, out);
-                }
-            }
-            StmtKind::Try { body, catches, finally } => {
-                check_returns_in(index, types, body, ret, out);
-                for c in catches {
-                    check_returns_in(index, types, &c.body, ret, out);
-                }
-                if let Some(f) = finally {
-                    check_returns_in(index, types, f, ret, out);
-                }
-            }
-            StmtKind::Declare { body: Some(b), .. } => check_returns_in(index, types, std::slice::from_ref(b), ret, out),
-            // Nested function/class declarations have their own return types and
-            // are checked separately (by `collect`); don't descend here.
-            _ => {}
+            self.collect(scope, body, out);
         }
     }
-}
 
-fn check_return_expr(index: &ReflectionIndex, types: &TypeMap, e: &Expr, ret: &Ret, out: &mut Vec<Diagnostic>) {
-    // Unmapped (e.g. inside a closure the map leaves opaque) → `mixed` → lenient.
-    let actual = types.get(&key(e)).cloned().unwrap_or(Type::Mixed);
-    if !is_assignable(index, &actual, &ret.declared) {
-        out.push(
-            Diagnostic::error(
-                e.span,
-                format!("{} should return {} but returns {}", ret.label, ret.declared, actual),
-            )
-            .with_code("return.type"),
-        );
+    /// Find every `return <expr>;` in `stmts` — descending control flow but NOT into
+    /// nested function/class declarations or closures, which carry their own return
+    /// types — and check each against `ret` using the flow-narrowed type map.
+    fn check_returns_in(&self, stmts: &[Stmt], ret: &Ret, out: &mut Vec<Diagnostic>) {
+        for st in stmts {
+            match &st.kind {
+                StmtKind::Return(Some(e)) => self.check_return_expr(e, ret, out),
+                StmtKind::Return(None) => {} // bare `return;` — needs generator awareness.
+                StmtKind::Block(b) => self.check_returns_in(b, ret, out),
+                StmtKind::If { then, elseifs, els, .. } => {
+                    self.check_returns_in(std::slice::from_ref(then), ret, out);
+                    for ei in elseifs {
+                        self.check_returns_in(std::slice::from_ref(&ei.body), ret, out);
+                    }
+                    if let Some(e) = els {
+                        self.check_returns_in(std::slice::from_ref(e), ret, out);
+                    }
+                }
+                StmtKind::While { body, .. }
+                | StmtKind::DoWhile { body, .. }
+                | StmtKind::For { body, .. }
+                | StmtKind::Foreach { body, .. } => self.check_returns_in(std::slice::from_ref(body), ret, out),
+                StmtKind::Switch { cases, .. } => {
+                    for c in cases {
+                        self.check_returns_in(&c.body, ret, out);
+                    }
+                }
+                StmtKind::Try { body, catches, finally } => {
+                    self.check_returns_in(body, ret, out);
+                    for c in catches {
+                        self.check_returns_in(&c.body, ret, out);
+                    }
+                    if let Some(f) = finally {
+                        self.check_returns_in(f, ret, out);
+                    }
+                }
+                StmtKind::Declare { body: Some(b), .. } => self.check_returns_in(std::slice::from_ref(b), ret, out),
+                // Nested function/class declarations have their own return types and
+                // are checked separately (by `collect`); don't descend here.
+                _ => {}
+            }
+        }
+    }
+
+    fn check_return_expr(&self, e: &Expr, ret: &Ret, out: &mut Vec<Diagnostic>) {
+        // Unmapped (e.g. inside a closure the map leaves opaque) → `mixed` → lenient.
+        let actual = self.types.get(&key(e)).cloned().unwrap_or(Type::Mixed);
+        if !assignable_certain(self.index, &actual, &ret.declared, self.treat_phpdoc_certain) {
+            out.push(
+                Diagnostic::error(
+                    e.span,
+                    format!("{} should return {} but returns {}", ret.label, ret.declared, actual),
+                )
+                .with_code("return.type"),
+            );
+        }
     }
 }
 
@@ -197,7 +211,7 @@ mod tests {
         let mut index = ReflectionIndex::new();
         index.add_file(&r.program, &r.interner);
         let types = php_infer::type_map(&index, &r.program, &r.interner);
-        return_type_errors(&index, &r.program, &r.interner, &types).into_iter().map(|d| d.message).collect()
+        return_type_errors(&index, &r.program, &r.interner, &types, true).into_iter().map(|d| d.message).collect()
     }
 
     #[test]

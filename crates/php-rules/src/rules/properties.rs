@@ -1453,7 +1453,7 @@ fn run_types_assigned_to_properties(fa: &FileAnalysis) -> Vec<Diagnostic> {
         let Some(found) = fa.reflection.find_property(&fqn, pname) else { return };
         let decl = found.member.ty.clone();
         let val = fa.type_of(rhs);
-        if !crate::is_assignable(fa.reflection, &val, &decl) {
+        if !fa.accepts(&val, &decl) {
             out.push(
                 Diagnostic::error(
                     rhs.span,

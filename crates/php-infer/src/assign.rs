@@ -40,6 +40,45 @@ pub fn is_castable_to_string(index: &ReflectionIndex, ty: &Type) -> bool {
     }
 }
 
+/// Strip the **PHPDoc-only** refinements from a type, leaving its *native* PHP
+/// shape. In PHP the only native container type is bare `array`/`object`; every
+/// element type (`array<Arg>`, `Arg[]`, `list<T>`, `array{…}`), generic argument
+/// (`Collection<User>`), `class-string<T>`, and literal (`'draft'`, `42`) is
+/// expressible *only* in PHPDoc. So this models "what the type would be if PHPDoc
+/// were ignored" — used to honour `treatPhpDocTypesAsCertain`. Native nullability
+/// is preserved (it can be a real `?T` hint).
+pub fn native_shape(t: &Type) -> Type {
+    use Type::*;
+    match t {
+        Array(_) | List(_) | Shape { .. } => Array(None),
+        Iterable(_) => Iterable(None),
+        ClassString(_) => ClassString(None),
+        LiteralInt(_) => Int,
+        LiteralString(_) => String,
+        Named { fqn, .. } => Named { fqn: fqn.clone(), args: Vec::new() },
+        Nullable(inner) => Type::nullable(native_shape(inner)),
+        Union(parts) => Type::union(parts.iter().map(native_shape).collect()),
+        Intersection(parts) => Type::intersection(parts.iter().map(native_shape).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Assignability honouring phpstan's `treatPhpDocTypesAsCertain`. When
+/// `treat_phpdoc_certain` is `false`, an incompatibility that only appears at the
+/// PHPDoc-refined level — an array *element* type, a generic argument, a literal —
+/// is treated as uncertain and accepted (the native shapes are compatible). A
+/// genuinely native mismatch (`string` where `array` is wanted) is still rejected.
+pub fn assignable_certain(
+    index: &ReflectionIndex,
+    value: &Type,
+    target: &Type,
+    treat_phpdoc_certain: bool,
+) -> bool {
+    is_assignable(index, value, target)
+        || (!treat_phpdoc_certain
+            && is_assignable(index, &native_shape(value), &native_shape(target)))
+}
+
 /// Whether a value of type `value` is assignable to a slot of type `target`.
 pub fn is_assignable(index: &ReflectionIndex, value: &Type, target: &Type) -> bool {
     use Type::*;
@@ -249,6 +288,30 @@ mod tests {
         // a coarse array ⊑ shape is lenient (can't disprove).
         assert!(ok(Type::Array(None), shape(vec![field("id", false, Type::Int)])));
         assert!(ok(Type::Array(Some(Box::new((Type::String, Type::Mixed)))), shape(vec![field("id", false, Type::Int)])));
+    }
+
+    #[test]
+    fn phpdoc_uncertain_suppresses_element_mismatch() {
+        let idx = empty_index();
+        let str_arr = Type::Array(Some(Box::new((Type::Int, Type::String))));
+        let int_arr = Type::Array(Some(Box::new((Type::Int, Type::Int))));
+        // With phpdoc certain (default), the element mismatch is a real error.
+        assert!(!is_assignable(&idx, &str_arr, &int_arr));
+        assert!(!assignable_certain(&idx, &str_arr, &int_arr, true));
+        // With phpdoc *uncertain*, both are native `array` → accepted.
+        assert!(assignable_certain(&idx, &str_arr, &int_arr, false));
+        // A genuinely native mismatch is still rejected even when uncertain.
+        assert!(!assignable_certain(&idx, &Type::String, &int_arr, false));
+    }
+
+    #[test]
+    fn native_shape_erases_phpdoc_refinements() {
+        assert_eq!(native_shape(&Type::List(Box::new(Type::Int))), Type::Array(None));
+        assert_eq!(native_shape(&Type::LiteralInt(5)), Type::Int);
+        assert_eq!(
+            native_shape(&Type::Named { fqn: "C".into(), args: vec![Type::Int] }),
+            Type::Named { fqn: "C".into(), args: vec![] }
+        );
     }
 
     #[test]
