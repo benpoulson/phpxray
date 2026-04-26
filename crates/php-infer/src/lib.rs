@@ -445,6 +445,18 @@ impl<'a> TypeCtx<'a> {
                 Type::Float => Some(Type::Float),
                 _ => None,
             },
+            // `array_search($needle, $haystack)` returns the *key* of the haystack
+            // (or `false`). The stub's `int|string|false` poisons int-keyed (list)
+            // uses — `array_splice($list, array_search(...), …)` after `!== false`.
+            "array_search" => {
+                let key = self.array_key_type(args.get(1)?)?;
+                Some(Type::union(vec![key, Type::False]))
+            }
+            // `array_key_first`/`array_key_last` return the key (or `null`).
+            "array_key_first" | "array_key_last" => {
+                let key = self.array_key_type(args.first()?)?;
+                Some(Type::union(vec![key, Type::Null]))
+            }
             _ => None,
         }
     }
@@ -454,6 +466,25 @@ impl<'a> TypeCtx<'a> {
         match self.infer(&arg.value) {
             Type::Array(Some(kv)) => Some(kv.1.clone()),
             Type::List(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// The key type of an array/list/shape argument, if known (`list` → `int`).
+    fn array_key_type(&self, arg: &php_ast::Arg) -> Option<Type> {
+        match self.infer(&arg.value) {
+            Type::Array(Some(kv)) => Some(kv.0.clone()),
+            Type::List(_) => Some(Type::Int),
+            Type::Shape { fields, .. } => Some(Type::union(
+                fields
+                    .iter()
+                    .map(|f| match &f.key {
+                        Some(k) if k.parse::<i64>().is_ok() => Type::Int,
+                        Some(_) => Type::String,
+                        None => Type::Int,
+                    })
+                    .collect(),
+            )),
             _ => None,
         }
     }
