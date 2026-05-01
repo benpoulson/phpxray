@@ -121,8 +121,8 @@ mod tests {
 
     #[test]
     fn literals() {
-        assert_eq!(ty_of("<?php 42;", |e| matches!(e.kind, ExprKind::Int(_))), "int");
-        assert_eq!(ty_of("<?php 'hi';", |e| matches!(&e.kind, ExprKind::Str(_))), "string");
+        assert_eq!(ty_of("<?php 42;", |e| matches!(e.kind, ExprKind::Int(_))), "42");
+        assert_eq!(ty_of("<?php 'hi';", |e| matches!(&e.kind, ExprKind::Str(_))), "'hi'");
     }
 
     #[test]
@@ -136,7 +136,7 @@ mod tests {
                 tys.push(map.get(&key(e.span)).map(|t| t.to_string()).unwrap_or_default());
             }
         });
-        assert_eq!(tys.last().map(String::as_str), Some("string"), "echo $x should be string; got {tys:?}");
+        assert_eq!(tys.last().map(String::as_str), Some("'hi'"), "echo $x should be the literal; got {tys:?}");
     }
 
     #[test]
@@ -168,7 +168,7 @@ mod tests {
     fn call_arguments_are_recorded() {
         // Args must be in the map (infer itself skips them) — the string literal arg.
         let src = "<?php function f(int $x) {} f('s');";
-        assert_eq!(ty_of(src, |e| matches!(&e.kind, ExprKind::Str(_))), "string");
+        assert_eq!(ty_of(src, |e| matches!(&e.kind, ExprKind::Str(_))), "'s'");
     }
 
     #[test]

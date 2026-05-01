@@ -1789,7 +1789,12 @@ fn run_sort_castable_to_string(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// unknown) is treated as castable to stay false-positive-free.
 fn is_definitely_not_numeric(ty: &php_types::Type) -> bool {
     use php_types::Type::*;
-    matches!(ty, Array(_) | List(_) | Iterable(_) | Shape { .. } | Callable(_) | Void)
+    match ty {
+        Array(_) | List(_) | Iterable(_) | Shape { .. } | Callable(_) | Void => true,
+        // A union is not-numeric only if *every* member is (e.g. `list<1>|list<2>`).
+        Union(parts) => parts.iter().all(is_definitely_not_numeric),
+        _ => false,
+    }
 }
 
 /// `ParameterCastableToNumberRule` — `array_sum`/`array_product` reduce an array

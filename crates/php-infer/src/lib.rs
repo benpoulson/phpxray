@@ -57,10 +57,11 @@ impl<'a> TypeCtx<'a> {
     /// Infer the type of `e`.
     pub fn infer(&self, e: &Expr) -> Type {
         match &e.kind {
-            // --- literals ---
-            ExprKind::Int(_) => Type::Int,
+            // --- literals --- (carry the value as a literal type, like phpstan, so
+            // literal-union params/`@return`s and constant comparisons type-check)
+            ExprKind::Int(n) => Type::LiteralInt(*n),
             ExprKind::Float(_) => Type::Float,
-            ExprKind::Str(_) => Type::String,
+            ExprKind::Str(bytes) => literal_string(bytes),
             ExprKind::Interpolated(_) | ExprKind::ShellExec(_) => Type::String,
 
             // --- references ---
@@ -609,7 +610,18 @@ impl<'a> TypeCtx<'a> {
         match op {
             UnOp::Not => Type::Bool,
             UnOp::BitNot => Type::Int,
-            UnOp::Plus | UnOp::Minus => numeric_unary(self.infer(expr)),
+            UnOp::Plus | UnOp::Minus => {
+                let t = self.infer(expr);
+                // Keep a literal int through the sign (`-1` is the `-1` type), so
+                // `@return -1|0|1` methods that `return -1;` type-check.
+                if let Type::LiteralInt(n) = t {
+                    return match op {
+                        UnOp::Minus => Type::LiteralInt(n.wrapping_neg()),
+                        _ => Type::LiteralInt(n),
+                    };
+                }
+                numeric_unary(t)
+            }
         }
     }
 
@@ -855,6 +867,20 @@ fn null_truth(t: &Type) -> Option<bool> {
     }
 }
 
+/// The type of a string literal: a [`Type::LiteralString`] when the bytes are
+/// valid UTF-8 and short enough to be worth tracking (literal-union params, value
+/// comparisons), otherwise a plain `string`. Capped to avoid carrying huge
+/// generated string constants around as types.
+fn literal_string(bytes: &[u8]) -> Type {
+    const MAX: usize = 64;
+    if bytes.len() <= MAX {
+        if let Ok(s) = std::str::from_utf8(bytes) {
+            return Type::LiteralString(s.to_string());
+        }
+    }
+    Type::String
+}
+
 /// Whether `e` is the `null` literal (through parentheses).
 fn is_null_literal(e: &Expr) -> bool {
     match &e.kind {
@@ -875,10 +901,20 @@ fn contains_mixed(t: &Type) -> bool {
 }
 
 fn is_int(t: &Type) -> bool {
-    matches!(t, Type::Int | Type::LiteralInt(_))
+    match t {
+        Type::Int | Type::LiteralInt(_) => true,
+        // A union of only int-like members (`0|1`, common from `$x = 0; … $x = 1;`)
+        // is int-like — so arithmetic on it stays `int`, not `int|float`.
+        Type::Union(parts) => parts.iter().all(is_int),
+        _ => false,
+    }
 }
 fn is_float(t: &Type) -> bool {
-    matches!(t, Type::Float)
+    match t {
+        Type::Float => true,
+        Type::Union(parts) => parts.iter().all(is_float),
+        _ => false,
+    }
 }
 fn is_array(t: &Type) -> bool {
     matches!(t, Type::Array(_) | Type::List(_) | Type::Shape { .. })
@@ -937,10 +973,10 @@ mod tests {
 
     #[test]
     fn literals() {
-        assert_eq!(infer("42;"), "int");
+        assert_eq!(infer("42;"), "42"); // literal-int type
         assert_eq!(infer("1.5;"), "float");
-        assert_eq!(infer("'hi';"), "string");
-        assert_eq!(infer("\"a$b\";"), "string");
+        assert_eq!(infer("'hi';"), "'hi'"); // literal-string type
+        assert_eq!(infer("\"a$b\";"), "string"); // interpolation widens
         assert_eq!(infer("true;"), "true");
         assert_eq!(infer("false;"), "false");
         assert_eq!(infer("null;"), "null");
@@ -951,13 +987,13 @@ mod tests {
     #[test]
     fn arrays() {
         assert_eq!(infer("[];"), "array");
-        // Keyless literals are lists (matching phpstan).
-        assert_eq!(infer("[1, 2, 3];"), "list<int>");
+        // Keyless literals are lists; elements carry literal types (matching phpstan).
+        assert_eq!(infer("[1, 2, 3];"), "list<1|2|3>");
         // Constant-keyed literals are array shapes.
-        assert_eq!(infer("['a' => 1, 'b' => 2];"), "array{a: int, b: int}");
-        assert_eq!(infer("[1, 'x'];"), "list<int|string>");
+        assert_eq!(infer("['a' => 1, 'b' => 2];"), "array{a: 1, b: 2}");
+        assert_eq!(infer("[1, 'x'];"), "list<1|'x'>");
         // A dynamic key drops shape precision back to `array<K, V>`.
-        assert_eq!(infer_with("[$k => 1, 'b' => 2];", &[("k", Type::String)], None), "array<string, int>");
+        assert_eq!(infer_with("[$k => 1, 'b' => 2];", &[("k", Type::String)], None), "array<string, 1|2>");
     }
 
     #[test]
@@ -1060,8 +1096,8 @@ mod tests {
 
     #[test]
     fn ternary_and_coalesce() {
-        assert_eq!(infer("true ? 1 : 'x';"), "int|string");
-        assert_eq!(infer_with("$x ?? 0;", &[("x", Type::Nullable(Box::new(Type::String)))], None), "string|int");
+        assert_eq!(infer("true ? 1 : 'x';"), "1|'x'");
+        assert_eq!(infer_with("$x ?? 0;", &[("x", Type::Nullable(Box::new(Type::String)))], None), "string|0");
     }
 
     #[test]
@@ -1158,6 +1194,6 @@ mod tests {
     fn closure_and_match() {
         assert_eq!(infer("fn() => 1;"), "Closure");
         assert_eq!(infer("function() {};"), "Closure");
-        assert_eq!(infer("match($x) { 1 => 'a', default => 2 };"), "string|int");
+        assert_eq!(infer("match($x) { 1 => 'a', default => 2 };"), "'a'|2");
     }
 }

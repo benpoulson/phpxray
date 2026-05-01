@@ -838,13 +838,13 @@ mod tests {
     fn simple_assignment_chain() {
         assert_eq!(var_after("$x = 1; $y = $x + 2;", "y"), "int");
         assert_eq!(var_after("$x = 'a' . 'b';", "x"), "string");
-        assert_eq!(var_after("$a = $b = 5;", "a"), "int");
-        assert_eq!(var_after("$a = $b = 5;", "b"), "int");
+        assert_eq!(var_after("$a = $b = 5;", "a"), "5");
+        assert_eq!(var_after("$a = $b = 5;", "b"), "5");
     }
 
     #[test]
     fn reassignment_updates_type() {
-        assert_eq!(var_after("$x = 1; $x = 'now a string';", "x"), "string");
+        assert_eq!(var_after("$x = 1; $x = 'now a string';", "x"), "'now a string'");
     }
 
     #[test]
@@ -885,7 +885,7 @@ mod tests {
                 if ($c) { $x = 1; } else { $x = 'two'; }
             }
         "#;
-        assert_eq!(var_after(src, "x"), "int|string");
+        assert_eq!(var_after(src, "x"), "1|'two'");
     }
 
     // --- M-T9 condition narrowing -----------------------------------------
@@ -926,7 +926,7 @@ mod tests {
         // No early return: the then-branch sees the narrowed type.
         let src = "function f($x) { $y = 0; if ($x instanceof Foo) { $y = $x; } }";
         // then: $y = Foo; fall-through: $y = int(0). Merged.
-        assert_eq!(var_after(src, "y"), "Foo|int");
+        assert_eq!(var_after(src, "y"), "Foo|0");
     }
 
     #[test]
@@ -1006,6 +1006,6 @@ mod tests {
             }
         "#;
         // Assigned in the then-branch, absent on the fall-through path -> int|mixed.
-        assert_eq!(var_after(src, "x"), "int|mixed");
+        assert_eq!(var_after(src, "x"), "1|mixed");
     }
 }

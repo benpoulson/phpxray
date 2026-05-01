@@ -226,13 +226,13 @@ mod tests {
     #[test]
     fn bad_scalar_return_is_flagged() {
         let d = check(r#"<?php function f(): int { return 'nope'; }"#);
-        assert_eq!(d, ["function f() should return int but returns string"]);
+        assert_eq!(d, ["function f() should return int but returns 'nope'"]);
     }
 
     #[test]
     fn return_of_local_variable_uses_flow() {
         let d = check(r#"<?php function f(): int { $x = 'a string'; return $x; }"#);
-        assert_eq!(d, ["function f() should return int but returns string"]);
+        assert_eq!(d, ["function f() should return int but returns 'a string'"]);
         // A correctly-typed local is silent.
         assert!(check(r#"<?php function f(): int { $x = 5; return $x; }"#).is_empty());
     }
@@ -252,7 +252,7 @@ mod tests {
             /** @return list<int> */
             function f(): array { return 'x'; }"#,
         );
-        assert_eq!(d, ["function f() should return list<int> but returns string"]);
+        assert_eq!(d, ["function f() should return list<int> but returns 'x'"]);
     }
 
     #[test]
@@ -264,7 +264,7 @@ mod tests {
                 public function bad(): string { return 42; }
             }"#,
         );
-        assert_eq!(d, ["C::bad() should return string but returns int"]);
+        assert_eq!(d, ["C::bad() should return string but returns 42"]);
     }
 
     #[test]
@@ -315,7 +315,7 @@ mod tests {
                 return 0;
             }"#,
         );
-        assert_eq!(d, ["function f() should return int but returns string"]);
+        assert_eq!(d, ["function f() should return int but returns 'bad'"]);
     }
 
     #[test]

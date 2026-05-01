@@ -106,6 +106,7 @@ impl Type {
             collect_union_members(p, &mut flat);
         }
         dedup(&mut flat);
+        absorb_literals(&mut flat);
         match flat.len() {
             0 => Type::Never,
             1 => flat.pop().unwrap(),
@@ -141,6 +142,22 @@ fn collect_union_members(t: Type, out: &mut Vec<Type>) {
         }
         other => out.push(other),
     }
+}
+
+/// Drop literal members already covered by their general type in the same union:
+/// `int|5` → `int`, `string|'x'` → `string`, `bool|true` → `bool`. A union of
+/// *only* literals (`1|2|3`, `'a'|'b'`) is kept — that's a precise type, not
+/// redundant. Mirrors phpstan, and keeps diagnostic messages clean.
+fn absorb_literals(types: &mut Vec<Type>) {
+    let has_int = types.contains(&Type::Int);
+    let has_string = types.contains(&Type::String);
+    let has_bool = types.contains(&Type::Bool);
+    types.retain(|t| match t {
+        Type::LiteralInt(_) => !has_int,
+        Type::LiteralString(_) => !has_string,
+        Type::True | Type::False => !has_bool,
+        _ => true,
+    });
 }
 
 /// Remove duplicate types while preserving first-seen order (unlike
