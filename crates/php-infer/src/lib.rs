@@ -458,6 +458,13 @@ impl<'a> TypeCtx<'a> {
                 let key = self.array_key_type(args.first()?)?;
                 Some(Type::union(vec![key, Type::Null]))
             }
+            // `count_chars($s, $mode)`: modes 0-2 return an array, mode 3/4 a string.
+            // The stub's `array|string` poisons `strlen(count_chars($s, 3))`.
+            "count_chars" => match self.infer(&args.get(1)?.value) {
+                Type::LiteralInt(3) | Type::LiteralInt(4) => Some(Type::String),
+                Type::LiteralInt(0..=2) => Some(Type::Array(None)),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -609,7 +616,12 @@ impl<'a> TypeCtx<'a> {
     fn unary_type(&self, op: UnOp, expr: &Expr) -> Type {
         match op {
             UnOp::Not => Type::Bool,
-            UnOp::BitNot => Type::Int,
+            // `~` is bytewise on a string (→ string), bitwise on a number (→ int).
+            UnOp::BitNot => match self.infer(expr) {
+                Type::String | Type::LiteralString(_) => Type::String,
+                Type::Float => Type::Float,
+                _ => Type::Int,
+            },
             UnOp::Plus | UnOp::Minus => {
                 let t = self.infer(expr);
                 // Keep a literal int through the sign (`-1` is the `-1` type), so
