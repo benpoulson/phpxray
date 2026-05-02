@@ -622,18 +622,10 @@ impl<'a> TypeCtx<'a> {
                 Type::Float => Type::Float,
                 _ => Type::Int,
             },
-            UnOp::Plus | UnOp::Minus => {
-                let t = self.infer(expr);
-                // Keep a literal int through the sign (`-1` is the `-1` type), so
-                // `@return -1|0|1` methods that `return -1;` type-check.
-                if let Type::LiteralInt(n) = t {
-                    return match op {
-                        UnOp::Minus => Type::LiteralInt(n.wrapping_neg()),
-                        _ => Type::LiteralInt(n),
-                    };
-                }
-                numeric_unary(t)
-            }
+            // Keep literal ints through the sign — distributing over a union — so
+            // `-$x` where `$x: -1|0|1` stays `-1|0|1` (e.g. `return $neg ? -$r : $r`
+            // in a `@return -1|0|1` comparator), not the absorbing `int`.
+            UnOp::Plus | UnOp::Minus => apply_sign(matches!(op, UnOp::Minus), self.infer(expr)),
         }
     }
 
@@ -822,6 +814,17 @@ fn strip_falsy(t: Type) -> Type {
 }
 
 /// `+$x` / `-$x`: numeric, preserving int vs float when known.
+/// Apply a unary `+`/`-` to a type, preserving literal ints (negating them when
+/// `neg`) and distributing over a union; non-literal operands fall back to
+/// [`numeric_unary`].
+fn apply_sign(neg: bool, t: Type) -> Type {
+    match t {
+        Type::LiteralInt(n) => Type::LiteralInt(if neg { n.wrapping_neg() } else { n }),
+        Type::Union(parts) => Type::union(parts.into_iter().map(|p| apply_sign(neg, p)).collect()),
+        other => numeric_unary(other),
+    }
+}
+
 fn numeric_unary(t: Type) -> Type {
     if contains_mixed(&t) {
         Type::Mixed // unknown operand → don't guess `int|float` (would false-flag)
