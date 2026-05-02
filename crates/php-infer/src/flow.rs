@@ -401,7 +401,24 @@ impl TypeCtx<'_> {
         self.vars = saved;
     }
 
+    /// Honour an inline `/** @var T $x */` on a statement: narrow `$x` to the
+    /// annotated type for this statement onward (phpstan does the same). Resolves
+    /// the PHPDoc type in the current scope; unnamed/unresolvable `@var`s are
+    /// ignored. The type set is the narrower of the annotation and the current type
+    /// so a bogus widening annotation can't introduce false positives.
+    fn apply_inline_var(&mut self, s: &Stmt) {
+        let Some(doc) = &s.doc else { return };
+        for v in php_phpdoc::parse(doc).vars {
+            let (Some(name), Some(dt)) = (v.name, v.ty) else { continue };
+            let t = php_reflect::resolve_doc_type(self.scope, &[], &dt);
+            let cur = self.vars.get(&name).cloned().unwrap_or(Type::Mixed);
+            let narrowed = narrow_to(&cur, &t, self.index);
+            self.vars.insert(name, narrowed);
+        }
+    }
+
     fn record_stmt(&mut self, s: &Stmt, map: &mut RecMap) {
+        self.apply_inline_var(s);
         match &s.kind {
             StmtKind::Expr(e) => {
                 self.rec_here(e, map);

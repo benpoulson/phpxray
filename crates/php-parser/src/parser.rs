@@ -196,6 +196,9 @@ impl<'a> Parser<'a> {
         }
         let start = self.cur_start();
         let doc = self.doc_before(start);
+        // An inline `/** @var T $x */` is kept on the statement for flow analysis
+        // (captured before `doc` is moved into a declaration parser below).
+        let inline_var = doc.as_ref().filter(|d| d.contains("@var")).map(|d| d.clone().into_boxed_str());
         let kind = match self.peek() {
             T::Semicolon => {
                 self.bump();
@@ -300,7 +303,9 @@ impl<'a> Parser<'a> {
             }
         };
         self.depth -= 1;
-        Stmt::new(self.span_to(start), kind)
+        let mut stmt = Stmt::new(self.span_to(start), kind);
+        stmt.doc = inline_var;
+        stmt
     }
 
     /// `{ stmt* }` — the statement list (depth is guarded by `parse_statement`).

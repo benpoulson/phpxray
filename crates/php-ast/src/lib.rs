@@ -39,11 +39,16 @@ pub struct Program {
 pub struct Stmt {
     pub span: Span,
     pub kind: StmtKind,
+    /// A preceding `/** … */` doc-comment carrying an *inline type annotation*
+    /// (`@var`), kept so flow analysis can honour `/** @var int $x */`. Only set
+    /// when the doc contains such an annotation; `None` otherwise (declaration
+    /// doc-comments are attached to the declaration node instead).
+    pub doc: Option<Box<str>>,
 }
 
 impl Stmt {
     pub fn new(span: Span, kind: StmtKind) -> Stmt {
-        Stmt { span, kind }
+        Stmt { span, kind, doc: None }
     }
 }
 
