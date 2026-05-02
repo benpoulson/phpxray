@@ -404,8 +404,13 @@ fn run_impossible_instanceof(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
         let vt = fa.type_of(expr);
         if let Some(result) = instanceof_result(fa, &vt, class_fqn) {
-            let (verb, code) =
-                if result { ("true", "instanceof.alwaysTrue") } else { ("false", "instanceof.alwaysFalse") };
+            // phpstan reports always-*false* instanceof by default but defaults the
+            // always-*true* report OFF (`checkAlwaysTrueInstanceof`) — defensive
+            // `instanceof` that's redundant is usually intentional. Match that.
+            if result {
+                return;
+            }
+            let (verb, code) = ("false", "instanceof.alwaysFalse");
             out.push(diag(
                 e.span,
                 format!("Instanceof between {vt} and {class_fqn} will always evaluate to {verb}."),
@@ -464,11 +469,13 @@ fn run_impossible_check_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
             return;
         }
         let Some(vcat) = category(&fa.type_of(&arg0.value)) else { return };
-        let (verb, code) = if vcat == pred {
-            ("true", "function.alreadyNarrowedType")
-        } else {
-            ("false", "function.impossibleType")
-        };
+        // Always-*true* type-check (`is_int($int)`) is OFF by default in phpstan
+        // (`checkAlwaysTrueCheckTypeFunctionCall`) — it reports the resulting dead
+        // code instead. Only report the impossible (always-false) case.
+        if vcat == pred {
+            return;
+        }
+        let (verb, code) = ("false", "function.impossibleType");
         out.push(diag(
             e.span,
             format!("Call to function {fname}() will always evaluate to {verb}."),
@@ -503,13 +510,15 @@ fn run_strict_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
         let lt = fa.type_of(lhs);
         let rt = fa.type_of(rhs);
         // 1. Disjoint *types* — provably never/always equal, even for non-constant
-        //    typed operands (`int $a === string $b`).
+        //    typed operands (`int $a === string $b`). `===` on disjoint types is
+        //    always false (reported); `!==` is always true — and phpstan defaults
+        //    the always-*true* strict-comparison report OFF
+        //    (`checkAlwaysTrueStrictComparison`), so we only report the false case.
         if disjoint(&lt, &rt) {
-            let (verb, code) = if always_false {
-                ("false", "identical.alwaysFalse")
-            } else {
-                ("true", "notIdentical.alwaysTrue")
-            };
+            if !always_false {
+                return;
+            }
+            let (verb, code) = ("false", "identical.alwaysFalse");
             out.push(diag(
                 e.span,
                 format!("Strict comparison using {sigil} between {lt} and {rt} will always evaluate to {verb}."),
@@ -741,15 +750,16 @@ mod tests {
     // --- impossible instanceof ---
 
     #[test]
-    fn instanceof_subclass_always_true() {
+    fn instanceof_subclass_always_true_is_off_by_default() {
+        // phpstan defaults always-true instanceof reporting OFF; we match that.
         let src = "<?php class A {} class B extends A {} function f(B $b) { return $b instanceof A; }";
-        assert_eq!(codes(src, run_impossible_instanceof), ["instanceof.alwaysTrue"]);
+        assert!(codes(src, run_impossible_instanceof).is_empty());
     }
 
     #[test]
-    fn instanceof_same_class_always_true() {
+    fn instanceof_same_class_always_true_is_off_by_default() {
         let src = "<?php class A {} function f(A $a) { return $a instanceof A; }";
-        assert_eq!(codes(src, run_impossible_instanceof), ["instanceof.alwaysTrue"]);
+        assert!(codes(src, run_impossible_instanceof).is_empty());
     }
 
     #[test]
@@ -774,9 +784,10 @@ mod tests {
     // --- impossible is_* checks ---
 
     #[test]
-    fn is_int_on_int_always_true() {
+    fn is_int_on_int_always_true_is_off_by_default() {
+        // Always-true type-check reporting is off by default in phpstan.
         let src = "<?php function f(int $x) { return is_int($x); }";
-        assert_eq!(codes(src, run_impossible_check_type), ["function.alreadyNarrowedType"]);
+        assert!(codes(src, run_impossible_check_type).is_empty());
     }
 
     #[test]
@@ -933,8 +944,9 @@ mod tests {
     }
 
     #[test]
-    fn strict_not_identical_disjoint_scalars() {
-        assert_eq!(codes("<?php $x = (1 !== 'a');", run_strict_comparison), ["notIdentical.alwaysTrue"]);
+    fn strict_not_identical_disjoint_scalars_off_by_default() {
+        // `!==` on disjoint types is always-true → off by default (phpstan).
+        assert!(codes("<?php $x = (1 !== 'a');", run_strict_comparison).is_empty());
     }
 
     #[test]
