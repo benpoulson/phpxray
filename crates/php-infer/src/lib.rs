@@ -633,7 +633,16 @@ impl<'a> TypeCtx<'a> {
         use BinOp::*;
         match op {
             Concat => Type::String,
-            BitOr | BitAnd | BitXor | Shl | Shr | Mod => Type::Int,
+            // `&` `|` `^` are *bytewise* on two strings (→ string), bitwise on
+            // numbers (→ int). Shift/modulo are always int.
+            BitOr | BitAnd | BitXor => {
+                if is_string_ty(&self.infer(lhs)) && is_string_ty(&self.infer(rhs)) {
+                    Type::String
+                } else {
+                    Type::Int
+                }
+            }
+            Shl | Shr | Mod => Type::Int,
             Eq | NotEq | Identical | NotIdentical | Lt | LtEq | Gt | GtEq | BoolAnd | BoolOr
             | LogicalAnd | LogicalOr | LogicalXor => Type::Bool,
             // The spaceship operator yields exactly `-1|0|1` (phpstan models it so,
@@ -913,6 +922,10 @@ fn contains_mixed(t: &Type) -> bool {
         Type::Nullable(inner) => contains_mixed(inner),
         _ => false,
     }
+}
+
+fn is_string_ty(t: &Type) -> bool {
+    matches!(t, Type::String | Type::LiteralString(_))
 }
 
 fn is_int(t: &Type) -> bool {
