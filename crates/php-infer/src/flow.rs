@@ -417,12 +417,28 @@ impl TypeCtx<'_> {
         }
     }
 
+    /// `assert($cond)` narrows the environment by the facts `$cond` implies (it
+    /// holds for all following code, like a guard that always passes) — e.g.
+    /// `assert($x !== false)` strips `false` from `$x`. Reuses the condition
+    /// narrowing; only sound refinements are applied.
+    fn apply_assert(&mut self, e: &Expr) {
+        let ExprKind::Call { callee, args } = &e.kind else { return };
+        let ExprKind::Name(n) = &callee.kind else { return };
+        if !last_segment(&n.text).eq_ignore_ascii_case("assert") {
+            return;
+        }
+        let Some(cond) = args.first() else { return };
+        let facts = self.narrow_facts(&cond.value, true);
+        self.apply_facts(&facts);
+    }
+
     fn record_stmt(&mut self, s: &Stmt, map: &mut RecMap) {
         self.apply_inline_var(s);
         match &s.kind {
             StmtKind::Expr(e) => {
                 self.rec_here(e, map);
                 self.apply_expr(e);
+                self.apply_assert(e);
             }
             StmtKind::Echo(es) => {
                 for e in es {
