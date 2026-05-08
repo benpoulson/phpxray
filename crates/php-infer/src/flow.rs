@@ -63,6 +63,9 @@ impl TypeCtx<'_> {
     /// simple variables) and return its inferred type.
     pub fn apply_expr(&mut self, e: &Expr) -> Type {
         match &e.kind {
+            // Peel parentheses so a parenthesised assignment still binds — e.g. the
+            // common `if (($x = f()))` / `while (($row = next()))` idiom.
+            ExprKind::Paren(inner) => self.apply_expr(inner),
             ExprKind::Assign { target, rhs } | ExprKind::AssignRef { target, rhs } => {
                 let t = self.apply_expr(rhs);
                 self.bind_target(target, &t);
