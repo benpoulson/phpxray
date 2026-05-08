@@ -43,6 +43,9 @@ pub struct ParamReflection {
     /// from a defaulted-to-`mixed` untyped parameter — used by the inherited-
     /// prototype check in the missing-typehint rules.
     pub explicit: bool,
+    /// The type from the *native* hint alone (`mixed` if none), ignoring PHPDoc —
+    /// used for `treatPhpDocTypesAsCertain: false` native-level checking.
+    pub native_ty: Type,
 }
 
 impl ParamReflection {
@@ -64,6 +67,8 @@ pub struct FunctionReflection {
     pub fqn: String,
     pub params: Vec<ParamReflection>,
     pub return_type: Type,
+    /// Native-hint-only return type (`mixed` if none).
+    pub native_return: Type,
     pub by_ref: bool,
     /// `@template` names in scope for this function.
     pub templates: Vec<String>,
@@ -88,6 +93,8 @@ pub struct MethodReflection {
     /// A return type was *explicitly* written (native hint or `@return`), even if
     /// `mixed`. See [`ParamReflection::explicit`].
     pub explicit_return: bool,
+    /// Native-hint-only return type (`mixed` if none). See [`ParamReflection::native_ty`].
+    pub native_return: Type,
     /// `@template` names in scope (class templates plus the method's own).
     pub templates: Vec<String>,
     pub deprecated: bool,
@@ -104,6 +111,8 @@ pub struct PropertyReflection {
     pub is_static: bool,
     pub is_readonly: bool,
     pub ty: Type,
+    /// Native-hint-only type (`mixed` if the property has only a `@var`).
+    pub native_ty: Type,
     pub has_default: bool,
     /// Read/write access — always [`PropertyAccess::ReadWrite`] for real
     /// properties; reflects the `@property-read`/`-write` tag for magic ones.
@@ -246,6 +255,7 @@ pub fn reflect_function(scope: &Scope, interner: &Interner, f: &FunctionDecl) ->
         fqn: scope.qualify(interner.resolve(f.name)),
         params: reflect_params(scope, interner, &templates, &f.params, &doc),
         return_type: merge_type(scope, &templates, f.return_type.as_ref(), doc.returns.as_ref()),
+        native_return: native_type(scope, f.return_type.as_ref()),
         by_ref: f.by_ref,
         templates,
         deprecated: doc.deprecated,
@@ -363,6 +373,7 @@ fn promoted_properties(
             is_static: false,
             is_readonly: p.modifiers.is_readonly || class_readonly,
             ty: merge_type(scope, &templates, p.ty.as_ref(), doc_ty),
+            native_ty: native_type(scope, p.ty.as_ref()),
             has_default: p.default.is_some(),
             access: PropertyAccess::ReadWrite,
             magic: false,
@@ -381,6 +392,7 @@ fn reflect_method(scope: &Scope, interner: &Interner, class_templates: &[String]
         is_final: m.modifiers.is_final,
         params: reflect_params(scope, interner, &templates, &m.params, &doc),
         return_type: merge_type(scope, &templates, m.return_type.as_ref(), doc.returns.as_ref()),
+        native_return: native_type(scope, m.return_type.as_ref()),
         explicit_return: m.return_type.is_some() || doc.returns.is_some(),
         templates,
         deprecated: doc.deprecated,
@@ -400,9 +412,11 @@ fn reflect_properties(
     // omitted on a property).
     let doc_ty = doc.vars.first().and_then(|v| v.ty.as_ref());
     let ty = merge_type(scope, templates, pd.ty.as_ref(), doc_ty);
+    let native = native_type(scope, pd.ty.as_ref());
     for elem in &pd.props {
         out.push(PropertyReflection {
             name: interner.resolve(elem.name).to_string(),
+            native_ty: native.clone(),
             visibility: pd.modifiers.visibility.unwrap_or(Visibility::Public),
             is_static: pd.modifiers.is_static,
             is_readonly: pd.modifiers.is_readonly,
@@ -455,6 +469,7 @@ fn magic_method(scope: &Scope, class_templates: &[String], m: &php_phpdoc::Metho
             .as_ref()
             .map(|t| resolve_doc_type(scope, &templates, t))
             .unwrap_or(Type::Mixed),
+        native_return: Type::Mixed,
         explicit_return: m.return_type.is_some(),
         templates,
         deprecated: false,
@@ -471,6 +486,7 @@ fn magic_param(scope: &Scope, templates: &[String], p: &MethodParam) -> ParamRef
         optional: p.default.is_some() || p.variadic,
         promoted: false,
         explicit: p.ty.is_some(),
+        native_ty: Type::Mixed,
     }
 }
 
@@ -483,6 +499,7 @@ fn magic_property(scope: &Scope, templates: &[String], p: &php_phpdoc::PropertyT
         is_static: false,
         is_readonly: p.access == PropertyAccess::ReadOnly,
         ty: p.ty.as_ref().map(|t| resolve_doc_type(scope, templates, t)).unwrap_or(Type::Mixed),
+        native_ty: Type::Mixed,
         has_default: false,
         access: p.access,
         magic: true,
@@ -508,6 +525,7 @@ fn reflect_params(
                 .and_then(|dp| dp.ty.as_ref());
             ParamReflection {
                 ty: merge_type(scope, templates, p.ty.as_ref(), doc_ty),
+                native_ty: native_type(scope, p.ty.as_ref()),
                 name,
                 by_ref: p.by_ref,
                 variadic: p.variadic,
@@ -549,6 +567,13 @@ fn merge_type(scope: &Scope, templates: &[String], native: Option<&AstType>, doc
         return resolve_ast_type(scope, n);
     }
     Type::Mixed
+}
+
+/// The *native*-hint-only type (ignoring PHPDoc): the resolved native hint, or
+/// `mixed` when there is no native type. Used for `treatPhpDocTypesAsCertain:
+/// false` native-level checking.
+fn native_type(scope: &Scope, native: Option<&AstType>) -> Type {
+    native.map(|n| resolve_ast_type(scope, n)).unwrap_or(Type::Mixed)
 }
 
 /// Class templates plus a method's own `@template` names.

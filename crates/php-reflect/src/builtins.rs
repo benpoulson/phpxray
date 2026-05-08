@@ -36,7 +36,8 @@ fn parse_line(line: &str, scope: &Scope) -> Option<FunctionReflection> {
     Some(FunctionReflection {
         fqn,
         params,
-        return_type,
+        return_type: return_type.clone(),
+        native_return: return_type,
         by_ref: false,
         templates: Vec::new(),
         deprecated: false,
@@ -51,6 +52,7 @@ fn parse_param(s: &str, scope: &Scope) -> Option<ParamReflection> {
     let flags = f.next().unwrap_or("");
     Some(ParamReflection {
         name,
+        native_ty: ty.clone(),
         ty,
         by_ref: flags.contains('r'),
         variadic: flags.contains('v'),
