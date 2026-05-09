@@ -13,7 +13,7 @@
 
 use php_ast::{ClassDecl, Expr, FunctionDecl, Member, Program, Stmt, StmtKind};
 use php_diagnostics::Diagnostic;
-use php_infer::{assignable_certain, TypeMap};
+use php_infer::{is_assignable, TypeMap};
 use php_intern::Interner;
 use php_reflect::{reflect_class, reflect_function, ReflectionIndex};
 use php_resolve::{for_each_region, Scope};
@@ -29,6 +29,8 @@ fn key(e: &Expr) -> (u32, u32) {
 /// a human label for diagnostics.
 struct Ret {
     declared: Type,
+    /// Native-only declared return (for treatPhpDocTypesAsCertain=false checking).
+    native_declared: Type,
     label: String,
 }
 
@@ -43,9 +45,10 @@ pub fn return_type_errors(
     program: &Program,
     interner: &Interner,
     types: &TypeMap,
+    native_types: &TypeMap,
     treat_phpdoc_certain: bool,
 ) -> Vec<Diagnostic> {
-    let cx = Cx { index, interner, types, treat_phpdoc_certain };
+    let cx = Cx { index, interner, types, native_types, treat_phpdoc_certain };
     let mut out = Vec::new();
     for_each_region(&program.stmts, interner, |scope, region| {
         cx.collect(scope, region, &mut out);
@@ -60,6 +63,7 @@ struct Cx<'a> {
     index: &'a ReflectionIndex,
     interner: &'a Interner,
     types: &'a TypeMap,
+    native_types: &'a TypeMap,
     treat_phpdoc_certain: bool,
 }
 
@@ -108,7 +112,7 @@ impl Cx<'_> {
     fn check_function(&self, scope: &Scope, f: &FunctionDecl, out: &mut Vec<Diagnostic>) {
         let refl = reflect_function(scope, self.interner, f);
         if !skip_return(&refl.return_type) {
-            let ret = Ret { declared: refl.return_type.clone(), label: format!("function {}()", refl.fqn) };
+            let ret = Ret { declared: refl.return_type.clone(), native_declared: refl.native_return.clone(), label: format!("function {}()", refl.fqn) };
             self.check_returns_in(&f.body, &ret, out);
         }
         // Nested declarations inside the body.
@@ -127,7 +131,7 @@ impl Cx<'_> {
                 continue;
             };
             if !skip_return(&mr.return_type) {
-                let ret = Ret { declared: mr.return_type.clone(), label: format!("{}::{}()", fqn, mr.name) };
+                let ret = Ret { declared: mr.return_type.clone(), native_declared: mr.native_return.clone(), label: format!("{}::{}()", fqn, mr.name) };
                 self.check_returns_in(body, &ret, out);
             }
             self.collect(scope, body, out);
@@ -181,15 +185,23 @@ impl Cx<'_> {
     fn check_return_expr(&self, e: &Expr, ret: &Ret, out: &mut Vec<Diagnostic>) {
         // Unmapped (e.g. inside a closure the map leaves opaque) → `mixed` → lenient.
         let actual = self.types.get(&key(e)).cloned().unwrap_or(Type::Mixed);
-        if !assignable_certain(self.index, &actual, &ret.declared, self.treat_phpdoc_certain) {
-            out.push(
-                Diagnostic::error(
-                    e.span,
-                    format!("{} should return {} but returns {}", ret.label, ret.declared, actual),
-                )
-                .with_code("return.type"),
-            );
+        if is_assignable(self.index, &actual, &ret.declared) {
+            return;
         }
+        // treatPhpDocTypesAsCertain=false: suppress if the *native* types agree.
+        if !self.treat_phpdoc_certain {
+            let native = self.native_types.get(&key(e)).cloned().unwrap_or(Type::Mixed);
+            if is_assignable(self.index, &native, &ret.native_declared) {
+                return;
+            }
+        }
+        out.push(
+            Diagnostic::error(
+                e.span,
+                format!("{} should return {} but returns {}", ret.label, ret.declared, actual),
+            )
+            .with_code("return.type"),
+        );
     }
 }
 
@@ -211,7 +223,8 @@ mod tests {
         let mut index = ReflectionIndex::new();
         index.add_file(&r.program, &r.interner);
         let types = php_infer::type_map(&index, &r.program, &r.interner);
-        return_type_errors(&index, &r.program, &r.interner, &types, true).into_iter().map(|d| d.message).collect()
+        let native = php_infer::native_type_map(&index, &r.program, &r.interner);
+        return_type_errors(&index, &r.program, &r.interner, &types, &native, true).into_iter().map(|d| d.message).collect()
     }
 
     #[test]

@@ -21,7 +21,7 @@ mod type_map;
 pub use assign::{assignable_certain, is_assignable, is_castable_to_string, native_shape};
 pub use const_eval::{eval_const, ConstVal};
 pub use definedness::{undefined_variables, UndefVar};
-pub use type_map::{type_map, TypeMap};
+pub use type_map::{native_type_map, type_map, TypeMap};
 
 use php_ast::{BinOp, CastKind, Expr, ExprKind, MemberName, Name, UnOp};
 use php_intern::Interner;
@@ -46,12 +46,17 @@ pub struct TypeCtx<'a> {
     /// level; a callee's body is analysed at depth+1. Bounded to one level so
     /// inference can't recurse without limit (mutual recursion, deep chains).
     pub depth: u32,
+    /// **Native mode**: infer using *native*-hint types only (ignore PHPDoc) —
+    /// member accesses use `native_ty`/`native_return`, array literals lose their
+    /// element types (native PHP `array` is untyped). Drives the native type map
+    /// that backs `treatPhpDocTypesAsCertain: false` checking.
+    pub native: bool,
 }
 
 impl<'a> TypeCtx<'a> {
     /// A context with no class and no known variables.
     pub fn new(index: &'a ReflectionIndex, scope: &'a Scope, interner: &'a Interner) -> Self {
-        TypeCtx { index, scope, interner, class: None, vars: HashMap::new(), depth: 0 }
+        TypeCtx { index, scope, interner, class: None, vars: HashMap::new(), depth: 0, native: false }
     }
 
     /// Infer the type of `e`.
@@ -160,6 +165,10 @@ impl<'a> TypeCtx<'a> {
     /// key/value types. An empty or spread-containing literal falls back to a
     /// bare `array`.
     fn array_type(&self, items: &[php_ast::ArrayItem]) -> Type {
+        // Native PHP arrays are untyped — element/shape precision is PHPDoc-level.
+        if self.native {
+            return Type::Array(None);
+        }
         if items.is_empty() || items.iter().any(|i| i.spread) {
             return Type::Array(None);
         }
@@ -221,6 +230,7 @@ impl<'a> TypeCtx<'a> {
             return t;
         }
         match self.function_reflection(n) {
+            Some(f) if self.native => f.native_return.clone(),
             Some(f) => {
                 let params: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
                 let body = self.index.function_body(&f.fqn);
@@ -264,6 +274,7 @@ impl<'a> TypeCtx<'a> {
             class: callee_class,
             vars: HashMap::new(),
             depth: self.depth + 1,
+            native: self.native,
         };
         for (name, arg) in params.iter().zip(args) {
             sub.vars.insert(name.clone(), self.infer(&arg.value));
@@ -503,6 +514,7 @@ impl<'a> TypeCtx<'a> {
         let Some(name) = self.member_ident(method) else { return Type::Mixed };
         let Some(fqn) = self.type_class_fqn(&recv_ty) else { return Type::Mixed };
         let ret = match self.index.find_method(&fqn, &name) {
+            Some(found) if self.native => self.bind_relative(found.member.native_return, &fqn),
             Some(found) => {
                 let params: Vec<String> = found.member.params.iter().map(|p| p.name.clone()).collect();
                 let body = self.index.method_body(&found.declaring_class, &name);
@@ -525,6 +537,7 @@ impl<'a> TypeCtx<'a> {
             return Type::Mixed;
         };
         match self.index.find_method(&fqn, &name) {
+            Some(found) if self.native => self.bind_relative(found.member.native_return, &fqn),
             Some(found) => {
                 let params: Vec<String> = found.member.params.iter().map(|p| p.name.clone()).collect();
                 let body = self.index.method_body(&found.declaring_class, &name);
@@ -541,6 +554,7 @@ impl<'a> TypeCtx<'a> {
         let Some(prop) = self.member_ident(name) else { return Type::Mixed };
         let Some(fqn) = self.type_class_fqn(&base_ty) else { return Type::Mixed };
         let ty = match self.index.find_property(&fqn, &prop) {
+            Some(found) if self.native => found.member.native_ty,
             Some(found) => found.member.ty,
             None => Type::Mixed,
         };
@@ -558,6 +572,7 @@ impl<'a> TypeCtx<'a> {
             return Type::Mixed;
         };
         match self.index.find_property(&fqn, &prop) {
+            Some(found) if self.native => found.member.native_ty,
             Some(found) => found.member.ty,
             None => Type::Mixed,
         }

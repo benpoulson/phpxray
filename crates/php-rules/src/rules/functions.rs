@@ -55,7 +55,7 @@ const SUPERGLOBALS: &[&str] = &[
 ];
 
 fn run_return_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    return_type_errors(fa.reflection, fa.program, fa.interner, fa.types, fa.treat_phpdoc_types_as_certain)
+    return_type_errors(fa.reflection, fa.program, fa.interner, fa.types, fa.native_types, fa.treat_phpdoc_types_as_certain)
 }
 
 // ---------------------------------------------------------------------------
@@ -1018,7 +1018,7 @@ fn run_argument_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 break; // variadic absorbs the rest; element-type checking is later
             }
             let given = fa.type_of(&arg.value);
-            if !fa.accepts(&given, &param.ty) {
+            if !fa.accepts(&arg.value, &param.ty, &param.native_ty) {
                 out.push(
                     Diagnostic::error(
                         arg.value.span,

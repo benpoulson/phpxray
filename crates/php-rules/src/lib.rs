@@ -16,7 +16,9 @@ mod rules;
 pub use php_ast::walk;
 #[cfg(test)]
 mod testutil;
-pub use php_infer::{is_assignable, is_castable_to_string, type_map, undefined_variables, TypeMap};
+pub use php_infer::{
+    is_assignable, is_castable_to_string, native_type_map, type_map, undefined_variables, TypeMap,
+};
 pub use registry::{analyze_file, rules_for_level, FileAnalysis, PhpVersion, RuleEntry};
 pub use return_type::return_type_errors;
 

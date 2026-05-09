@@ -77,6 +77,10 @@ pub struct FileAnalysis<'a> {
     pub resolved_refs: &'a [ResolvedRef],
     /// Inferred type of every expression in the file, keyed by span.
     pub types: &'a TypeMap,
+    /// Native-only inferred type of every expression (PHPDoc ignored), keyed by
+    /// span — used by the type-compatibility rules when `treatPhpDocTypesAsCertain`
+    /// is off, to suppress mismatches visible only at the PHPDoc-refined level.
+    pub native_types: &'a TypeMap,
     /// Target PHP version of the analyzed project (gates version-dependent rules).
     pub php_version: PhpVersion,
     /// phpstan's `treatPhpDocTypesAsCertain` (default `true`). When `false`, the
@@ -93,13 +97,25 @@ impl FileAnalysis<'_> {
         self.types.get(&(r.start as u32, r.end as u32)).cloned().unwrap_or(Type::Mixed)
     }
 
-    /// Whether a value of type `value` may be assigned/passed/returned where
-    /// `target` is expected, honouring this run's `treatPhpDocTypesAsCertain`. Use
-    /// this (not bare `is_assignable`) in the type-compatibility rules — when the
-    /// flag is off, mismatches that exist only at the PHPDoc-refined level (array
-    /// element types, generics, literals) are not reported.
-    pub fn accepts(&self, value: &Type, target: &Type) -> bool {
-        php_infer::assignable_certain(self.reflection, value, target, self.treat_phpdoc_types_as_certain)
+    /// The native-only inferred type of `e` (`mixed` if untyped/PHPDoc-only).
+    pub fn native_type_of(&self, e: &Expr) -> Type {
+        let r = e.span.range();
+        self.native_types.get(&(r.start as u32, r.end as u32)).cloned().unwrap_or(Type::Mixed)
+    }
+
+    /// Whether expression `e` may be assigned/passed/returned where `target`
+    /// (native form `native_target`) is expected, honouring this run's
+    /// `treatPhpDocTypesAsCertain`. Use this in the type-compatibility rules. When
+    /// the flag is off, a merged mismatch is suppressed if the **native** types are
+    /// compatible — i.e. the discrepancy was only at the PHPDoc-refined level.
+    pub fn accepts(&self, e: &Expr, target: &Type, native_target: &Type) -> bool {
+        if php_infer::is_assignable(self.reflection, &self.type_of(e), target) {
+            return true;
+        }
+        if self.treat_phpdoc_types_as_certain {
+            return false;
+        }
+        php_infer::is_assignable(self.reflection, &self.native_type_of(e), native_target)
     }
 
     /// Whether `fqn` and *every* class it transitively extends/implements/uses/
@@ -195,6 +211,7 @@ mod tests {
         reflection.add_file(&r.program, &r.interner);
         let refs = resolve_references(&r.program, &r.interner);
         let types = php_infer::type_map(&reflection, &r.program, &r.interner);
+        let native_types = php_infer::native_type_map(&reflection, &r.program, &r.interner);
         let fa = FileAnalysis {
             path: "t.php",
             source: src,
@@ -204,6 +221,7 @@ mod tests {
             reflection: &reflection,
             resolved_refs: &refs,
             types: &types,
+            native_types: &native_types,
             php_version: PhpVersion::default(),
             treat_phpdoc_types_as_certain: true,
         };

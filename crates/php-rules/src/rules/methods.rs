@@ -1175,7 +1175,7 @@ fn run_method_argument_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 break;
             }
             let given = fa.type_of(&arg.value);
-            if !fa.accepts(&given, &param.ty) {
+            if !fa.accepts(&arg.value, &param.ty, &param.native_ty) {
                 out.push(
                     Diagnostic::error(
                         arg.value.span,

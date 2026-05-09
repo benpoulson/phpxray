@@ -129,6 +129,7 @@ pub fn analyze_parsed(
     for f in parsed {
         let refs = resolve_references(&f.program, interner);
         let types = php_rules::type_map(&reflection, &f.program, interner);
+        let native_types = php_rules::native_type_map(&reflection, &f.program, interner);
         let fa = FileAnalysis {
             path: &f.path,
             source: &f.source,
@@ -138,6 +139,7 @@ pub fn analyze_parsed(
             reflection: &reflection,
             resolved_refs: &refs,
             types: &types,
+            native_types: &native_types,
             php_version,
             treat_phpdoc_types_as_certain,
         };

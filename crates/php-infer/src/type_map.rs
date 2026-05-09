@@ -27,29 +27,53 @@ fn key(span: php_span::Span) -> (u32, u32) {
     (r.start as u32, r.end as u32)
 }
 
-/// Build the type map for one parsed file.
+/// Build the (merged native+PHPDoc) type map for one parsed file.
 pub fn type_map(reflection: &ReflectionIndex, program: &Program, interner: &Interner) -> TypeMap {
+    build(reflection, program, interner, false)
+}
+
+/// Build the **native**-only type map: types inferred ignoring PHPDoc (member
+/// accesses use `native_ty`/`native_return`, arrays are untyped). Backs the
+/// `treatPhpDocTypesAsCertain: false` native-level checking.
+pub fn native_type_map(reflection: &ReflectionIndex, program: &Program, interner: &Interner) -> TypeMap {
+    build(reflection, program, interner, true)
+}
+
+fn build(reflection: &ReflectionIndex, program: &Program, interner: &Interner, native: bool) -> TypeMap {
     let mut map = TypeMap::new();
     for_each_region(&program.stmts, interner, |scope, region| {
         // Global scope of this region.
-        record_scope(reflection, scope, interner, None, HashMap::new(), region, &mut map);
+        record_scope(reflection, scope, interner, None, HashMap::new(), native, region, &mut map);
         // Every function / method declared in the region (descending into nested
         // and conditional declarations; each is its own scope).
         for st in region {
-            walk::for_each_stmt_in_stmt(st, &mut |s| collect_scope(reflection, scope, interner, s, &mut map));
+            walk::for_each_stmt_in_stmt(st, &mut |s| collect_scope(reflection, scope, interner, s, native, &mut map));
         }
     });
     map
 }
 
+/// The seeded local type of a parameter — native (untyped variadic → `array`) or
+/// merged, depending on `native`.
+fn seed_type(p: &php_reflect::ParamReflection, native: bool) -> Type {
+    if !native {
+        return p.local_type();
+    }
+    if p.variadic {
+        Type::Array(None)
+    } else {
+        p.native_ty.clone()
+    }
+}
+
 /// If `s` declares a function or class, record types for each of its bodies in a
 /// fresh scope.
-fn collect_scope(reflection: &ReflectionIndex, scope: &Scope, interner: &Interner, s: &php_ast::Stmt, map: &mut TypeMap) {
+fn collect_scope(reflection: &ReflectionIndex, scope: &Scope, interner: &Interner, s: &php_ast::Stmt, native: bool, map: &mut TypeMap) {
     match &s.kind {
         StmtKind::Function(f) => {
             let refl = reflect_function(scope, interner, f);
-            let vars = refl.params.iter().map(|p| (p.name.clone(), p.local_type())).collect();
-            record_scope(reflection, scope, interner, None, vars, &f.body, map);
+            let vars = refl.params.iter().map(|p| (p.name.clone(), seed_type(p, native))).collect();
+            record_scope(reflection, scope, interner, None, vars, native, &f.body, map);
         }
         StmtKind::Class(c) => {
             let Some(name) = c.name else { return };
@@ -62,9 +86,9 @@ fn collect_scope(reflection: &ReflectionIndex, scope: &Scope, interner: &Interne
                 let Some(mr) = cls.methods.iter().find(|x| !x.magic && x.name.eq_ignore_ascii_case(mname)) else {
                     continue;
                 };
-                let mut vars: HashMap<String, Type> = mr.params.iter().map(|p| (p.name.clone(), p.local_type())).collect();
+                let mut vars: HashMap<String, Type> = mr.params.iter().map(|p| (p.name.clone(), seed_type(p, native))).collect();
                 vars.insert("this".to_string(), Type::Named { fqn: fqn.clone(), args: Vec::new() });
-                record_scope(reflection, scope, interner, Some(fqn.clone()), vars, body, map);
+                record_scope(reflection, scope, interner, Some(fqn.clone()), vars, native, body, map);
             }
         }
         _ => {}
@@ -73,18 +97,21 @@ fn collect_scope(reflection: &ReflectionIndex, scope: &Scope, interner: &Interne
 
 /// Record types for the expressions in one scope's `body`, flowing the
 /// environment between statements.
+#[allow(clippy::too_many_arguments)]
 fn record_scope(
     reflection: &ReflectionIndex,
     scope: &Scope,
     interner: &Interner,
     class: Option<String>,
     init_vars: HashMap<String, Type>,
+    native: bool,
     body: &[php_ast::Stmt],
     map: &mut TypeMap,
 ) {
     let mut ctx = TypeCtx::new(reflection, scope, interner);
     ctx.class = class;
     ctx.vars = init_vars;
+    ctx.native = native;
     // The recording pass flows the environment statement-by-statement *and*
     // records each expression at its narrowed flow point, so expressions inside
     // `if`/`else`/loop branches are typed against the narrowed environment.

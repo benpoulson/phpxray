@@ -621,6 +621,7 @@ fn cmd_check(dir: Option<PathBuf>) -> ExitCode {
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let refs = resolve_references(program, &interner);
             let types = php_rules::type_map(&reflection, program, &interner);
+            let native_types = php_rules::native_type_map(&reflection, program, &interner);
             let fa = FileAnalysis {
                 path: label,
                 source,
@@ -630,6 +631,7 @@ fn cmd_check(dir: Option<PathBuf>) -> ExitCode {
                 reflection: &reflection,
                 resolved_refs: &refs,
                 types: &types,
+                native_types: &native_types,
                 php_version: php_rules::PhpVersion::default(),
                 treat_phpdoc_types_as_certain: true,
             };

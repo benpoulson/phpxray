@@ -27,6 +27,7 @@ pub(crate) fn run_version(
     reflection.add_file(&r.program, &r.interner);
     let refs = resolve_references(&r.program, &r.interner);
     let types = type_map(&reflection, &r.program, &r.interner);
+    let native_types = php_infer::native_type_map(&reflection, &r.program, &r.interner);
     let fa = FileAnalysis {
         path: "test.php",
         source: src,
@@ -36,6 +37,7 @@ pub(crate) fn run_version(
         reflection: &reflection,
         resolved_refs: &refs,
         types: &types,
+        native_types: &native_types,
         php_version,
         treat_phpdoc_types_as_certain: true,
     };

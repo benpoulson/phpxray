@@ -1452,8 +1452,9 @@ fn run_types_assigned_to_properties(fa: &FileAnalysis) -> Vec<Diagnostic> {
         let pname = fa.interner.resolve(*psym);
         let Some(found) = fa.reflection.find_property(&fqn, pname) else { return };
         let decl = found.member.ty.clone();
+        let native_decl = found.member.native_ty.clone();
         let val = fa.type_of(rhs);
-        if !fa.accepts(&val, &decl) {
+        if !fa.accepts(rhs, &decl, &native_decl) {
             out.push(
                 Diagnostic::error(
                     rhs.span,
