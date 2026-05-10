@@ -153,7 +153,7 @@ fn assignable_atom(index: &ReflectionIndex, value: &Type, target: &Type) -> bool
             ge_bound(*a0, *b0) && le_bound(*a1, *b1)
         }
         (LiteralInt(n), IntRange { min, max }) => {
-            min.map_or(true, |lo| *n >= lo) && max.map_or(true, |hi| *n <= hi)
+            min.is_none_or(|lo| *n >= lo) && max.is_none_or(|hi| *n <= hi)
         }
         (Float, Float) => true,
         (Bool | True | False, Bool) => true,
