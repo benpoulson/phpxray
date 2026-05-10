@@ -53,7 +53,7 @@ pub fn native_shape(t: &Type) -> Type {
         Array(_) | List(_) | Shape { .. } => Array(None),
         Iterable(_) => Iterable(None),
         ClassString(_) => ClassString(None),
-        LiteralInt(_) => Int,
+        LiteralInt(_) | IntRange { .. } => Int,
         LiteralString(_) => String,
         Named { fqn, .. } => Named { fqn: fqn.clone(), args: Vec::new() },
         Nullable(inner) => Type::nullable(native_shape(inner)),
@@ -77,6 +77,26 @@ pub fn assignable_certain(
     is_assignable(index, value, target)
         || (!treat_phpdoc_certain
             && is_assignable(index, &native_shape(value), &native_shape(target)))
+}
+
+/// Lower-bound `≥`: is value-bound `a` at least target-bound `b`? `None` target
+/// bound is -∞ (any `a` qualifies); `None` value bound is -∞ (qualifies only if
+/// `b` is also -∞).
+fn ge_bound(a: Option<i64>, b: Option<i64>) -> bool {
+    match (a, b) {
+        (_, None) => true,
+        (Some(a), Some(b)) => a >= b,
+        (None, Some(_)) => false,
+    }
+}
+
+/// Upper-bound `≤`: is value-bound `a` at most target-bound `b`? `None` target is +∞.
+fn le_bound(a: Option<i64>, b: Option<i64>) -> bool {
+    match (a, b) {
+        (_, None) => true,
+        (Some(a), Some(b)) => a <= b,
+        (None, Some(_)) => false,
+    }
 }
 
 /// Whether a value of type `value` is assignable to a slot of type `target`.
@@ -126,7 +146,15 @@ fn assignable_atom(index: &ReflectionIndex, value: &Type, target: &Type) -> bool
         (SelfType | StaticType | Parent, _) | (_, SelfType | StaticType | Parent) => true,
 
         // --- scalars (with PHP's int → float widening) ---
-        (Int | LiteralInt(_), Int | Float) => true,
+        (Int | LiteralInt(_) | IntRange { .. }, Int | Float) => true,
+        // An int-range fits a target range iff it's fully contained; a literal fits
+        // iff in bounds. (`min`/`max` `None` are -inf/+inf.)
+        (IntRange { min: a0, max: a1 }, IntRange { min: b0, max: b1 }) => {
+            ge_bound(*a0, *b0) && le_bound(*a1, *b1)
+        }
+        (LiteralInt(n), IntRange { min, max }) => {
+            min.map_or(true, |lo| *n >= lo) && max.map_or(true, |hi| *n <= hi)
+        }
         (Float, Float) => true,
         (Bool | True | False, Bool) => true,
         (True, True) | (False, False) => true,

@@ -396,6 +396,14 @@ impl<'a> TypeCtx<'a> {
                 }
                 None
             }
+            // `a < b` / `<=` / `>` / `>=` between int-valued operands, decided when
+            // the operand ranges don't overlap (e.g. `1 < int<2, max>` is always
+            // true) — drives loop-iteration proof.
+            ExprKind::Binary { op: op @ (BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq), lhs, rhs } => {
+                let a = int_bounds(&self.infer(lhs))?;
+                let b = int_bounds(&self.infer(rhs))?;
+                cmp_ranges(*op, a, b)
+            }
             ExprKind::Call { callee, args } => {
                 let ExprKind::Name(n) = &callee.kind else { return None };
                 if !n.text.trim_start_matches('\\').eq_ignore_ascii_case("is_null") {
@@ -943,9 +951,44 @@ fn is_string_ty(t: &Type) -> bool {
     matches!(t, Type::String | Type::LiteralString(_))
 }
 
+/// The `(min, max)` integer bounds of an int-valued type (`None` = unbounded),
+/// or `None` if the type isn't a plain int/range/literal-int.
+fn int_bounds(t: &Type) -> Option<(Option<i64>, Option<i64>)> {
+    match t {
+        Type::Int => Some((None, None)),
+        Type::LiteralInt(n) => Some((Some(*n), Some(*n))),
+        Type::IntRange { min, max } => Some((*min, *max)),
+        _ => None,
+    }
+}
+
+/// Statically decide `a OP b` between two integer ranges, when the ranges make it
+/// certain; `None` if they overlap. `a`/`b` are `(min, max)` with `None` = ±∞.
+fn cmp_ranges(op: BinOp, a: (Option<i64>, Option<i64>), b: (Option<i64>, Option<i64>)) -> Option<bool> {
+    let (a_lo, a_hi) = a;
+    let (b_lo, b_hi) = b;
+    // `a < b` is always true iff max(a) < min(b); always false iff min(a) >= max(b).
+    let always_lt = matches!((a_hi, b_lo), (Some(ah), Some(bl)) if ah < bl);
+    let always_ge = matches!((a_lo, b_hi), (Some(al), Some(bh)) if al >= bh);
+    // `a <= b` always true iff max(a) <= min(b); always false iff min(a) > max(b).
+    let always_le = matches!((a_hi, b_lo), (Some(ah), Some(bl)) if ah <= bl);
+    let always_gt = matches!((a_lo, b_hi), (Some(al), Some(bh)) if al > bh);
+    match op {
+        BinOp::Lt if always_lt => Some(true),
+        BinOp::Lt if always_ge => Some(false),
+        BinOp::GtEq if always_ge => Some(true),
+        BinOp::GtEq if always_lt => Some(false),
+        BinOp::LtEq if always_le => Some(true),
+        BinOp::LtEq if always_gt => Some(false),
+        BinOp::Gt if always_gt => Some(true),
+        BinOp::Gt if always_le => Some(false),
+        _ => None,
+    }
+}
+
 fn is_int(t: &Type) -> bool {
     match t {
-        Type::Int | Type::LiteralInt(_) => true,
+        Type::Int | Type::LiteralInt(_) | Type::IntRange { .. } => true,
         // A union of only int-like members (`0|1`, common from `$x = 0; … $x = 1;`)
         // is int-like — so arithmetic on it stays `int`, not `int|float`.
         Type::Union(parts) => parts.iter().all(is_int),

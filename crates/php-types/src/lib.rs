@@ -26,6 +26,10 @@ pub enum Type {
     /// The literal `false` type.
     False,
     Int,
+    /// A bounded integer `int<min, max>` (phpstan's integer-range type). `None`
+    /// bounds are open (`int<2, max>` = `IntRange { min: Some(2), max: None }`).
+    /// A fully-open range normalises to `Int` via [`Type::int_range`].
+    IntRange { min: Option<i64>, max: Option<i64> },
     Float,
     String,
     /// Bare `object`.
@@ -114,6 +118,16 @@ impl Type {
         }
     }
 
+    /// Smart constructor for a bounded int: a fully-open range is just `Int`, and
+    /// a degenerate `min == max` collapses to that literal int.
+    pub fn int_range(min: Option<i64>, max: Option<i64>) -> Type {
+        match (min, max) {
+            (None, None) => Type::Int,
+            (Some(a), Some(b)) if a == b => Type::LiteralInt(a),
+            _ => Type::IntRange { min, max },
+        }
+    }
+
     /// Build an intersection, flattening + deduping; a single member collapses.
     pub fn intersection(parts: Vec<Type>) -> Type {
         let mut flat = Vec::new();
@@ -184,6 +198,11 @@ impl fmt::Display for Type {
             Type::True => f.write_str("true"),
             Type::False => f.write_str("false"),
             Type::Int => f.write_str("int"),
+            Type::IntRange { min, max } => {
+                let lo = min.map(|n| n.to_string()).unwrap_or_else(|| "min".into());
+                let hi = max.map(|n| n.to_string()).unwrap_or_else(|| "max".into());
+                write!(f, "int<{lo}, {hi}>")
+            }
             Type::Float => f.write_str("float"),
             Type::String => f.write_str("string"),
             Type::Object => f.write_str("object"),

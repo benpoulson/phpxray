@@ -139,6 +139,10 @@ impl TypeCtx<'_> {
                 // `$x === null` true ⇒ $x is null; false ⇒ null stripped.
                 BinOp::Identical | BinOp::Eq => self.null_cmp(lhs, rhs, truthy, out),
                 BinOp::NotIdentical | BinOp::NotEq => self.null_cmp(lhs, rhs, !truthy, out),
+                // Integer-range narrowing: `$x < 2` false ⇒ `$x: int<2, max>`, etc.
+                BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
+                    self.int_cmp_facts(*op, lhs, rhs, truthy, out)
+                }
                 _ => {}
             },
             ExprKind::Instanceof { expr, class } => {
@@ -192,6 +196,38 @@ impl TypeCtx<'_> {
             }
             _ => {}
         }
+    }
+
+    /// Integer-range narrowing from a `<`/`<=`/`>`/`>=` comparison between a place
+    /// and an int literal. Produces `place: int<min, max>` for the branch where the
+    /// comparison has truth value `truthy` (intersected with the place's current
+    /// range). E.g. the false branch of `$n < 2` ⇒ `$n: int<2, max>`.
+    fn int_cmp_facts(&self, op: BinOp, lhs: &Expr, rhs: &Expr, truthy: bool, out: &mut Vec<Fact>) {
+        // Normalise to `place OP literal`. If the literal is on the left, flip the op.
+        let (place_expr, lit, op) = if let Some(n) = int_lit(rhs) {
+            (lhs, n, op)
+        } else if let Some(n) = int_lit(lhs) {
+            (rhs, n, flip_cmp(op))
+        } else {
+            return;
+        };
+        let Some(place) = self.place_key(place_expr) else { return };
+        // The effective op for this branch (negate when the condition is false).
+        let eff = if truthy { op } else { negate_cmp(op) };
+        // `place eff lit` ⇒ a half-bounded int range.
+        let (min, max) = match eff {
+            BinOp::Lt => (None, Some(lit - 1)),
+            BinOp::LtEq => (None, Some(lit)),
+            BinOp::Gt => (Some(lit + 1), None),
+            BinOp::GtEq => (Some(lit), None),
+            _ => return,
+        };
+        // Only narrow a value that's currently int-like (avoid clobbering unknowns).
+        let cur = self.infer(place_expr);
+        if !matches!(cur, Type::Int | Type::IntRange { .. } | Type::LiteralInt(_)) {
+            return;
+        }
+        out.push((place, Type::int_range(min, max)));
     }
 
     /// `$x <cmp> null|false` / `null|false <cmp> $x`. `eq` = whether the
@@ -474,11 +510,20 @@ impl TypeCtx<'_> {
                     self.rec_here(e, map);
                     self.apply_expr(e);
                 }
+                // A `for` whose condition is provably true after `init` runs at
+                // least once, so its body's assignments are definite (post-loop env
+                // = post-body, not merged with the pre-loop env). PHP uses the *last*
+                // condition expression; check it before `update` advances the loop var.
+                let definite = cond.last().is_some_and(|c| self.static_truth(c) == Some(true));
                 for e in cond.iter().chain(update) {
                     self.rec_here(e, map);
                     self.apply_expr(e);
                 }
-                self.record_maybe(body, map);
+                if definite {
+                    self.record_definite_loop(body, map);
+                } else {
+                    self.record_maybe(body, map);
+                }
             }
             StmtKind::Foreach { subject, key, value, body, .. } => {
                 self.record_foreach(subject, key.as_ref(), value, body, map);
@@ -582,6 +627,14 @@ impl TypeCtx<'_> {
         self.record_stmt(body, map);
         let after = std::mem::take(&mut self.vars);
         self.vars = merge(vec![base, after]);
+    }
+
+    /// A loop that *definitely* runs at least once: record the body and keep its
+    /// resulting environment (no merge with the pre-loop env), so an unconditional
+    /// body assignment is the variable's type after the loop.
+    fn record_definite_loop(&mut self, body: &Stmt, map: &mut RecMap) {
+        self.widen_loop_assignments(body);
+        self.record_stmt(body, map);
     }
 
     /// Before recording a loop body, generalize the *literal* type of any simple
@@ -778,6 +831,39 @@ fn confident_subclass(m: &Type, t: &Type, index: &php_reflect::ReflectionIndex) 
     index.class(mf).is_some() && index.class(tf).is_some() && index.is_subclass_of(mf, tf)
 }
 
+/// The integer value of a literal expression (`5`, `(5)`, `-5`), if any.
+fn int_lit(e: &Expr) -> Option<i64> {
+    match &e.kind {
+        ExprKind::Int(n) => Some(*n),
+        ExprKind::Paren(inner) => int_lit(inner),
+        ExprKind::Unary { op: UnOp::Minus, expr } => int_lit(expr).map(|n| n.wrapping_neg()),
+        ExprKind::Unary { op: UnOp::Plus, expr } => int_lit(expr),
+        _ => None,
+    }
+}
+
+/// Swap a comparison operator's operands (`a < b` ⇔ `b > a`).
+fn flip_cmp(op: BinOp) -> BinOp {
+    match op {
+        BinOp::Lt => BinOp::Gt,
+        BinOp::Gt => BinOp::Lt,
+        BinOp::LtEq => BinOp::GtEq,
+        BinOp::GtEq => BinOp::LtEq,
+        other => other,
+    }
+}
+
+/// Logical negation of a comparison operator (`!(a < b)` ⇔ `a >= b`).
+fn negate_cmp(op: BinOp) -> BinOp {
+    match op {
+        BinOp::Lt => BinOp::GtEq,
+        BinOp::GtEq => BinOp::Lt,
+        BinOp::Gt => BinOp::LtEq,
+        BinOp::LtEq => BinOp::Gt,
+        other => other,
+    }
+}
+
 /// Generalize a *literal* scalar type to its base, used to widen a loop-carried
 /// variable so it isn't mistaken for a compile-time constant. Non-literal types
 /// pass through unchanged.
@@ -963,6 +1049,21 @@ mod tests {
         let src = "function f($x) { $y = 0; if ($x instanceof Foo) { $y = $x; } }";
         // then: $y = Foo; fall-through: $y = int(0). Merged.
         assert_eq!(var_after(src, "y"), "Foo|0");
+    }
+
+    #[test]
+    fn lower_bound_guard_narrows_to_int_range() {
+        // After `if ($n < 2) return;`, `$n` is `int<2, max>`.
+        let src = "function f(int $n) { if ($n < 2) { return; } $y = $n; }";
+        assert_eq!(var_after(src, "y"), "int<2, max>");
+    }
+
+    #[test]
+    fn definite_for_loop_makes_body_assignment_definite() {
+        // `$n >= 2` ⇒ `for ($i=1; $i<$n; …)` runs ≥1 ⇒ `$x` is the body's value, not
+        // merged with the pre-loop `0`.
+        let src = "function f(int $n) { if ($n < 2) { return; } $x = 0; for ($i = 1; $i < $n; $i++) { $x = 'str'; } $y = $x; }";
+        assert_eq!(var_after(src, "y"), "'str'");
     }
 
     #[test]
