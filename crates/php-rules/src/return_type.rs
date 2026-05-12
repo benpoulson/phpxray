@@ -47,8 +47,9 @@ pub fn return_type_errors(
     types: &TypeMap,
     native_types: &TypeMap,
     treat_phpdoc_certain: bool,
+    check_nullables: bool,
 ) -> Vec<Diagnostic> {
-    let cx = Cx { index, interner, types, native_types, treat_phpdoc_certain };
+    let cx = Cx { index, interner, types, native_types, treat_phpdoc_certain, check_nullables };
     let mut out = Vec::new();
     for_each_region(&program.stmts, interner, |scope, region| {
         cx.collect(scope, region, &mut out);
@@ -65,6 +66,10 @@ struct Cx<'a> {
     types: &'a TypeMap,
     native_types: &'a TypeMap,
     treat_phpdoc_certain: bool,
+    /// phpstan's `checkNullables` (level 8+). When `false`, `null` is stripped from
+    /// the returned value's type before checking — a nullable value satisfies a
+    /// non-null declared return below level 8.
+    check_nullables: bool,
 }
 
 impl Cx<'_> {
@@ -185,12 +190,16 @@ impl Cx<'_> {
     fn check_return_expr(&self, e: &Expr, ret: &Ret, out: &mut Vec<Diagnostic>) {
         // Unmapped (e.g. inside a closure the map leaves opaque) → `mixed` → lenient.
         let actual = self.types.get(&key(e)).cloned().unwrap_or(Type::Mixed);
-        if is_assignable(self.index, &actual, &ret.declared) {
+        // checkNullables gate (level < 8): strip `null` from the returned value.
+        let checked = if self.check_nullables { actual.clone() } else { php_infer::strip_null_lenient(&actual) };
+        if is_assignable(self.index, &checked, &ret.declared) {
             return;
         }
         // treatPhpDocTypesAsCertain=false: suppress if the *native* types agree.
         if !self.treat_phpdoc_certain {
             let native = self.native_types.get(&key(e)).cloned().unwrap_or(Type::Mixed);
+            let native =
+                if self.check_nullables { native } else { php_infer::strip_null_lenient(&native) };
             if is_assignable(self.index, &native, &ret.native_declared) {
                 return;
             }
@@ -224,7 +233,10 @@ mod tests {
         index.add_file(&r.program, &r.interner);
         let types = php_infer::type_map(&index, &r.program, &r.interner);
         let native = php_infer::native_type_map(&index, &r.program, &r.interner);
-        return_type_errors(&index, &r.program, &r.interner, &types, &native, true).into_iter().map(|d| d.message).collect()
+        return_type_errors(&index, &r.program, &r.interner, &types, &native, true, true)
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
     }
 
     #[test]

@@ -142,6 +142,8 @@ pub fn analyze_parsed(
             native_types: &native_types,
             php_version,
             treat_phpdoc_types_as_certain,
+            // phpstan's `checkNullables` turns on at level 8.
+            check_nullables: level >= 8,
         };
         let line_index = LineIndex::new(&f.source);
         for d in analyze_file(&fa, level) {

@@ -87,6 +87,11 @@ pub struct FileAnalysis<'a> {
     /// always-true / impossible-type narrowing rules don't fire on redundancies
     /// only provable via PHPDoc-derived types.
     pub treat_phpdoc_types_as_certain: bool,
+    /// phpstan's `checkNullables` strictness gate (level 8+). When `false` (levels
+    /// 0–7), the type-compatibility rules strip `null` from the *value* type before
+    /// checking it — so passing a nullable value where a non-null type is expected
+    /// is not reported until level 8 (matching phpstan exactly).
+    pub check_nullables: bool,
 }
 
 impl FileAnalysis<'_> {
@@ -109,13 +114,29 @@ impl FileAnalysis<'_> {
     /// the flag is off, a merged mismatch is suppressed if the **native** types are
     /// compatible — i.e. the discrepancy was only at the PHPDoc-refined level.
     pub fn accepts(&self, e: &Expr, target: &Type, native_target: &Type) -> bool {
-        if php_infer::is_assignable(self.reflection, &self.type_of(e), target) {
+        if php_infer::is_assignable(self.reflection, &self.lenient_src(self.type_of(e)), target) {
             return true;
         }
         if self.treat_phpdoc_types_as_certain {
             return false;
         }
-        php_infer::is_assignable(self.reflection, &self.native_type_of(e), native_target)
+        php_infer::is_assignable(
+            self.reflection,
+            &self.lenient_src(self.native_type_of(e)),
+            native_target,
+        )
+    }
+
+    /// Apply the `checkNullables` strictness gate to a *value* type before a
+    /// type-compatibility check: below level 8 (`check_nullables == false`), `null`
+    /// is stripped, so a nullable value satisfies a non-null target (phpstan's
+    /// behaviour). At level 8+ the type is checked as-is.
+    pub fn lenient_src(&self, t: Type) -> Type {
+        if self.check_nullables {
+            t
+        } else {
+            php_infer::strip_null_lenient(&t)
+        }
     }
 
     /// Whether `fqn` and *every* class it transitively extends/implements/uses/
@@ -224,6 +245,7 @@ mod tests {
             native_types: &native_types,
             php_version: PhpVersion::default(),
             treat_phpdoc_types_as_certain: true,
+            check_nullables: true,
         };
 
         // Level 0: only the unknown-symbol rule fires.

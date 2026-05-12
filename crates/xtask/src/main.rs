@@ -582,6 +582,17 @@ fn cmd_infer(dir: Option<PathBuf>) -> ExitCode {
 /// the total diagnostics and a sample, and asserts 0 panics. Over the Zend
 /// corpus (intentionally weird code) this is mostly a false-positive gauge.
 fn cmd_check(dir: Option<PathBuf>) -> ExitCode {
+    // Left-associative chains in the corpus produce very deep ASTs; the recursive
+    // visitors (infer/flow/walk) need a large stack (same as `astdiff`).
+    std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(move || cmd_check_run(dir))
+        .expect("spawn check thread")
+        .join()
+        .expect("check thread panicked")
+}
+
+fn cmd_check_run(dir: Option<PathBuf>) -> ExitCode {
     use php_index::ProjectIndex;
     use php_reflect::ReflectionIndex;
     use php_resolve::{index_file, resolve_references};
@@ -634,6 +645,7 @@ fn cmd_check(dir: Option<PathBuf>) -> ExitCode {
                 native_types: &native_types,
                 php_version: php_rules::PhpVersion::default(),
                 treat_phpdoc_types_as_certain: true,
+                check_nullables: true, // xtask check runs at level 10
             };
             analyze_file(&fa, 10)
                 .into_iter()

@@ -11,6 +11,31 @@
 use php_reflect::ReflectionIndex;
 use php_types::{ShapeField, Type};
 
+/// Remove `null` from a type, returning the non-nullable remainder. A type that
+/// is *purely* `null` is returned unchanged (there's nothing left to strip to).
+///
+/// This implements phpstan's `checkNullables` strictness gate: below level 8,
+/// phpstan strips `null` from the *value* type before a type-compatibility check
+/// (argument/return/property), so passing a nullable value where a non-null type
+/// is expected is not reported until level 8+. Passing a *literal* `null` is still
+/// reported at every level (hence the pure-`null` carve-out).
+pub fn strip_null_lenient(t: &Type) -> Type {
+    match t {
+        Type::Null => Type::Null,
+        Type::Nullable(inner) => (**inner).clone(),
+        Type::Union(parts) => {
+            let kept: Vec<Type> =
+                parts.iter().filter(|p| !matches!(p, Type::Null)).cloned().collect();
+            if kept.is_empty() {
+                Type::Null
+            } else {
+                Type::union(kept)
+            }
+        }
+        other => other.clone(),
+    }
+}
+
 /// The key type of a shape field: an integer-valued literal key is `int`,
 /// otherwise `string` (a positional field, no key, is treated as `int`).
 fn shape_key_type(f: &ShapeField) -> Type {
@@ -118,6 +143,21 @@ pub fn is_assignable(index: &ReflectionIndex, value: &Type, target: &Type) -> bo
         return true;
     }
 
+    // PHP's `/` and `**` yield a *benevolent* `int|float` (phpstan's
+    // `BenevolentUnionType`). With `checkBenevolentUnionTypes` off — phpstan's
+    // default at *every* level — a benevolent union satisfies a target if *any*
+    // member does, so `$even / 2` (typed `int|float`) is accepted where `int` is
+    // expected. We can't distinguish a benevolent union from a declared
+    // `int|float`, so a declared one is likewise lenient toward a numeric target;
+    // that's a safe under-report (phpstan would flag the declared case only at
+    // level 8+), never a false positive.
+    if let Union(parts) = value {
+        let numeric = parts.iter().all(|p| matches!(p, Int | Float | LiteralInt(_) | IntRange { .. }))
+            && parts.iter().any(|p| matches!(p, Float));
+        if numeric && matches!(target, Int | Float) {
+            return true;
+        }
+    }
     // A union value is assignable only if *every* member is.
     if let Union(parts) = value {
         return parts.iter().all(|p| is_assignable(index, p, target));

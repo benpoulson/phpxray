@@ -55,7 +55,15 @@ const SUPERGLOBALS: &[&str] = &[
 ];
 
 fn run_return_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    return_type_errors(fa.reflection, fa.program, fa.interner, fa.types, fa.native_types, fa.treat_phpdoc_types_as_certain)
+    return_type_errors(
+        fa.reflection,
+        fa.program,
+        fa.interner,
+        fa.types,
+        fa.native_types,
+        fa.treat_phpdoc_types_as_certain,
+        fa.check_nullables,
+    )
 }
 
 // ---------------------------------------------------------------------------

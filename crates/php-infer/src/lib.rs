@@ -18,7 +18,9 @@ mod definedness;
 mod flow;
 mod type_map;
 
-pub use assign::{assignable_certain, is_assignable, is_castable_to_string, native_shape};
+pub use assign::{
+    assignable_certain, is_assignable, is_castable_to_string, native_shape, strip_null_lenient,
+};
 pub use const_eval::{eval_const, ConstVal};
 pub use definedness::{undefined_variables, UndefVar};
 pub use type_map::{native_type_map, type_map, TypeMap};
