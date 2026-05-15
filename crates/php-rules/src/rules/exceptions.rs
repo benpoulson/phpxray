@@ -302,10 +302,69 @@ fn run_overwritten_finally(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// CatchWithUnthrownExceptionRule — `catch.alreadyCaught` (the structural half)
+// ---------------------------------------------------------------------------
+
+/// phpstan's `CatchWithUnthrownExceptionRule` reports `catch.alreadyCaught` when a
+/// `catch` is dead because every type it names is already covered by an earlier
+/// `catch` in the same `try` (the caught type subtracts down to `never`). We model
+/// exactly that structural case — a later catch type that is the *same as*, or a
+/// subclass/implementor of, a type caught above. The other half (`catch.neverThrown`)
+/// needs throw-set analysis of the try body and stays deferred.
+///
+/// FP-safe: [`ReflectionIndex::is_subclass_of`] is reflexive on the resolved FQN
+/// (so identical catches are caught regardless of indexing) but only reports a real
+/// subclass link when the class is indexed — an unindexed/built-in hierarchy yields
+/// `false`, i.e. we under-report rather than guess.
+fn run_dead_catch(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            walk::for_each_stmt_in_stmt(st, &mut |s| {
+                let StmtKind::Try { catches, .. } = &s.kind else { return };
+                check_dead_catches(fa, scope, catches, &mut out);
+            });
+        }
+    });
+    out
+}
+
+fn check_dead_catches(fa: &FileAnalysis, scope: &Scope, catches: &[Catch], out: &mut Vec<Diagnostic>) {
+    // FQNs (leading `\` stripped) caught by earlier `catch` blocks in this `try`.
+    let mut seen: Vec<String> = Vec::new();
+    for c in catches {
+        let resolved: Vec<String> = c
+            .types
+            .iter()
+            .filter_map(|t| match scope.resolve_class(t) {
+                Resolution::Fqn(fqn) => Some(fqn.trim_start_matches('\\').to_string()),
+                _ => None,
+            })
+            .collect();
+        // Only flag when *every* written type resolved AND each is already caught
+        // above (so the whole caught type is dead). A partially-covered union
+        // (`A|B` with only `A` caught) is live → no report.
+        let all_covered = resolved.len() == c.types.len()
+            && !resolved.is_empty()
+            && resolved.iter().all(|ty| seen.iter().any(|prev| fa.reflection.is_subclass_of(ty, prev)));
+        if all_covered {
+            let display = resolved.join("|");
+            let span = c.types.first().unwrap().span.to(c.types.last().unwrap().span);
+            out.push(
+                Diagnostic::error(span, format!("Dead catch - {display} is already caught above."))
+                    .with_code("catch.alreadyCaught"),
+            );
+        }
+        seen.extend(resolved);
+    }
+}
+
 pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "throw.notThrowable", level: 3, run: run_throw_expr_type },
     RuleEntry { name: "catch.notThrowable", level: 0, run: run_caught_exception },
     RuleEntry { name: "finally.exitPoint", level: 4, run: run_overwritten_finally },
+    RuleEntry { name: "catch.alreadyCaught", level: 4, run: run_dead_catch },
 ];
 
 #[cfg(test)]
@@ -420,5 +479,72 @@ mod tests {
     fn no_finally_is_ok() {
         let src = r#"<?php function f() { try { return 1; } catch (Exception $e) {} }"#;
         assert!(codes(src, run_overwritten_finally).is_empty());
+    }
+
+    // --- CatchWithUnthrownExceptionRule (catch.alreadyCaught) ---
+
+    #[test]
+    fn duplicate_catch_class_is_dead() {
+        let src = r#"<?php
+            class MyErr extends \Exception {}
+            function f() { try {} catch (MyErr $e) {} catch (MyErr $e) {} }"#;
+        assert_eq!(codes(src, run_dead_catch), ["catch.alreadyCaught"]);
+    }
+
+    #[test]
+    fn subclass_caught_after_parent_is_dead() {
+        // Catching the parent first makes the child catch dead.
+        let src = r#"<?php
+            class Base extends \Exception {}
+            class Child extends Base {}
+            function f() { try {} catch (Base $e) {} catch (Child $e) {} }"#;
+        assert_eq!(codes(src, run_dead_catch), ["catch.alreadyCaught"]);
+    }
+
+    #[test]
+    fn parent_after_child_is_live() {
+        // Catching the child first does NOT make the parent catch dead.
+        let src = r#"<?php
+            class Base extends \Exception {}
+            class Child extends Base {}
+            function f() { try {} catch (Child $e) {} catch (Base $e) {} }"#;
+        assert!(codes(src, run_dead_catch).is_empty());
+    }
+
+    #[test]
+    fn distinct_catches_are_live() {
+        let src = r#"<?php
+            class A extends \Exception {}
+            class B extends \Exception {}
+            function f() { try {} catch (A $e) {} catch (B $e) {} }"#;
+        assert!(codes(src, run_dead_catch).is_empty());
+    }
+
+    #[test]
+    fn partially_covered_union_is_live() {
+        // `A|C` where only `A` is caught above is still live (C may be thrown).
+        let src = r#"<?php
+            class A extends \Exception {}
+            class C extends \Exception {}
+            function f() { try {} catch (A $e) {} catch (A | C $e) {} }"#;
+        assert!(codes(src, run_dead_catch).is_empty());
+    }
+
+    #[test]
+    fn fully_covered_union_is_dead() {
+        let src = r#"<?php
+            class A extends \Exception {}
+            class C extends \Exception {}
+            function f() { try {} catch (A $e) {} catch (C $e) {} catch (A | C $e) {} }"#;
+        assert_eq!(codes(src, run_dead_catch), ["catch.alreadyCaught"]);
+    }
+
+    #[test]
+    fn unindexed_hierarchy_is_not_guessed() {
+        // Built-in SPL hierarchy isn't indexed → no subclass link proven → no
+        // report (under-report rather than risk a false positive).
+        let src = r#"<?php
+            function f() { try {} catch (\Exception $e) {} catch (\RuntimeException $e) {} }"#;
+        assert!(codes(src, run_dead_catch).is_empty());
     }
 }

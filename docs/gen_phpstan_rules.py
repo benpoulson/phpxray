@@ -156,6 +156,12 @@ DONE = {
     # Exceptions / Traits
     "ThrowExprTypeRule", "CaughtExceptionExistenceRule", "OverwrittenExitPointByFinallyRule",
     "ConflictingTraitConstantsRule",
+    # catch.alreadyCaught — structural dead-catch (earlier catch covers this one);
+    # the rule's other half (catch.neverThrown) needs throw-set analysis (deferred).
+    "CatchWithUnthrownExceptionRule",
+    # Functions/Methods ReturnTypeRule (`return.type`) — return statements checked
+    # against the declared return via return_type.rs (functions + methods).
+    "ReturnTypeRule",
     # Comparison / Generators
     "MatchExpressionRule", "UsageOfVoidMatchExpressionRule", "YieldInGeneratorRule", "YieldFromTypeRule",
     # TooWideTypehints
@@ -214,6 +220,9 @@ DEFERRED = {
     "ArrayFilterRule": "needs falsy-value / non-emptiness type tracking",
     # --- Capability: literal/value types ---
     "RandomIntParametersRule": "needs literal-int range types (min > max comparison)",
+    # --- Capability: type inference inside closures/arrow-fns ---
+    "ClosureReturnTypeRule": "the type map is opaque inside closure bodies (inner exprs -> mixed), so a return-type check there is a no-op; needs closure-body inference",
+    "ArrowFunctionReturnTypeRule": "type map is opaque inside arrow-fn bodies (inner exprs -> mixed); needs closure-body inference",
 }
 
 level_params = {
