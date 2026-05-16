@@ -66,6 +66,38 @@ fn run_return_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
     )
 }
 
+/// First-class callables (`f(...)`, `$o->m(...)`, `C::m(...)`) are only valid on
+/// PHP 8.1+. Mirrors the version gate of phpstan's `FunctionCallableRule`,
+/// `MethodCallableRule`, and `StaticMethodCallableRule` (`callable.notSupported`).
+/// Gated on `fa.php_version` (default 8.4 → silent). The existence half of those
+/// rules is handled by the shared `function.notFound`/`method.notFound`/
+/// `staticMethod.notFound` rules, which walk these call nodes regardless of the
+/// first-class-callable placeholder.
+fn run_first_class_callable_version(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    if fa.php_version.at_least(80100) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    crate::walk::for_each_expr(fa.program, &mut |e| {
+        let args = match &e.kind {
+            ExprKind::Call { args, .. }
+            | ExprKind::MethodCall { args, .. }
+            | ExprKind::StaticCall { args, .. } => args,
+            _ => return,
+        };
+        if args.iter().any(|a| a.placeholder) {
+            out.push(
+                Diagnostic::error(
+                    e.span,
+                    "First-class callables are supported only on PHP 8.1 and later.".to_string(),
+                )
+                .with_code("callable.notSupported"),
+            );
+        }
+    });
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Parameter-name rules (operate on every FunctionLike's params)
 // ---------------------------------------------------------------------------
@@ -2121,6 +2153,7 @@ pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "function.notFound", level: 0, run: run_call_to_non_existent_function },
     RuleEntry { name: "function.nameCase", level: 0, run: run_function_name_case },
     RuleEntry { name: "function.callable", level: 0, run: run_function_callable },
+    RuleEntry { name: "callable.notSupported", level: 0, run: run_first_class_callable_version },
     RuleEntry { name: "argument.printf", level: 0, run: run_printf_parameters },
     RuleEntry { name: "argument.printfArray", level: 0, run: run_printf_array_parameters },
     RuleEntry { name: "argument.define", level: 0, run: run_define_parameters },
@@ -2155,7 +2188,35 @@ pub(crate) static RULES: &[RuleEntry] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::codes;
+    use crate::testutil::{codes, codes_version};
+    use crate::PhpVersion;
+
+    // --- first-class-callable version gate (callable.notSupported) --------
+
+    #[test]
+    fn fcc_flagged_below_php81() {
+        let v74 = PhpVersion::parse("7.4").unwrap();
+        assert_eq!(
+            codes_version("<?php strlen(...);", run_first_class_callable_version, v74),
+            ["callable.notSupported"]
+        );
+        assert_eq!(
+            codes_version("<?php $o->m(...);", run_first_class_callable_version, v74),
+            ["callable.notSupported"]
+        );
+        assert_eq!(
+            codes_version("<?php C::m(...);", run_first_class_callable_version, v74),
+            ["callable.notSupported"]
+        );
+    }
+
+    #[test]
+    fn fcc_ok_on_php81_plus() {
+        assert!(codes("<?php strlen(...);", run_first_class_callable_version).is_empty()); // default 8.4
+        // A normal call (no placeholder) is never flagged, even below 8.1.
+        let v74 = PhpVersion::parse("7.4").unwrap();
+        assert!(codes_version("<?php strlen($x);", run_first_class_callable_version, v74).is_empty());
+    }
 
     // --- closure/arrow default parameter type ----------------------------
 

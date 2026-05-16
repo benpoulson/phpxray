@@ -360,16 +360,88 @@ fn check_dead_catches(fa: &FileAnalysis, scope: &Scope, catches: &[Catch], out: 
     }
 }
 
+// ---------------------------------------------------------------------------
+// NoncapturingCatchRule / ThrowExpressionRule — PHP-version gated (< 8.0)
+// ---------------------------------------------------------------------------
+
+/// `catch (X)` without a captured variable is only valid on PHP 8.0+. Gated on
+/// `fa.php_version` (default 8.4 → silent); fires when a project pins PHP < 8.0.
+fn run_noncapturing_catch(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    if fa.php_version.at_least(80000) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    walk::for_each_stmt(fa.program, &mut |s| {
+        let StmtKind::Try { catches, .. } = &s.kind else { return };
+        for c in catches {
+            if c.var.is_none() {
+                if let Some(t) = c.types.first() {
+                    out.push(
+                        Diagnostic::error(
+                            t.span,
+                            "Non-capturing catch is supported only on PHP 8.0 and later."
+                                .to_string(),
+                        )
+                        .with_code("catch.nonCapturingNotSupported"),
+                    );
+                }
+            }
+        }
+    });
+    out
+}
+
+/// `throw` used as an *expression* (anywhere other than a standalone `throw …;`
+/// statement) is only valid on PHP 8.0+. A standalone throw — the direct
+/// expression of an expression statement — is fine at every version (mirrors
+/// phpstan's `StandaloneThrowExprVisitor`). Gated on `fa.php_version`.
+fn run_throw_expression(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    if fa.php_version.at_least(80000) {
+        return Vec::new();
+    }
+    // Spans of throws that sit directly as an expression statement (`throw X;`).
+    let mut standalone: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+    walk::for_each_stmt(fa.program, &mut |s| {
+        if let StmtKind::Expr(e) = &s.kind {
+            if matches!(e.kind, ExprKind::Throw(_)) {
+                let r = e.span.range();
+                standalone.insert((r.start as u32, r.end as u32));
+            }
+        }
+    });
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e| {
+        if !matches!(e.kind, ExprKind::Throw(_)) {
+            return;
+        }
+        let r = e.span.range();
+        if standalone.contains(&(r.start as u32, r.end as u32)) {
+            return;
+        }
+        out.push(
+            Diagnostic::error(
+                e.span,
+                "Throw expression is supported only on PHP 8.0 and later.".to_string(),
+            )
+            .with_code("throw.notSupported"),
+        );
+    });
+    out
+}
+
 pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "throw.notThrowable", level: 3, run: run_throw_expr_type },
     RuleEntry { name: "catch.notThrowable", level: 0, run: run_caught_exception },
     RuleEntry { name: "finally.exitPoint", level: 4, run: run_overwritten_finally },
     RuleEntry { name: "catch.alreadyCaught", level: 4, run: run_dead_catch },
+    RuleEntry { name: "catch.nonCapturingNotSupported", level: 0, run: run_noncapturing_catch },
+    RuleEntry { name: "throw.notSupported", level: 0, run: run_throw_expression },
 ];
 
 #[cfg(test)]
 mod tests {
-    use crate::testutil::codes;
+    use crate::testutil::{codes, codes_version};
+    use crate::PhpVersion;
 
     use super::*;
 
@@ -546,5 +618,48 @@ mod tests {
         let src = r#"<?php
             function f() { try {} catch (\Exception $e) {} catch (\RuntimeException $e) {} }"#;
         assert!(codes(src, run_dead_catch).is_empty());
+    }
+
+    // --- NoncapturingCatchRule (version-gated) ---
+
+    #[test]
+    fn noncapturing_catch_flagged_below_php80() {
+        let src = r#"<?php function f() { try {} catch (\Exception) {} }"#;
+        assert_eq!(
+            codes_version(src, run_noncapturing_catch, PhpVersion::parse("7.4").unwrap()),
+            ["catch.nonCapturingNotSupported"]
+        );
+    }
+
+    #[test]
+    fn noncapturing_catch_ok_on_php80_plus() {
+        let src = r#"<?php function f() { try {} catch (\Exception) {} }"#;
+        assert!(codes(src, run_noncapturing_catch).is_empty()); // default 8.4
+        // A capturing catch is fine even below 8.0.
+        let cap = r#"<?php function f() { try {} catch (\Exception $e) {} }"#;
+        assert!(codes_version(cap, run_noncapturing_catch, PhpVersion::parse("7.4").unwrap()).is_empty());
+    }
+
+    // --- ThrowExpressionRule (version-gated) ---
+
+    #[test]
+    fn throw_expression_flagged_below_php80() {
+        let src = r#"<?php function f($x) { $y = $x ?? throw new \Exception(); }"#;
+        assert_eq!(
+            codes_version(src, run_throw_expression, PhpVersion::parse("7.4").unwrap()),
+            ["throw.notSupported"]
+        );
+    }
+
+    #[test]
+    fn standalone_throw_is_ok_below_php80() {
+        let src = r#"<?php function f() { throw new \Exception(); }"#;
+        assert!(codes_version(src, run_throw_expression, PhpVersion::parse("7.4").unwrap()).is_empty());
+    }
+
+    #[test]
+    fn throw_expression_ok_on_php80_plus() {
+        let src = r#"<?php function f($x) { $y = $x ?? throw new \Exception(); }"#;
+        assert!(codes(src, run_throw_expression).is_empty()); // default 8.4
     }
 }

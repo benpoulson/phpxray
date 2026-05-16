@@ -840,7 +840,7 @@ fn run_require_sealed_placement(fa: &FileAnalysis) -> Vec<Diagnostic> {
             );
         }
 
-        // `@sealed`: not valid on an enum.
+        // `@sealed`: not valid on an enum (`SealedDefinitionClassRule`) …
         if has_tag(doc, "sealed") && c.kind == ClassKind::Enum {
             out.push(
                 Diagnostic::error(
@@ -848,6 +848,16 @@ fn run_require_sealed_placement(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     "PHPDoc tag @phpstan-sealed is not supported above an enum.".to_string(),
                 )
                 .with_code("sealed.onEnum"),
+            );
+        }
+        // … nor on a trait (`SealedDefinitionTraitRule`).
+        if has_tag(doc, "sealed") && c.kind == ClassKind::Trait {
+            out.push(
+                Diagnostic::error(
+                    s.span,
+                    "PHPDoc tag @phpstan-sealed is only valid on class or interface.".to_string(),
+                )
+                .with_code("sealed.onTrait"),
             );
         }
     });

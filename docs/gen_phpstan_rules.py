@@ -159,6 +159,18 @@ DONE = {
     # catch.alreadyCaught — structural dead-catch (earlier catch covers this one);
     # the rule's other half (catch.neverThrown) needs throw-set analysis (deferred).
     "CatchWithUnthrownExceptionRule",
+    # Version-gated (fire only when the project pins PHP < the feature version);
+    # silent at the default 8.4 target. NoncapturingCatch/ThrowExpression < 8.0.
+    "NoncapturingCatchRule", "ThrowExpressionRule",
+    # Names: UsedNamesRule — in-file duplicate class-like declarations + use aliases.
+    "UsedNamesRule",
+    # Methods: first-class-callable version gate (callable.notSupported, < 8.1); the
+    # existence half is the shared method.notFound/staticMethod.notFound rules.
+    "MethodCallableRule", "StaticMethodCallableRule",
+    # PhpDoc: @phpstan-sealed on a trait (sealed.onTrait) — placement check.
+    "SealedDefinitionTraitRule",
+    # Properties: @readonly (PHPDoc) property may not have a default value.
+    "ReadOnlyByPhpDocPropertyRule",
     # Functions/Methods ReturnTypeRule (`return.type`) — return statements checked
     # against the declared return via return_type.rs (functions + methods).
     "ReturnTypeRule",
@@ -204,8 +216,6 @@ DEFERRED = {
     # ones now done below, or have a phpstan copy-paste-bug identifier).
     "ConstantAttributesRule": _VGATE,
     "ReadOnlyClassRule": "version gate; phpstan's own identifier is a copy-paste bug (classConstant.nativeTypeNotSupported)",
-    "NoncapturingCatchRule": _VGATE,
-    "ThrowExpressionRule": _VGATE,
     "ArrayUnpackingRule": _VGATE + " (string-keyed unpacking allowed since 8.1)",
     # This batch's deferrals (not capability gaps unless noted):
     "RegularExpressionQuotingRule": "needs phpstan's delimiter-from-Concat helper to know the pattern delimiter; FP-risky without it",

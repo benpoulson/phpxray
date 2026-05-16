@@ -144,6 +144,48 @@ fn run_readonly_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
+// --- ReadOnlyByPhpDocPropertyRule (level 0) --------------------------------
+
+/// Whether a property docblock carries a `@readonly` tag (or its
+/// `@phpstan-readonly`/`@psalm-readonly` variants).
+fn has_readonly_doc(doc_raw: &str, base: &str) -> bool {
+    php_phpdoc::parse_block(doc_raw).tags.iter().any(|t| {
+        let n = t
+            .name
+            .strip_prefix("phpstan-")
+            .or_else(|| t.name.strip_prefix("psalm-"))
+            .unwrap_or(t.name.as_str());
+        n == base
+    })
+}
+
+/// phpstan `ReadOnlyByPhpDocPropertyRule` (`property.readOnlyByPhpDocDefaultValue`):
+/// a `@readonly` (PHPDoc, not native `readonly`) property may not have a default
+/// value. We require the property-level `@readonly` tag, no native `readonly`
+/// modifier (that case is `property.readOnlyDefaultValue`), and no
+/// `@psalm-allow-private-mutation` opt-out (which lets the property be mutated).
+fn run_readonly_phpdoc_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_property(fa.program, &mut |_class, pd| {
+        if pd.modifiers.is_readonly {
+            return; // native readonly — handled by run_readonly_property
+        }
+        let Some(doc) = &pd.doc else { return };
+        if !has_readonly_doc(doc, "readonly") || has_readonly_doc(doc, "allow-private-mutation") {
+            return;
+        }
+        for elem in &pd.props {
+            if let Some(d) = &elem.default {
+                out.push(
+                    Diagnostic::error(d.span, "@readonly property cannot have a default value.")
+                        .with_code("property.readOnlyByPhpDocDefaultValue"),
+                );
+            }
+        }
+    });
+    out
+}
+
 // --- PropertyInClassRule (level 0) -----------------------------------------
 
 /// phpstan `PropertyInClassRule` (the AST-decidable subset): modifier conflicts
@@ -1469,6 +1511,11 @@ fn run_types_assigned_to_properties(fa: &FileAnalysis) -> Vec<Diagnostic> {
 
 pub(crate) static RULES: &[RuleEntry] = &[
     RuleEntry { name: "property.readOnly", level: 0, run: run_readonly_property },
+    RuleEntry {
+        name: "property.readOnlyByPhpDocDefaultValue",
+        level: 0,
+        run: run_readonly_phpdoc_property,
+    },
     RuleEntry { name: "property.inClass", level: 0, run: run_property_in_class },
     RuleEntry { name: "property.inInterface", level: 0, run: run_properties_in_interface },
     RuleEntry { name: "property.hookAttributes", level: 0, run: run_property_hook_attributes },
@@ -1495,6 +1542,57 @@ pub(crate) static RULES: &[RuleEntry] = &[
 mod tests {
     use super::*;
     use crate::testutil::codes;
+
+    // --- ReadOnlyByPhpDocPropertyRule -----------------------------------
+
+    #[test]
+    fn readonly_phpdoc_property_with_default_flagged() {
+        let src = r#"<?php
+            class C {
+                /** @readonly */
+                public int $x = 5;
+            }"#;
+        assert_eq!(codes(src, run_readonly_phpdoc_property), ["property.readOnlyByPhpDocDefaultValue"]);
+    }
+
+    #[test]
+    fn readonly_phpdoc_property_without_default_ok() {
+        let src = r#"<?php
+            class C {
+                /** @readonly */
+                public int $x;
+            }"#;
+        assert!(codes(src, run_readonly_phpdoc_property).is_empty());
+    }
+
+    #[test]
+    fn native_readonly_with_default_not_this_rule() {
+        // Native `readonly` + default is property.readOnlyDefaultValue, not this rule.
+        let src = r#"<?php
+            class C {
+                public readonly int $x;
+            }"#;
+        assert!(codes(src, run_readonly_phpdoc_property).is_empty());
+    }
+
+    #[test]
+    fn plain_property_with_default_ok() {
+        let src = r#"<?php class C { public int $x = 5; }"#;
+        assert!(codes(src, run_readonly_phpdoc_property).is_empty());
+    }
+
+    #[test]
+    fn allow_private_mutation_opt_out() {
+        let src = r#"<?php
+            class C {
+                /**
+                 * @readonly
+                 * @psalm-allow-private-mutation
+                 */
+                public int $x = 5;
+            }"#;
+        assert!(codes(src, run_readonly_phpdoc_property).is_empty());
+    }
 
     // --- TypesAssignedToPropertiesRule ----------------------------------
 
