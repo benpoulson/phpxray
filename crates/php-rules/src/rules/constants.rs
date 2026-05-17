@@ -199,6 +199,46 @@ fn run_native_typed_constant_version(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
+/// `MissingClassConstantTypehintRule` (`missingType.iterableValue`): a class
+/// constant with a *native* type that is a bare `array`/`iterable` (no value
+/// type), e.g. `const array FOO = […]`. Conservative — only native-typed constants
+/// with no `@var` (which could supply a value type) in a fully-known class. An
+/// untyped constant infers its value type from the literal, so it's never bare.
+fn run_missing_const_iterable_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_class(fa.program, fa.interner, |scope, c| {
+        let Some(nm) = c.name else { return };
+        let fqn = scope.qualify(fa.interner.resolve(nm));
+        if !fa.class_fully_known(&fqn) {
+            return;
+        }
+        let short = fqn.trim_start_matches('\\').to_string();
+        for m in &c.members {
+            let Member::ClassConst(cd) = m else { continue };
+            let Some(ty) = &cd.ty else { continue };
+            if cd.doc.as_deref().is_some_and(|d| d.contains("@var")) {
+                continue;
+            }
+            let resolved = php_reflect::resolve_ast_type(scope, ty);
+            let Some(word) = crate::rules::functions::bare_iterable_word(&resolved) else { continue };
+            for ce in &cd.consts {
+                let cname = fa.interner.resolve(ce.name);
+                out.push(
+                    Diagnostic::error(
+                        ce.value.span,
+                        format!(
+                            "Constant {short}::{cname} type has no value type specified in \
+                             iterable type {word}."
+                        ),
+                    )
+                    .with_code("missingType.iterableValue"),
+                );
+            }
+        }
+    });
+    out
+}
+
 /// A `final private` class constant: final is meaningless because private
 /// constants are never inherited and so can never be overridden.
 fn run_final_private_constant(fa: &FileAnalysis) -> Vec<Diagnostic> {
@@ -803,6 +843,7 @@ fn is_concrete(t: &Type) -> bool {
 }
 
 pub(crate) static RULES: &[RuleEntry] = &[
+    RuleEntry { name: "missingType.iterableValue", level: 6, run: run_missing_const_iterable_value },
     RuleEntry { name: "classConstant.class", level: 0, run: run_class_as_class_constant },
     RuleEntry { name: "classConstant.finalPrivate", level: 0, run: run_final_private_constant },
     RuleEntry { name: "magicConstant.context", level: 0, run: run_magic_constant_context },
@@ -818,6 +859,33 @@ mod tests {
     use super::*;
     use crate::testutil::{codes, codes_version};
     use crate::PhpVersion;
+
+    // --- MissingClassConstantTypehintRule (missingType.iterableValue) ----
+
+    #[test]
+    fn bare_array_typed_const_flagged() {
+        let src = r#"<?php class C { const array FOO = [1, 2]; }"#;
+        assert_eq!(codes(src, run_missing_const_iterable_value), ["missingType.iterableValue"]);
+    }
+
+    #[test]
+    fn typed_const_with_var_value_type_clean() {
+        let src = r#"<?php class C { /** @var array<int, int> */ const array FOO = [1, 2]; }"#;
+        assert!(codes(src, run_missing_const_iterable_value).is_empty());
+    }
+
+    #[test]
+    fn untyped_const_clean() {
+        // No native type → value type inferred from the literal → never bare.
+        let src = r#"<?php class C { const FOO = [1, 2]; }"#;
+        assert!(codes(src, run_missing_const_iterable_value).is_empty());
+    }
+
+    #[test]
+    fn scalar_typed_const_clean() {
+        let src = r#"<?php class C { const int FOO = 1; }"#;
+        assert!(codes(src, run_missing_const_iterable_value).is_empty());
+    }
 
     // --- version-gated: final / native-typed class constants -------------
 

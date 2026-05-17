@@ -206,7 +206,21 @@ fn run_variadic_parameters(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// else a zero-length span at the function. Param has no `span`, so synthesize
 /// from its name via the surrounding nodes is not possible; use the default or
 /// the attr group span when present, otherwise an empty span.
-fn p_span(p: &Param) -> php_span::Span {
+/// If `ty` (a resolved param/return/property type) is a bare `array`/`iterable`
+/// with no value type — including through nullability and unions — the iterable
+/// word to report. The substrate of phpstan's `missingType.iterableValue` checks.
+pub(crate) fn bare_iterable_word(ty: &php_types::Type) -> Option<&'static str> {
+    use php_types::Type;
+    match ty {
+        Type::Array(None) => Some("array"),
+        Type::Iterable(None) => Some("iterable"),
+        Type::Nullable(inner) => bare_iterable_word(inner),
+        Type::Union(parts) => parts.iter().find_map(bare_iterable_word),
+        _ => None,
+    }
+}
+
+pub(crate) fn p_span(p: &Param) -> php_span::Span {
     if let Some(d) = &p.default {
         return d.span;
     }
@@ -1439,6 +1453,52 @@ fn run_missing_function_parameter_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
+/// `MissingFunctionReturn/ParameterTypehintRule` — the `missingType.iterableValue`
+/// branch: a *declared* (native or `@param`/`@return`) function type that is a bare
+/// `array`/`iterable` with no value type. Uses the reflected (native ∪ PHPDoc)
+/// type, so `array $x` with `@param array<int> $x` is fine. Disjoint from the
+/// no-type-at-all `missingType.parameter`/`missingType.return` checks above.
+fn run_missing_function_iterable_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    php_resolve::for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            let StmtKind::Function(fd) = &st.kind else { continue };
+            let refl = php_reflect::reflect_function(scope, fa.interner, fd);
+            let name = refl.fqn.trim_start_matches('\\');
+            for (p, pr) in fd.params.iter().zip(refl.params.iter()) {
+                if let Some(word) = bare_iterable_word(&pr.ty) {
+                    let pname = fa.interner.resolve(p.name);
+                    out.push(
+                        Diagnostic::error(
+                            p_span(p),
+                            format!(
+                                "Function {name}() has parameter ${pname} with no value type \
+                                 specified in iterable type {word}."
+                            ),
+                        )
+                        .with_code("missingType.iterableValue"),
+                    );
+                }
+            }
+            if let Some(rt) = &fd.return_type {
+                if let Some(word) = bare_iterable_word(&refl.return_type) {
+                    out.push(
+                        Diagnostic::error(
+                            rt.span,
+                            format!(
+                                "Function {name}() return type has no value type specified in \
+                                 iterable type {word}."
+                            ),
+                        )
+                        .with_code("missingType.iterableValue"),
+                    );
+                }
+            }
+        }
+    });
+    out
+}
+
 /// Conservative scan of a raw docblock for a tag (e.g. `@return`). Any occurrence
 /// of the tag — even partial — counts as "specified", to avoid false positives.
 fn doc_has_tag(doc: Option<&str>, tag: &str) -> bool {
@@ -1556,7 +1616,7 @@ fn run_call_statement_no_side_effects(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// Invoke `f` on every expression that appears in *statement position* (the whole
 /// value of an `Expr` statement). Descends through blocks/control flow and into
 /// function-like bodies (their statement lists), but not into sub-expressions.
-fn stmt_level_calls<F: FnMut(&Expr)>(s: &Stmt, f: &mut F) {
+pub(crate) fn stmt_level_calls<F: FnMut(&Expr)>(s: &Stmt, f: &mut F) {
     match &s.kind {
         StmtKind::Expr(e) => f(e),
         StmtKind::Block(b) => b.iter().for_each(|st| stmt_level_calls(st, f)),
@@ -2183,6 +2243,11 @@ pub(crate) static RULES: &[RuleEntry] = &[
     // Level 6 — missing typehints.
     RuleEntry { name: "missingType.return", level: 6, run: run_missing_function_return_type },
     RuleEntry { name: "missingType.parameter", level: 6, run: run_missing_function_parameter_type },
+    RuleEntry {
+        name: "missingType.iterableValue",
+        level: 6,
+        run: run_missing_function_iterable_value,
+    },
 ];
 
 #[cfg(test)]

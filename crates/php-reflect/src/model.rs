@@ -73,6 +73,9 @@ pub struct FunctionReflection {
     /// `@template` names in scope for this function.
     pub templates: Vec<String>,
     pub deprecated: bool,
+    /// Declared side-effect-free via `@pure`/`@phpstan-pure`/`@psalm-pure` (and not
+    /// `@phpstan-impure`). Used by the `*.resultUnused` rules.
+    pub pure: bool,
     /// Loaded from the built-in stub manifest (Cap #4) rather than reflected from
     /// project source. The stub *arity* is unreliable (phpstorm-stubs omits
     /// defaults on some optional params and over-/under-counts variadics), so the
@@ -98,6 +101,9 @@ pub struct MethodReflection {
     /// `@template` names in scope (class templates plus the method's own).
     pub templates: Vec<String>,
     pub deprecated: bool,
+    /// Declared side-effect-free via `@pure`/`@phpstan-pure`/`@psalm-pure` (and not
+    /// `@phpstan-impure`). Used by the `*.resultUnused` rules.
+    pub pure: bool,
     /// Declared only via a class-level `@method` tag (no real implementation).
     pub magic: bool,
 }
@@ -259,6 +265,7 @@ pub fn reflect_function(scope: &Scope, interner: &Interner, f: &FunctionDecl) ->
         by_ref: f.by_ref,
         templates,
         deprecated: doc.deprecated,
+        pure: doc_is_pure(f.doc.as_deref()),
         builtin: false,
     }
 }
@@ -396,6 +403,7 @@ fn reflect_method(scope: &Scope, interner: &Interner, class_templates: &[String]
         explicit_return: m.return_type.is_some() || doc.returns.is_some(),
         templates,
         deprecated: doc.deprecated,
+        pure: doc_is_pure(m.doc.as_deref()),
         magic: false,
     }
 }
@@ -473,6 +481,7 @@ fn magic_method(scope: &Scope, class_templates: &[String], m: &php_phpdoc::Metho
         explicit_return: m.return_type.is_some(),
         templates,
         deprecated: false,
+        pure: false,
         magic: true,
     }
 }
@@ -586,6 +595,26 @@ fn combine_templates(class_templates: &[String], doc: &Doc) -> Vec<String> {
 /// Parse a declaration's docblock text, or an empty [`Doc`] when absent.
 fn parse_doc(raw: Option<&str>) -> Doc {
     raw.map(php_phpdoc::parse).unwrap_or_default()
+}
+
+/// Whether a docblock declares the symbol side-effect-free: a `@pure`
+/// (`@phpstan-pure`/`@psalm-pure`) tag and no `@phpstan-impure`/`@impure`.
+fn doc_is_pure(raw: Option<&str>) -> bool {
+    let Some(raw) = raw else { return false };
+    let (mut pure, mut impure) = (false, false);
+    for t in &php_phpdoc::parse_block(raw).tags {
+        let base = t
+            .name
+            .strip_prefix("phpstan-")
+            .or_else(|| t.name.strip_prefix("psalm-"))
+            .unwrap_or(t.name.as_str());
+        match base {
+            "pure" => pure = true,
+            "impure" => impure = true,
+            _ => {}
+        }
+    }
+    pure && !impure
 }
 
 #[cfg(test)]

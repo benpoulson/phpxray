@@ -41,6 +41,9 @@ fn parse_line(line: &str, scope: &Scope) -> Option<FunctionReflection> {
         by_ref: false,
         templates: Vec::new(),
         deprecated: false,
+        // Built-in purity is curated separately (rules' PURE_BUILTINS); the stub
+        // manifest carries no purity info.
+        pure: false,
         builtin: true,
     })
 }

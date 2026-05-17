@@ -73,7 +73,7 @@ use php_ast::{
 };
 use php_diagnostics::Diagnostic;
 use php_intern::Interner;
-use php_reflect::{ClassReflection, Found, MethodReflection, ReflectionIndex};
+use php_reflect::{reflect_class, ClassReflection, Found, MethodReflection, ReflectionIndex};
 use php_resolve::{for_each_region, Resolution, Scope};
 use php_span::Span;
 use php_types::Type;
@@ -1577,7 +1577,161 @@ fn has_consistent_constructor_tag(_fa: &FileAnalysis, c: &ClassDecl) -> bool {
         || raw.contains("@psalm-consistent-constructor")
 }
 
+// ---------------------------------------------------------------------------
+// Call-as-statement to a pure method (CallToMethodStatementWithoutSideEffectsRule
+// / CallToStaticMethodStatementWithoutSideEffectsRule) — method/staticMethod.resultUnused
+// ---------------------------------------------------------------------------
+
+/// `$obj->m();` as a whole statement where `m` is a *pure* method (`@pure`/
+/// `@phpstan-pure`): the return value is the only effect, so the statement is dead.
+/// Conservative — fires only when the receiver pins to a known class and the
+/// resolved method is annotated pure (never on `mixed`/unknown/magic).
+fn run_method_result_unused(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for s in &fa.program.stmts {
+        crate::rules::functions::stmt_level_calls(s, &mut |e| {
+            let ExprKind::MethodCall { recv, method, .. } = &e.kind else { return };
+            let MemberName::Ident(name) = method else { return };
+            let Some(fqn) = named_fqn(&fa.type_of(recv)) else { return };
+            let mname = fa.interner.resolve(*name);
+            let Some(found) = fa.reflection.find_method(&fqn, mname) else { return };
+            if let Some(d) = pure_call_diag(&found.member, &fqn, "method.resultUnused", e.span) {
+                out.push(d);
+            }
+        });
+    }
+    out
+}
+
+/// `C::m();` as a whole statement where `m` is a *pure* static (or instance)
+/// method. Class names resolved through the region scope (skips self/static/parent
+/// and built-ins).
+fn run_static_method_result_unused(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for s in region {
+            crate::rules::functions::stmt_level_calls(s, &mut |e| {
+                let ExprKind::StaticCall { class, method, .. } = &e.kind else { return };
+                let MemberName::Ident(name) = method else { return };
+                let ExprKind::Name(n) = &class.kind else { return };
+                let fqn = match scope.resolve_class(n) {
+                    Resolution::LateStatic(_) | Resolution::BuiltinType(_) => return,
+                    r => match r.fqn() {
+                        Some(f) => f.trim_start_matches('\\').to_string(),
+                        None => return,
+                    },
+                };
+                let mname = fa.interner.resolve(*name);
+                let Some(found) = fa.reflection.find_method(&fqn, mname) else { return };
+                if let Some(d) = pure_call_diag(&found.member, &fqn, "staticMethod.resultUnused", e.span)
+                {
+                    out.push(d);
+                }
+            });
+        }
+    });
+    out
+}
+
+/// Build the `*.resultUnused` diagnostic for a discarded call to `m`, if `m` is a
+/// non-magic pure method that doesn't return `never`.
+fn pure_call_diag(m: &MethodReflection, fqn: &str, code: &'static str, span: Span) -> Option<Diagnostic> {
+    if m.magic || !m.pure || matches!(m.return_type, Type::Never) {
+        return None;
+    }
+    let short = fqn.trim_start_matches('\\');
+    let kind = if m.is_static { "static method" } else { "method" };
+    Some(
+        Diagnostic::error(
+            span,
+            format!("Call to {kind} {short}::{}() on a separate line has no effect.", m.name),
+        )
+        .with_code(code),
+    )
+}
+
+/// `MissingMethodReturn/ParameterTypehintRule` — the `missingType.iterableValue`
+/// branch: a method param/return whose reflected (native ∪ PHPDoc) type is a bare
+/// `array`/`iterable`. Disjoint from the no-type-at-all `missingType.*` checks.
+fn run_missing_method_iterable_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            let StmtKind::Class(c) = &st.kind else { continue };
+            let Some(nm) = c.name else { continue };
+            let fqn = scope.qualify(fa.interner.resolve(nm));
+            let refl = reflect_class(scope, fa.interner, &fqn, c);
+            // phpstan inherits @param/@return from overridden parent/interface
+            // methods. We don't model that, so we only check methods that can't
+            // inherit: the class (and all its ancestors) must be fully known, and
+            // the method must not override an ancestor method. Otherwise skip
+            // (under-report) to stay false-positive-free.
+            if !fa.class_fully_known(&fqn) {
+                continue;
+            }
+            let ancestors: Vec<String> = refl
+                .parents
+                .iter()
+                .chain(refl.interfaces.iter())
+                .chain(refl.traits.iter())
+                .filter_map(named_fqn)
+                .collect();
+            let short = fqn.trim_start_matches('\\');
+            for m in &c.members {
+                let Member::Method(md) = m else { continue };
+                let mname = fa.interner.resolve(md.name);
+                let Some(mr) =
+                    refl.methods.iter().find(|x| !x.magic && x.name.eq_ignore_ascii_case(mname))
+                else {
+                    continue;
+                };
+                // Overrides an ancestor method → its @param/@return may be inherited.
+                if ancestors.iter().any(|a| fa.reflection.find_method(a, mname).is_some()) {
+                    continue;
+                }
+                for (p, pr) in md.params.iter().zip(mr.params.iter()) {
+                    if let Some(word) = crate::rules::functions::bare_iterable_word(&pr.ty) {
+                        let pname = fa.interner.resolve(p.name);
+                        out.push(
+                            Diagnostic::error(
+                                crate::rules::functions::p_span(p),
+                                format!(
+                                    "Method {short}::{mname}() has parameter ${pname} with no \
+                                     value type specified in iterable type {word}."
+                                ),
+                            )
+                            .with_code("missingType.iterableValue"),
+                        );
+                    }
+                }
+                if let Some(rt) = &md.return_type {
+                    if let Some(word) = crate::rules::functions::bare_iterable_word(&mr.return_type) {
+                        out.push(
+                            Diagnostic::error(
+                                rt.span,
+                                format!(
+                                    "Method {short}::{mname}() return type has no value type \
+                                     specified in iterable type {word}."
+                                ),
+                            )
+                            .with_code("missingType.iterableValue"),
+                        );
+                    }
+                }
+            }
+        }
+    });
+    out
+}
+
 pub(crate) static RULES: &[RuleEntry] = &[
+    RuleEntry { name: "method.resultUnused", level: 4, run: run_method_result_unused },
+    RuleEntry {
+        name: "missingType.iterableValue",
+        level: 6,
+        run: run_missing_method_iterable_value,
+    },
+    RuleEntry { name: "staticMethod.resultUnused", level: 4, run: run_static_method_result_unused },
     RuleEntry { name: "method.abstract", level: 0, run: run_abstract_in_non_abstract },
     RuleEntry { name: "method.abstractPrivate", level: 0, run: run_abstract_private },
     RuleEntry { name: "method.nonAbstract", level: 0, run: run_abstract_body },
@@ -1607,6 +1761,86 @@ pub(crate) static RULES: &[RuleEntry] = &[
 mod tests {
     use super::*;
     use crate::testutil::codes;
+
+    // --- missingType.iterableValue ---
+
+    #[test]
+    fn bare_array_param_flagged() {
+        let src = r#"<?php class C { public function m(array $a): void {} }"#;
+        assert_eq!(codes(src, run_missing_method_iterable_value), ["missingType.iterableValue"]);
+    }
+
+    #[test]
+    fn typed_array_param_via_phpdoc_clean() {
+        let src = r#"<?php class C { /** @param array<string, mixed> $a */ public function m(array $a): void {} }"#;
+        assert!(codes(src, run_missing_method_iterable_value).is_empty(), "{:?}", codes(src, run_missing_method_iterable_value));
+    }
+
+    #[test]
+    fn typed_array_param_multiline_with_description_clean() {
+        let src = "<?php class C {\n    /**\n     * @param array<string, mixed> $attributes Additional attributes\n     */\n    public function m(array $attributes = []): void {}\n}";
+        assert!(codes(src, run_missing_method_iterable_value).is_empty(), "{:?}", codes(src, run_missing_method_iterable_value));
+    }
+
+    // --- method/staticMethod.resultUnused (pure call discarded) ---------
+
+    #[test]
+    fn pure_method_call_discarded_is_flagged() {
+        let src = r#"<?php
+            class C {
+                /** @pure */
+                public function val(): int { return 1; }
+            }
+            function f(C $c) { $c->val(); }"#;
+        assert_eq!(codes(src, run_method_result_unused), ["method.resultUnused"]);
+    }
+
+    #[test]
+    fn pure_method_call_used_is_clean() {
+        let src = r#"<?php
+            class C {
+                /** @pure */
+                public function val(): int { return 1; }
+            }
+            function f(C $c) { $x = $c->val(); }"#;
+        assert!(codes(src, run_method_result_unused).is_empty());
+    }
+
+    #[test]
+    fn impure_method_call_discarded_is_clean() {
+        // No @pure annotation → assume side effects → not flagged.
+        let src = r#"<?php
+            class C {
+                public function doThing(): int { return 1; }
+            }
+            function f(C $c) { $c->doThing(); }"#;
+        assert!(codes(src, run_method_result_unused).is_empty());
+    }
+
+    #[test]
+    fn pure_static_method_call_discarded_is_flagged() {
+        let src = r#"<?php
+            class C {
+                /** @pure */
+                public static function val(): int { return 1; }
+            }
+            function f() { C::val(); }"#;
+        assert_eq!(codes(src, run_static_method_result_unused), ["staticMethod.resultUnused"]);
+    }
+
+    #[test]
+    fn impure_annotated_pure_is_not_pure() {
+        let src = r#"<?php
+            class C {
+                /**
+                 * @pure
+                 * @phpstan-impure
+                 */
+                public function val(): int { return 1; }
+            }
+            function f(C $c) { $c->val(); }"#;
+        assert!(codes(src, run_method_result_unused).is_empty());
+    }
 
     #[test]
     fn abstract_method_in_non_abstract_class() {

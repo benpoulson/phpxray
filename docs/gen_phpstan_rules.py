@@ -171,6 +171,12 @@ DONE = {
     "SealedDefinitionTraitRule",
     # Properties: @readonly (PHPDoc) property may not have a default value.
     "ReadOnlyByPhpDocPropertyRule",
+    # Methods: discarded call to a @pure method (method/staticMethod.resultUnused),
+    # via the new `pure` flag on MethodReflection.
+    "CallToMethodStatementWithoutSideEffectsRule",
+    "CallToStaticMethodStatementWithoutSideEffectsRule",
+    # Constants: missingType.iterableValue for a native-typed bare-array class const.
+    "MissingClassConstantTypehintRule",
     # Functions/Methods ReturnTypeRule (`return.type`) — return statements checked
     # against the declared return via return_type.rs (functions + methods).
     "ReturnTypeRule",
