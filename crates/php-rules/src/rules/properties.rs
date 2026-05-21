@@ -19,10 +19,9 @@
 //! - `TypesAssignedToPropertiesRule` / `DefaultValueTypesAssignedToPropertiesRule`
 //!   (`assign.propertyType`, `property.defaultValue`) — need inference of an
 //!   assigned/default expression's TYPE vs the property type.
-//! - `MissingReadOnlyPropertyAssignRule` (`property.uninitializedReadonly`) —
-//!   needs constructor-flow analysis (which assignments definitely happen).
-//! - `ReadOnlyByPhpDocPropertyRule` (`property.readOnlyByPhpDocDefaultValue`) —
-//!   needs the parsed `@readonly` PHPDoc + `isAllowedPrivateMutation` flow.
+//! - `MissingReadOnlyPropertyAssignRule` / `MissingReadOnlyByPhpDocPropertyAssignRule`
+//!   full parity for branchy constructors / helper calls / configured additional
+//!   constructors — current implementation is the straight-line, zero-FP subset.
 //! - `PropertyAttributesRule` attribute-target body (`property.overrideAttribute`)
 //!   — needs the (possibly cross-file) `#[Attribute(flags)]` of the attribute
 //!   class to know its allowed targets. (We do the hook `nodiscard` variant,
@@ -32,8 +31,8 @@
 //!   need native-type equality / PHPDoc `@final`. (We do the static / readonly /
 //!   visibility / `#[\Override]` parts.)
 //! - `SetPropertyHookParameterRule` (`propertySetHook.nativeParameterType`) —
-//!   the real rule checks set-param type vs property type; needs the type system
-//!   (variadic/by-ref params are rejected by PHP's own parser, not this rule).
+//!   needs hook-param/property type contravariance plus the missing iterable /
+//!   generic / callable signature checks.
 //! - `NullsafePropertyFetchRule` (`nullsafe.neverNull`) — needs the receiver
 //!   type (is it ever null?).
 //! - `MissingPropertyTypehintRule` (`missingType.property`) — needs the merged
@@ -45,10 +44,13 @@
 use crate::{walk, FileAnalysis, RuleEntry};
 use php_ast::{
     AttributeGroup, ClassDecl, ClassKind, Expr, ExprKind, HookBody, Member, MemberName, Name,
-    Program, PropElem, PropertyDecl, Stmt, StmtKind, Visibility,
+    Param, Program, PropElem, PropertyDecl, PropertyHook, Stmt, StmtKind, Visibility,
 };
 use php_diagnostics::Diagnostic;
+use php_infer::TypeCtx;
 use php_phpdoc::PropertyAccess;
+use php_reflect::reflect_class;
+use php_resolve::{for_each_region, Scope};
 use php_span::Span;
 use php_types::Type;
 
@@ -65,11 +67,18 @@ fn has_hooks(p: &PropElem) -> bool {
 fn span_of(p: &PropElem) -> Span {
     if let Some(d) = &p.default {
         d.span
-    } else if let Some(HookBody::Short(e)) = p.hooks.as_ref().and_then(|hs| hs.first()).map(|h| &h.body) {
+    } else if let Some(HookBody::Short(e)) =
+        p.hooks.as_ref().and_then(|hs| hs.first()).map(|h| &h.body)
+    {
         e.span
     } else {
         Span::DUMMY
     }
+}
+
+fn same_fqn(a: &str, b: &str) -> bool {
+    a.trim_start_matches('\\')
+        .eq_ignore_ascii_case(b.trim_start_matches('\\'))
 }
 
 /// Walk every property declaration in the program together with the class it
@@ -93,7 +102,9 @@ fn for_each_property(program: &Program, f: &mut impl FnMut(&ClassDecl, &Property
             }
             StmtKind::Namespace { body: Some(b), .. } => visit_stmts(b, f),
             StmtKind::Block(b) => visit_stmts(b, f),
-            StmtKind::If { then, elseifs, els, .. } => {
+            StmtKind::If {
+                then, elseifs, els, ..
+            } => {
                 visit_stmt(then, f);
                 for ei in elseifs {
                     visit_stmt(&ei.body, f);
@@ -107,6 +118,90 @@ fn for_each_property(program: &Program, f: &mut impl FnMut(&ClassDecl, &Property
         }
     }
     visit_stmts(&program.stmts, f);
+}
+
+fn for_each_property_elem(
+    fa: &FileAnalysis,
+    f: &mut impl FnMut(&str, &ClassDecl, &PropertyDecl, &PropElem),
+) {
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            visit_property_elem_stmt(fa, scope, st, f);
+        }
+    });
+}
+
+fn visit_property_elem_stmt(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    st: &Stmt,
+    f: &mut impl FnMut(&str, &ClassDecl, &PropertyDecl, &PropElem),
+) {
+    match &st.kind {
+        StmtKind::Class(c) => {
+            let class_fqn = c
+                .name
+                .map(|n| scope.qualify(fa.interner.resolve(n)))
+                .unwrap_or_else(|| "class@anonymous".to_string());
+            for m in &c.members {
+                if let Member::Property(pd) = m {
+                    for elem in &pd.props {
+                        f(&class_fqn, c, pd, elem);
+                    }
+                }
+            }
+        }
+        StmtKind::Namespace { body: Some(b), .. } | StmtKind::Block(b) => {
+            b.iter()
+                .for_each(|s| visit_property_elem_stmt(fa, scope, s, f));
+        }
+        StmtKind::If {
+            then, elseifs, els, ..
+        } => {
+            visit_property_elem_stmt(fa, scope, then, f);
+            for e in elseifs {
+                visit_property_elem_stmt(fa, scope, &e.body, f);
+            }
+            if let Some(e) = els {
+                visit_property_elem_stmt(fa, scope, e, f);
+            }
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::DoWhile { body, .. }
+        | StmtKind::For { body, .. }
+        | StmtKind::Foreach { body, .. } => visit_property_elem_stmt(fa, scope, body, f),
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            body.iter()
+                .for_each(|s| visit_property_elem_stmt(fa, scope, s, f));
+            for c in catches {
+                c.body
+                    .iter()
+                    .for_each(|s| visit_property_elem_stmt(fa, scope, s, f));
+            }
+            if let Some(fin) = finally {
+                fin.iter()
+                    .for_each(|s| visit_property_elem_stmt(fa, scope, s, f));
+            }
+        }
+        StmtKind::Switch { cases, .. } => {
+            for case in cases {
+                case.body
+                    .iter()
+                    .for_each(|s| visit_property_elem_stmt(fa, scope, s, f));
+            }
+        }
+        StmtKind::Declare { body: Some(b), .. } => visit_property_elem_stmt(fa, scope, b, f),
+        StmtKind::Function(fd) => {
+            fd.body
+                .iter()
+                .for_each(|s| visit_property_elem_stmt(fa, scope, s, f));
+        }
+        _ => {}
+    }
 }
 
 // --- ReadOnlyPropertyRule (level 0) ----------------------------------------
@@ -150,12 +245,32 @@ fn run_readonly_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// `@phpstan-readonly`/`@psalm-readonly` variants).
 fn has_readonly_doc(doc_raw: &str, base: &str) -> bool {
     php_phpdoc::parse_block(doc_raw).tags.iter().any(|t| {
-        let n = t
-            .name
-            .strip_prefix("phpstan-")
-            .or_else(|| t.name.strip_prefix("psalm-"))
-            .unwrap_or(t.name.as_str());
-        n == base
+        let n = t.name.as_str();
+        match base {
+            "readonly" => matches!(
+                n,
+                "readonly"
+                    | "phan-read-only"
+                    | "psalm-readonly"
+                    | "phpstan-readonly"
+                    | "phpstan-readonly-allow-private-mutation"
+                    | "psalm-readonly-allow-private-mutation"
+            ),
+            "allow-private-mutation" => matches!(
+                n,
+                "phpstan-readonly-allow-private-mutation"
+                    | "phpstan-allow-private-mutation"
+                    | "psalm-readonly-allow-private-mutation"
+                    | "psalm-allow-private-mutation"
+            ),
+            _ => {
+                let n = n
+                    .strip_prefix("phpstan-")
+                    .or_else(|| n.strip_prefix("psalm-"))
+                    .unwrap_or(n);
+                n == base
+            }
+        }
     })
 }
 
@@ -184,6 +299,117 @@ fn run_readonly_phpdoc_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
     });
     out
+}
+
+#[derive(Clone, Debug)]
+struct PropertyDeclInfo {
+    declaring_class: String,
+    visibility: Visibility,
+    is_static: bool,
+    is_native_readonly: bool,
+    set_visibility: Option<Visibility>,
+    doc_readonly: bool,
+    doc_allow_private_mutation: bool,
+    span: Span,
+}
+
+fn property_decl_info(
+    fa: &FileAnalysis,
+    receiver_class: &str,
+    prop: &str,
+) -> Option<PropertyDeclInfo> {
+    let found = fa.reflection.find_property(receiver_class, prop)?;
+    let mut info = PropertyDeclInfo {
+        declaring_class: found.declaring_class.clone(),
+        visibility: found.member.visibility,
+        is_static: found.member.is_static,
+        is_native_readonly: found.member.is_readonly,
+        set_visibility: None,
+        doc_readonly: false,
+        doc_allow_private_mutation: false,
+        span: Span::DUMMY,
+    };
+
+    for_each_property_elem(fa, &mut |class_fqn, _class, pd, elem| {
+        if !same_fqn(class_fqn, &found.declaring_class) {
+            return;
+        }
+        if fa.interner.resolve(elem.name) != prop {
+            return;
+        }
+        let doc = pd.doc.as_deref();
+        info.set_visibility = pd.modifiers.set_visibility;
+        info.doc_readonly = doc.is_some_and(|d| has_readonly_doc(d, "readonly"));
+        info.doc_allow_private_mutation =
+            doc.is_some_and(|d| has_readonly_doc(d, "allow-private-mutation"));
+        info.span = span_of(elem);
+    });
+
+    Some(info)
+}
+
+fn write_visibility(info: &PropertyDeclInfo) -> Visibility {
+    info.set_visibility.unwrap_or(info.visibility)
+}
+
+fn write_visibility_label(info: &PropertyDeclInfo) -> &'static str {
+    match info.set_visibility {
+        Some(Visibility::Private) => "private(set)",
+        Some(Visibility::Protected) => "protected(set)",
+        _ => match info.visibility {
+            Visibility::Private => "private",
+            Visibility::Protected => "protected",
+            Visibility::Public => "public",
+        },
+    }
+}
+
+fn can_write_property(
+    fa: &FileAnalysis,
+    current_class: Option<&str>,
+    info: &PropertyDeclInfo,
+) -> bool {
+    match write_visibility(info) {
+        Visibility::Public => true,
+        Visibility::Private => current_class.is_some_and(|c| same_fqn(c, &info.declaring_class)),
+        Visibility::Protected => current_class.is_some_and(|c| {
+            same_fqn(c, &info.declaring_class)
+                || fa.reflection.is_subclass_of(c, &info.declaring_class)
+        }),
+    }
+}
+
+fn receiver_class_for_property_fetch(
+    fa: &FileAnalysis,
+    current_class: Option<&str>,
+    base: &Expr,
+) -> Option<String> {
+    if matches!(&base.kind, ExprKind::Variable(v) if fa.interner.resolve(*v) == "this") {
+        return current_class.map(|c| c.to_string());
+    }
+    sole_class(&fa.type_of(base))
+}
+
+fn property_fetch_parts<'a>(fa: &'a FileAnalysis, fetch: &'a Expr) -> Option<(&'a Expr, &'a str)> {
+    let ExprKind::Prop {
+        base,
+        name: MemberName::Ident(p),
+        ..
+    } = &fetch.kind
+    else {
+        return None;
+    };
+    Some((base, fa.interner.resolve(*p)))
+}
+
+fn property_fetch_from_write_target(target: &Expr) -> Option<&Expr> {
+    match &target.kind {
+        ExprKind::Prop { .. } => Some(target),
+        ExprKind::Index { base, .. } | ExprKind::Paren(base) => {
+            property_fetch_from_write_target(base)
+        }
+        _ => None,
+    }
 }
 
 // --- PropertyInClassRule (level 0) -----------------------------------------
@@ -311,9 +537,11 @@ fn all_hooks_have_body(pd: &PropertyDecl) -> bool {
 }
 
 fn any_final_hook(pd: &PropertyDecl) -> bool {
-    pd.props
-        .iter()
-        .any(|p| p.hooks.as_ref().is_some_and(|hs| hs.iter().any(|h| h.modifiers.is_final)))
+    pd.props.iter().any(|p| {
+        p.hooks
+            .as_ref()
+            .is_some_and(|hs| hs.iter().any(|h| h.modifiers.is_final))
+    })
 }
 
 fn any_hook_has_body(pd: &PropertyDecl) -> bool {
@@ -356,8 +584,11 @@ fn run_properties_in_interface(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
         if m.is_readonly {
             out.push(
-                Diagnostic::error(span, "Interfaces cannot include readonly hooked properties.")
-                    .with_code("property.readOnlyInInterface"),
+                Diagnostic::error(
+                    span,
+                    "Interfaces cannot include readonly hooked properties.",
+                )
+                .with_code("property.readOnlyInInterface"),
             );
             return;
         }
@@ -391,8 +622,11 @@ fn run_properties_in_interface(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
         if any_hook_has_body(pd) {
             out.push(
-                Diagnostic::error(span, "Interfaces cannot include property hooks with bodies.")
-                    .with_code("property.hookBodyInInterface"),
+                Diagnostic::error(
+                    span,
+                    "Interfaces cannot include property hooks with bodies.",
+                )
+                .with_code("property.hookBodyInInterface"),
             );
         }
     });
@@ -432,6 +666,687 @@ fn run_property_hook_attributes(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
+// --- GetNonVirtualPropertyHookReadRule (level 3, conservative) ------------
+
+/// phpstan `GetNonVirtualPropertyHookReadRule` (`propertyGetHook.noRead`): a
+/// non-virtual property's `get` hook must read the backing value. We implement
+/// the AST-decidable subset: the property is definitely backed when a `set`
+/// hook is the short `set => expr` form (implicit backing assignment) or when a
+/// hook body directly assigns `$this->sameProperty`.
+fn run_get_non_virtual_property_hook_read(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_property_elem(fa, &mut |class_fqn, _class, _pd, elem| {
+        let prop = fa.interner.resolve(elem.name);
+        let Some(get_hook) = hook_named(elem, fa, "get") else {
+            return;
+        };
+        if matches!(get_hook.body, HookBody::Abstract) {
+            return;
+        }
+        if hook_body_reads_this_property(&get_hook.body, prop, fa) {
+            return;
+        }
+        if !hooked_property_is_definitely_backed(elem, prop, fa) {
+            return;
+        }
+        out.push(
+            Diagnostic::error(
+                hook_span(get_hook),
+                format!(
+                    "Get hook for non-virtual property {}::${prop} does not read its value.",
+                    class_fqn.trim_start_matches('\\')
+                ),
+            )
+            .with_code("propertyGetHook.noRead"),
+        );
+    });
+    out
+}
+
+// --- SetNonVirtualPropertyHookAssignRule (level 3, conservative) ----------
+
+/// phpstan `SetNonVirtualPropertyHookAssignRule` (`propertySetHook.noAssign`):
+/// a non-virtual property's block `set` hook must assign the backing value. We
+/// only report the unambiguous "does not assign" case: a block set hook for a
+/// definitely-backed property that contains no direct `$this->sameProperty = ...`
+/// assignment and no explicit terminator. The "does not always assign" branch
+/// needs path-sensitive execution-end merging and is deferred.
+fn run_set_non_virtual_property_hook_assign(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_property_elem(fa, &mut |class_fqn, _class, _pd, elem| {
+        let prop = fa.interner.resolve(elem.name);
+        let Some(set_hook) = hook_named(elem, fa, "set") else {
+            return;
+        };
+        if !matches!(set_hook.body, HookBody::Block(_)) {
+            return;
+        }
+        if !hooked_property_is_definitely_backed(elem, prop, fa) {
+            return;
+        }
+        if hook_body_assigns_this_property(&set_hook.body, prop, fa) {
+            return;
+        }
+        if hook_body_has_terminator(&set_hook.body) {
+            return;
+        }
+        out.push(
+            Diagnostic::error(
+                hook_span(set_hook),
+                format!(
+                    "Set hook for non-virtual property {}::${prop} does not assign value to it.",
+                    class_fqn.trim_start_matches('\\')
+                ),
+            )
+            .with_code("propertySetHook.noAssign"),
+        );
+    });
+    out
+}
+
+// --- SetPropertyHookParameterRule (level 0, conservative) -----------------
+
+fn run_set_property_hook_parameter(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            check_set_property_hook_parameter_stmt(fa, scope, st, &mut out);
+        }
+    });
+    out
+}
+
+fn check_set_property_hook_parameter_stmt(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    st: &Stmt,
+    out: &mut Vec<Diagnostic>,
+) {
+    match &st.kind {
+        StmtKind::Class(c) => {
+            let fqn = c
+                .name
+                .map(|n| scope.qualify(fa.interner.resolve(n)))
+                .unwrap_or_else(|| "class@anonymous".to_string());
+            let reflected = reflect_class(scope, fa.interner, &fqn, c);
+            for m in &c.members {
+                let Member::Property(pd) = m else { continue };
+                for elem in &pd.props {
+                    let prop = fa.interner.resolve(elem.name);
+                    let Some(set_hook) = hook_named(elem, fa, "set") else {
+                        continue;
+                    };
+                    let Some(params) = &set_hook.params else {
+                        continue;
+                    };
+                    let Some(param) = params.first() else {
+                        continue;
+                    };
+                    let Some(prop_refl) = reflected.properties.iter().find(|p| p.name == prop)
+                    else {
+                        continue;
+                    };
+                    let ctx = SetHookParameterContext {
+                        fa,
+                        scope,
+                        class_name: fqn.trim_start_matches('\\'),
+                        prop,
+                        pd,
+                        prop_type: &prop_refl.ty,
+                        prop_native: &prop_refl.native_ty,
+                    };
+                    check_set_property_hook_parameter(&ctx, param, out);
+                }
+            }
+        }
+        StmtKind::Namespace { body: Some(b), .. } | StmtKind::Block(b) => {
+            b.iter()
+                .for_each(|s| check_set_property_hook_parameter_stmt(fa, scope, s, out));
+        }
+        StmtKind::If {
+            then, elseifs, els, ..
+        } => {
+            check_set_property_hook_parameter_stmt(fa, scope, then, out);
+            for e in elseifs {
+                check_set_property_hook_parameter_stmt(fa, scope, &e.body, out);
+            }
+            if let Some(e) = els {
+                check_set_property_hook_parameter_stmt(fa, scope, e, out);
+            }
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::DoWhile { body, .. }
+        | StmtKind::For { body, .. }
+        | StmtKind::Foreach { body, .. } => {
+            check_set_property_hook_parameter_stmt(fa, scope, body, out)
+        }
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            body.iter()
+                .for_each(|s| check_set_property_hook_parameter_stmt(fa, scope, s, out));
+            for c in catches {
+                c.body
+                    .iter()
+                    .for_each(|s| check_set_property_hook_parameter_stmt(fa, scope, s, out));
+            }
+            if let Some(fin) = finally {
+                fin.iter()
+                    .for_each(|s| check_set_property_hook_parameter_stmt(fa, scope, s, out));
+            }
+        }
+        StmtKind::Switch { cases, .. } => {
+            for case in cases {
+                case.body
+                    .iter()
+                    .for_each(|s| check_set_property_hook_parameter_stmt(fa, scope, s, out));
+            }
+        }
+        StmtKind::Declare { body: Some(b), .. } => {
+            check_set_property_hook_parameter_stmt(fa, scope, b, out)
+        }
+        StmtKind::Function(fd) => {
+            fd.body
+                .iter()
+                .for_each(|s| check_set_property_hook_parameter_stmt(fa, scope, s, out));
+        }
+        _ => {}
+    }
+}
+
+struct SetHookParameterContext<'fa, 'ctx> {
+    fa: &'ctx FileAnalysis<'fa>,
+    scope: &'ctx Scope,
+    class_name: &'ctx str,
+    prop: &'ctx str,
+    pd: &'ctx PropertyDecl,
+    prop_type: &'ctx Type,
+    prop_native: &'ctx Type,
+}
+
+fn check_set_property_hook_parameter(
+    ctx: &SetHookParameterContext<'_, '_>,
+    param: &Param,
+    out: &mut Vec<Diagnostic>,
+) {
+    let fa = ctx.fa;
+    let class_name = ctx.class_name;
+    let prop = ctx.prop;
+    let prop_type = ctx.prop_type;
+    let prop_native = ctx.prop_native;
+    let pname = fa.interner.resolve(param.name);
+    let prop_has_native = ctx.pd.ty.is_some();
+    let param_has_native = param.ty.is_some();
+    let param_native = param
+        .ty
+        .as_ref()
+        .map(|t| php_reflect::resolve_ast_type(ctx.scope, t))
+        .unwrap_or(Type::Mixed);
+    let mut native_failed = false;
+
+    match (prop_has_native, param_has_native) {
+        (false, true) => {
+            native_failed = true;
+            out.push(
+                Diagnostic::error(
+                    param.span,
+                    format!(
+                        "Parameter ${pname} of set hook has a native type but the property {class_name}::${prop} does not."
+                    ),
+                )
+                .with_code("propertySetHook.nativeParameterType"),
+            );
+        }
+        (true, false) => {
+            native_failed = true;
+            out.push(
+                Diagnostic::error(
+                    param.span,
+                    format!(
+                        "Parameter ${pname} of set hook does not have a native type but the property {class_name}::${prop} does."
+                    ),
+                )
+                .with_code("propertySetHook.nativeParameterType"),
+            );
+        }
+        (true, true)
+            if native_hook_type_is_checkable(prop_native, fa)
+                && native_hook_type_is_checkable(&param_native, fa)
+                && !native_type_is_accepted_by_parameter(fa, prop_native, &param_native) =>
+        {
+            native_failed = true;
+            out.push(
+                Diagnostic::error(
+                    param.span,
+                    format!(
+                        "Native type {param_native} of set hook parameter ${pname} is not contravariant with native type {prop_native} of property {class_name}::${prop}."
+                    ),
+                )
+                .with_code("propertySetHook.nativeParameterType"),
+            );
+        }
+        _ => {}
+    }
+
+    if native_failed {
+        return;
+    }
+
+    if fa.treat_phpdoc_types_as_certain
+        && property_readable_type_is_certain(fa, prop_type, prop_native)
+        && !php_infer::is_assignable(fa.reflection, prop_type, &param_native)
+    {
+        out.push(
+            Diagnostic::error(
+                param.span,
+                format!(
+                    "Type {param_native} of set hook parameter ${pname} is not contravariant with type {prop_type} of property {class_name}::${prop}."
+                ),
+            )
+            .with_code("propertySetHook.parameterType"),
+        );
+    }
+
+    if param_native == *prop_type {
+        return;
+    }
+
+    for word in bare_iterable_words(&param_native) {
+        out.push(
+            Diagnostic::error(
+                param.span,
+                format!(
+                    "Set hook for property {class_name}::${prop} has parameter ${pname} with no value type specified in iterable type {word}."
+                ),
+            )
+            .with_code("missingType.iterableValue"),
+        );
+    }
+
+    for (name, templates) in non_generic_object_types_with_generic_class(fa, &param_native) {
+        out.push(
+            Diagnostic::error(
+                param.span,
+                format!(
+                    "Set hook for property {class_name}::${prop} has parameter ${pname} with generic {name} but does not specify its types: {templates}"
+                ),
+            )
+            .with_code("missingType.generics"),
+        );
+    }
+
+    for callable in callables_with_missing_signature(&param_native) {
+        out.push(
+            Diagnostic::error(
+                param.span,
+                format!(
+                    "Set hook for property {class_name}::${prop} has parameter ${pname} with no signature specified for {callable}."
+                ),
+            )
+            .with_code("missingType.callable"),
+        );
+    }
+}
+
+fn native_hook_type_is_checkable(ty: &Type, fa: &FileAnalysis) -> bool {
+    match ty {
+        Type::Mixed
+        | Type::ExplicitMixed
+        | Type::Never
+        | Type::Void
+        | Type::SelfType
+        | Type::StaticType
+        | Type::Parent
+        | Type::TemplateVar(_)
+        | Type::Unknown(_)
+        | Type::Conditional { .. }
+        | Type::Intersection(_)
+        | Type::List(_)
+        | Type::Shape { .. }
+        | Type::ClassString(_)
+        | Type::LiteralInt(_)
+        | Type::LiteralString(_) => false,
+        Type::Named { fqn, args } => args.is_empty() && fa.reflection.class(fqn).is_some(),
+        Type::Nullable(inner) => native_hook_type_is_checkable(inner, fa),
+        Type::Union(parts) => {
+            !parts.is_empty() && parts.iter().all(|p| native_hook_type_is_checkable(p, fa))
+        }
+        Type::Array(Some(kv)) | Type::Iterable(Some(kv)) => {
+            native_hook_type_is_checkable(&kv.0, fa) && native_hook_type_is_checkable(&kv.1, fa)
+        }
+        Type::Callable(Some(sig)) => {
+            sig.params
+                .iter()
+                .all(|p| native_hook_type_is_checkable(p, fa))
+                && native_hook_type_is_checkable(&sig.ret, fa)
+        }
+        Type::Null
+        | Type::Bool
+        | Type::True
+        | Type::False
+        | Type::Int
+        | Type::IntRange { .. }
+        | Type::Float
+        | Type::String
+        | Type::Object
+        | Type::Resource
+        | Type::Array(None)
+        | Type::Iterable(None)
+        | Type::Callable(None) => true,
+    }
+}
+
+fn native_type_is_accepted_by_parameter(fa: &FileAnalysis, value: &Type, target: &Type) -> bool {
+    match value {
+        Type::Union(parts) => {
+            return parts
+                .iter()
+                .all(|p| native_type_is_accepted_by_parameter(fa, p, target));
+        }
+        Type::Nullable(inner) => {
+            return native_type_is_accepted_by_parameter(fa, inner, target)
+                && native_type_is_accepted_by_parameter(fa, &Type::Null, target);
+        }
+        _ => {}
+    }
+
+    match target {
+        Type::Nullable(inner) => {
+            matches!(value, Type::Null) || native_type_is_accepted_by_parameter(fa, value, inner)
+        }
+        Type::Union(parts) => parts
+            .iter()
+            .any(|p| native_type_is_accepted_by_parameter(fa, value, p)),
+        _ => php_infer::is_assignable(fa.reflection, value, target),
+    }
+}
+
+fn property_readable_type_is_certain(
+    fa: &FileAnalysis,
+    prop_type: &Type,
+    prop_native: &Type,
+) -> bool {
+    prop_native.is_mixed()
+        || (native_hook_type_is_checkable(prop_native, fa)
+            && php_infer::is_assignable(fa.reflection, prop_type, prop_native))
+}
+
+fn bare_iterable_words(ty: &Type) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    collect_bare_iterable_words(ty, &mut out);
+    out
+}
+
+fn collect_bare_iterable_words(ty: &Type, out: &mut Vec<&'static str>) {
+    match ty {
+        Type::Array(None) => out.push("array"),
+        Type::Iterable(None) => out.push("iterable"),
+        Type::Nullable(inner) => collect_bare_iterable_words(inner, out),
+        Type::Union(parts) | Type::Intersection(parts) => {
+            parts
+                .iter()
+                .for_each(|p| collect_bare_iterable_words(p, out));
+        }
+        _ => {}
+    }
+}
+
+fn non_generic_object_types_with_generic_class(
+    fa: &FileAnalysis,
+    ty: &Type,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    collect_non_generic_object_types_with_generic_class(fa, ty, &mut out);
+    out
+}
+
+fn collect_non_generic_object_types_with_generic_class(
+    fa: &FileAnalysis,
+    ty: &Type,
+    out: &mut Vec<(String, String)>,
+) {
+    match ty {
+        Type::Named { fqn, args } if args.is_empty() => {
+            if let Some(class) = fa.reflection.class(fqn) {
+                if !class.templates.is_empty() {
+                    out.push((
+                        fqn.trim_start_matches('\\').to_string(),
+                        class.templates.join(", "),
+                    ));
+                }
+            }
+        }
+        Type::Nullable(inner) => {
+            collect_non_generic_object_types_with_generic_class(fa, inner, out)
+        }
+        Type::Union(parts) | Type::Intersection(parts) => {
+            parts
+                .iter()
+                .for_each(|p| collect_non_generic_object_types_with_generic_class(fa, p, out));
+        }
+        _ => {}
+    }
+}
+
+fn callables_with_missing_signature(ty: &Type) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_callables_with_missing_signature(ty, &mut out);
+    out
+}
+
+fn collect_callables_with_missing_signature(ty: &Type, out: &mut Vec<String>) {
+    match ty {
+        Type::Callable(None) => out.push("callable".to_string()),
+        Type::Nullable(inner) => collect_callables_with_missing_signature(inner, out),
+        Type::Union(parts) | Type::Intersection(parts) => {
+            parts
+                .iter()
+                .for_each(|p| collect_callables_with_missing_signature(p, out));
+        }
+        _ => {}
+    }
+}
+
+fn hook_named<'a>(elem: &'a PropElem, fa: &FileAnalysis, name: &str) -> Option<&'a PropertyHook> {
+    elem.hooks
+        .as_ref()?
+        .iter()
+        .find(|h| fa.interner.resolve(h.name).eq_ignore_ascii_case(name))
+}
+
+fn hooked_property_is_definitely_backed(elem: &PropElem, prop: &str, fa: &FileAnalysis) -> bool {
+    let Some(hooks) = &elem.hooks else {
+        return false;
+    };
+    hooks.iter().any(|h| {
+        if fa.interner.resolve(h.name).eq_ignore_ascii_case("set") {
+            matches!(h.body, HookBody::Short(_))
+                || hook_body_assigns_this_property(&h.body, prop, fa)
+        } else {
+            hook_body_reads_this_property(&h.body, prop, fa)
+        }
+    })
+}
+
+fn hook_span(hook: &PropertyHook) -> Span {
+    match &hook.body {
+        HookBody::Short(e) => e.span,
+        HookBody::Block(stmts) => stmts.first().map(|s| s.span).unwrap_or(Span::DUMMY),
+        HookBody::Abstract => Span::DUMMY,
+    }
+}
+
+fn hook_body_reads_this_property(body: &HookBody, prop: &str, fa: &FileAnalysis) -> bool {
+    let mut found = false;
+    let write_targets = hook_body_plain_write_target_spans(body);
+    hook_body_exprs(body, &mut |e| {
+        if found {
+            return;
+        }
+        let r = e.span.range();
+        if expr_is_this_property(e, prop, fa)
+            && !write_targets.contains(&(r.start as u32, r.end as u32))
+        {
+            found = true;
+        }
+    });
+    found
+}
+
+fn hook_body_assigns_this_property(body: &HookBody, prop: &str, fa: &FileAnalysis) -> bool {
+    let mut found = false;
+    hook_body_exprs(body, &mut |e| {
+        if found {
+            return;
+        }
+        let (ExprKind::Assign { target, .. } | ExprKind::AssignRef { target, .. }) = &e.kind else {
+            return;
+        };
+        if expr_is_this_property(target, prop, fa) {
+            found = true;
+        }
+    });
+    found
+}
+
+fn hook_body_plain_write_target_spans(body: &HookBody) -> Vec<(u32, u32)> {
+    let mut spans = Vec::new();
+    hook_body_exprs(body, &mut |e| {
+        let (ExprKind::Assign { target, .. } | ExprKind::AssignRef { target, .. }) = &e.kind else {
+            return;
+        };
+        if matches!(&target.kind, ExprKind::Prop { .. }) {
+            let r = target.span.range();
+            spans.push((r.start as u32, r.end as u32));
+        }
+    });
+    spans
+}
+
+fn hook_body_has_terminator(body: &HookBody) -> bool {
+    let mut found = false;
+    if let HookBody::Block(stmts) = body {
+        for st in stmts {
+            stmt_has_terminator(st, &mut found);
+        }
+    }
+    found
+}
+
+fn stmt_has_terminator(st: &Stmt, found: &mut bool) {
+    if *found {
+        return;
+    }
+    match &st.kind {
+        StmtKind::Return(_) => *found = true,
+        StmtKind::Expr(e) => expr_has_terminator(e, found),
+        StmtKind::Block(b) => b.iter().for_each(|s| stmt_has_terminator(s, found)),
+        StmtKind::If {
+            cond,
+            then,
+            elseifs,
+            els,
+        } => {
+            expr_has_terminator(cond, found);
+            stmt_has_terminator(then, found);
+            for e in elseifs {
+                expr_has_terminator(&e.cond, found);
+                stmt_has_terminator(&e.body, found);
+            }
+            if let Some(e) = els {
+                stmt_has_terminator(e, found);
+            }
+        }
+        StmtKind::While { cond, body } => {
+            expr_has_terminator(cond, found);
+            stmt_has_terminator(body, found);
+        }
+        StmtKind::DoWhile { body, cond } => {
+            stmt_has_terminator(body, found);
+            expr_has_terminator(cond, found);
+        }
+        StmtKind::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            for e in init.iter().chain(cond).chain(update) {
+                expr_has_terminator(e, found);
+            }
+            stmt_has_terminator(body, found);
+        }
+        StmtKind::Foreach {
+            subject,
+            key,
+            value,
+            body,
+            ..
+        } => {
+            expr_has_terminator(subject, found);
+            if let Some(k) = key {
+                expr_has_terminator(k, found);
+            }
+            expr_has_terminator(value, found);
+            stmt_has_terminator(body, found);
+        }
+        StmtKind::Switch { subject, cases } => {
+            expr_has_terminator(subject, found);
+            for c in cases {
+                if let Some(t) = &c.test {
+                    expr_has_terminator(t, found);
+                }
+                c.body.iter().for_each(|s| stmt_has_terminator(s, found));
+            }
+        }
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            body.iter().for_each(|s| stmt_has_terminator(s, found));
+            for c in catches {
+                c.body.iter().for_each(|s| stmt_has_terminator(s, found));
+            }
+            if let Some(f) = finally {
+                f.iter().for_each(|s| stmt_has_terminator(s, found));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn expr_has_terminator(e: &Expr, found: &mut bool) {
+    walk_expr_local(e, &mut |inner| {
+        if matches!(inner.kind, ExprKind::Throw(_) | ExprKind::Exit(_)) {
+            *found = true;
+        }
+    });
+}
+
+fn hook_body_exprs(body: &HookBody, f: &mut impl FnMut(&Expr)) {
+    match body {
+        HookBody::Block(stmts) => stmts.iter().for_each(|s| stmt_exprs(s, f)),
+        HookBody::Short(e) => walk_expr_local(e, f),
+        HookBody::Abstract => {}
+    }
+}
+
+fn expr_is_this_property(e: &Expr, prop: &str, fa: &FileAnalysis) -> bool {
+    let ExprKind::Prop {
+        base,
+        name: MemberName::Ident(p),
+        ..
+    } = &e.kind
+    else {
+        return false;
+    };
+    matches!(&base.kind, ExprKind::Variable(v) if fa.interner.resolve(*v) == "this")
+        && fa.interner.resolve(*p) == prop
+}
+
 // --- OverridingPropertyRule (level 0) --------------------------------------
 
 /// phpstan `OverridingPropertyRule` (the AST + reflection-decidable subset): a
@@ -448,10 +1363,10 @@ fn run_overriding_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
         // Resolve the parent property (prototype) once per declaration name.
         for elem in &pd.props {
             let prop = fa.interner.resolve(elem.name).to_string();
-            let proto = class
-                .extends
-                .iter()
-                .find_map(|p| fa.reflection.find_property(p.text.trim_start_matches('\\'), &prop));
+            let proto = class.extends.iter().find_map(|p| {
+                fa.reflection
+                    .find_property(p.text.trim_start_matches('\\'), &prop)
+            });
             let has_override = has_override_attr(&pd.attrs);
             let span = span_of(elem);
 
@@ -475,7 +1390,8 @@ fn run_overriding_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
             // `#[\Override]` on a *property* only exists in PHP ≥ 8.5, so phpstan
             // gates `property.missingOverride` on `supportsOverrideAttributeOnProperty()`
             // (versionId ≥ 80500). Below that target it reports nothing.
-            if fa.php_version.at_least(80500) && has_override_should_be_present(class, has_override) {
+            if fa.php_version.at_least(80500) && has_override_should_be_present(class, has_override)
+            {
                 out.push(
                     Diagnostic::error(
                         span,
@@ -540,7 +1456,11 @@ fn run_overriding_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
             // Visibility may not be narrowed.
             let own_vis = m.visibility.unwrap_or(Visibility::Public);
             if proto.member.visibility == Visibility::Public && own_vis != Visibility::Public {
-                let kind = if own_vis == Visibility::Private { "Private" } else { "Protected" };
+                let kind = if own_vis == Visibility::Private {
+                    "Private"
+                } else {
+                    "Protected"
+                };
                 out.push(
                     Diagnostic::error(
                         span,
@@ -572,9 +1492,12 @@ fn run_overriding_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
 
 fn has_override_attr(attrs: &[AttributeGroup]) -> bool {
     attrs.iter().any(|g| {
-        g.attrs
-            .iter()
-            .any(|a| a.name.text.trim_start_matches('\\').eq_ignore_ascii_case("Override"))
+        g.attrs.iter().any(|a| {
+            a.name
+                .text
+                .trim_start_matches('\\')
+                .eq_ignore_ascii_case("Override")
+        })
     })
 }
 
@@ -586,7 +1509,10 @@ fn has_override_should_be_present(class: &ClassDecl, has_override: bool) -> bool
 }
 
 fn class_name(class: &ClassDecl, fa: &FileAnalysis) -> String {
-    class.name.map(|n| fa.interner.resolve(n).to_string()).unwrap_or_else(|| "class@anonymous".into())
+    class
+        .name
+        .map(|n| fa.interner.resolve(n).to_string())
+        .unwrap_or_else(|| "class@anonymous".into())
 }
 
 // --- AccessPropertiesRule (level 0, $this only) ----------------------------
@@ -598,27 +1524,41 @@ fn class_name(class: &ClassDecl, fa: &FileAnalysis) -> String {
 /// unresolved type never yields a false positive.
 fn run_access_properties(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk_scoped(&fa.program.stmts, None, "", fa, &mut out, &mut |class, e, fa, out| {
-        if let ExprKind::Prop { base, name, .. } = &e.kind {
-            if let (ExprKind::Variable(v), MemberName::Ident(p)) = (&base.kind, name) {
-                if fa.interner.resolve(*v) == "this" {
-                    let prop = fa.interner.resolve(*p);
-                    if class_is_fully_known(class, fa)
-                        && fa.reflection.find_property(class, prop).is_none()
-                        && fa.reflection.find_method(class, "__get").is_none()
-                    {
-                        out.push(
-                            Diagnostic::error(
-                                e.span,
-                                format!("Access to an undefined property {class}::${prop}."),
-                            )
-                            .with_code("property.notFound"),
-                        );
+    walk_scoped(
+        &fa.program.stmts,
+        None,
+        "",
+        fa,
+        &mut out,
+        &mut |class, e, fa, out| {
+            if fa
+                .reflection
+                .class(class)
+                .is_some_and(|c| c.kind == ClassKind::Trait)
+            {
+                return;
+            }
+            if let ExprKind::Prop { base, name, .. } = &e.kind {
+                if let (ExprKind::Variable(v), MemberName::Ident(p)) = (&base.kind, name) {
+                    if fa.interner.resolve(*v) == "this" {
+                        let prop = fa.interner.resolve(*p);
+                        if class_is_fully_known(class, fa)
+                            && fa.reflection.find_property(class, prop).is_none()
+                            && fa.reflection.find_method(class, "__get").is_none()
+                        {
+                            out.push(
+                                Diagnostic::error(
+                                    e.span,
+                                    format!("Access to an undefined property {class}::${prop}."),
+                                )
+                                .with_code("property.notFound"),
+                            );
+                        }
                     }
                 }
             }
-        }
-    });
+        },
+    );
     out
 }
 
@@ -630,38 +1570,863 @@ fn run_access_properties(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// reflection.
 fn run_readonly_property_assign(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk_scoped_methods(&fa.program.stmts, None, false, "", fa, &mut out, &mut |class, in_ctor, e, fa, out| {
-        if in_ctor {
+    walk_scoped_methods(
+        &fa.program.stmts,
+        None,
+        false,
+        "",
+        fa,
+        &mut out,
+        &mut |class, in_ctor, e, fa, out| {
+            if in_ctor {
+                return;
+            }
+            let target = match &e.kind {
+                ExprKind::Assign { target, .. } | ExprKind::AssignOp { target, .. } => target,
+                _ => return,
+            };
+            let ExprKind::Prop { base, name, .. } = &target.kind else {
+                return;
+            };
+            let (ExprKind::Variable(v), MemberName::Ident(p)) = (&base.kind, name) else {
+                return;
+            };
+            if fa.interner.resolve(*v) != "this" {
+                return;
+            }
+            let prop = fa.interner.resolve(*p);
+            let Some(found) = fa.reflection.find_property(class, prop) else {
+                return;
+            };
+            if !found.member.is_readonly {
+                return;
+            }
+            out.push(
+                Diagnostic::error(
+                    e.span,
+                    format!(
+                        "Readonly property {}::${prop} is assigned outside of the constructor.",
+                        found.declaring_class
+                    ),
+                )
+                .with_code("property.readOnlyAssignNotInConstructor"),
+            );
+        },
+    );
+    out
+}
+
+// --- MissingReadOnlyPropertyAssignRule (level 0, straight-line ctor) --------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MissingReadonlyKind {
+    Native,
+    PhpDoc,
+}
+
+struct MissingReadonlyProp {
+    name: String,
+    span: Span,
+}
+
+struct MissingReadonlyCtorScan<'a> {
+    class_name: &'a str,
+    kind: MissingReadonlyKind,
+    candidates: &'a [MissingReadonlyProp],
+    initialized: Vec<String>,
+    out: Vec<Diagnostic>,
+    returned: bool,
+}
+
+impl<'a> MissingReadonlyCtorScan<'a> {
+    fn new(
+        class_name: &'a str,
+        kind: MissingReadonlyKind,
+        candidates: &'a [MissingReadonlyProp],
+    ) -> Self {
+        Self {
+            class_name,
+            kind,
+            candidates,
+            initialized: Vec::new(),
+            out: Vec::new(),
+            returned: false,
+        }
+    }
+
+    fn candidate(&self, prop: &str) -> Option<&MissingReadonlyProp> {
+        self.candidates.iter().find(|p| p.name == prop)
+    }
+
+    fn is_initialized(&self, prop: &str) -> bool {
+        self.initialized.iter().any(|p| p == prop)
+    }
+
+    fn mark_initialized(&mut self, prop: &str) {
+        if !self.is_initialized(prop) {
+            self.initialized.push(prop.to_string());
+        }
+    }
+
+    fn note_read(&mut self, prop: &str, span: Span) {
+        if self.candidate(prop).is_some() && !self.is_initialized(prop) {
+            self.out.push(
+                Diagnostic::error(span, self.uninitialized_access_message(prop))
+                    .with_code(self.uninitialized_code()),
+            );
+        }
+    }
+
+    fn note_write(&mut self, prop: &str, span: Span) {
+        if self.candidate(prop).is_none() {
             return;
         }
-        let target = match &e.kind {
-            ExprKind::Assign { target, .. }
-            | ExprKind::AssignRef { target, .. }
-            | ExprKind::AssignOp { target, .. } => target,
-            _ => return,
-        };
-        if let ExprKind::Prop { base, name, .. } = &target.kind {
-            if let (ExprKind::Variable(v), MemberName::Ident(p)) = (&base.kind, name) {
-                if fa.interner.resolve(*v) == "this" {
+        if self.is_initialized(prop) {
+            self.out.push(
+                Diagnostic::error(span, self.already_assigned_message(prop))
+                    .with_code(self.already_assigned_code()),
+            );
+        } else {
+            self.mark_initialized(prop);
+        }
+    }
+
+    fn uninitialized_code(&self) -> &'static str {
+        match self.kind {
+            MissingReadonlyKind::Native => "property.uninitializedReadonly",
+            MissingReadonlyKind::PhpDoc => "property.uninitializedReadonlyByPhpDoc",
+        }
+    }
+
+    fn already_assigned_code(&self) -> &'static str {
+        match self.kind {
+            MissingReadonlyKind::Native => "assign.readOnlyProperty",
+            MissingReadonlyKind::PhpDoc => "assign.readOnlyPropertyByPhpDoc",
+        }
+    }
+
+    fn missing_message(&self, prop: &str) -> String {
+        match self.kind {
+            MissingReadonlyKind::Native => format!(
+                "Class {} has an uninitialized readonly property ${prop}. Assign it in the constructor.",
+                self.class_name
+            ),
+            MissingReadonlyKind::PhpDoc => format!(
+                "Class {} has an uninitialized @readonly property ${prop}. Assign it in the constructor.",
+                self.class_name
+            ),
+        }
+    }
+
+    fn uninitialized_access_message(&self, prop: &str) -> String {
+        match self.kind {
+            MissingReadonlyKind::Native => format!(
+                "Access to an uninitialized readonly property {}::${prop}.",
+                self.class_name
+            ),
+            MissingReadonlyKind::PhpDoc => format!(
+                "Access to an uninitialized @readonly property {}::${prop}.",
+                self.class_name
+            ),
+        }
+    }
+
+    fn already_assigned_message(&self, prop: &str) -> String {
+        match self.kind {
+            MissingReadonlyKind::Native => format!(
+                "Readonly property {}::${prop} is already assigned.",
+                self.class_name
+            ),
+            MissingReadonlyKind::PhpDoc => format!(
+                "@readonly property {}::${prop} is already assigned.",
+                self.class_name
+            ),
+        }
+    }
+}
+
+fn run_missing_readonly_property_assign(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    run_missing_readonly_property_assign_kind(fa, MissingReadonlyKind::Native)
+}
+
+fn run_missing_readonly_phpdoc_property_assign(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    run_missing_readonly_property_assign_kind(fa, MissingReadonlyKind::PhpDoc)
+}
+
+fn run_missing_readonly_property_assign_kind(
+    fa: &FileAnalysis,
+    kind: MissingReadonlyKind,
+) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            check_missing_readonly_stmt(fa, scope, st, kind, &mut out);
+        }
+    });
+    out
+}
+
+fn check_missing_readonly_stmt(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    st: &Stmt,
+    kind: MissingReadonlyKind,
+    out: &mut Vec<Diagnostic>,
+) {
+    match &st.kind {
+        StmtKind::Class(c) => check_missing_readonly_class(fa, scope, c, kind, out),
+        StmtKind::Namespace { body: Some(b), .. } | StmtKind::Block(b) => b
+            .iter()
+            .for_each(|s| check_missing_readonly_stmt(fa, scope, s, kind, out)),
+        StmtKind::If {
+            then, elseifs, els, ..
+        } => {
+            check_missing_readonly_stmt(fa, scope, then, kind, out);
+            for e in elseifs {
+                check_missing_readonly_stmt(fa, scope, &e.body, kind, out);
+            }
+            if let Some(e) = els {
+                check_missing_readonly_stmt(fa, scope, e, kind, out);
+            }
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::DoWhile { body, .. }
+        | StmtKind::For { body, .. }
+        | StmtKind::Foreach { body, .. } => check_missing_readonly_stmt(fa, scope, body, kind, out),
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            body.iter()
+                .for_each(|s| check_missing_readonly_stmt(fa, scope, s, kind, out));
+            for c in catches {
+                c.body
+                    .iter()
+                    .for_each(|s| check_missing_readonly_stmt(fa, scope, s, kind, out));
+            }
+            if let Some(fin) = finally {
+                fin.iter()
+                    .for_each(|s| check_missing_readonly_stmt(fa, scope, s, kind, out));
+            }
+        }
+        StmtKind::Declare { body: Some(b), .. } => {
+            check_missing_readonly_stmt(fa, scope, b, kind, out)
+        }
+        StmtKind::Function(fd) => {
+            fd.body
+                .iter()
+                .for_each(|s| check_missing_readonly_stmt(fa, scope, s, kind, out));
+        }
+        _ => {}
+    }
+}
+
+fn check_missing_readonly_class(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    class: &ClassDecl,
+    kind: MissingReadonlyKind,
+    out: &mut Vec<Diagnostic>,
+) {
+    if class.kind != ClassKind::Class {
+        return;
+    }
+    let Some(name) = class.name else { return };
+    let class_fqn = scope.qualify(fa.interner.resolve(name));
+    let class_display = class_fqn.trim_start_matches('\\').to_string();
+    let candidates = missing_readonly_candidates(fa, &class_fqn, class, kind);
+    if candidates.is_empty() {
+        return;
+    }
+
+    let ctor = class.members.iter().find_map(|m| {
+        let Member::Method(md) = m else { return None };
+        fa.interner
+            .resolve(md.name)
+            .eq_ignore_ascii_case("__construct")
+            .then_some(md)
+    });
+
+    let Some(ctor) = ctor else {
+        for prop in &candidates {
+            out.push(
+                Diagnostic::error(
+                    prop.span,
+                    missing_readonly_message(kind, &class_display, &prop.name),
+                )
+                .with_code(missing_readonly_uninitialized_code(kind)),
+            );
+        }
+        return;
+    };
+    let Some(body) = &ctor.body else { return };
+
+    let mut scan = MissingReadonlyCtorScan::new(&class_display, kind, &candidates);
+    if !scan_missing_readonly_ctor_body(fa, body, &mut scan) {
+        return;
+    }
+    for prop in &candidates {
+        if !scan.is_initialized(&prop.name) {
+            out.push(
+                Diagnostic::error(prop.span, scan.missing_message(&prop.name))
+                    .with_code(scan.uninitialized_code()),
+            );
+        }
+    }
+    out.extend(scan.out);
+}
+
+fn missing_readonly_candidates(
+    fa: &FileAnalysis,
+    class_fqn: &str,
+    class: &ClassDecl,
+    kind: MissingReadonlyKind,
+) -> Vec<MissingReadonlyProp> {
+    let mut props = Vec::new();
+    for m in &class.members {
+        let Member::Property(pd) = m else { continue };
+        if pd.modifiers.is_static || pd.modifiers.is_abstract || pd.ty.is_none() {
+            continue;
+        }
+        let doc = pd.doc.as_deref();
+        let is_phpdoc = doc.is_some_and(|d| has_readonly_doc(d, "readonly"));
+        for elem in &pd.props {
+            if elem.default.is_some() || elem.hooks.as_ref().is_some_and(|h| !h.is_empty()) {
+                continue;
+            }
+            let prop = fa.interner.resolve(elem.name);
+            let Some(info) = property_decl_info(fa, class_fqn, prop) else {
+                continue;
+            };
+            let matches_kind = match kind {
+                MissingReadonlyKind::Native => info.is_native_readonly,
+                MissingReadonlyKind::PhpDoc => is_phpdoc && !info.is_native_readonly,
+            };
+            if matches_kind && same_fqn(&info.declaring_class, class_fqn) {
+                props.push(MissingReadonlyProp {
+                    name: prop.to_string(),
+                    span: span_of(elem),
+                });
+            }
+        }
+    }
+    props
+}
+
+fn missing_readonly_uninitialized_code(kind: MissingReadonlyKind) -> &'static str {
+    match kind {
+        MissingReadonlyKind::Native => "property.uninitializedReadonly",
+        MissingReadonlyKind::PhpDoc => "property.uninitializedReadonlyByPhpDoc",
+    }
+}
+
+fn missing_readonly_message(kind: MissingReadonlyKind, class: &str, prop: &str) -> String {
+    match kind {
+        MissingReadonlyKind::Native => format!(
+            "Class {class} has an uninitialized readonly property ${prop}. Assign it in the constructor."
+        ),
+        MissingReadonlyKind::PhpDoc => format!(
+            "Class {class} has an uninitialized @readonly property ${prop}. Assign it in the constructor."
+        ),
+    }
+}
+
+fn scan_missing_readonly_ctor_body(
+    fa: &FileAnalysis,
+    body: &[Stmt],
+    scan: &mut MissingReadonlyCtorScan<'_>,
+) -> bool {
+    for st in body {
+        if scan.returned {
+            break;
+        }
+        if !scan_missing_readonly_ctor_stmt(fa, st, scan) {
+            return false;
+        }
+    }
+    true
+}
+
+fn scan_missing_readonly_ctor_stmt(
+    fa: &FileAnalysis,
+    st: &Stmt,
+    scan: &mut MissingReadonlyCtorScan<'_>,
+) -> bool {
+    match &st.kind {
+        StmtKind::Expr(e) => scan_missing_readonly_ctor_expr(fa, e, scan, false, true),
+        StmtKind::Echo(es) => es
+            .iter()
+            .all(|e| scan_missing_readonly_ctor_expr(fa, e, scan, false, false)),
+        StmtKind::Return(e) => {
+            if let Some(e) = e {
+                if !scan_missing_readonly_ctor_expr(fa, e, scan, false, false) {
+                    return false;
+                }
+            }
+            scan.returned = true;
+            true
+        }
+        StmtKind::Block(b) => scan_missing_readonly_ctor_body(fa, b, scan),
+        _ => false,
+    }
+}
+
+fn scan_missing_readonly_ctor_expr(
+    fa: &FileAnalysis,
+    e: &Expr,
+    scan: &mut MissingReadonlyCtorScan<'_>,
+    as_write_target: bool,
+    allow_writes: bool,
+) -> bool {
+    match &e.kind {
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Name(_)
+        | ExprKind::Variable(_) => true,
+        ExprKind::Paren(x)
+        | ExprKind::Unary { expr: x, .. }
+        | ExprKind::Cast { expr: x, .. }
+        | ExprKind::ErrorSuppress(x)
+        | ExprKind::Print(x)
+        | ExprKind::Empty(x) => scan_missing_readonly_ctor_expr(fa, x, scan, false, false),
+        ExprKind::Array { items, .. } => items.iter().all(|it| {
+            it.key
+                .as_ref()
+                .is_none_or(|k| scan_missing_readonly_ctor_expr(fa, k, scan, false, false))
+                && it
+                    .value
+                    .as_ref()
+                    .is_none_or(|v| scan_missing_readonly_ctor_expr(fa, v, scan, false, false))
+        }),
+        ExprKind::Interpolated(parts) | ExprKind::ShellExec(parts) | ExprKind::Isset(parts) => {
+            parts
+                .iter()
+                .all(|p| scan_missing_readonly_ctor_expr(fa, p, scan, false, false))
+        }
+        ExprKind::Index { base, index } => {
+            scan_missing_readonly_ctor_expr(fa, base, scan, false, false)
+                && index
+                    .as_ref()
+                    .is_none_or(|i| scan_missing_readonly_ctor_expr(fa, i, scan, false, false))
+        }
+        ExprKind::Prop { base, name, .. } => {
+            let ExprKind::Variable(v) = &base.kind else {
+                return scan_missing_readonly_ctor_expr(fa, base, scan, false, false);
+            };
+            if fa.interner.resolve(*v) != "this" {
+                return true;
+            }
+            let MemberName::Ident(p) = name else {
+                return false;
+            };
+            let prop = fa.interner.resolve(*p);
+            if as_write_target {
+                if !allow_writes {
+                    return false;
+                }
+                scan.note_write(prop, e.span);
+            } else {
+                scan.note_read(prop, e.span);
+            }
+            true
+        }
+        ExprKind::Assign { target, rhs } => {
+            if !allow_writes {
+                return false;
+            }
+            if !scan_missing_readonly_ctor_expr(fa, rhs, scan, false, false) {
+                return false;
+            }
+            if matches!(&target.kind, ExprKind::Prop { .. }) {
+                scan_missing_readonly_ctor_expr(fa, target, scan, true, true)
+            } else if property_fetch_from_write_target(target).is_some() {
+                false
+            } else {
+                scan_missing_readonly_ctor_expr(fa, target, scan, false, false)
+            }
+        }
+        ExprKind::AssignOp { target, rhs, .. } => {
+            if !allow_writes {
+                return false;
+            }
+            if property_fetch_from_write_target(target).is_some()
+                && !matches!(&target.kind, ExprKind::Prop { .. })
+            {
+                return false;
+            }
+            if !scan_missing_readonly_ctor_expr(fa, target, scan, false, false)
+                || !scan_missing_readonly_ctor_expr(fa, rhs, scan, false, false)
+            {
+                return false;
+            }
+            if let ExprKind::Prop { base, name, .. } = &target.kind {
+                if matches!(&base.kind, ExprKind::Variable(v) if fa.interner.resolve(*v) == "this")
+                {
+                    let MemberName::Ident(p) = name else {
+                        return false;
+                    };
                     let prop = fa.interner.resolve(*p);
-                    if let Some(found) = fa.reflection.find_property(class, prop) {
-                        if found.member.is_readonly {
-                            out.push(
-                                Diagnostic::error(
-                                    e.span,
-                                    format!(
-                                        "Readonly property {}::${prop} is assigned outside of the constructor.",
-                                        found.declaring_class
-                                    ),
-                                )
-                                .with_code("property.readOnlyAssignNotInConstructor"),
-                            );
-                        }
+                    if scan.candidate(prop).is_some() && scan.is_initialized(prop) {
+                        scan.note_write(prop, target.span);
                     }
                 }
             }
+            true
         }
-    });
+        ExprKind::Binary { lhs, rhs, .. } | ExprKind::Coalesce { lhs, rhs } => {
+            scan_missing_readonly_ctor_expr(fa, lhs, scan, false, false)
+                && scan_missing_readonly_ctor_expr(fa, rhs, scan, false, false)
+        }
+        ExprKind::Ternary { cond, then, els } => {
+            scan_missing_readonly_ctor_expr(fa, cond, scan, false, false)
+                && then
+                    .as_ref()
+                    .is_none_or(|t| scan_missing_readonly_ctor_expr(fa, t, scan, false, false))
+                && scan_missing_readonly_ctor_expr(fa, els, scan, false, false)
+        }
+        ExprKind::PreInc(x) | ExprKind::PreDec(x) | ExprKind::PostInc(x) | ExprKind::PostDec(x) => {
+            if !allow_writes {
+                return false;
+            }
+            if property_fetch_from_write_target(x).is_some()
+                && !matches!(&x.kind, ExprKind::Prop { .. })
+            {
+                return false;
+            }
+            if !scan_missing_readonly_ctor_expr(fa, x, scan, false, false) {
+                return false;
+            }
+            if let ExprKind::Prop { base, name, .. } = &x.kind {
+                if matches!(&base.kind, ExprKind::Variable(v) if fa.interner.resolve(*v) == "this")
+                {
+                    let MemberName::Ident(p) = name else {
+                        return false;
+                    };
+                    let prop = fa.interner.resolve(*p);
+                    if scan.candidate(prop).is_some() && scan.is_initialized(prop) {
+                        scan.note_write(prop, x.span);
+                    }
+                }
+            }
+            true
+        }
+        ExprKind::Exit(e) => {
+            if let Some(e) = e {
+                scan_missing_readonly_ctor_expr(fa, e, scan, false, false)
+            } else {
+                true
+            }
+        }
+        _ => false,
+    }
+}
+
+// --- ReadOnlyPropertyAssignRefRule (level 3, conservative) ----------------
+
+/// phpstan `ReadOnlyPropertyAssignRefRule` (`property.readOnlyAssignByRef`):
+/// assigning a native `readonly` property by reference is forbidden. FP-safe
+/// subset: `$this->prop` where the property is declared on the current class and
+/// known native-readonly. External receivers need PHPStan's `canWriteProperty`
+/// visibility/asymmetric-set checks, so they are left to future work.
+fn run_readonly_property_assign_ref(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    walk_scoped_methods(
+        &fa.program.stmts,
+        None,
+        false,
+        "",
+        fa,
+        &mut out,
+        &mut |class, _in_ctor, e, fa, out| {
+            let ExprKind::AssignRef { rhs, .. } = &e.kind else {
+                return;
+            };
+            let ExprKind::Prop { base, name, .. } = &rhs.kind else {
+                return;
+            };
+            let (ExprKind::Variable(v), MemberName::Ident(p)) = (&base.kind, name) else {
+                return;
+            };
+            if fa.interner.resolve(*v) != "this" {
+                return;
+            }
+            let prop = fa.interner.resolve(*p);
+            let Some(found) = fa.reflection.find_property(class, prop) else {
+                return;
+            };
+            if found.declaring_class.trim_start_matches('\\') != class.trim_start_matches('\\') {
+                return;
+            }
+            if !found.member.is_readonly || found.member.magic {
+                return;
+            }
+            out.push(
+                Diagnostic::error(
+                    e.span,
+                    format!(
+                        "Readonly property {}::${prop} is assigned by reference.",
+                        found.declaring_class.trim_start_matches('\\')
+                    ),
+                )
+                .with_code("property.readOnlyAssignByRef"),
+            );
+        },
+    );
+    out
+}
+
+// --- PropertyAssignRefRule (level 0, PHP 8.4+) ----------------------------
+
+/// phpstan `PropertyAssignRefRule` (`property.assignByRef`): assigning a
+/// property by reference is forbidden when the current scope cannot write that
+/// property (private/protected or asymmetric private(set)/protected(set)).
+/// FP-safe subset: an exact receiver class (`$this`, a typed/inferred object)
+/// and a statically named instance property.
+fn run_property_assign_ref(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    if !fa.php_version.at_least(80400) {
+        return out;
+    }
+    walk_exprs_with_class(
+        &fa.program.stmts,
+        None,
+        "",
+        fa,
+        &mut out,
+        &mut |current_class, e, fa, out| {
+            let ExprKind::AssignRef { rhs, .. } = &e.kind else {
+                return;
+            };
+            let Some((base, prop)) = property_fetch_parts(fa, rhs) else {
+                return;
+            };
+            let Some(receiver_class) = receiver_class_for_property_fetch(fa, current_class, base)
+            else {
+                return;
+            };
+            let Some(info) = property_decl_info(fa, &receiver_class, prop) else {
+                return;
+            };
+            if can_write_property(fa, current_class, &info) {
+                return;
+            }
+            out.push(
+                Diagnostic::error(
+                    rhs.span,
+                    format!(
+                        "Property {}::${prop} with {} visibility is assigned by reference.",
+                        info.declaring_class.trim_start_matches('\\'),
+                        write_visibility_label(&info),
+                    ),
+                )
+                .with_code("property.assignByRef"),
+            );
+        },
+    );
+    out
+}
+
+// --- ReadOnlyByPhpDocPropertyAssignRefRule (level 3) ----------------------
+
+/// phpstan `ReadOnlyByPhpDocPropertyAssignRefRule`
+/// (`property.readOnlyByPhpDocAssignByRef`), for real properties whose declaring
+/// property docblock is in this file. Cross-file PHPDoc readonly metadata is not
+/// yet reflected, so those cases are skipped rather than guessed.
+fn run_readonly_phpdoc_property_assign_ref(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    walk_exprs_with_class(
+        &fa.program.stmts,
+        None,
+        "",
+        fa,
+        &mut out,
+        &mut |current_class, e, fa, out| {
+            let ExprKind::AssignRef { rhs, .. } = &e.kind else {
+                return;
+            };
+            let Some((base, prop)) = property_fetch_parts(fa, rhs) else {
+                return;
+            };
+            let Some(receiver_class) = receiver_class_for_property_fetch(fa, current_class, base)
+            else {
+                return;
+            };
+            let Some(info) = property_decl_info(fa, &receiver_class, prop) else {
+                return;
+            };
+            if !info.doc_readonly || info.is_native_readonly {
+                return;
+            }
+            if !can_write_property(fa, current_class, &info) {
+                return;
+            }
+            out.push(
+                Diagnostic::error(
+                    rhs.span,
+                    format!(
+                        "@readonly property {}::${prop} is assigned by reference.",
+                        info.declaring_class.trim_start_matches('\\')
+                    ),
+                )
+                .with_code("property.readOnlyByPhpDocAssignByRef"),
+            );
+        },
+    );
+    out
+}
+
+// --- ReadOnlyByPhpDocPropertyAssignRule (level 3) -------------------------
+
+/// phpstan `ReadOnlyByPhpDocPropertyAssignRule`: assignments to a real
+/// `@readonly` property must happen on `$this` inside the declaring class's
+/// constructor (or `__unserialize`). `@*-allow-private-mutation` permits later
+/// in-class writes, matching phpstan's `isAllowedPrivateMutation()`.
+fn run_readonly_phpdoc_property_assign(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    walk_exprs_with_method_context(
+        &fa.program.stmts,
+        None,
+        false,
+        "",
+        fa,
+        &mut out,
+        &mut |current_class, in_ctor, e, fa, out| {
+            let fetch = match &e.kind {
+                ExprKind::Assign { target, .. } | ExprKind::AssignOp { target, .. } => {
+                    property_fetch_from_write_target(target)
+                }
+                ExprKind::PreInc(target)
+                | ExprKind::PreDec(target)
+                | ExprKind::PostInc(target)
+                | ExprKind::PostDec(target) => property_fetch_from_write_target(target),
+                _ => None,
+            };
+            let Some(fetch) = fetch else { return };
+            let Some((base, prop)) = property_fetch_parts(fa, fetch) else {
+                return;
+            };
+            let Some(receiver_class) = receiver_class_for_property_fetch(fa, current_class, base)
+            else {
+                return;
+            };
+            let Some(info) = property_decl_info(fa, &receiver_class, prop) else {
+                return;
+            };
+            if !info.doc_readonly || info.is_native_readonly {
+                return;
+            }
+            if !can_write_property(fa, current_class, &info) {
+                return;
+            }
+
+            let declaring = info.declaring_class.trim_start_matches('\\');
+            let outside_declaring =
+                current_class.is_none_or(|c| !same_fqn(c, &info.declaring_class));
+            if outside_declaring {
+                out.push(
+                    Diagnostic::error(
+                        fetch.span,
+                        format!(
+                            "@readonly property {declaring}::${prop} is assigned outside of its declaring class."
+                        ),
+                    )
+                    .with_code("property.readOnlyByPhpDocAssignOutOfClass"),
+                );
+                return;
+            }
+
+            let assigned_on_this =
+                matches!(&base.kind, ExprKind::Variable(v) if fa.interner.resolve(*v) == "this");
+            if in_ctor {
+                if !assigned_on_this {
+                    out.push(
+                        Diagnostic::error(
+                            fetch.span,
+                            format!(
+                                "@readonly property {declaring}::${prop} is not assigned on $this."
+                            ),
+                        )
+                        .with_code("property.readOnlyByPhpDocAssignNotOnThis"),
+                    );
+                }
+                return;
+            }
+
+            if info.doc_allow_private_mutation {
+                return;
+            }
+            out.push(
+                Diagnostic::error(
+                    fetch.span,
+                    format!(
+                        "@readonly property {declaring}::${prop} is assigned outside of the constructor."
+                    ),
+                )
+                .with_code("property.readOnlyByPhpDocAssignNotInConstructor"),
+            );
+        },
+    );
+    out
+}
+
+// --- AccessPrivatePropertyThroughStaticRule (level 2) ---------------------
+
+/// phpstan `AccessPrivatePropertyThroughStaticRule`
+/// (`staticClassAccess.privateProperty`): `static::$p` is unsafe for a private
+/// static property declared on a non-final class, because late static binding can
+/// target a subclass where the private slot is not the same property.
+fn run_access_private_property_through_static(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    walk_exprs_with_class(
+        &fa.program.stmts,
+        None,
+        "",
+        fa,
+        &mut out,
+        &mut |current_class, e, fa, out| {
+            let Some(current_class) = current_class else {
+                return;
+            };
+            let ExprKind::StaticProp { class, name } = &e.kind else {
+                return;
+            };
+            let (ExprKind::Name(class_name), MemberName::Var(p)) = (&class.kind, name) else {
+                return;
+            };
+            if !class_name.text.eq_ignore_ascii_case("static") {
+                return;
+            }
+            if fa
+                .reflection
+                .class(current_class)
+                .is_none_or(|c| c.is_final)
+            {
+                return;
+            }
+            let prop = fa.interner.resolve(*p);
+            let Some(info) = property_decl_info(fa, current_class, prop) else {
+                return;
+            };
+            if !info.is_static
+                || info.visibility != Visibility::Private
+                || !same_fqn(&info.declaring_class, current_class)
+            {
+                return;
+            }
+            out.push(
+                Diagnostic::error(
+                    e.span,
+                    format!(
+                        "Unsafe access to private property {}::${prop} through static::.",
+                        info.declaring_class.trim_start_matches('\\')
+                    ),
+                )
+                .with_code("staticClassAccess.privateProperty"),
+            );
+        },
+    );
     out
 }
 
@@ -684,7 +2449,9 @@ fn qualify_fqn(ns: &str, name: &str) -> String {
 
 /// The namespace name a `namespace` statement introduces (sans leading `\`).
 fn ns_of(name: &Option<Name>) -> String {
-    name.as_ref().map(|n| n.text.trim_start_matches('\\').to_string()).unwrap_or_default()
+    name.as_ref()
+        .map(|n| n.text.trim_start_matches('\\').to_string())
+        .unwrap_or_default()
 }
 
 fn walk_scoped(
@@ -709,9 +2476,10 @@ fn walk_scoped(
                     }
                 }
             }
-            StmtKind::Namespace { name, body: Some(b) } => {
-                walk_scoped(b, None, &ns_of(name), fa, out, on_expr)
-            }
+            StmtKind::Namespace {
+                name,
+                body: Some(b),
+            } => walk_scoped(b, None, &ns_of(name), fa, out, on_expr),
             StmtKind::Namespace { name, body: None } => cur_ns = ns_of(name),
             StmtKind::Function(fd) => walk_scoped(&fd.body, None, &cur_ns, fa, out, on_expr),
             _ => {
@@ -742,16 +2510,27 @@ fn walk_scoped_methods(
                 for m in &c.members {
                     if let Member::Method(md) = m {
                         if let Some(body) = &md.body {
-                            let is_ctor =
-                                fa.interner.resolve(md.name).eq_ignore_ascii_case("__construct");
-                            walk_scoped_methods(body, fqn.as_deref(), is_ctor, &cur_ns, fa, out, on_expr);
+                            let method = fa.interner.resolve(md.name);
+                            let is_ctor = method.eq_ignore_ascii_case("__construct")
+                                || method.eq_ignore_ascii_case("__unserialize")
+                                || method.eq_ignore_ascii_case("__clone");
+                            walk_scoped_methods(
+                                body,
+                                fqn.as_deref(),
+                                is_ctor,
+                                &cur_ns,
+                                fa,
+                                out,
+                                on_expr,
+                            );
                         }
                     }
                 }
             }
-            StmtKind::Namespace { name, body: Some(b) } => {
-                walk_scoped_methods(b, None, in_ctor, &ns_of(name), fa, out, on_expr)
-            }
+            StmtKind::Namespace {
+                name,
+                body: Some(b),
+            } => walk_scoped_methods(b, None, in_ctor, &ns_of(name), fa, out, on_expr),
             StmtKind::Namespace { name, body: None } => cur_ns = ns_of(name),
             StmtKind::Function(fd) => {
                 walk_scoped_methods(&fd.body, None, false, &cur_ns, fa, out, on_expr)
@@ -761,6 +2540,90 @@ fn walk_scoped_methods(
                     stmt_exprs(s, &mut |e| on_expr(class, in_ctor, e, fa, out));
                 }
             }
+        }
+    }
+}
+
+/// Walk all expressions while tracking the enclosing named class, if any.
+/// Nested functions/classes reset the class scope; closures/arrow functions
+/// inherit it through `stmt_exprs`/`walk_expr_local`.
+fn walk_exprs_with_class(
+    stmts: &[Stmt],
+    cur_class: Option<&str>,
+    ns: &str,
+    fa: &FileAnalysis,
+    out: &mut Vec<Diagnostic>,
+    on_expr: &mut impl FnMut(Option<&str>, &Expr, &FileAnalysis, &mut Vec<Diagnostic>),
+) {
+    let mut cur_ns = ns.to_string();
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Class(c) => {
+                let fqn = c.name.map(|n| qualify_fqn(&cur_ns, fa.interner.resolve(n)));
+                for m in &c.members {
+                    if let Member::Method(md) = m {
+                        if let Some(body) = &md.body {
+                            walk_exprs_with_class(body, fqn.as_deref(), &cur_ns, fa, out, on_expr);
+                        }
+                    }
+                }
+            }
+            StmtKind::Namespace {
+                name,
+                body: Some(b),
+            } => walk_exprs_with_class(b, None, &ns_of(name), fa, out, on_expr),
+            StmtKind::Namespace { name, body: None } => cur_ns = ns_of(name),
+            StmtKind::Function(fd) => {
+                walk_exprs_with_class(&fd.body, None, &cur_ns, fa, out, on_expr)
+            }
+            _ => stmt_exprs(s, &mut |e| on_expr(cur_class, e, fa, out)),
+        }
+    }
+}
+
+/// Like [`walk_exprs_with_class`], and also marks constructor-like methods.
+fn walk_exprs_with_method_context(
+    stmts: &[Stmt],
+    cur_class: Option<&str>,
+    in_ctor: bool,
+    ns: &str,
+    fa: &FileAnalysis,
+    out: &mut Vec<Diagnostic>,
+    on_expr: &mut impl FnMut(Option<&str>, bool, &Expr, &FileAnalysis, &mut Vec<Diagnostic>),
+) {
+    let mut cur_ns = ns.to_string();
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Class(c) => {
+                let fqn = c.name.map(|n| qualify_fqn(&cur_ns, fa.interner.resolve(n)));
+                for m in &c.members {
+                    if let Member::Method(md) = m {
+                        if let Some(body) = &md.body {
+                            let method = fa.interner.resolve(md.name);
+                            let is_ctor = method.eq_ignore_ascii_case("__construct")
+                                || method.eq_ignore_ascii_case("__unserialize");
+                            walk_exprs_with_method_context(
+                                body,
+                                fqn.as_deref(),
+                                is_ctor,
+                                &cur_ns,
+                                fa,
+                                out,
+                                on_expr,
+                            );
+                        }
+                    }
+                }
+            }
+            StmtKind::Namespace {
+                name,
+                body: Some(b),
+            } => walk_exprs_with_method_context(b, None, in_ctor, &ns_of(name), fa, out, on_expr),
+            StmtKind::Namespace { name, body: None } => cur_ns = ns_of(name),
+            StmtKind::Function(fd) => {
+                walk_exprs_with_method_context(&fd.body, None, false, &cur_ns, fa, out, on_expr)
+            }
+            _ => stmt_exprs(s, &mut |e| on_expr(cur_class, in_ctor, e, fa, out)),
         }
     }
 }
@@ -778,7 +2641,12 @@ fn stmt_exprs(s: &Stmt, on_expr: &mut impl FnMut(&Expr)) {
         }
         StmtKind::Return(Some(e)) => walk_expr_local(e, on_expr),
         StmtKind::Block(b) => b.iter().for_each(|st| stmt_exprs(st, on_expr)),
-        StmtKind::If { cond, then, elseifs, els } => {
+        StmtKind::If {
+            cond,
+            then,
+            elseifs,
+            els,
+        } => {
             walk_expr_local(cond, on_expr);
             stmt_exprs(then, on_expr);
             for ei in elseifs {
@@ -797,13 +2665,24 @@ fn stmt_exprs(s: &Stmt, on_expr: &mut impl FnMut(&Expr)) {
             stmt_exprs(body, on_expr);
             walk_expr_local(cond, on_expr);
         }
-        StmtKind::For { init, cond, update, body } => {
+        StmtKind::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
             for e in init.iter().chain(cond).chain(update) {
                 walk_expr_local(e, on_expr);
             }
             stmt_exprs(body, on_expr);
         }
-        StmtKind::Foreach { subject, key, value, body, .. } => {
+        StmtKind::Foreach {
+            subject,
+            key,
+            value,
+            body,
+            ..
+        } => {
             walk_expr_local(subject, on_expr);
             if let Some(k) = key {
                 walk_expr_local(k, on_expr);
@@ -820,7 +2699,11 @@ fn stmt_exprs(s: &Stmt, on_expr: &mut impl FnMut(&Expr)) {
                 c.body.iter().for_each(|st| stmt_exprs(st, on_expr));
             }
         }
-        StmtKind::Try { body, catches, finally } => {
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
             body.iter().for_each(|st| stmt_exprs(st, on_expr));
             for c in catches {
                 c.body.iter().for_each(|st| stmt_exprs(st, on_expr));
@@ -880,7 +2763,9 @@ fn walk_expr_local(e: &Expr, on_expr: &mut impl FnMut(&Expr)) {
         ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => go(expr),
         ExprKind::Binary { lhs, rhs, .. }
         | ExprKind::Assign { target: lhs, rhs }
-        | ExprKind::AssignOp { target: lhs, rhs, .. }
+        | ExprKind::AssignOp {
+            target: lhs, rhs, ..
+        }
         | ExprKind::AssignRef { target: lhs, rhs }
         | ExprKind::Coalesce { lhs, rhs } => {
             go(lhs);
@@ -946,7 +2831,9 @@ fn class_is_fully_known(fqn: &str, fa: &FileAnalysis) -> bool {
             return true;
         }
         seen.push(key);
-        let Some(c) = fa.reflection.class(fqn) else { return false };
+        let Some(c) = fa.reflection.class(fqn) else {
+            return false;
+        };
         c.parents
             .iter()
             .chain(&c.interfaces)
@@ -1010,7 +2897,12 @@ fn run_access_properties_general(fa: &FileAnalysis) -> Vec<Diagnostic> {
     // double-report (mirrors phpstan's `isInExpressionAssign` skip).
     let assign_targets = assignment_target_spans(fa.program);
     walk::for_each_expr(fa.program, &mut |e: &Expr| {
-        if let ExprKind::Prop { base, name, nullsafe } = &e.kind {
+        if let ExprKind::Prop {
+            base,
+            name,
+            nullsafe,
+        } = &e.kind
+        {
             let r = e.span.range();
             if assign_targets.contains(&(r.start as u32, r.end as u32)) {
                 return;
@@ -1038,6 +2930,126 @@ fn assignment_target_spans(program: &Program) -> Vec<(u32, u32)> {
     spans
 }
 
+fn mark_property_subtree(expr: &Expr, spans: &mut Vec<(u32, u32)>) {
+    walk::for_each_subexpr(expr, &mut |e| {
+        if matches!(e.kind, ExprKind::Prop { .. }) {
+            let r = e.span.range();
+            spans.push((r.start as u32, r.end as u32));
+        }
+    });
+}
+
+fn undefined_allowed_property_spans(program: &Program) -> Vec<(u32, u32)> {
+    let mut spans = Vec::new();
+    walk::for_each_expr(program, &mut |e: &Expr| match &e.kind {
+        ExprKind::Isset(vars) => {
+            for v in vars {
+                mark_property_subtree(v, &mut spans);
+            }
+        }
+        ExprKind::Empty(inner) => mark_property_subtree(inner, &mut spans),
+        ExprKind::Coalesce { lhs, .. } => mark_property_subtree(lhs, &mut spans),
+        ExprKind::AssignOp {
+            op: php_ast::BinOp::Coalesce,
+            target,
+            ..
+        } => mark_property_subtree(target, &mut spans),
+        _ => {}
+    });
+    spans
+}
+
+/// Level-8 `checkNullables` strictness for property access. Below level 8
+/// phpstan strips `null` from nullable receivers before checking the property;
+/// at level 8+ it reports `property.nonObject` for `$maybeC->p`. Undefined-
+/// probing contexts (`isset`, `empty`, `??`) stay silent like phpstan.
+fn run_nullable_property_access(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let suppressed = undefined_allowed_property_spans(fa.program);
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e: &Expr| {
+        let ExprKind::Prop {
+            base,
+            name,
+            nullsafe,
+        } = &e.kind
+        else {
+            return;
+        };
+        if *nullsafe {
+            return;
+        }
+        let r = e.span.range();
+        if suppressed.contains(&(r.start as u32, r.end as u32)) {
+            return;
+        }
+        let MemberName::Ident(p) = name else { return };
+        let base_ty = fa.type_of(base);
+        let Some(non_null) = super::non_null_part(&base_ty) else {
+            return;
+        };
+        if !super::known_objectish_type(fa, &non_null) {
+            return;
+        }
+        let prop = fa.interner.resolve(*p);
+        out.push(
+            Diagnostic::error(
+                e.span,
+                format!(
+                    "Cannot access property ${prop} on {}.",
+                    super::nullable_type_display(&base_ty)
+                ),
+            )
+            .with_code("property.nonObject"),
+        );
+    });
+    out
+}
+
+/// Level-7 `checkUnionTypes` for property fetches: report when a concrete
+/// object union has the property on some arms and definitely lacks it on others.
+/// Interface arms are skipped to avoid false positives on properties declared by
+/// runtime implementors rather than by the interface type itself.
+fn run_union_property_access(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let suppressed = undefined_allowed_property_spans(fa.program);
+    let assign_targets = assignment_target_spans(fa.program);
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e: &Expr| {
+        let ExprKind::Prop {
+            base,
+            name,
+            nullsafe,
+        } = &e.kind
+        else {
+            return;
+        };
+        if *nullsafe {
+            return;
+        }
+        let r = e.span.range();
+        let span = (r.start as u32, r.end as u32);
+        if suppressed.contains(&span) || assign_targets.contains(&span) {
+            return;
+        }
+        let MemberName::Ident(p) = name else { return };
+        let base_ty = fa.type_of(base);
+        let prop = fa.interner.resolve(*p);
+        let Some((has_prop, lacks_prop)) = union_property_status(fa, &base_ty, prop, false) else {
+            return;
+        };
+        if !(has_prop && lacks_prop) {
+            return;
+        }
+        out.push(
+            Diagnostic::error(
+                e.span,
+                format!("Access to an undefined property {base_ty}::${prop}."),
+            )
+            .with_code("property.notFound"),
+        );
+    });
+    out
+}
+
 /// The write-side (`AccessPropertiesInAssignRule`): same check, but on the target
 /// of an assignment, judging *write* access (so a `private(set)`-ish member could
 /// differ — but our model has no asymmetric-visibility split, so for writes we
@@ -1049,11 +3061,90 @@ fn run_access_properties_in_assign(fa: &FileAnalysis) -> Vec<Diagnostic> {
         let (ExprKind::Assign { target, .. } | ExprKind::AssignRef { target, .. }) = &e.kind else {
             return;
         };
-        if let ExprKind::Prop { base, name, nullsafe } = &target.kind {
+        if let ExprKind::Prop {
+            base,
+            name,
+            nullsafe,
+        } = &target.kind
+        {
             check_property_access(fa, target, base, name, *nullsafe, true, &mut out);
         }
     });
     out
+}
+
+fn run_union_property_access_in_assign(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e: &Expr| {
+        let (ExprKind::Assign { target, .. } | ExprKind::AssignRef { target, .. }) = &e.kind else {
+            return;
+        };
+        let ExprKind::Prop {
+            base,
+            name,
+            nullsafe,
+        } = &target.kind
+        else {
+            return;
+        };
+        if *nullsafe {
+            return;
+        }
+        let MemberName::Ident(p) = name else { return };
+        let base_ty = fa.type_of(base);
+        let prop = fa.interner.resolve(*p);
+        let Some((has_prop, lacks_prop)) = union_property_status(fa, &base_ty, prop, true) else {
+            return;
+        };
+        if !(has_prop && lacks_prop) {
+            return;
+        }
+        out.push(
+            Diagnostic::error(
+                target.span,
+                format!("Access to an undefined property {base_ty}::${prop}."),
+            )
+            .with_code("property.notFound"),
+        );
+    });
+    out
+}
+
+
+fn union_property_status(
+    fa: &FileAnalysis,
+    ty: &Type,
+    prop: &str,
+    write: bool,
+) -> Option<(bool, bool)> {
+    let Type::Union(parts) = ty else {
+        return None;
+    };
+    if parts.len() < 2 || super::type_contains_null(ty) {
+        return None;
+    }
+    let mut has_prop = false;
+    let mut lacks_prop = false;
+    for part in parts {
+        let Type::Named { fqn, .. } = part else {
+            return None;
+        };
+        let class = fqn.trim_start_matches('\\');
+        if !known_class_tree(class, fa) {
+            return None;
+        }
+        if fa.reflection.class(class).map(|c| c.kind) == Some(ClassKind::Interface) {
+            return None;
+        }
+        if fa.reflection.find_property(class, prop).is_some()
+            || has_magic_accessor(class, fa, write)
+        {
+            has_prop = true;
+        } else {
+            lacks_prop = true;
+        }
+    }
+    Some((has_prop, lacks_prop))
 }
 
 /// The shared per-fetch check: when `base` has a single, fully-known concrete
@@ -1081,7 +3172,13 @@ fn check_property_access(
     let MemberName::Ident(p) = name else { return }; // dynamic `$o->$x` — skip.
     let prop = fa.interner.resolve(*p);
 
-    let Some(class) = sole_class(&fa.type_of(base)) else { return };
+    let base_ty = fa.type_of(base);
+    if fa.check_nullables && super::type_contains_null(&base_ty) {
+        return;
+    }
+    let Some(class) = sole_class(&base_ty) else {
+        return;
+    };
     if !known_class_tree(&class, fa) {
         return; // unresolved hierarchy → no judgement.
     }
@@ -1091,13 +3188,17 @@ fn check_property_access(
     if fa.reflection.class(&class).map(|c| c.kind) == Some(ClassKind::Interface) {
         return;
     }
-    if fa.reflection.find_property(&class, prop).is_some() || has_magic_accessor(&class, fa, write) {
+    if fa.reflection.find_property(&class, prop).is_some() || has_magic_accessor(&class, fa, write)
+    {
         return;
     }
     out.push(
         Diagnostic::error(
             fetch.span,
-            format!("Access to an undefined property {}::${prop}.", class.trim_start_matches('\\')),
+            format!(
+                "Access to an undefined property {}::${prop}.",
+                class.trim_start_matches('\\')
+            ),
         )
         .with_code("property.notFound"),
     );
@@ -1119,7 +3220,9 @@ fn run_access_static_properties(fa: &FileAnalysis) -> Vec<Diagnostic> {
     for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
         for s in region {
             walk_region_exprs(s, &mut |e: &Expr| {
-                let ExprKind::StaticProp { .. } = &e.kind else { return };
+                let ExprKind::StaticProp { .. } = &e.kind else {
+                    return;
+                };
                 let r = e.span.range();
                 if assign_targets.contains(&(r.start as u32, r.end as u32)) {
                     return;
@@ -1160,10 +3263,16 @@ fn check_static_property(
     e: &Expr,
 ) -> Option<Diagnostic> {
     use php_resolve::Resolution;
-    let ExprKind::StaticProp { class, name } = &e.kind else { return None };
+    let ExprKind::StaticProp { class, name } = &e.kind else {
+        return None;
+    };
     // `C::$b` — the static-property name is the `$b` variable token.
-    let MemberName::Var(p) = name else { return None };
-    let ExprKind::Name(n) = &class.kind else { return None };
+    let MemberName::Var(p) = name else {
+        return None;
+    };
+    let ExprKind::Name(n) = &class.kind else {
+        return None;
+    };
     // Skip self/static/parent — need enclosing-class context.
     let fqn = match scope.resolve_class(n) {
         Resolution::Fqn(f) => f.trim_start_matches('\\').to_string(),
@@ -1207,7 +3316,9 @@ fn run_access_static_properties_in_assign(fa: &FileAnalysis) -> Vec<Diagnostic> 
     for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
         for s in region {
             walk_region_exprs(s, &mut |e: &Expr| {
-                let ExprKind::StaticProp { .. } = &e.kind else { return };
+                let ExprKind::StaticProp { .. } = &e.kind else {
+                    return;
+                };
                 let r = e.span.range();
                 if !targets.contains(&(r.start as u32, r.end as u32)) {
                     return;
@@ -1263,7 +3374,14 @@ fn walk_region_exprs(s: &Stmt, on_expr: &mut impl FnMut(&Expr)) {
 fn run_nullsafe_property_fetch(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     walk::for_each_expr(fa.program, &mut |e: &Expr| {
-        let ExprKind::Prop { base, nullsafe: true, .. } = &e.kind else { return };
+        let ExprKind::Prop {
+            base,
+            nullsafe: true,
+            ..
+        } = &e.kind
+        else {
+            return;
+        };
         let recv = fa.type_of(base);
         // Only when we are SURE it's never null: a concrete named object type.
         if matches!(recv, Type::Named { .. }) {
@@ -1310,13 +3428,17 @@ fn run_reading_write_only(fa: &FileAnalysis) -> Vec<Diagnostic> {
     });
 
     walk::for_each_expr(fa.program, &mut |e: &Expr| {
-        let ExprKind::Prop { base, name, .. } = &e.kind else { return };
+        let ExprKind::Prop { base, name, .. } = &e.kind else {
+            return;
+        };
         let MemberName::Ident(p) = name else { return };
         let r = e.span.range();
         if write_targets.contains(&(r.start as u32, r.end as u32)) {
             return; // it's a write, not a read.
         }
-        let Some(class) = receiver_class(fa, base) else { return };
+        let Some(class) = receiver_class(fa, base) else {
+            return;
+        };
         if !known_class_tree(&class, fa) {
             return;
         }
@@ -1351,9 +3473,13 @@ fn run_writing_to_read_only(fa: &FileAnalysis) -> Vec<Diagnostic> {
         let (ExprKind::Assign { target, .. } | ExprKind::AssignOp { target, .. }) = &e.kind else {
             return;
         };
-        let ExprKind::Prop { base, name, .. } = &target.kind else { return };
+        let ExprKind::Prop { base, name, .. } = &target.kind else {
+            return;
+        };
         let MemberName::Ident(p) = name else { return };
-        let Some(class) = receiver_class(fa, base) else { return };
+        let Some(class) = receiver_class(fa, base) else {
+            return;
+        };
         if !known_class_tree(&class, fa) {
             return;
         }
@@ -1422,9 +3548,10 @@ fn run_invalid_callable_property_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// rejects as a property type; `Closure` is a real class and is allowed.)
 fn type_mentions_callable(ty: &php_ast::Type) -> bool {
     match &ty.kind {
-        php_ast::TypeKind::Simple(n) => {
-            n.text.trim_start_matches('\\').eq_ignore_ascii_case("callable")
-        }
+        php_ast::TypeKind::Simple(n) => n
+            .text
+            .trim_start_matches('\\')
+            .eq_ignore_ascii_case("callable"),
         php_ast::TypeKind::Nullable(inner) => type_mentions_callable(inner),
         php_ast::TypeKind::Union(parts) | php_ast::TypeKind::Intersection(parts) => {
             parts.iter().any(type_mentions_callable)
@@ -1482,8 +3609,15 @@ fn doc_has_var(doc: Option<&str>) -> bool {
 fn run_types_assigned_to_properties(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Assign { target, rhs } = &e.kind else { return };
-        let ExprKind::Prop { base, name: MemberName::Ident(psym), .. } = &target.kind else {
+        let ExprKind::Assign { target, rhs } = &e.kind else {
+            return;
+        };
+        let ExprKind::Prop {
+            base,
+            name: MemberName::Ident(psym),
+            ..
+        } = &target.kind
+        else {
             return;
         };
         let recv = fa.type_of(base);
@@ -1492,7 +3626,9 @@ fn run_types_assigned_to_properties(fa: &FileAnalysis) -> Vec<Diagnostic> {
             return;
         }
         let pname = fa.interner.resolve(*psym);
-        let Some(found) = fa.reflection.find_property(&fqn, pname) else { return };
+        let Some(found) = fa.reflection.find_property(&fqn, pname) else {
+            return;
+        };
         let decl = found.member.ty.clone();
         let native_decl = found.member.native_ty.clone();
         let val = fa.type_of(rhs);
@@ -1509,33 +3645,299 @@ fn run_types_assigned_to_properties(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// DefaultValueTypesAssignedToPropertiesRule — property.defaultValue
+// ---------------------------------------------------------------------------
+
+/// A property default value must be accepted by the property's writable type.
+/// Mirrors phpstan's `DefaultValueTypesAssignedToPropertiesRule`: if a property
+/// has no native type, `= null` is allowed even when PHPDoc says otherwise.
+fn run_default_value_types_assigned_to_properties(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            check_property_defaults_stmt(fa, scope, st, &mut out);
+        }
+    });
+    out
+}
+
+fn check_property_defaults_stmt(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    st: &Stmt,
+    out: &mut Vec<Diagnostic>,
+) {
+    match &st.kind {
+        StmtKind::Class(c) => {
+            let fqn = c
+                .name
+                .map(|n| scope.qualify(fa.interner.resolve(n)))
+                .unwrap_or_else(|| "class@anonymous".to_string());
+            let class = reflect_class(scope, fa.interner, &fqn, c);
+            let ctx = TypeCtx::new(fa.reflection, scope, fa.interner);
+            let mut native_ctx = TypeCtx::new(fa.reflection, scope, fa.interner);
+            native_ctx.native = true;
+            for m in &c.members {
+                let Member::Property(pd) = m else { continue };
+                for elem in &pd.props {
+                    let Some(default) = &elem.default else {
+                        continue;
+                    };
+                    let pname = fa.interner.resolve(elem.name);
+                    let Some(prop) = class.properties.iter().find(|p| p.name == pname) else {
+                        continue;
+                    };
+                    let value = ctx.infer(default);
+                    if pd.ty.is_none() && matches!(value, Type::Null) {
+                        continue;
+                    }
+                    if php_infer::is_assignable(
+                        fa.reflection,
+                        &fa.lenient_src(value.clone()),
+                        &prop.ty,
+                    ) || (!fa.treat_phpdoc_types_as_certain
+                        && php_infer::is_assignable(
+                            fa.reflection,
+                            &fa.lenient_src(native_ctx.infer(default)),
+                            &prop.native_ty,
+                        ))
+                    {
+                        continue;
+                    }
+                    let kind = if prop.is_static {
+                        "Static property"
+                    } else {
+                        "Property"
+                    };
+                    out.push(
+                        Diagnostic::error(
+                            default.span,
+                            format!(
+                                "{kind} {}::${pname} ({}) does not accept default value of type {value}.",
+                                fqn.trim_start_matches('\\'),
+                                prop.ty
+                            ),
+                        )
+                        .with_code("property.defaultValue"),
+                    );
+                }
+            }
+        }
+        StmtKind::Namespace { body: Some(b), .. } | StmtKind::Block(b) => {
+            b.iter()
+                .for_each(|s| check_property_defaults_stmt(fa, scope, s, out));
+        }
+        StmtKind::If {
+            then, elseifs, els, ..
+        } => {
+            check_property_defaults_stmt(fa, scope, then, out);
+            for e in elseifs {
+                check_property_defaults_stmt(fa, scope, &e.body, out);
+            }
+            if let Some(e) = els {
+                check_property_defaults_stmt(fa, scope, e, out);
+            }
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::DoWhile { body, .. }
+        | StmtKind::For { body, .. }
+        | StmtKind::Foreach { body, .. } => check_property_defaults_stmt(fa, scope, body, out),
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            body.iter()
+                .for_each(|s| check_property_defaults_stmt(fa, scope, s, out));
+            for c in catches {
+                c.body
+                    .iter()
+                    .for_each(|s| check_property_defaults_stmt(fa, scope, s, out));
+            }
+            if let Some(fin) = finally {
+                fin.iter()
+                    .for_each(|s| check_property_defaults_stmt(fa, scope, s, out));
+            }
+        }
+        StmtKind::Switch { cases, .. } => {
+            for case in cases {
+                case.body
+                    .iter()
+                    .for_each(|s| check_property_defaults_stmt(fa, scope, s, out));
+            }
+        }
+        StmtKind::Declare { body: Some(b), .. } => check_property_defaults_stmt(fa, scope, b, out),
+        StmtKind::Function(fd) => {
+            fd.body
+                .iter()
+                .for_each(|s| check_property_defaults_stmt(fa, scope, s, out));
+        }
+        _ => {}
+    }
+}
+
 pub(crate) static RULES: &[RuleEntry] = &[
-    RuleEntry { name: "property.readOnly", level: 0, run: run_readonly_property },
+    RuleEntry {
+        name: "property.readOnly",
+        level: 0,
+        run: run_readonly_property,
+    },
     RuleEntry {
         name: "property.readOnlyByPhpDocDefaultValue",
         level: 0,
         run: run_readonly_phpdoc_property,
     },
-    RuleEntry { name: "property.inClass", level: 0, run: run_property_in_class },
-    RuleEntry { name: "property.inInterface", level: 0, run: run_properties_in_interface },
-    RuleEntry { name: "property.hookAttributes", level: 0, run: run_property_hook_attributes },
-    RuleEntry { name: "property.overriding", level: 0, run: run_overriding_property },
-    RuleEntry { name: "property.accessUndefined", level: 0, run: run_access_properties },
-    RuleEntry { name: "property.readOnlyAssign", level: 3, run: run_readonly_property_assign },
-    RuleEntry { name: "property.access", level: 0, run: run_access_properties_general },
-    RuleEntry { name: "property.accessInAssign", level: 0, run: run_access_properties_in_assign },
-    RuleEntry { name: "staticProperty.access", level: 0, run: run_access_static_properties },
+    RuleEntry {
+        name: "property.inClass",
+        level: 0,
+        run: run_property_in_class,
+    },
+    RuleEntry {
+        name: "property.inInterface",
+        level: 0,
+        run: run_properties_in_interface,
+    },
+    RuleEntry {
+        name: "property.hookAttributes",
+        level: 0,
+        run: run_property_hook_attributes,
+    },
+    RuleEntry {
+        name: "propertySetHook.parameter",
+        level: 0,
+        run: run_set_property_hook_parameter,
+    },
+    RuleEntry {
+        name: "propertyGetHook.noRead",
+        level: 3,
+        run: run_get_non_virtual_property_hook_read,
+    },
+    RuleEntry {
+        name: "propertySetHook.noAssign",
+        level: 3,
+        run: run_set_non_virtual_property_hook_assign,
+    },
+    RuleEntry {
+        name: "property.overriding",
+        level: 0,
+        run: run_overriding_property,
+    },
+    RuleEntry {
+        name: "property.accessUndefined",
+        level: 0,
+        run: run_access_properties,
+    },
+    RuleEntry {
+        name: "property.readOnlyAssign",
+        level: 3,
+        run: run_readonly_property_assign,
+    },
+    RuleEntry {
+        name: "property.missingReadOnlyAssign",
+        level: 0,
+        run: run_missing_readonly_property_assign,
+    },
+    RuleEntry {
+        name: "property.readOnlyAssignByRef",
+        level: 3,
+        run: run_readonly_property_assign_ref,
+    },
+    RuleEntry {
+        name: "property.assignByRef",
+        level: 0,
+        run: run_property_assign_ref,
+    },
+    RuleEntry {
+        name: "property.readOnlyByPhpDocAssign",
+        level: 3,
+        run: run_readonly_phpdoc_property_assign,
+    },
+    RuleEntry {
+        name: "property.missingReadOnlyByPhpDocAssign",
+        level: 0,
+        run: run_missing_readonly_phpdoc_property_assign,
+    },
+    RuleEntry {
+        name: "property.readOnlyByPhpDocAssignByRef",
+        level: 3,
+        run: run_readonly_phpdoc_property_assign_ref,
+    },
+    RuleEntry {
+        name: "property.access",
+        level: 0,
+        run: run_access_properties_general,
+    },
+    RuleEntry {
+        name: "property.nullableAccess",
+        level: 8,
+        run: run_nullable_property_access,
+    },
+    RuleEntry {
+        name: "property.unionAccess",
+        level: 7,
+        run: run_union_property_access,
+    },
+    RuleEntry {
+        name: "property.accessInAssign",
+        level: 0,
+        run: run_access_properties_in_assign,
+    },
+    RuleEntry {
+        name: "property.unionAccessInAssign",
+        level: 7,
+        run: run_union_property_access_in_assign,
+    },
+    RuleEntry {
+        name: "staticProperty.access",
+        level: 0,
+        run: run_access_static_properties,
+    },
     RuleEntry {
         name: "staticProperty.accessInAssign",
         level: 0,
         run: run_access_static_properties_in_assign,
     },
-    RuleEntry { name: "property.nullsafeNeverNull", level: 4, run: run_nullsafe_property_fetch },
-    RuleEntry { name: "property.readingWriteOnly", level: 0, run: run_reading_write_only },
-    RuleEntry { name: "property.writingToReadOnly", level: 0, run: run_writing_to_read_only },
-    RuleEntry { name: "property.callableType", level: 0, run: run_invalid_callable_property_type },
-    RuleEntry { name: "property.missingType", level: 6, run: run_missing_property_typehint },
-    RuleEntry { name: "assign.propertyType", level: 3, run: run_types_assigned_to_properties },
+    RuleEntry {
+        name: "staticClassAccess.privateProperty",
+        level: 2,
+        run: run_access_private_property_through_static,
+    },
+    RuleEntry {
+        name: "property.nullsafeNeverNull",
+        level: 4,
+        run: run_nullsafe_property_fetch,
+    },
+    RuleEntry {
+        name: "property.readingWriteOnly",
+        level: 0,
+        run: run_reading_write_only,
+    },
+    RuleEntry {
+        name: "property.writingToReadOnly",
+        level: 0,
+        run: run_writing_to_read_only,
+    },
+    RuleEntry {
+        name: "property.callableType",
+        level: 0,
+        run: run_invalid_callable_property_type,
+    },
+    RuleEntry {
+        name: "property.missingType",
+        level: 6,
+        run: run_missing_property_typehint,
+    },
+    RuleEntry {
+        name: "assign.propertyType",
+        level: 3,
+        run: run_types_assigned_to_properties,
+    },
+    RuleEntry {
+        name: "property.defaultValue",
+        level: 3,
+        run: run_default_value_types_assigned_to_properties,
+    },
 ];
 
 #[cfg(test)]
@@ -1552,7 +3954,10 @@ mod tests {
                 /** @readonly */
                 public int $x = 5;
             }"#;
-        assert_eq!(codes(src, run_readonly_phpdoc_property), ["property.readOnlyByPhpDocDefaultValue"]);
+        assert_eq!(
+            codes(src, run_readonly_phpdoc_property),
+            ["property.readOnlyByPhpDocDefaultValue"]
+        );
     }
 
     #[test]
@@ -1594,12 +3999,25 @@ mod tests {
         assert!(codes(src, run_readonly_phpdoc_property).is_empty());
     }
 
+    #[test]
+    fn readonly_allow_private_mutation_combined_tag_opt_out() {
+        let src = r#"<?php
+            class C {
+                /** @phpstan-readonly-allow-private-mutation */
+                public int $x = 5;
+            }"#;
+        assert!(codes(src, run_readonly_phpdoc_property).is_empty());
+    }
+
     // --- TypesAssignedToPropertiesRule ----------------------------------
 
     #[test]
     fn wrong_typed_property_assignment_flagged() {
         let src = "<?php class C { public int $n; function f() { $this->n = 'x'; } }";
-        assert_eq!(codes(src, run_types_assigned_to_properties), ["assign.propertyType"]);
+        assert_eq!(
+            codes(src, run_types_assigned_to_properties),
+            ["assign.propertyType"]
+        );
     }
 
     #[test]
@@ -1623,7 +4041,51 @@ mod tests {
     #[test]
     fn assignment_on_external_object_flagged() {
         let src = "<?php class C { public int $n; } function f() { $c = new C(); $c->n = 'x'; }";
-        assert_eq!(codes(src, run_types_assigned_to_properties), ["assign.propertyType"]);
+        assert_eq!(
+            codes(src, run_types_assigned_to_properties),
+            ["assign.propertyType"]
+        );
+    }
+
+    // --- DefaultValueTypesAssignedToPropertiesRule ----------------------
+
+    #[test]
+    fn wrong_typed_property_default_flagged() {
+        let src = "<?php class C { public int $n = 'x'; }";
+        assert_eq!(
+            codes(src, run_default_value_types_assigned_to_properties),
+            ["property.defaultValue"]
+        );
+    }
+
+    #[test]
+    fn correct_typed_property_default_clean() {
+        let src = "<?php class C { public int $n = 1; }";
+        assert!(codes(src, run_default_value_types_assigned_to_properties).is_empty());
+    }
+
+    #[test]
+    fn wrong_static_property_default_flagged() {
+        let src = "<?php class C { public static string $s = 1; }";
+        assert_eq!(
+            codes(src, run_default_value_types_assigned_to_properties),
+            ["property.defaultValue"]
+        );
+    }
+
+    #[test]
+    fn phpdoc_property_default_is_checked() {
+        let src = "<?php class C { /** @var int */ public $n = 'x'; }";
+        assert_eq!(
+            codes(src, run_default_value_types_assigned_to_properties),
+            ["property.defaultValue"]
+        );
+    }
+
+    #[test]
+    fn untyped_phpdoc_property_default_null_is_clean() {
+        let src = "<?php class C { /** @var int */ public $n = null; }";
+        assert!(codes(src, run_default_value_types_assigned_to_properties).is_empty());
     }
 
     // --- ReadOnlyPropertyRule -------------------------------------------
@@ -1631,7 +4093,10 @@ mod tests {
     #[test]
     fn readonly_without_type_is_flagged() {
         let src = "<?php class C { public readonly $x; }";
-        assert_eq!(codes(src, run_readonly_property), ["property.readOnlyNoNativeType"]);
+        assert_eq!(
+            codes(src, run_readonly_property),
+            ["property.readOnlyNoNativeType"]
+        );
     }
 
     #[test]
@@ -1643,13 +4108,19 @@ mod tests {
     #[test]
     fn readonly_static_is_flagged() {
         let src = "<?php class C { public static readonly int $x; }";
-        assert_eq!(codes(src, run_readonly_property), ["property.readOnlyStatic"]);
+        assert_eq!(
+            codes(src, run_readonly_property),
+            ["property.readOnlyStatic"]
+        );
     }
 
     #[test]
     fn readonly_with_default_is_flagged() {
         let src = "<?php class C { public readonly int $x = 1; }";
-        assert_eq!(codes(src, run_readonly_property), ["property.readOnlyDefaultValue"]);
+        assert_eq!(
+            codes(src, run_readonly_property),
+            ["property.readOnlyDefaultValue"]
+        );
     }
 
     #[test]
@@ -1663,7 +4134,10 @@ mod tests {
     #[test]
     fn abstract_non_hooked_property_is_flagged() {
         let src = "<?php abstract class C { abstract public int $x; }";
-        assert_eq!(codes(src, run_property_in_class), ["property.abstractNonHooked"]);
+        assert_eq!(
+            codes(src, run_property_in_class),
+            ["property.abstractNonHooked"]
+        );
     }
 
     #[test]
@@ -1707,7 +4181,10 @@ mod tests {
     #[test]
     fn non_hooked_property_in_interface_is_flagged() {
         let src = "<?php interface I { public int $x; }";
-        assert_eq!(codes(src, run_properties_in_interface), ["property.nonHookedInInterface"]);
+        assert_eq!(
+            codes(src, run_properties_in_interface),
+            ["property.nonHookedInInterface"]
+        );
     }
 
     #[test]
@@ -1719,13 +4196,19 @@ mod tests {
     #[test]
     fn non_public_hooked_property_in_interface_is_flagged() {
         let src = "<?php interface I { protected int $x { get; } }";
-        assert_eq!(codes(src, run_properties_in_interface), ["property.nonPublicInInterface"]);
+        assert_eq!(
+            codes(src, run_properties_in_interface),
+            ["property.nonPublicInInterface"]
+        );
     }
 
     #[test]
     fn hook_with_body_in_interface_is_flagged() {
         let src = "<?php interface I { public int $x { get => 1; } }";
-        assert_eq!(codes(src, run_properties_in_interface), ["property.hookBodyInInterface"]);
+        assert_eq!(
+            codes(src, run_properties_in_interface),
+            ["property.hookBodyInInterface"]
+        );
     }
 
     #[test]
@@ -1739,7 +4222,10 @@ mod tests {
     #[test]
     fn nodiscard_on_hook_is_flagged() {
         let src = "<?php class C { public int $x { #[NoDiscard] get => 1; } }";
-        assert_eq!(codes(src, run_property_hook_attributes), ["attribute.target"]);
+        assert_eq!(
+            codes(src, run_property_hook_attributes),
+            ["attribute.target"]
+        );
     }
 
     #[test]
@@ -1748,11 +4234,154 @@ mod tests {
         assert!(codes(src, run_property_hook_attributes).is_empty());
     }
 
+    // --- SetPropertyHookParameterRule -----------------------------------
+
+    #[test]
+    fn set_hook_param_without_native_type_for_typed_property_is_flagged() {
+        let src = "<?php class C { public int $x { set($v) {} } }";
+        assert_eq!(
+            codes(src, run_set_property_hook_parameter),
+            ["propertySetHook.nativeParameterType"]
+        );
+    }
+
+    #[test]
+    fn set_hook_param_native_type_for_untyped_property_is_flagged() {
+        let src = "<?php class C { public $x { set(int $v) {} } }";
+        assert_eq!(
+            codes(src, run_set_property_hook_parameter),
+            ["propertySetHook.nativeParameterType"]
+        );
+    }
+
+    #[test]
+    fn set_hook_param_native_type_must_be_contravariant() {
+        let src = "<?php class C { public int|float $x { set(int $v) {} } }";
+        assert_eq!(
+            codes(src, run_set_property_hook_parameter),
+            ["propertySetHook.nativeParameterType"]
+        );
+    }
+
+    #[test]
+    fn set_hook_param_native_supertype_is_clean() {
+        let src = "<?php class C { public int $x { set(int|float $v) {} } }";
+        assert!(codes(src, run_set_property_hook_parameter).is_empty());
+    }
+
+    #[test]
+    fn implicit_set_hook_param_is_clean() {
+        let src = "<?php class C { public int $x { set { $this->x = $value; } } }";
+        assert!(codes(src, run_set_property_hook_parameter).is_empty());
+    }
+
+    #[test]
+    fn set_hook_param_type_checks_phpdoc_certain_property_type() {
+        let src = r#"<?php
+            class C {
+                /** @var string */
+                public mixed $x { set(int $v) {} }
+            }"#;
+        assert_eq!(
+            codes(src, run_set_property_hook_parameter),
+            ["propertySetHook.parameterType"]
+        );
+    }
+
+    #[test]
+    fn set_hook_param_type_skips_phpdoc_that_is_not_native_refinement() {
+        let src = r#"<?php
+            class C {
+                /** @var string */
+                public int $x { set(int $v) {} }
+            }"#;
+        assert!(codes(src, run_set_property_hook_parameter).is_empty());
+    }
+
+    #[test]
+    fn set_hook_param_bare_array_reports_missing_iterable_value() {
+        let src = "<?php class C { public mixed $x { set(array $v) {} } }";
+        assert_eq!(
+            codes(src, run_set_property_hook_parameter),
+            ["missingType.iterableValue"]
+        );
+    }
+
+    #[test]
+    fn set_hook_param_bare_callable_reports_missing_signature() {
+        let src = "<?php class C { public mixed $x { set(callable $cb) {} } }";
+        assert_eq!(
+            codes(src, run_set_property_hook_parameter),
+            ["missingType.callable"]
+        );
+    }
+
+    #[test]
+    fn set_hook_param_generic_class_without_args_is_flagged() {
+        let src = r#"<?php
+            /** @template T */
+            class Box {}
+            class C {
+                public mixed $x { set(Box $box) {} }
+            }"#;
+        assert_eq!(
+            codes(src, run_set_property_hook_parameter),
+            ["missingType.generics"]
+        );
+    }
+
+    // --- GetNonVirtualPropertyHookReadRule ------------------------------
+
+    #[test]
+    fn get_hook_for_backed_property_without_read_is_flagged() {
+        let src = "<?php class C { public int $k { get => 1; set => $value + 1; } }";
+        assert_eq!(
+            codes(src, run_get_non_virtual_property_hook_read),
+            ["propertyGetHook.noRead"]
+        );
+    }
+
+    #[test]
+    fn get_hook_that_reads_backing_value_is_clean() {
+        let src = "<?php class C { public int $k { get => $this->k + 1; set => $value + 1; } }";
+        assert!(codes(src, run_get_non_virtual_property_hook_read).is_empty());
+    }
+
+    #[test]
+    fn virtual_get_hook_without_read_is_clean() {
+        let src = "<?php class C { public int $j; public int $k { get => 1; set { $this->j = $value; } } }";
+        assert!(codes(src, run_get_non_virtual_property_hook_read).is_empty());
+    }
+
+    // --- SetNonVirtualPropertyHookAssignRule ----------------------------
+
+    #[test]
+    fn set_hook_for_backed_property_without_assign_is_flagged() {
+        let src = "<?php class C { public int $j; public int $k { get { return $this->k + 1; } set { $this->j = $value; } } }";
+        assert_eq!(
+            codes(src, run_set_non_virtual_property_hook_assign),
+            ["propertySetHook.noAssign"]
+        );
+    }
+
+    #[test]
+    fn set_hook_that_assigns_backing_value_is_clean() {
+        let src = "<?php class C { public int $k { get { return $this->k + 1; } set { $this->k = $value; } } }";
+        assert!(codes(src, run_set_non_virtual_property_hook_assign).is_empty());
+    }
+
+    #[test]
+    fn short_set_hook_is_clean() {
+        let src = "<?php class C { public int $k { get { return $this->k + 1; } set => $value; } }";
+        assert!(codes(src, run_set_non_virtual_property_hook_assign).is_empty());
+    }
+
     // --- OverridingPropertyRule -----------------------------------------
 
     #[test]
     fn override_static_with_nonstatic_is_flagged() {
-        let src = "<?php class B { public static int $x = 0; } class C extends B { public int $x = 0; }";
+        let src =
+            "<?php class B { public static int $x = 0; } class C extends B { public int $x = 0; }";
         let got = codes(src, run_overriding_property);
         assert!(got.contains(&"property.nonStatic"), "{got:?}");
     }
@@ -1766,7 +4395,8 @@ mod tests {
 
     #[test]
     fn override_narrows_visibility_is_flagged() {
-        let src = "<?php class B { public int $x = 0; } class C extends B { protected int $x = 0; }";
+        let src =
+            "<?php class B { public int $x = 0; } class C extends B { protected int $x = 0; }";
         let got = codes(src, run_overriding_property);
         assert!(got.contains(&"property.visibility"), "{got:?}");
     }
@@ -1863,12 +4493,350 @@ mod tests {
         assert!(codes(src, run_readonly_property_assign).is_empty());
     }
 
+    #[test]
+    fn readonly_assign_in_unserialize_is_clean() {
+        let src =
+            "<?php class C { public readonly int $x; function __unserialize(array $d) { $this->x = 1; } }";
+        assert!(codes(src, run_readonly_property_assign).is_empty());
+    }
+
+    #[test]
+    fn readonly_assign_in_clone_is_clean() {
+        let src = "<?php class C { public readonly int $x; function __clone() { $this->x = 1; } }";
+        assert!(codes(src, run_readonly_property_assign).is_empty());
+    }
+
+    // --- MissingReadOnlyPropertyAssignRule --------------------------------
+
+    #[test]
+    fn missing_readonly_without_constructor_is_flagged() {
+        let src = "<?php class C { public readonly int $x; }";
+        assert_eq!(
+            codes(src, run_missing_readonly_property_assign),
+            ["property.uninitializedReadonly"]
+        );
+    }
+
+    #[test]
+    fn missing_readonly_not_assigned_in_ctor_is_flagged() {
+        let src = "<?php class C { public readonly int $x; function __construct() {} }";
+        assert_eq!(
+            codes(src, run_missing_readonly_property_assign),
+            ["property.uninitializedReadonly"]
+        );
+    }
+
+    #[test]
+    fn missing_readonly_assigned_in_ctor_is_clean() {
+        let src =
+            "<?php class C { public readonly int $x; function __construct() { $this->x = 1; } }";
+        assert!(codes(src, run_missing_readonly_property_assign).is_empty());
+    }
+
+    #[test]
+    fn missing_readonly_read_before_assign_in_ctor_is_flagged() {
+        let src = "<?php class C { public readonly int $x; function __construct() { echo $this->x; $this->x = 1; } }";
+        assert_eq!(
+            codes(src, run_missing_readonly_property_assign),
+            ["property.uninitializedReadonly"]
+        );
+    }
+
+    #[test]
+    fn missing_readonly_double_assign_in_ctor_is_flagged() {
+        let src = "<?php class C { public readonly int $x; function __construct() { $this->x = 1; $this->x = 2; } }";
+        assert_eq!(
+            codes(src, run_missing_readonly_property_assign),
+            ["assign.readOnlyProperty"]
+        );
+    }
+
+    #[test]
+    fn missing_readonly_helper_call_in_ctor_is_skipped() {
+        let src = "<?php class C { public readonly int $x; function __construct() { $this->init(); } function init() { $this->x = 1; } }";
+        assert!(codes(src, run_missing_readonly_property_assign).is_empty());
+    }
+
+    #[test]
+    fn missing_readonly_branchy_ctor_is_skipped() {
+        let src = "<?php class C { public readonly int $x; function __construct(bool $ok) { if ($ok) { $this->x = 1; } } }";
+        assert!(codes(src, run_missing_readonly_property_assign).is_empty());
+    }
+
+    #[test]
+    fn missing_readonly_nested_conditional_assignment_is_skipped() {
+        let src = "<?php class C { public readonly int $x; function __construct(bool $ok) { $ok && ($this->x = 1); } }";
+        assert!(codes(src, run_missing_readonly_property_assign).is_empty());
+    }
+
+    #[test]
+    fn missing_readonly_offset_write_is_skipped() {
+        let src = "<?php class C { public readonly array $x; function __construct() { $this->x[0] = 1; } }";
+        assert!(codes(src, run_missing_readonly_property_assign).is_empty());
+    }
+
+    // --- ReadOnlyPropertyAssignRefRule ----------------------------------
+
+    #[test]
+    fn readonly_assign_ref_on_this_is_flagged() {
+        let src = "<?php class C { public readonly int $x; function f() { $r = &$this->x; } }";
+        assert_eq!(
+            codes(src, run_readonly_property_assign_ref),
+            ["property.readOnlyAssignByRef"]
+        );
+    }
+
+    #[test]
+    fn readonly_assign_ref_is_not_reported_as_plain_assign() {
+        let src = "<?php class C { public readonly int $x; function f() { $r = &$this->x; } }";
+        assert!(codes(src, run_readonly_property_assign).is_empty());
+    }
+
+    #[test]
+    fn non_readonly_assign_ref_is_clean() {
+        let src = "<?php class C { public int $x; function f() { $r = &$this->x; } }";
+        assert!(codes(src, run_readonly_property_assign_ref).is_empty());
+    }
+
+    // --- PropertyAssignRefRule ------------------------------------------
+
+    #[test]
+    fn assign_ref_to_private_property_is_flagged() {
+        let src = "<?php class C { private int $x; } function f(C $c) { $r = &$c->x; }";
+        assert_eq!(
+            codes(src, run_property_assign_ref),
+            ["property.assignByRef"]
+        );
+    }
+
+    #[test]
+    fn assign_ref_to_private_property_on_this_is_clean() {
+        let src = "<?php class C { private int $x; function f() { $r = &$this->x; } }";
+        assert!(codes(src, run_property_assign_ref).is_empty());
+    }
+
+    #[test]
+    fn assign_ref_to_protected_set_property_is_flagged() {
+        let src =
+            "<?php class C { public protected(set) int $x; } function f(C $c) { $r = &$c->x; }";
+        assert_eq!(
+            codes(src, run_property_assign_ref),
+            ["property.assignByRef"]
+        );
+    }
+
+    // --- ReadOnlyByPhpDocPropertyAssignRule -----------------------------
+
+    #[test]
+    fn readonly_phpdoc_assign_outside_ctor_is_flagged() {
+        let src = r#"<?php
+            class C {
+                /** @readonly */
+                public int $x;
+                function f() { $this->x = 1; }
+            }"#;
+        assert_eq!(
+            codes(src, run_readonly_phpdoc_property_assign),
+            ["property.readOnlyByPhpDocAssignNotInConstructor"]
+        );
+    }
+
+    #[test]
+    fn readonly_phpdoc_assign_in_ctor_on_this_is_clean() {
+        let src = r#"<?php
+            class C {
+                /** @readonly */
+                public int $x;
+                function __construct() { $this->x = 1; }
+            }"#;
+        assert!(codes(src, run_readonly_phpdoc_property_assign).is_empty());
+    }
+
+    #[test]
+    fn readonly_phpdoc_assign_in_ctor_not_on_this_is_flagged() {
+        let src = r#"<?php
+            class C {
+                /** @readonly */
+                public int $x;
+                function __construct(C $c) { $c->x = 1; }
+            }"#;
+        assert_eq!(
+            codes(src, run_readonly_phpdoc_property_assign),
+            ["property.readOnlyByPhpDocAssignNotOnThis"]
+        );
+    }
+
+    #[test]
+    fn readonly_phpdoc_assign_outside_declaring_class_is_flagged() {
+        let src = r#"<?php
+            class C {
+                /** @readonly */
+                public int $x;
+            }
+            function f(C $c) { $c->x = 1; }"#;
+        assert_eq!(
+            codes(src, run_readonly_phpdoc_property_assign),
+            ["property.readOnlyByPhpDocAssignOutOfClass"]
+        );
+    }
+
+    #[test]
+    fn readonly_phpdoc_allow_private_mutation_allows_in_class_assign() {
+        let src = r#"<?php
+            class C {
+                /** @phpstan-readonly-allow-private-mutation */
+                public int $x;
+                function f() { $this->x = 1; }
+            }"#;
+        assert!(codes(src, run_readonly_phpdoc_property_assign).is_empty());
+    }
+
+    // --- MissingReadOnlyByPhpDocPropertyAssignRule -----------------------
+
+    #[test]
+    fn missing_readonly_phpdoc_without_constructor_is_flagged() {
+        let src = r#"<?php
+            class C {
+                /** @readonly */
+                public int $x;
+            }"#;
+        assert_eq!(
+            codes(src, run_missing_readonly_phpdoc_property_assign),
+            ["property.uninitializedReadonlyByPhpDoc"]
+        );
+    }
+
+    #[test]
+    fn missing_readonly_phpdoc_not_assigned_in_ctor_is_flagged() {
+        let src = r#"<?php
+            class C {
+                /** @readonly */
+                public int $x;
+                function __construct() {}
+            }"#;
+        assert_eq!(
+            codes(src, run_missing_readonly_phpdoc_property_assign),
+            ["property.uninitializedReadonlyByPhpDoc"]
+        );
+    }
+
+    #[test]
+    fn missing_readonly_phpdoc_assigned_in_ctor_is_clean() {
+        let src = r#"<?php
+            class C {
+                /** @readonly */
+                public int $x;
+                function __construct() { $this->x = 1; }
+            }"#;
+        assert!(codes(src, run_missing_readonly_phpdoc_property_assign).is_empty());
+    }
+
+    #[test]
+    fn missing_readonly_phpdoc_read_before_assign_in_ctor_is_flagged() {
+        let src = r#"<?php
+            class C {
+                /** @readonly */
+                public int $x;
+                function __construct() { echo $this->x; $this->x = 1; }
+            }"#;
+        assert_eq!(
+            codes(src, run_missing_readonly_phpdoc_property_assign),
+            ["property.uninitializedReadonlyByPhpDoc"]
+        );
+    }
+
+    #[test]
+    fn missing_readonly_phpdoc_double_assign_in_ctor_is_flagged() {
+        let src = r#"<?php
+            class C {
+                /** @readonly */
+                public int $x;
+                function __construct() { $this->x = 1; $this->x = 2; }
+            }"#;
+        assert_eq!(
+            codes(src, run_missing_readonly_phpdoc_property_assign),
+            ["assign.readOnlyPropertyByPhpDoc"]
+        );
+    }
+
+    #[test]
+    fn missing_readonly_phpdoc_native_readonly_is_skipped() {
+        let src = r#"<?php
+            class C {
+                /** @readonly */
+                public readonly int $x;
+                function __construct() {}
+            }"#;
+        assert!(codes(src, run_missing_readonly_phpdoc_property_assign).is_empty());
+    }
+
+    #[test]
+    fn missing_readonly_phpdoc_helper_call_in_ctor_is_skipped() {
+        let src = r#"<?php
+            class C {
+                /** @readonly */
+                public int $x;
+                function __construct() { $this->init(); }
+                function init() { $this->x = 1; }
+            }"#;
+        assert!(codes(src, run_missing_readonly_phpdoc_property_assign).is_empty());
+    }
+
+    // --- ReadOnlyByPhpDocPropertyAssignRefRule --------------------------
+
+    #[test]
+    fn readonly_phpdoc_assign_ref_is_flagged() {
+        let src = r#"<?php
+            class C {
+                /** @readonly */
+                public int $x;
+                function f() { $r = &$this->x; }
+            }"#;
+        assert_eq!(
+            codes(src, run_readonly_phpdoc_property_assign_ref),
+            ["property.readOnlyByPhpDocAssignByRef"]
+        );
+    }
+
+    #[test]
+    fn native_readonly_assign_ref_not_phpdoc_rule() {
+        let src = "<?php class C { public readonly int $x; function f() { $r = &$this->x; } }";
+        assert!(codes(src, run_readonly_phpdoc_property_assign_ref).is_empty());
+    }
+
+    // --- AccessPrivatePropertyThroughStaticRule -------------------------
+
+    #[test]
+    fn private_static_property_through_static_is_flagged() {
+        let src = "<?php class C { private static int $x; function f() { return static::$x; } }";
+        assert_eq!(
+            codes(src, run_access_private_property_through_static),
+            ["staticClassAccess.privateProperty"]
+        );
+    }
+
+    #[test]
+    fn private_static_property_through_static_in_final_class_is_clean() {
+        let src =
+            "<?php final class C { private static int $x; function f() { return static::$x; } }";
+        assert!(codes(src, run_access_private_property_through_static).is_empty());
+    }
+
+    #[test]
+    fn public_static_property_through_static_is_clean() {
+        let src = "<?php class C { public static int $x; function f() { return static::$x; } }";
+        assert!(codes(src, run_access_private_property_through_static).is_empty());
+    }
+
     // --- AccessPropertiesRule (general receiver) ------------------------
 
     #[test]
     fn access_undefined_property_on_new_is_flagged() {
         let src = "<?php class C { public int $a; } function f() { return (new C())->b; }";
-        assert_eq!(codes(src, run_access_properties_general), ["property.notFound"]);
+        assert_eq!(
+            codes(src, run_access_properties_general),
+            ["property.notFound"]
+        );
     }
 
     #[test]
@@ -1898,6 +4866,67 @@ mod tests {
     }
 
     #[test]
+    fn nullable_property_access_is_flagged_at_strict_level() {
+        let src = "<?php class C { public int $a; } function f(?C $c): int { return $c->a; }";
+        assert_eq!(
+            codes(src, run_nullable_property_access),
+            ["property.nonObject"]
+        );
+    }
+
+    #[test]
+    fn nullsafe_property_access_on_nullable_is_clean() {
+        let src = "<?php class C { public int $a; } function f(?C $c): mixed { return $c?->a; }";
+        assert!(codes(src, run_nullable_property_access).is_empty());
+    }
+
+    #[test]
+    fn nullable_property_access_in_isset_is_clean() {
+        let src =
+            "<?php class C { public int $a; } function f(?C $c): bool { return isset($c->a); }";
+        assert!(codes(src, run_nullable_property_access).is_empty());
+    }
+
+    #[test]
+    fn narrowed_nullable_property_access_is_clean() {
+        let src = "<?php class C { public int $a; } function f(?C $c): int { if ($c === null) { return 0; } return $c->a; }";
+        assert!(codes(src, run_nullable_property_access).is_empty());
+    }
+
+    #[test]
+    fn nullable_property_access_suppresses_not_found_branch() {
+        let src = "<?php class C {} function f(?C $c): mixed { return $c->missing; }";
+        assert!(codes(src, run_access_properties_general).is_empty());
+    }
+
+    #[test]
+    fn union_property_access_missing_on_one_arm_is_flagged() {
+        let src = "<?php class A { public int $p; } class B {} \
+            /** @param A|B $x */ function f($x): int { return $x->p; }";
+        assert_eq!(
+            codes(src, run_union_property_access),
+            ["property.notFound"]
+        );
+    }
+
+    #[test]
+    fn union_property_access_present_on_all_arms_is_clean() {
+        let src = "<?php class A { public int $p; } class B { public int $p; } \
+            /** @param A|B $x */ function f($x): int { return $x->p; }";
+        assert!(codes(src, run_union_property_access).is_empty());
+    }
+
+    #[test]
+    fn union_property_assignment_missing_on_one_arm_is_flagged() {
+        let src = "<?php class A { public int $p; } class B {} \
+            /** @param A|B $x */ function f($x): void { $x->p = 1; }";
+        assert_eq!(
+            codes(src, run_union_property_access_in_assign),
+            ["property.notFound"]
+        );
+    }
+
+    #[test]
     fn access_inherited_property_on_new_is_clean() {
         let src = "<?php class B { public int $a; } class C extends B {} function f() { return (new C())->a; }";
         assert!(codes(src, run_access_properties_general).is_empty());
@@ -1908,7 +4937,10 @@ mod tests {
     #[test]
     fn assign_undefined_property_is_flagged() {
         let src = "<?php class C { public int $a; } function f() { (new C())->b = 1; }";
-        assert_eq!(codes(src, run_access_properties_in_assign), ["property.notFound"]);
+        assert_eq!(
+            codes(src, run_access_properties_in_assign),
+            ["property.notFound"]
+        );
     }
 
     #[test]
@@ -1922,7 +4954,10 @@ mod tests {
     #[test]
     fn access_undefined_static_property_is_flagged() {
         let src = "<?php class C { public static int $a; } function f() { return C::$b; }";
-        assert_eq!(codes(src, run_access_static_properties), ["staticProperty.notFound"]);
+        assert_eq!(
+            codes(src, run_access_static_properties),
+            ["staticProperty.notFound"]
+        );
     }
 
     #[test]
@@ -1949,7 +4984,10 @@ mod tests {
     #[test]
     fn nullsafe_on_nonnull_object_is_flagged() {
         let src = "<?php class C { public int $a; } function f() { return (new C())?->a; }";
-        assert_eq!(codes(src, run_nullsafe_property_fetch), ["nullsafe.neverNull"]);
+        assert_eq!(
+            codes(src, run_nullsafe_property_fetch),
+            ["nullsafe.neverNull"]
+        );
     }
 
     #[test]
@@ -1974,13 +5012,15 @@ mod tests {
 
     #[test]
     fn reading_write_only_magic_property_is_flagged() {
-        let src = "<?php /** @property-write int $w */ class C {} function f() { return (new C())->w; }";
+        let src =
+            "<?php /** @property-write int $w */ class C {} function f() { return (new C())->w; }";
         assert_eq!(codes(src, run_reading_write_only), ["property.writeOnly"]);
     }
 
     #[test]
     fn writing_write_only_magic_property_is_clean() {
-        let src = "<?php /** @property-write int $w */ class C {} function f() { (new C())->w = 1; }";
+        let src =
+            "<?php /** @property-write int $w */ class C {} function f() { (new C())->w = 1; }";
         assert!(codes(src, run_reading_write_only).is_empty());
     }
 
@@ -1994,13 +5034,18 @@ mod tests {
 
     #[test]
     fn writing_read_only_magic_property_is_flagged() {
-        let src = "<?php /** @property-read int $r */ class C {} function f() { (new C())->r = 1; }";
-        assert_eq!(codes(src, run_writing_to_read_only), ["assign.propertyReadOnly"]);
+        let src =
+            "<?php /** @property-read int $r */ class C {} function f() { (new C())->r = 1; }";
+        assert_eq!(
+            codes(src, run_writing_to_read_only),
+            ["assign.propertyReadOnly"]
+        );
     }
 
     #[test]
     fn reading_read_only_magic_property_is_clean() {
-        let src = "<?php /** @property-read int $r */ class C {} function f() { return (new C())->r; }";
+        let src =
+            "<?php /** @property-read int $r */ class C {} function f() { return (new C())->r; }";
         assert!(codes(src, run_writing_to_read_only).is_empty());
     }
 
@@ -2015,7 +5060,10 @@ mod tests {
     #[test]
     fn assign_undefined_static_property_is_flagged() {
         let src = "<?php class C { public static int $a; } function f() { C::$b = 1; }";
-        assert_eq!(codes(src, run_access_static_properties_in_assign), ["staticProperty.notFound"]);
+        assert_eq!(
+            codes(src, run_access_static_properties_in_assign),
+            ["staticProperty.notFound"]
+        );
     }
 
     #[test]
@@ -2053,7 +5101,10 @@ mod tests {
     #[test]
     fn read_static_property_still_flagged_after_split() {
         let src = "<?php class C { public static int $a; } function f() { return C::$b; }";
-        assert_eq!(codes(src, run_access_static_properties), ["staticProperty.notFound"]);
+        assert_eq!(
+            codes(src, run_access_static_properties),
+            ["staticProperty.notFound"]
+        );
     }
 
     // --- InvalidCallablePropertyTypeRule -------------------------------
@@ -2061,19 +5112,28 @@ mod tests {
     #[test]
     fn callable_property_type_is_flagged() {
         let src = "<?php class C { public callable $cb; }";
-        assert_eq!(codes(src, run_invalid_callable_property_type), ["property.callableType"]);
+        assert_eq!(
+            codes(src, run_invalid_callable_property_type),
+            ["property.callableType"]
+        );
     }
 
     #[test]
     fn nullable_callable_property_type_is_flagged() {
         let src = "<?php class C { public ?callable $cb; }";
-        assert_eq!(codes(src, run_invalid_callable_property_type), ["property.callableType"]);
+        assert_eq!(
+            codes(src, run_invalid_callable_property_type),
+            ["property.callableType"]
+        );
     }
 
     #[test]
     fn callable_in_union_property_type_is_flagged() {
         let src = "<?php class C { public int|callable $cb; }";
-        assert_eq!(codes(src, run_invalid_callable_property_type), ["property.callableType"]);
+        assert_eq!(
+            codes(src, run_invalid_callable_property_type),
+            ["property.callableType"]
+        );
     }
 
     #[test]
@@ -2103,7 +5163,10 @@ mod tests {
     #[test]
     fn untyped_property_is_flagged() {
         let src = "<?php class C { public $x; }";
-        assert_eq!(codes(src, run_missing_property_typehint), ["missingType.property"]);
+        assert_eq!(
+            codes(src, run_missing_property_typehint),
+            ["missingType.property"]
+        );
     }
 
     #[test]
@@ -2125,7 +5188,10 @@ mod tests {
         // ClassPropertyNode regardless of container; the interface-shape rule is
         // separate).
         let src = "<?php class C { /** something */ public $x; }";
-        assert_eq!(codes(src, run_missing_property_typehint), ["missingType.property"]);
+        assert_eq!(
+            codes(src, run_missing_property_typehint),
+            ["missingType.property"]
+        );
     }
 
     #[test]

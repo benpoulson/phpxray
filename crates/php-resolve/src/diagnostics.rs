@@ -21,8 +21,11 @@ pub fn diagnostics(program: &php_ast::Program, interner: &Interner) -> Vec<Diagn
             let key = (imp.kind, imp.fold());
             if seen.contains(&key) {
                 out.push(
-                    Diagnostic::warning(imp.span, format!("duplicate import: `{}` is already imported", imp.alias))
-                        .with_code("duplicate-import"),
+                    Diagnostic::warning(
+                        imp.span,
+                        format!("duplicate import: `{}` is already imported", imp.alias),
+                    )
+                    .with_code("duplicate-import"),
                 );
             } else {
                 seen.push(key);
@@ -65,9 +68,19 @@ fn region_imports(stmts: &[Stmt], interner: &Interner) -> Vec<Import> {
     let mut add = |it: &UseItem| {
         let alias = match it.alias {
             Some(s) => interner.resolve(s).to_string(),
-            None => it.name.text.rsplit('\\').next().unwrap_or(&it.name.text).to_string(),
+            None => it
+                .name
+                .text
+                .rsplit('\\')
+                .next()
+                .unwrap_or(&it.name.text)
+                .to_string(),
         };
-        imports.push(Import { kind: it.kind, alias, span: it.name.span });
+        imports.push(Import {
+            kind: it.kind,
+            alias,
+            span: it.name.span,
+        });
     };
     for st in stmts {
         match &st.kind {
@@ -133,7 +146,10 @@ mod tests {
             new Used();
             "#,
         );
-        assert_eq!(d, [("unused-import".into(), "unused import: `Unused`".into())]);
+        assert_eq!(
+            d,
+            [("unused-import".into(), "unused import: `Unused`".into())]
+        );
     }
 
     #[test]
@@ -179,8 +195,13 @@ mod tests {
     #[test]
     fn function_and_class_imports_with_same_name_dont_collide() {
         // Different symbol namespaces — both used, no diagnostics.
-        let d = diags(r#"<?php namespace App; use App\Thing; use function App\Thing; new Thing(); Thing();"#);
-        assert!(d.is_empty(), "class and function imports are independent: {d:?}");
+        let d = diags(
+            r#"<?php namespace App; use App\Thing; use function App\Thing; new Thing(); Thing();"#,
+        );
+        assert!(
+            d.is_empty(),
+            "class and function imports are independent: {d:?}"
+        );
     }
 
     #[test]

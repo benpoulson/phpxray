@@ -30,7 +30,10 @@ mod tests {
         assert_eq!(TokenKind::Variable.php_name(), Some("T_VARIABLE"));
         assert_eq!(TokenKind::DoubleColon.php_name(), Some("T_DOUBLE_COLON"));
         assert_eq!(TokenKind::Eq.php_name(), Some("="));
-        assert_eq!(TokenKind::Keyword(Kw::Function).php_name(), Some("T_FUNCTION"));
+        assert_eq!(
+            TokenKind::Keyword(Kw::Function).php_name(),
+            Some("T_FUNCTION")
+        );
         assert_eq!(TokenKind::Eof.php_name(), None);
     }
 
@@ -41,7 +44,10 @@ mod tests {
 
     #[test]
     fn keywords_are_case_insensitive() {
-        assert_eq!(names("<?php FUNCTION Foo"), ["T_OPEN_TAG", "T_FUNCTION", "T_STRING"]);
+        assert_eq!(
+            names("<?php FUNCTION Foo"),
+            ["T_OPEN_TAG", "T_FUNCTION", "T_STRING"]
+        );
     }
 
     #[test]

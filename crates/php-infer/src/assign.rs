@@ -24,8 +24,11 @@ pub fn strip_null_lenient(t: &Type) -> Type {
         Type::Null => Type::Null,
         Type::Nullable(inner) => (**inner).clone(),
         Type::Union(parts) => {
-            let kept: Vec<Type> =
-                parts.iter().filter(|p| !matches!(p, Type::Null)).cloned().collect();
+            let kept: Vec<Type> = parts
+                .iter()
+                .filter(|p| !matches!(p, Type::Null))
+                .cloned()
+                .collect();
             if kept.is_empty() {
                 Type::Null
             } else {
@@ -59,7 +62,9 @@ pub fn is_castable_to_string(index: &ReflectionIndex, ty: &Type) -> bool {
         Union(parts) => parts.iter().all(|p| is_castable_to_string(index, p)),
         // An object is castable iff it declares `__toString` (Stringable); be
         // lenient when the class isn't indexed (built-in / unknown).
-        Named { fqn, .. } => index.find_method(fqn, "__toString").is_some() || index.class(fqn).is_none(),
+        Named { fqn, .. } => {
+            index.find_method(fqn, "__toString").is_some() || index.class(fqn).is_none()
+        }
         // scalars, `null`, `mixed`, `object`, `self`/`static`, templates, literals.
         _ => true,
     }
@@ -80,7 +85,10 @@ pub fn native_shape(t: &Type) -> Type {
         ClassString(_) => ClassString(None),
         LiteralInt(_) | IntRange { .. } => Int,
         LiteralString(_) => String,
-        Named { fqn, .. } => Named { fqn: fqn.clone(), args: Vec::new() },
+        Named { fqn, .. } => Named {
+            fqn: fqn.clone(),
+            args: Vec::new(),
+        },
         Nullable(inner) => Type::nullable(native_shape(inner)),
         Union(parts) => Type::union(parts.iter().map(native_shape).collect()),
         Intersection(parts) => Type::intersection(parts.iter().map(native_shape).collect()),
@@ -130,9 +138,9 @@ pub fn is_assignable(index: &ReflectionIndex, value: &Type, target: &Type) -> bo
 
     // Leniency escapes: top/bottom and anything we couldn't resolve.
     match (value, target) {
-        (_, Mixed) => return true,           // everything fits mixed
-        (Never, _) => return true,           // never is the bottom type
-        (Mixed, _) => return true,           // unknown value — don't flag
+        (_, Mixed | ExplicitMixed) => return true, // everything fits mixed
+        (Never, _) => return true, // never is the bottom type
+        (Mixed | ExplicitMixed, _) => return true, // mixed value — don't flag by default
         (Unknown(_), _) | (_, Unknown(_)) => return true,
         // A template variable's concrete type is unknown (bounded by its
         // `@template T of …`, which we don't track) — stay lenient either way.
@@ -152,7 +160,9 @@ pub fn is_assignable(index: &ReflectionIndex, value: &Type, target: &Type) -> bo
     // that's a safe under-report (phpstan would flag the declared case only at
     // level 8+), never a false positive.
     if let Union(parts) = value {
-        let numeric = parts.iter().all(|p| matches!(p, Int | Float | LiteralInt(_) | IntRange { .. }))
+        let numeric = parts
+            .iter()
+            .all(|p| matches!(p, Int | Float | LiteralInt(_) | IntRange { .. }))
             && parts.iter().any(|p| matches!(p, Float));
         if numeric && matches!(target, Int | Float) {
             return true;
@@ -216,7 +226,9 @@ fn assignable_atom(index: &ReflectionIndex, value: &Type, target: &Type) -> bool
         (Array(Some(a)), Array(Some(b))) => {
             is_assignable(index, &a.0, &b.0) && is_assignable(index, &a.1, &b.1)
         }
-        (List(v), Array(Some(b))) => is_assignable(index, &Int, &b.0) && is_assignable(index, v, &b.1),
+        (List(v), Array(Some(b))) => {
+            is_assignable(index, &Int, &b.0) && is_assignable(index, v, &b.1)
+        }
         (List(a), List(b)) => is_assignable(index, a, b),
         // An int-keyed array may be a list — lenient (only the value type matters).
         (Array(Some(a)), List(b)) => is_assignable(index, &a.1, b),
@@ -226,12 +238,13 @@ fn assignable_atom(index: &ReflectionIndex, value: &Type, target: &Type) -> bool
         // assignable; a target-optional field is checked only when the value
         // supplies it. Extra value fields are tolerated (lenient — avoids false
         // positives against sealed targets, where phpstan would be stricter).
-        (Shape { fields: av, .. }, Shape { fields: bv, .. }) => bv.iter().all(|bf| {
-            match av.iter().find(|af| af.key == bf.key) {
-                Some(af) => is_assignable(index, &af.ty, &bf.ty),
-                None => bf.optional,
-            }
-        }),
+        (Shape { fields: av, .. }, Shape { fields: bv, .. }) => {
+            bv.iter()
+                .all(|bf| match av.iter().find(|af| af.key == bf.key) {
+                    Some(af) => is_assignable(index, &af.ty, &bf.ty),
+                    None => bf.optional,
+                })
+        }
         // shape ⊑ array<K,V>: each field's key and value must fit the element types.
         (Shape { fields, .. }, Array(Some(kv))) => fields.iter().all(|f| {
             is_assignable(index, &shape_key_type(f), &kv.0) && is_assignable(index, &f.ty, &kv.1)
@@ -262,7 +275,10 @@ fn assignable_atom(index: &ReflectionIndex, value: &Type, target: &Type) -> bool
         // string, or an `[$obj, 'method']` array — all accepted leniently (PHP's
         // `callable` is structural; rejecting a `string`/`array` would false-flag
         // `array_map('trim', …)` and `[$this, 'm']`).
-        (Callable(_) | Named { .. } | Object | String | LiteralString(_) | Array(_) | List(_), Callable(_)) => true,
+        (
+            Callable(_) | Named { .. } | Object | String | LiteralString(_) | Array(_) | List(_),
+            Callable(_),
+        ) => true,
 
         _ => false,
     }
@@ -291,7 +307,10 @@ mod tests {
     }
 
     fn named(s: &str) -> Type {
-        Type::Named { fqn: s.into(), args: vec![] }
+        Type::Named {
+            fqn: s.into(),
+            args: vec![],
+        }
     }
 
     #[test]
@@ -331,31 +350,59 @@ mod tests {
     }
 
     fn field(key: &str, optional: bool, ty: Type) -> ShapeField {
-        ShapeField { key: Some(key.into()), optional, ty }
+        ShapeField {
+            key: Some(key.into()),
+            optional,
+            ty,
+        }
     }
     fn shape(fields: Vec<ShapeField>) -> Type {
-        Type::Shape { fields, sealed: true }
+        Type::Shape {
+            fields,
+            sealed: true,
+        }
     }
 
     #[test]
     fn shape_assignability() {
         // shape ⊑ shape: required field present & assignable.
-        let v = shape(vec![field("id", false, Type::Int), field("name", false, Type::String)]);
+        let v = shape(vec![
+            field("id", false, Type::Int),
+            field("name", false, Type::String),
+        ]);
         let t = shape(vec![field("id", false, Type::Int)]);
         assert!(ok(v.clone(), t)); // extra value field tolerated
-        // a wrong field type is rejected (capability preserved).
+                                   // a wrong field type is rejected (capability preserved).
         let bad = shape(vec![field("id", false, Type::String)]);
         assert!(!ok(v.clone(), bad));
         // a missing *required* target field is rejected; optional is fine.
-        let needs_extra = shape(vec![field("id", false, Type::Int), field("x", false, Type::Bool)]);
+        let needs_extra = shape(vec![
+            field("id", false, Type::Int),
+            field("x", false, Type::Bool),
+        ]);
         assert!(!ok(v.clone(), needs_extra));
-        let opt_extra = shape(vec![field("id", false, Type::Int), field("x", true, Type::Bool)]);
+        let opt_extra = shape(vec![
+            field("id", false, Type::Int),
+            field("x", true, Type::Bool),
+        ]);
         assert!(ok(v.clone(), opt_extra));
         // shape ⊑ array<string, int|string>.
-        assert!(ok(v.clone(), Type::Array(Some(Box::new((Type::String, Type::union(vec![Type::Int, Type::String])))))));
+        assert!(ok(
+            v.clone(),
+            Type::Array(Some(Box::new((
+                Type::String,
+                Type::union(vec![Type::Int, Type::String])
+            ))))
+        ));
         // a coarse array ⊑ shape is lenient (can't disprove).
-        assert!(ok(Type::Array(None), shape(vec![field("id", false, Type::Int)])));
-        assert!(ok(Type::Array(Some(Box::new((Type::String, Type::Mixed)))), shape(vec![field("id", false, Type::Int)])));
+        assert!(ok(
+            Type::Array(None),
+            shape(vec![field("id", false, Type::Int)])
+        ));
+        assert!(ok(
+            Type::Array(Some(Box::new((Type::String, Type::Mixed)))),
+            shape(vec![field("id", false, Type::Int)])
+        ));
     }
 
     #[test]
@@ -374,11 +421,20 @@ mod tests {
 
     #[test]
     fn native_shape_erases_phpdoc_refinements() {
-        assert_eq!(native_shape(&Type::List(Box::new(Type::Int))), Type::Array(None));
+        assert_eq!(
+            native_shape(&Type::List(Box::new(Type::Int))),
+            Type::Array(None)
+        );
         assert_eq!(native_shape(&Type::LiteralInt(5)), Type::Int);
         assert_eq!(
-            native_shape(&Type::Named { fqn: "C".into(), args: vec![Type::Int] }),
-            Type::Named { fqn: "C".into(), args: vec![] }
+            native_shape(&Type::Named {
+                fqn: "C".into(),
+                args: vec![Type::Int]
+            }),
+            Type::Named {
+                fqn: "C".into(),
+                args: vec![]
+            }
         );
     }
 
@@ -401,14 +457,22 @@ mod tests {
     fn arrays_are_covariant_and_lenient_on_bare() {
         let ai = Type::Array(Some(Box::new((Type::Int, Type::Int))));
         assert!(ok(ai.clone(), Type::Array(None)));
-        assert!(ok(ai.clone(), Type::Array(Some(Box::new((Type::Int, Type::Float)))))); // int->float value
-        assert!(!ok(ai, Type::Array(Some(Box::new((Type::Int, Type::String))))));
+        assert!(ok(
+            ai.clone(),
+            Type::Array(Some(Box::new((Type::Int, Type::Float))))
+        )); // int->float value
+        assert!(!ok(
+            ai,
+            Type::Array(Some(Box::new((Type::Int, Type::String))))
+        ));
         assert!(ok(Type::List(Box::new(Type::Int)), Type::Array(None)));
     }
 
     #[test]
     fn class_subtyping_uses_the_index() {
-        let (idx, _) = index_of("class Base {} class User extends Base {} interface I {} class Impl implements I {}");
+        let (idx, _) = index_of(
+            "class Base {} class User extends Base {} interface I {} class Impl implements I {}",
+        );
         assert!(is_assignable(&idx, &named("User"), &named("Base")));
         assert!(!is_assignable(&idx, &named("Base"), &named("User"))); // downcast
         assert!(is_assignable(&idx, &named("Impl"), &named("I")));
@@ -425,7 +489,13 @@ mod tests {
     #[test]
     fn objects_and_callables() {
         assert!(ok(named("Anything"), Type::Object));
-        assert!(ok(Type::Named { fqn: "Closure".into(), args: vec![] }, Type::Callable(None)));
+        assert!(ok(
+            Type::Named {
+                fqn: "Closure".into(),
+                args: vec![]
+            },
+            Type::Callable(None)
+        ));
         assert!(!ok(Type::Int, Type::Object));
     }
 }

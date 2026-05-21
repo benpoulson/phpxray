@@ -61,7 +61,12 @@ where
         StmtKind::Echo(es) => es.iter().for_each(|e| walk_expr(e, on_s, on_e, cross)),
         StmtKind::Return(Some(e)) => walk_expr(e, on_s, on_e, cross),
         StmtKind::Block(b) => b.iter().for_each(|st| walk_stmt(st, on_s, on_e, cross)),
-        StmtKind::If { cond, then, elseifs, els } => {
+        StmtKind::If {
+            cond,
+            then,
+            elseifs,
+            els,
+        } => {
             walk_expr(cond, on_s, on_e, cross);
             walk_stmt(then, on_s, on_e, cross);
             for ei in elseifs {
@@ -80,13 +85,24 @@ where
             walk_stmt(body, on_s, on_e, cross);
             walk_expr(cond, on_s, on_e, cross);
         }
-        StmtKind::For { init, cond, update, body } => {
+        StmtKind::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
             for e in init.iter().chain(cond).chain(update) {
                 walk_expr(e, on_s, on_e, cross);
             }
             walk_stmt(body, on_s, on_e, cross);
         }
-        StmtKind::Foreach { subject, key, value, body, .. } => {
+        StmtKind::Foreach {
+            subject,
+            key,
+            value,
+            body,
+            ..
+        } => {
             walk_expr(subject, on_s, on_e, cross);
             if let Some(k) = key {
                 walk_expr(k, on_s, on_e, cross);
@@ -100,13 +116,21 @@ where
                 if let Some(t) = &c.test {
                     walk_expr(t, on_s, on_e, cross);
                 }
-                c.body.iter().for_each(|st| walk_stmt(st, on_s, on_e, cross));
+                c.body
+                    .iter()
+                    .for_each(|st| walk_stmt(st, on_s, on_e, cross));
             }
         }
-        StmtKind::Try { body, catches, finally } => {
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
             body.iter().for_each(|st| walk_stmt(st, on_s, on_e, cross));
             for c in catches {
-                c.body.iter().for_each(|st| walk_stmt(st, on_s, on_e, cross));
+                c.body
+                    .iter()
+                    .for_each(|st| walk_stmt(st, on_s, on_e, cross));
             }
             if let Some(f) = finally {
                 f.iter().for_each(|st| walk_stmt(st, on_s, on_e, cross));
@@ -117,7 +141,9 @@ where
                 walk_expr(e, on_s, on_e, cross);
             }
         }
-        StmtKind::Global(es) | StmtKind::Unset(es) => es.iter().for_each(|e| walk_expr(e, on_s, on_e, cross)),
+        StmtKind::Global(es) | StmtKind::Unset(es) => {
+            es.iter().for_each(|e| walk_expr(e, on_s, on_e, cross))
+        }
         StmtKind::StaticVars(vars) => {
             for v in vars {
                 if let Some(e) = &v.default {
@@ -133,14 +159,20 @@ where
                 walk_stmt(b, on_s, on_e, cross);
             }
         }
-        StmtKind::Namespace { body: Some(b), .. } => b.iter().for_each(|st| walk_stmt(st, on_s, on_e, cross)),
+        StmtKind::Namespace { body: Some(b), .. } => {
+            b.iter().for_each(|st| walk_stmt(st, on_s, on_e, cross))
+        }
         // Nested declarations introduce new scopes: only descend when crossing.
         StmtKind::Function(fd) if cross => {
             walk_params(&fd.params, on_s, on_e);
-            fd.body.iter().for_each(|st| walk_stmt(st, on_s, on_e, true));
+            fd.body
+                .iter()
+                .for_each(|st| walk_stmt(st, on_s, on_e, true));
         }
         StmtKind::Class(c) if cross => walk_class(c, on_s, on_e),
-        StmtKind::ConstDecl { consts, .. } => consts.iter().for_each(|c| walk_expr(&c.value, on_s, on_e, cross)),
+        StmtKind::ConstDecl { consts, .. } => consts
+            .iter()
+            .for_each(|c| walk_expr(&c.value, on_s, on_e, cross)),
         // No nested expressions/statements (or a scope boundary we don't cross):
         // Function/Class when !cross, Use, GroupUse, Goto, Label, HaltCompiler,
         // InlineHtml, Nop, Error.
@@ -169,7 +201,8 @@ where
     for group in attrs {
         for attr in &group.attrs {
             if let Some(args) = &attr.args {
-                args.iter().for_each(|a| walk_expr(&a.value, on_s, on_e, true));
+                args.iter()
+                    .for_each(|a| walk_expr(&a.value, on_s, on_e, true));
             }
         }
     }
@@ -201,7 +234,10 @@ where
                     }
                 }
             }
-            Member::ClassConst(cd) => cd.consts.iter().for_each(|c| walk_expr(&c.value, on_s, on_e, true)),
+            Member::ClassConst(cd) => cd
+                .consts
+                .iter()
+                .for_each(|c| walk_expr(&c.value, on_s, on_e, true)),
             Member::EnumCase(ec) => {
                 if let Some(v) = &ec.value {
                     walk_expr(v, on_s, on_e, true);
@@ -235,8 +271,15 @@ where
     on_e(e);
     let go = |x: &Expr, on_s: &mut S, on_e: &mut E| walk_expr(x, on_s, on_e, cross);
     match &e.kind {
-        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Str(_) | ExprKind::Variable(_) | ExprKind::Name(_) | ExprKind::Error => {}
-        ExprKind::Interpolated(parts) | ExprKind::ShellExec(parts) => parts.iter().for_each(|p| go(p, on_s, on_e)),
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Variable(_)
+        | ExprKind::Name(_)
+        | ExprKind::Error => {}
+        ExprKind::Interpolated(parts) | ExprKind::ShellExec(parts) => {
+            parts.iter().for_each(|p| go(p, on_s, on_e))
+        }
         ExprKind::VariableVariable(x) | ExprKind::DollarBrace(x) => go(x, on_s, on_e),
         ExprKind::Array { items, .. } => {
             for it in items {
@@ -252,12 +295,18 @@ where
             go(callee, on_s, on_e);
             walk_args(args, on_s, on_e, cross);
         }
-        ExprKind::MethodCall { recv, method, args, .. } => {
+        ExprKind::MethodCall {
+            recv, method, args, ..
+        } => {
             go(recv, on_s, on_e);
             walk_member(method, on_s, on_e, cross);
             walk_args(args, on_s, on_e, cross);
         }
-        ExprKind::StaticCall { class, method, args } => {
+        ExprKind::StaticCall {
+            class,
+            method,
+            args,
+        } => {
             go(class, on_s, on_e);
             walk_member(method, on_s, on_e, cross);
             walk_args(args, on_s, on_e, cross);
@@ -295,7 +344,9 @@ where
         ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => go(expr, on_s, on_e),
         ExprKind::Binary { lhs, rhs, .. }
         | ExprKind::Assign { target: lhs, rhs }
-        | ExprKind::AssignOp { target: lhs, rhs, .. }
+        | ExprKind::AssignOp {
+            target: lhs, rhs, ..
+        }
         | ExprKind::AssignRef { target: lhs, rhs }
         | ExprKind::Coalesce { lhs, rhs } => {
             go(lhs, on_s, on_e);
@@ -308,14 +359,20 @@ where
             }
             go(els, on_s, on_e);
         }
-        ExprKind::PreInc(x) | ExprKind::PreDec(x) | ExprKind::PostInc(x) | ExprKind::PostDec(x) => go(x, on_s, on_e),
+        ExprKind::PreInc(x) | ExprKind::PreDec(x) | ExprKind::PostInc(x) | ExprKind::PostDec(x) => {
+            go(x, on_s, on_e)
+        }
         ExprKind::Instanceof { expr, class } => {
             go(expr, on_s, on_e);
             go(class, on_s, on_e);
         }
-        ExprKind::Clone(x) | ExprKind::Print(x) | ExprKind::Throw(x) | ExprKind::ErrorSuppress(x) | ExprKind::YieldFrom(x) | ExprKind::Eval(x) | ExprKind::Empty(x) => {
-            go(x, on_s, on_e)
-        }
+        ExprKind::Clone(x)
+        | ExprKind::Print(x)
+        | ExprKind::Throw(x)
+        | ExprKind::ErrorSuppress(x)
+        | ExprKind::YieldFrom(x)
+        | ExprKind::Eval(x)
+        | ExprKind::Empty(x) => go(x, on_s, on_e),
         ExprKind::Yield { key, value } => {
             if let Some(k) = key {
                 go(k, on_s, on_e);
@@ -356,7 +413,8 @@ where
     S: FnMut(&Stmt),
     E: FnMut(&Expr),
 {
-    args.iter().for_each(|a| walk_expr(&a.value, on_s, on_e, cross));
+    args.iter()
+        .for_each(|a| walk_expr(&a.value, on_s, on_e, cross));
 }
 
 fn walk_member<S, E>(m: &MemberName, on_s: &mut S, on_e: &mut E, cross: bool)

@@ -36,7 +36,10 @@ impl Span {
     /// An empty span at a single offset (used for synthesized / error nodes).
     #[inline]
     pub fn at(offset: u32) -> Span {
-        Span { start: offset, end: offset }
+        Span {
+            start: offset,
+            end: offset,
+        }
     }
 
     #[inline]
@@ -121,7 +124,10 @@ impl LineIndex {
             Err(next) => next - 1,
         };
         let col = offset - self.line_starts[line];
-        LineCol { line: line as u32 + 1, col: col + 1 }
+        LineCol {
+            line: line as u32 + 1,
+            col: col + 1,
+        }
     }
 
     /// Total number of lines.

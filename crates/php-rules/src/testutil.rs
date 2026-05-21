@@ -47,7 +47,10 @@ pub(crate) fn run_version(
 
 /// Run `rule` and return the error identifiers (`Diagnostic::code`) it emits.
 pub(crate) fn codes(src: &str, rule: fn(&FileAnalysis) -> Vec<Diagnostic>) -> Vec<&'static str> {
-    run(src, rule).into_iter().map(|d| d.code.unwrap_or("")).collect()
+    run(src, rule)
+        .into_iter()
+        .map(|d| d.code.unwrap_or(""))
+        .collect()
 }
 
 /// Like [`codes`] but with an explicit target PHP version (for version-gated rules).
@@ -57,5 +60,8 @@ pub(crate) fn codes_version(
     rule: fn(&FileAnalysis) -> Vec<Diagnostic>,
     php_version: PhpVersion,
 ) -> Vec<&'static str> {
-    run_version(src, rule, php_version).into_iter().map(|d| d.code.unwrap_or("")).collect()
+    run_version(src, rule, php_version)
+        .into_iter()
+        .map(|d| d.code.unwrap_or(""))
+        .collect()
 }

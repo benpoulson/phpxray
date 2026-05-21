@@ -105,7 +105,8 @@ impl<'a> Lexer<'a> {
 
     #[inline]
     fn push(&mut self, kind: TokenKind, start: usize) {
-        self.tokens.push(Token::new(kind, Span::from_range(start..self.pos)));
+        self.tokens
+            .push(Token::new(kind, Span::from_range(start..self.pos)));
     }
 
     fn run(mut self) -> (Vec<Token>, Vec<Diagnostic>) {
@@ -122,7 +123,8 @@ impl<'a> Lexer<'a> {
                 State::Heredoc(ctx) => self.heredoc_step(&ctx),
             }
         }
-        self.tokens.push(Token::new(TokenKind::Eof, Span::at(self.pos as u32)));
+        self.tokens
+            .push(Token::new(TokenKind::Eof, Span::at(self.pos as u32)));
         (self.tokens, self.diags)
     }
 
@@ -554,9 +556,7 @@ impl<'a> Lexer<'a> {
         if self.at(0) == b'0' && matches!(self.at(1), b'x' | b'X' | b'b' | b'B' | b'o' | b'O') {
             self.pos += 2;
         }
-        while self.pos < self.len()
-            && (self.at(0).is_ascii_hexdigit() || self.at(0) == b'_')
-        {
+        while self.pos < self.len() && (self.at(0).is_ascii_hexdigit() || self.at(0) == b'_') {
             self.pos += 1;
         }
     }
@@ -668,7 +668,8 @@ impl<'a> Lexer<'a> {
             self.pos += 1;
         }
         self.push(TokenKind::StartHeredoc, start);
-        self.states.push(State::Heredoc(HeredocCtx { label, nowdoc }));
+        self.states
+            .push(State::Heredoc(HeredocCtx { label, nowdoc }));
     }
 
     /// Is position `at` the start of this heredoc's closing marker? Returns the
@@ -744,7 +745,11 @@ impl<'a> Lexer<'a> {
                 if c == b'\\' {
                     // A backslash before a newline escapes only itself; the
                     // newline must still be seen so the closing marker is found.
-                    let step = if matches!(self.at(1), b'\n' | b'\r') { 1 } else { 2 };
+                    let step = if matches!(self.at(1), b'\n' | b'\r') {
+                        1
+                    } else {
+                        2
+                    };
                     self.pos = (self.pos + step).min(self.len());
                     continue;
                 }

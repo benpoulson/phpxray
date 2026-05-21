@@ -98,12 +98,17 @@ mod tests {
         let mut index = ProjectIndex::with_builtins();
         index.add_file("test.php", &index_file(&r.program, &r.interner));
         let refs = resolve_references(&r.program, &r.interner);
-        unknown_symbols(&index, &refs).into_iter().map(|d| d.message).collect()
+        unknown_symbols(&index, &refs)
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
     }
 
     #[test]
     fn builtins_are_known() {
-        let d = unknowns(r#"<?php strlen("x"); new Exception(); echo PHP_EOL; $a instanceof Countable;"#);
+        let d = unknowns(
+            r#"<?php strlen("x"); new Exception(); echo PHP_EOL; $a instanceof Countable;"#,
+        );
         assert!(d.is_empty(), "builtins should be known: {d:?}");
     }
 
@@ -119,7 +124,10 @@ mod tests {
             $i = new Imagick();
             "#,
         );
-        assert!(d.is_empty(), "non-core extension symbols should be known: {d:?}");
+        assert!(
+            d.is_empty(),
+            "non-core extension symbols should be known: {d:?}"
+        );
     }
 
     #[test]
@@ -169,7 +177,10 @@ mod tests {
         let d = unknowns(
             r#"<?php class B {} class C extends B { function m() { new self(); new parent(); new static(); } }"#,
         );
-        assert!(d.is_empty(), "late-static refs are not index lookups: {d:?}");
+        assert!(
+            d.is_empty(),
+            "late-static refs are not index lookups: {d:?}"
+        );
     }
 
     #[test]

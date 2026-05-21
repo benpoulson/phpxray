@@ -107,8 +107,11 @@ fn run_invalid_assign_var(fa: &FileAnalysis) -> Vec<Diagnostic> {
 
         if contains_nullsafe(target) {
             out.push(
-                Diagnostic::error(e.span, "Nullsafe operator cannot be on left side of assignment.")
-                    .with_code("nullsafe.assign"),
+                Diagnostic::error(
+                    e.span,
+                    "Nullsafe operator cannot be on left side of assignment.",
+                )
+                .with_code("nullsafe.assign"),
             );
             return;
         }
@@ -128,8 +131,11 @@ fn run_invalid_assign_var(fa: &FileAnalysis) -> Vec<Diagnostic> {
 
         if contains_non_assignable(target) {
             out.push(
-                Diagnostic::error(e.span, "Expression on left side of assignment is not assignable.")
-                    .with_code("assign.invalidExpr"),
+                Diagnostic::error(
+                    e.span,
+                    "Expression on left side of assignment is not assignable.",
+                )
+                .with_code("assign.invalidExpr"),
             );
         }
     });
@@ -255,7 +261,9 @@ fn never_string(t: &Type) -> bool {
 /// accepts). Conservative on objects/mixed/unknown.
 fn never_bitnot_operand(t: &Type) -> bool {
     match t {
-        Type::Array(_) | Type::Iterable(_) | Type::List(_) | Type::Shape { .. } | Type::Null => true,
+        Type::Array(_) | Type::Iterable(_) | Type::List(_) | Type::Shape { .. } | Type::Null => {
+            true
+        }
         Type::Bool | Type::True | Type::False => true,
         Type::Int | Type::Float | Type::String | Type::LiteralInt(_) | Type::LiteralString(_) => {
             false
@@ -349,7 +357,9 @@ fn run_invalid_binary(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_invalid_unary(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Unary { op, expr } = &e.kind else { return };
+        let ExprKind::Unary { op, expr } = &e.kind else {
+            return;
+        };
         let (sigil, bad): (&str, fn(&Type) -> bool) = match op {
             UnOp::Plus => ("+", never_number),
             UnOp::Minus => ("-", never_number),
@@ -359,8 +369,11 @@ fn run_invalid_unary(fa: &FileAnalysis) -> Vec<Diagnostic> {
         let t = fa.type_of(expr);
         if bad(&t) {
             out.push(
-                Diagnostic::error(e.span, format!("Unary operation \"{sigil}\" on {t} results in an error."))
-                    .with_code("unaryOp.invalid"),
+                Diagnostic::error(
+                    e.span,
+                    format!("Unary operation \"{sigil}\" on {t} results in an error."),
+                )
+                .with_code("unaryOp.invalid"),
             );
         }
     });
@@ -374,7 +387,9 @@ fn run_invalid_unary(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_invalid_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Binary { op, lhs, rhs } = &e.kind else { return };
+        let ExprKind::Binary { op, lhs, rhs } = &e.kind else {
+            return;
+        };
         let (sigil, ident) = match op {
             BinOp::Eq => ("==", "equal.invalid"),
             BinOp::NotEq => ("!=", "notEqual.invalid"),
@@ -421,9 +436,20 @@ fn run_pipe_byref(fa: &FileAnalysis) -> Vec<Diagnostic> {
         .collect();
     let mut out = Vec::new();
     walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Binary { op: BinOp::Pipe, rhs, .. } = &e.kind else { return };
+        let ExprKind::Binary {
+            op: BinOp::Pipe,
+            rhs,
+            ..
+        } = &e.kind
+        else {
+            return;
+        };
         if let Some((true, name)) = callable_first_param(fa, rhs, &fmap) {
-            let suffix = if name.is_empty() { String::new() } else { format!(" ${name}") };
+            let suffix = if name.is_empty() {
+                String::new()
+            } else {
+                format!(" ${name}")
+            };
             out.push(
                 Diagnostic::error(
                     rhs.span,
@@ -445,15 +471,19 @@ fn callable_first_param(
     fmap: &HashMap<(u32, u32), &ResolvedRef>,
 ) -> Option<(bool, String)> {
     match &e.kind {
-        ExprKind::Closure(c) => {
-            c.params.first().map(|p| (p.by_ref, fa.interner.resolve(p.name).to_string()))
-        }
-        ExprKind::ArrowFn(a) => {
-            a.params.first().map(|p| (p.by_ref, fa.interner.resolve(p.name).to_string()))
-        }
+        ExprKind::Closure(c) => c
+            .params
+            .first()
+            .map(|p| (p.by_ref, fa.interner.resolve(p.name).to_string())),
+        ExprKind::ArrowFn(a) => a
+            .params
+            .first()
+            .map(|p| (p.by_ref, fa.interner.resolve(p.name).to_string())),
         // First-class-callable `f(...)`.
         ExprKind::Call { callee, args } if args.iter().any(|a| a.placeholder) => {
-            let ExprKind::Name(n) = &callee.kind else { return None };
+            let ExprKind::Name(n) = &callee.kind else {
+                return None;
+            };
             let r = fmap.get(&(n.span.start, n.span.end))?;
             let fqn = match &r.resolution {
                 Resolution::Fqn(f) => f.clone(),
@@ -480,13 +510,41 @@ fn callable_first_param(
 }
 
 pub(crate) static RULES: &[RuleEntry] = &[
-    RuleEntry { name: "operators.invalidAssignVar", level: 0, run: run_invalid_assign_var },
-    RuleEntry { name: "operators.invalidIncDec", level: 0, run: run_invalid_inc_dec },
-    RuleEntry { name: "operators.backtick", level: 0, run: run_backtick },
-    RuleEntry { name: "operators.pipeByRef", level: 0, run: run_pipe_byref },
-    RuleEntry { name: "operators.invalidBinary", level: 2, run: run_invalid_binary },
-    RuleEntry { name: "operators.invalidUnary", level: 2, run: run_invalid_unary },
-    RuleEntry { name: "operators.invalidComparison", level: 2, run: run_invalid_comparison },
+    RuleEntry {
+        name: "operators.invalidAssignVar",
+        level: 0,
+        run: run_invalid_assign_var,
+    },
+    RuleEntry {
+        name: "operators.invalidIncDec",
+        level: 0,
+        run: run_invalid_inc_dec,
+    },
+    RuleEntry {
+        name: "operators.backtick",
+        level: 0,
+        run: run_backtick,
+    },
+    RuleEntry {
+        name: "operators.pipeByRef",
+        level: 0,
+        run: run_pipe_byref,
+    },
+    RuleEntry {
+        name: "operators.invalidBinary",
+        level: 2,
+        run: run_invalid_binary,
+    },
+    RuleEntry {
+        name: "operators.invalidUnary",
+        level: 2,
+        run: run_invalid_unary,
+    },
+    RuleEntry {
+        name: "operators.invalidComparison",
+        level: 2,
+        run: run_invalid_comparison,
+    },
 ];
 
 #[cfg(test)]
@@ -547,26 +605,47 @@ mod tests {
 
     #[test]
     fn non_assignable_left_side_is_flagged() {
-        assert_eq!(codes("<?php 1 = 1;", run_invalid_assign_var), ["assign.invalidExpr"]);
-        assert_eq!(codes("<?php foo() = 1;", run_invalid_assign_var), ["assign.invalidExpr"]);
+        assert_eq!(
+            codes("<?php 1 = 1;", run_invalid_assign_var),
+            ["assign.invalidExpr"]
+        );
+        assert_eq!(
+            codes("<?php foo() = 1;", run_invalid_assign_var),
+            ["assign.invalidExpr"]
+        );
     }
 
     #[test]
     fn non_assignable_inside_destructuring_is_flagged() {
-        assert_eq!(codes("<?php [foo()] = $c;", run_invalid_assign_var), ["assign.invalidExpr"]);
+        assert_eq!(
+            codes("<?php [foo()] = $c;", run_invalid_assign_var),
+            ["assign.invalidExpr"]
+        );
     }
 
     #[test]
     fn nullsafe_on_left_side_is_flagged() {
-        assert_eq!(codes("<?php $a?->b = 1;", run_invalid_assign_var), ["nullsafe.assign"]);
+        assert_eq!(
+            codes("<?php $a?->b = 1;", run_invalid_assign_var),
+            ["nullsafe.assign"]
+        );
         // Nullsafe deeper in the chain spine is still flagged.
-        assert_eq!(codes("<?php $a?->b->c = 1;", run_invalid_assign_var), ["nullsafe.assign"]);
-        assert_eq!(codes("<?php $a?->b[0] = 1;", run_invalid_assign_var), ["nullsafe.assign"]);
+        assert_eq!(
+            codes("<?php $a?->b->c = 1;", run_invalid_assign_var),
+            ["nullsafe.assign"]
+        );
+        assert_eq!(
+            codes("<?php $a?->b[0] = 1;", run_invalid_assign_var),
+            ["nullsafe.assign"]
+        );
     }
 
     #[test]
     fn nullsafe_on_right_of_byref_assign_is_flagged() {
-        assert_eq!(codes("<?php $a = &$b?->c;", run_invalid_assign_var), ["nullsafe.byRef"]);
+        assert_eq!(
+            codes("<?php $a = &$b?->c;", run_invalid_assign_var),
+            ["nullsafe.byRef"]
+        );
     }
 
     #[test]
@@ -588,17 +667,32 @@ mod tests {
     #[test]
     fn inc_dec_on_non_variable_is_flagged() {
         assert_eq!(codes("<?php 1++;", run_invalid_inc_dec), ["postInc.expr"]);
-        assert_eq!(codes("<?php ++foo();", run_invalid_inc_dec), ["preInc.expr"]);
-        assert_eq!(codes("<?php foo()--;", run_invalid_inc_dec), ["postDec.expr"]);
-        assert_eq!(codes("<?php --foo();", run_invalid_inc_dec), ["preDec.expr"]);
+        assert_eq!(
+            codes("<?php ++foo();", run_invalid_inc_dec),
+            ["preInc.expr"]
+        );
+        assert_eq!(
+            codes("<?php foo()--;", run_invalid_inc_dec),
+            ["postDec.expr"]
+        );
+        assert_eq!(
+            codes("<?php --foo();", run_invalid_inc_dec),
+            ["preDec.expr"]
+        );
     }
 
     // --- BacktickRule ---------------------------------------------------------
 
     #[test]
     fn backtick_is_flagged() {
-        assert_eq!(codes("<?php `ls -la`;", run_backtick), ["backtick.deprecated"]);
-        assert_eq!(codes("<?php $x = `whoami`;", run_backtick), ["backtick.deprecated"]);
+        assert_eq!(
+            codes("<?php `ls -la`;", run_backtick),
+            ["backtick.deprecated"]
+        );
+        assert_eq!(
+            codes("<?php $x = `whoami`;", run_backtick),
+            ["backtick.deprecated"]
+        );
     }
 
     #[test]
@@ -610,21 +704,39 @@ mod tests {
 
     #[test]
     fn arithmetic_on_array_literal_is_flagged() {
-        assert_eq!(codes("<?php $x = [] - 1;", run_invalid_binary), ["binaryOp.invalid"]);
-        assert_eq!(codes("<?php $x = [1] * 2;", run_invalid_binary), ["binaryOp.invalid"]);
-        assert_eq!(codes("<?php $x = 3 % [];", run_invalid_binary), ["binaryOp.invalid"]);
+        assert_eq!(
+            codes("<?php $x = [] - 1;", run_invalid_binary),
+            ["binaryOp.invalid"]
+        );
+        assert_eq!(
+            codes("<?php $x = [1] * 2;", run_invalid_binary),
+            ["binaryOp.invalid"]
+        );
+        assert_eq!(
+            codes("<?php $x = 3 % [];", run_invalid_binary),
+            ["binaryOp.invalid"]
+        );
     }
 
     #[test]
     fn concat_with_array_literal_is_flagged() {
-        assert_eq!(codes("<?php $x = [] . 'a';", run_invalid_binary), ["binaryOp.invalid"]);
-        assert_eq!(codes("<?php $x = 'a' . [1, 2];", run_invalid_binary), ["binaryOp.invalid"]);
+        assert_eq!(
+            codes("<?php $x = [] . 'a';", run_invalid_binary),
+            ["binaryOp.invalid"]
+        );
+        assert_eq!(
+            codes("<?php $x = 'a' . [1, 2];", run_invalid_binary),
+            ["binaryOp.invalid"]
+        );
     }
 
     #[test]
     fn assign_op_on_array_literal_is_flagged() {
         // `$y .= []` — concat-assign with an array operand.
-        assert_eq!(codes("<?php $y = 'x'; $y .= [];", run_invalid_binary), ["assignOp.invalid"]);
+        assert_eq!(
+            codes("<?php $y = 'x'; $y .= [];", run_invalid_binary),
+            ["assignOp.invalid"]
+        );
     }
 
     #[test]
@@ -639,14 +751,25 @@ mod tests {
     #[test]
     fn unknown_operand_is_not_flagged() {
         // An untyped param is `mixed` — never flag (zero false positives).
-        assert!(codes("<?php function f($a) { return $a * 2; }", run_invalid_binary).is_empty());
-        assert!(codes("<?php function f($a) { return $a . 'x'; }", run_invalid_binary).is_empty());
+        assert!(codes(
+            "<?php function f($a) { return $a * 2; }",
+            run_invalid_binary
+        )
+        .is_empty());
+        assert!(codes(
+            "<?php function f($a) { return $a . 'x'; }",
+            run_invalid_binary
+        )
+        .is_empty());
     }
 
     #[test]
     fn nested_binary_is_reached() {
         assert_eq!(
-            codes("<?php function f() { $z = (1 + ([] * 3)); return $z; }", run_invalid_binary),
+            codes(
+                "<?php function f() { $z = (1 + ([] * 3)); return $z; }",
+                run_invalid_binary
+            ),
             ["binaryOp.invalid"]
         );
     }
@@ -655,13 +778,22 @@ mod tests {
 
     #[test]
     fn unary_minus_on_array_is_flagged() {
-        assert_eq!(codes("<?php $x = -[];", run_invalid_unary), ["unaryOp.invalid"]);
-        assert_eq!(codes("<?php $x = +[1];", run_invalid_unary), ["unaryOp.invalid"]);
+        assert_eq!(
+            codes("<?php $x = -[];", run_invalid_unary),
+            ["unaryOp.invalid"]
+        );
+        assert_eq!(
+            codes("<?php $x = +[1];", run_invalid_unary),
+            ["unaryOp.invalid"]
+        );
     }
 
     #[test]
     fn bitnot_on_array_is_flagged() {
-        assert_eq!(codes("<?php $x = ~[];", run_invalid_unary), ["unaryOp.invalid"]);
+        assert_eq!(
+            codes("<?php $x = ~[];", run_invalid_unary),
+            ["unaryOp.invalid"]
+        );
     }
 
     #[test]
@@ -686,9 +818,18 @@ mod tests {
 
     #[test]
     fn number_vs_array_comparison_is_flagged() {
-        assert_eq!(codes("<?php $x = 1 < [];", run_invalid_comparison), ["smaller.invalid"]);
-        assert_eq!(codes("<?php $x = [] > 2;", run_invalid_comparison), ["greater.invalid"]);
-        assert_eq!(codes("<?php $x = 1 <=> [1];", run_invalid_comparison), ["spaceship.invalid"]);
+        assert_eq!(
+            codes("<?php $x = 1 < [];", run_invalid_comparison),
+            ["smaller.invalid"]
+        );
+        assert_eq!(
+            codes("<?php $x = [] > 2;", run_invalid_comparison),
+            ["greater.invalid"]
+        );
+        assert_eq!(
+            codes("<?php $x = 1 <=> [1];", run_invalid_comparison),
+            ["spaceship.invalid"]
+        );
     }
 
     #[test]
@@ -707,6 +848,10 @@ mod tests {
 
     #[test]
     fn comparison_with_unknown_is_not_flagged() {
-        assert!(codes("<?php function f($a) { return 1 < $a; }", run_invalid_comparison).is_empty());
+        assert!(codes(
+            "<?php function f($a) { return 1 < $a; }",
+            run_invalid_comparison
+        )
+        .is_empty());
     }
 }

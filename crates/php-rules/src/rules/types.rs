@@ -15,10 +15,14 @@
 #![allow(unused_imports)]
 use crate::{walk, FileAnalysis, RuleEntry};
 use php_ast::{
-    ArrowFn, ClassDecl, ClosureExpr, ExprKind, FunctionDecl, Member, MethodDecl, Param,
+    ArrowFn, ClassDecl, ClosureExpr, Expr, ExprKind, FunctionDecl, Member, MemberName, MethodDecl,
+    Param, Stmt,
     PropertyHook, StmtKind, Type, TypeKind,
 };
 use php_diagnostics::Diagnostic;
+use php_reflect::{reflect_class, reflect_function};
+use php_resolve::{for_each_region, RefKind, Resolution, ResolvedRef, Scope};
+use std::collections::HashMap;
 
 /// The reserved keywords that may only appear *standalone*, never as a member of
 /// a union or nullable type. Mirrors phpstan's `ONLY_STANDALONE_TYPES`.
@@ -186,11 +190,377 @@ fn run_invalid_types_in_union(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
-pub(crate) static RULES: &[RuleEntry] = &[RuleEntry {
-    name: "types.invalidTypesInUnion",
-    level: 0,
-    run: run_invalid_types_in_union,
-}];
+fn run_explicit_mixed_strictness(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    run_strict_mixed(fa, false)
+}
+
+fn run_implicit_mixed_strictness(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    run_strict_mixed(fa, true)
+}
+
+fn run_strict_mixed(fa: &FileAnalysis, include_implicit: bool) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    check_function_call_mixed(fa, include_implicit, &mut out);
+    check_method_call_mixed(fa, include_implicit, &mut out);
+    check_return_mixed(fa, include_implicit, &mut out);
+    check_member_access_mixed(fa, include_implicit, &mut out);
+    out
+}
+
+fn strict_mixed_source(ty: &php_types::Type, include_implicit: bool) -> bool {
+    ty.contains_explicit_mixed() || (include_implicit && ty.contains_implicit_mixed())
+}
+
+fn concrete_target(ty: &php_types::Type) -> bool {
+    use php_types::Type as T;
+    !ty.is_mixed()
+        && !matches!(
+            ty,
+            T::Unknown(_) | T::TemplateVar(_) | T::Conditional { .. } | T::Void | T::Never
+        )
+}
+
+fn function_refs(refs: &[ResolvedRef]) -> HashMap<(u32, u32), &ResolvedRef> {
+    refs.iter()
+        .filter(|r| r.kind == RefKind::Function)
+        .map(|r| ((r.span.start, r.span.end), r))
+        .collect()
+}
+
+fn resolved_callee<'a>(
+    callee: &Expr,
+    fmap: &HashMap<(u32, u32), &'a ResolvedRef>,
+) -> Option<&'a ResolvedRef> {
+    if let ExprKind::Name(n) = &callee.kind {
+        return fmap.get(&(n.span.start, n.span.end)).copied();
+    }
+    None
+}
+
+fn reflected_function_target(fa: &FileAnalysis, r: &ResolvedRef) -> Option<String> {
+    match &r.resolution {
+        Resolution::Fqn(fqn) => fa.reflection.function(fqn).map(|_| fqn.clone()),
+        Resolution::Fallback { namespaced, global } => {
+            if fa.reflection.function(namespaced).is_some() {
+                Some(namespaced.clone())
+            } else {
+                fa.reflection.function(global).map(|_| global.clone())
+            }
+        }
+        _ => None,
+    }
+}
+
+fn check_function_call_mixed(
+    fa: &FileAnalysis,
+    include_implicit: bool,
+    out: &mut Vec<Diagnostic>,
+) {
+    let fmap = function_refs(fa.resolved_refs);
+    walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Call { callee, args } = &e.kind else {
+            return;
+        };
+        if args
+            .iter()
+            .any(|a| a.spread || a.placeholder || a.name.is_some())
+        {
+            return;
+        }
+        let Some(r) = resolved_callee(callee, &fmap) else {
+            return;
+        };
+        let Some(fqn) = reflected_function_target(fa, r) else {
+            return;
+        };
+        let Some(func) = fa.reflection.function(&fqn) else {
+            return;
+        };
+        if func.builtin && !func.params.iter().any(|p| p.variadic) && args.len() > func.params.len()
+        {
+            return;
+        }
+        let display = r.name.trim_start_matches('\\');
+        for (i, arg) in args.iter().enumerate() {
+            let Some(param) = func.params.get(i) else { break };
+            if param.variadic || !concrete_target(&param.ty) {
+                break;
+            }
+            let given = fa.type_of(&arg.value);
+            if strict_mixed_source(&given, include_implicit) {
+                out.push(
+                    Diagnostic::error(
+                        arg.value.span,
+                        format!(
+                            "Parameter #{} ${} of function {display} expects {}, mixed given.",
+                            i + 1,
+                            param.name,
+                            param.ty
+                        ),
+                    )
+                    .with_code("argument.type"),
+                );
+            }
+        }
+    });
+}
+
+fn check_method_call_mixed(
+    fa: &FileAnalysis,
+    include_implicit: bool,
+    out: &mut Vec<Diagnostic>,
+) {
+    walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::MethodCall {
+            recv, method, args, ..
+        } = &e.kind
+        else {
+            return;
+        };
+        if args
+            .iter()
+            .any(|a| a.spread || a.placeholder || a.name.is_some())
+        {
+            return;
+        }
+        let Some(fqn) = named_fqn(&fa.type_of(recv)) else {
+            return;
+        };
+        let MemberName::Ident(name) = method else {
+            return;
+        };
+        let mname = fa.interner.resolve(*name);
+        let Some(found) = fa.reflection.find_method(&fqn, mname) else {
+            return;
+        };
+        if found.member.magic {
+            return;
+        }
+        let short = fqn.trim_start_matches('\\');
+        for (i, arg) in args.iter().enumerate() {
+            let Some(param) = found.member.params.get(i) else {
+                break;
+            };
+            if param.variadic || !concrete_target(&param.ty) {
+                break;
+            }
+            let given = fa.type_of(&arg.value);
+            if strict_mixed_source(&given, include_implicit) {
+                out.push(
+                    Diagnostic::error(
+                        arg.value.span,
+                        format!(
+                            "Parameter #{} ${} of method {short}::{mname}() expects {}, mixed given.",
+                            i + 1,
+                            param.name,
+                            param.ty
+                        ),
+                    )
+                    .with_code("argument.type"),
+                );
+            }
+        }
+    });
+}
+
+fn named_fqn(ty: &php_types::Type) -> Option<String> {
+    match ty {
+        php_types::Type::Named { fqn, .. } => Some(fqn.clone()),
+        php_types::Type::Nullable(inner) => named_fqn(inner),
+        _ => None,
+    }
+}
+
+fn check_return_mixed(fa: &FileAnalysis, include_implicit: bool, out: &mut Vec<Diagnostic>) {
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            collect_return_scopes(fa, scope, st, include_implicit, out);
+        }
+    });
+}
+
+fn collect_return_scopes(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    st: &php_ast::Stmt,
+    include_implicit: bool,
+    out: &mut Vec<Diagnostic>,
+) {
+    match &st.kind {
+        StmtKind::Function(f) => {
+            let refl = reflect_function(scope, fa.interner, f);
+            if concrete_target(&refl.return_type) {
+                for s in &f.body {
+                    check_return_stmts(fa, &refl.return_type, s, include_implicit, out);
+                }
+            }
+        }
+        StmtKind::Class(c) => {
+            let Some(name) = c.name else { return };
+            let fqn = scope.qualify(fa.interner.resolve(name));
+            let cls = reflect_class(scope, fa.interner, &fqn, c);
+            for m in &c.members {
+                let Member::Method(md) = m else { continue };
+                let Some(body) = &md.body else { continue };
+                let mname = fa.interner.resolve(md.name);
+                let Some(mr) = cls
+                    .methods
+                    .iter()
+                    .find(|x| !x.magic && x.name.eq_ignore_ascii_case(mname))
+                else {
+                    continue;
+                };
+                if !concrete_target(&mr.return_type) {
+                    continue;
+                }
+                for s in body {
+                    check_return_stmts(fa, &mr.return_type, s, include_implicit, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn check_return_stmts(
+    fa: &FileAnalysis,
+    target: &php_types::Type,
+    st: &Stmt,
+    include_implicit: bool,
+    out: &mut Vec<Diagnostic>,
+) {
+    match &st.kind {
+        StmtKind::Return(Some(value)) => {
+            let given = fa.type_of(value);
+            if strict_mixed_source(&given, include_implicit) {
+                out.push(
+                    Diagnostic::error(
+                        value.span,
+                        format!("Function should return {target} but returns mixed."),
+                    )
+                    .with_code("return.type"),
+                );
+            }
+        }
+        StmtKind::Block(body) => {
+            for s in body {
+                check_return_stmts(fa, target, s, include_implicit, out);
+            }
+        }
+        StmtKind::If {
+            then, elseifs, els, ..
+        } => {
+            check_return_stmts(fa, target, then, include_implicit, out);
+            for elseif in elseifs {
+                check_return_stmts(fa, target, &elseif.body, include_implicit, out);
+            }
+            if let Some(els) = els {
+                check_return_stmts(fa, target, els, include_implicit, out);
+            }
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::DoWhile { body, .. }
+        | StmtKind::For { body, .. }
+        | StmtKind::Foreach { body, .. }
+        | StmtKind::Declare {
+            body: Some(body), ..
+        } => check_return_stmts(fa, target, body, include_implicit, out),
+        StmtKind::Switch { cases, .. } => {
+            for case in cases {
+                for s in &case.body {
+                    check_return_stmts(fa, target, s, include_implicit, out);
+                }
+            }
+        }
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            for s in body {
+                check_return_stmts(fa, target, s, include_implicit, out);
+            }
+            for catch in catches {
+                for s in &catch.body {
+                    check_return_stmts(fa, target, s, include_implicit, out);
+                }
+            }
+            if let Some(finally) = finally {
+                for s in finally {
+                    check_return_stmts(fa, target, s, include_implicit, out);
+                }
+            }
+        }
+        StmtKind::Function(_) | StmtKind::Class(_) => {}
+        _ => {}
+    }
+}
+
+fn check_member_access_mixed(
+    fa: &FileAnalysis,
+    include_implicit: bool,
+    out: &mut Vec<Diagnostic>,
+) {
+    walk::for_each_expr(fa.program, &mut |e| match &e.kind {
+        ExprKind::MethodCall { recv, method, .. } => {
+            if !strict_mixed_source(&fa.type_of(recv), include_implicit) {
+                return;
+            }
+            let MemberName::Ident(name) = method else {
+                return;
+            };
+            let mname = fa.interner.resolve(*name);
+            out.push(
+                Diagnostic::error(e.span, format!("Cannot call method {mname}() on mixed."))
+                    .with_code("method.nonObject"),
+            );
+        }
+        ExprKind::Prop { base, name, .. } => {
+            if !strict_mixed_source(&fa.type_of(base), include_implicit) {
+                return;
+            }
+            let MemberName::Ident(name) = name else {
+                return;
+            };
+            let pname = fa.interner.resolve(*name);
+            out.push(
+                Diagnostic::error(e.span, format!("Cannot access property ${pname} on mixed."))
+                    .with_code("property.nonObject"),
+            );
+        }
+        ExprKind::Index { base, index } => {
+            if !strict_mixed_source(&fa.type_of(base), include_implicit) {
+                return;
+            }
+            let message = if let Some(index) = index {
+                let dim_ty = fa.type_of(index);
+                format!("Cannot access offset {dim_ty} on mixed.")
+            } else {
+                "Cannot access an offset on mixed.".to_string()
+            };
+            out.push(Diagnostic::error(e.span, message).with_code("offsetAccess.nonOffsetAccessible"));
+        }
+        _ => {}
+    });
+}
+
+pub(crate) static RULES: &[RuleEntry] = &[
+    RuleEntry {
+        name: "types.invalidTypesInUnion",
+        level: 0,
+        run: run_invalid_types_in_union,
+    },
+    RuleEntry {
+        name: "types.explicitMixedStrictness",
+        level: 9,
+        run: run_explicit_mixed_strictness,
+    },
+    RuleEntry {
+        name: "types.implicitMixedStrictness",
+        level: 10,
+        run: run_implicit_mixed_strictness,
+    },
+];
 
 #[cfg(test)]
 mod tests {
@@ -202,7 +572,10 @@ mod tests {
     #[test]
     fn void_in_union_return_is_flagged() {
         assert_eq!(
-            codes("<?php function f(): int|void {}", run_invalid_types_in_union),
+            codes(
+                "<?php function f(): int|void {}",
+                run_invalid_types_in_union
+            ),
             ["unionType.void"]
         );
     }
@@ -210,7 +583,10 @@ mod tests {
     #[test]
     fn never_in_union_param_is_flagged() {
         assert_eq!(
-            codes("<?php function f(int|never $x) {}", run_invalid_types_in_union),
+            codes(
+                "<?php function f(int|never $x) {}",
+                run_invalid_types_in_union
+            ),
             ["unionType.never"]
         );
     }
@@ -218,7 +594,10 @@ mod tests {
     #[test]
     fn mixed_in_union_is_flagged() {
         assert_eq!(
-            codes("<?php function f(): int|mixed {}", run_invalid_types_in_union),
+            codes(
+                "<?php function f(): int|mixed {}",
+                run_invalid_types_in_union
+            ),
             ["unionType.mixed"]
         );
     }
@@ -259,7 +638,11 @@ mod tests {
 
     #[test]
     fn ordinary_union_is_ok() {
-        assert!(codes("<?php function f(): int|string|null {}", run_invalid_types_in_union).is_empty());
+        assert!(codes(
+            "<?php function f(): int|string|null {}",
+            run_invalid_types_in_union
+        )
+        .is_empty());
     }
 
     #[test]
@@ -270,7 +653,10 @@ mod tests {
     #[test]
     fn case_insensitive() {
         assert_eq!(
-            codes("<?php function f(): int|VOID {}", run_invalid_types_in_union),
+            codes(
+                "<?php function f(): int|VOID {}",
+                run_invalid_types_in_union
+            ),
             ["unionType.void"]
         );
     }
@@ -280,7 +666,10 @@ mod tests {
     #[test]
     fn method_return_in_union_is_flagged() {
         assert_eq!(
-            codes("<?php class C { function m(): int|void {} }", run_invalid_types_in_union),
+            codes(
+                "<?php class C { function m(): int|void {} }",
+                run_invalid_types_in_union
+            ),
             ["unionType.void"]
         );
     }
@@ -288,7 +677,10 @@ mod tests {
     #[test]
     fn typed_property_in_union_is_flagged() {
         assert_eq!(
-            codes("<?php class C { public int|void $p; }", run_invalid_types_in_union),
+            codes(
+                "<?php class C { public int|void $p; }",
+                run_invalid_types_in_union
+            ),
             ["unionType.void"]
         );
     }
@@ -296,7 +688,10 @@ mod tests {
     #[test]
     fn closure_param_in_union_is_flagged() {
         assert_eq!(
-            codes("<?php $f = function (int|never $x) {};", run_invalid_types_in_union),
+            codes(
+                "<?php $f = function (int|never $x) {};",
+                run_invalid_types_in_union
+            ),
             ["unionType.never"]
         );
     }
@@ -304,7 +699,10 @@ mod tests {
     #[test]
     fn arrow_fn_return_in_union_is_flagged() {
         assert_eq!(
-            codes("<?php $f = fn (): int|void => 1;", run_invalid_types_in_union),
+            codes(
+                "<?php $f = fn (): int|void => 1;",
+                run_invalid_types_in_union
+            ),
             ["unionType.void"]
         );
     }
@@ -344,6 +742,54 @@ mod tests {
 
     #[test]
     fn no_types_no_diagnostics() {
-        assert!(codes("<?php function f($a) { return $a; }", run_invalid_types_in_union).is_empty());
+        assert!(codes(
+            "<?php function f($a) { return $a; }",
+            run_invalid_types_in_union
+        )
+        .is_empty());
+    }
+
+    // --- strict mixed --------------------------------------------------------
+
+    #[test]
+    fn explicit_mixed_argument_is_flagged_at_level_9_strictness() {
+        let src = "<?php function takesInt(int $i): void {} function f(mixed $x): void { takesInt($x); }";
+        assert_eq!(
+            codes(src, run_explicit_mixed_strictness),
+            ["argument.type"]
+        );
+    }
+
+    #[test]
+    fn implicit_mixed_argument_waits_for_level_10_strictness() {
+        let src = "<?php function takesInt(int $i): void {} function f($x): void { takesInt($x); }";
+        assert!(codes(src, run_explicit_mixed_strictness).is_empty());
+        assert_eq!(
+            codes(src, run_implicit_mixed_strictness),
+            ["argument.type"]
+        );
+    }
+
+    #[test]
+    fn explicit_mixed_return_to_concrete_type_is_flagged() {
+        let src = "<?php function f(mixed $x): int { return $x; }";
+        assert_eq!(codes(src, run_explicit_mixed_strictness), ["return.type"]);
+    }
+
+    #[test]
+    fn explicit_mixed_method_access_is_flagged() {
+        let src = "<?php function f(mixed $x): void { $x->foo(); }";
+        assert_eq!(
+            codes(src, run_explicit_mixed_strictness),
+            ["method.nonObject"]
+        );
+    }
+
+    #[test]
+    fn explicit_mixed_property_and_offset_access_are_flagged() {
+        let src = "<?php function f(mixed $x): void { echo $x->p; echo $x['k']; }";
+        let codes = codes(src, run_explicit_mixed_strictness);
+        assert!(codes.contains(&"property.nonObject"));
+        assert!(codes.contains(&"offsetAccess.nonOffsetAccessible"));
     }
 }

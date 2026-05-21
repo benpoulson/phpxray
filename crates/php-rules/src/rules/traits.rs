@@ -12,6 +12,8 @@
 //!   `classConstant.nonFinal`/`classConstant.final`, level 0) — a class constant
 //!   overriding a same-named constant inherited from one of the class's traits
 //!   must keep a compatible visibility / finality.
+//! - **NotAnalysedTraitRule** (`trait.unused`, level 4) — a trait declared in
+//!   the analysed project but not used by any indexed class-like symbol.
 //!
 //! Deferred (need analysis / inputs we don't model):
 //! - `ConstantsInTraitsRule` (`classConstant.inTrait`) — a pure PHP-version gate
@@ -22,16 +24,13 @@
 //!   (`classConstant.value`/`classConstant.nativeType`/`classConstant.missingNativeType`)
 //!   — need constant-value evaluation + native-type-equality of trait constants,
 //!   not modelled here.
-//! - `NotAnalysedTraitRule` (`trait.unused`) — needs cross-file collected data
-//!   (which traits are `use`d project-wide); our per-file engine has no collector.
 
-#![allow(unused_imports)]
-use crate::{walk, FileAnalysis, RuleEntry};
+use crate::{FileAnalysis, RuleEntry};
 use php_ast::{ClassDecl, ClassKind, Member, Stmt, StmtKind, Visibility};
 use php_diagnostics::Diagnostic;
 use php_reflect::{ConstReflection, ReflectionIndex};
-use php_resolve::{for_each_region, Resolution, Scope};
-use std::collections::HashMap;
+use php_resolve::{for_each_region, Scope};
+use std::collections::{HashMap, HashSet};
 
 /// Visit each class-like declaration with its enclosing namespace [`Scope`],
 /// descending into nested/conditional blocks (so a class declared inside an
@@ -45,7 +44,9 @@ fn for_each_class(
         match &st.kind {
             StmtKind::Class(c) => f(scope, c),
             StmtKind::Block(b) => b.iter().for_each(|s| visit(scope, s, f)),
-            StmtKind::If { then, elseifs, els, .. } => {
+            StmtKind::If {
+                then, elseifs, els, ..
+            } => {
                 visit(scope, then, f);
                 for e in elseifs {
                     visit(scope, &e.body, f);
@@ -58,7 +59,11 @@ fn for_each_class(
             | StmtKind::DoWhile { body, .. }
             | StmtKind::For { body, .. }
             | StmtKind::Foreach { body, .. } => visit(scope, body, f),
-            StmtKind::Try { body, catches, finally } => {
+            StmtKind::Try {
+                body,
+                catches,
+                finally,
+            } => {
                 body.iter().for_each(|s| visit(scope, s, f));
                 for c in catches {
                     c.body.iter().for_each(|s| visit(scope, s, f));
@@ -203,14 +208,16 @@ fn run_conflicting_trait_constants(fa: &FileAnalysis) -> Vec<Diagnostic> {
             let class_final = cd.modifiers.is_final;
             for ce in &cd.consts {
                 let cname = fa.interner.resolve(ce.name);
-                let Some((tc, trait_fqn)) = trait_consts.get(cname) else { continue };
+                let Some((tc, trait_fqn)) = trait_consts.get(cname) else {
+                    continue;
+                };
                 let trait_bare = trait_fqn.trim_start_matches('\\').to_string();
 
                 // Visibility mismatch (the overriding constant must keep the
                 // trait constant's visibility).
-                if let Some(msg) = visibility_message(
-                    class_vis, tc.visibility, &class_bare, cname, &trait_bare,
-                ) {
+                if let Some(msg) =
+                    visibility_message(class_vis, tc.visibility, &class_bare, cname, &trait_bare)
+                {
                     out.push(
                         Diagnostic::error(ce.value.span, msg).with_code("classConstant.visibility"),
                     );
@@ -277,14 +284,71 @@ fn cap(s: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// NotAnalysedTraitRule — unused traits
+// ---------------------------------------------------------------------------
+
+fn run_not_analysed_trait(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let used_traits: HashSet<String> = fa
+        .project
+        .classes()
+        .flat_map(|c| c.uses_traits.iter())
+        .map(|t| t.trim_start_matches('\\').to_ascii_lowercase())
+        .collect();
+
+    let mut out = Vec::new();
+    for_each_class(fa.program, fa.interner, |scope, c| {
+        if c.kind != ClassKind::Trait {
+            return;
+        }
+        let Some(name) = c.name else {
+            return;
+        };
+        let fqn = scope.qualify(fa.interner.resolve(name));
+        let Some(entry) = fa.project.class(&fqn) else {
+            return;
+        };
+        if !entry.sources.iter().any(|source| source == fa.path) {
+            return;
+        }
+        if used_traits.contains(&fqn.trim_start_matches('\\').to_ascii_lowercase()) {
+            return;
+        }
+        out.push(
+            Diagnostic::error(
+                php_span::Span::new(0, 0),
+                format!(
+                    "Trait {} is used zero times and is not analysed.",
+                    fqn.trim_start_matches('\\')
+                ),
+            )
+            .with_code("trait.unused"),
+        );
+    });
+    out
+}
+
 pub(crate) static RULES: &[RuleEntry] = &[
-    RuleEntry { name: "trait.allowDynamicProperties", level: 0, run: run_trait_attributes },
+    RuleEntry {
+        name: "trait.allowDynamicProperties",
+        level: 0,
+        run: run_trait_attributes,
+    },
     RuleEntry {
         name: "trait.conflictingConstants",
         level: 0,
         run: run_conflicting_trait_constants,
     },
-    RuleEntry { name: "classConstant.inTrait", level: 0, run: run_constants_in_traits },
+    RuleEntry {
+        name: "classConstant.inTrait",
+        level: 0,
+        run: run_constants_in_traits,
+    },
+    RuleEntry {
+        name: "trait.unused",
+        level: 4,
+        run: run_not_analysed_trait,
+    },
 ];
 
 #[cfg(test)]
@@ -298,7 +362,10 @@ mod tests {
     fn const_in_trait_flagged_below_82() {
         let src = "<?php trait T { const X = 1; }";
         let v81 = PhpVersion::parse("8.1").unwrap();
-        assert_eq!(codes_version(src, run_constants_in_traits, v81), ["classConstant.inTrait"]);
+        assert_eq!(
+            codes_version(src, run_constants_in_traits, v81),
+            ["classConstant.inTrait"]
+        );
     }
 
     #[test]
@@ -319,7 +386,10 @@ mod tests {
     #[test]
     fn allow_dynamic_properties_on_trait_is_flagged() {
         let src = r#"<?php #[AllowDynamicProperties] trait T {}"#;
-        assert_eq!(codes(src, run_trait_attributes), ["trait.allowDynamicProperties"]);
+        assert_eq!(
+            codes(src, run_trait_attributes),
+            ["trait.allowDynamicProperties"]
+        );
     }
 
     #[test]
@@ -334,6 +404,20 @@ mod tests {
         assert!(codes(src, run_trait_attributes).is_empty());
     }
 
+    // --- NotAnalysedTraitRule ---
+
+    #[test]
+    fn unused_trait_is_flagged() {
+        let src = "<?php namespace App; trait T {}";
+        assert_eq!(codes(src, run_not_analysed_trait), ["trait.unused"]);
+    }
+
+    #[test]
+    fn used_trait_is_clean() {
+        let src = "<?php namespace App; trait T {} class C { use T; }";
+        assert!(codes(src, run_not_analysed_trait).is_empty());
+    }
+
     // --- ConflictingTraitConstantsRule ---
 
     #[test]
@@ -342,7 +426,10 @@ mod tests {
             trait T { public const FOO = 1; }
             class C { use T; private const FOO = 1; }
         "#;
-        assert_eq!(codes(src, run_conflicting_trait_constants), ["classConstant.visibility"]);
+        assert_eq!(
+            codes(src, run_conflicting_trait_constants),
+            ["classConstant.visibility"]
+        );
     }
 
     #[test]
@@ -351,7 +438,10 @@ mod tests {
             trait T { final public const FOO = 1; }
             class C { use T; public const FOO = 1; }
         "#;
-        assert_eq!(codes(src, run_conflicting_trait_constants), ["classConstant.nonFinal"]);
+        assert_eq!(
+            codes(src, run_conflicting_trait_constants),
+            ["classConstant.nonFinal"]
+        );
     }
 
     #[test]
@@ -384,6 +474,9 @@ mod tests {
             trait T { public const FOO = 1; }
             class C { use T; final public const FOO = 1; }
         "#;
-        assert_eq!(codes(src, run_conflicting_trait_constants), ["classConstant.final"]);
+        assert_eq!(
+            codes(src, run_conflicting_trait_constants),
+            ["classConstant.final"]
+        );
     }
 }

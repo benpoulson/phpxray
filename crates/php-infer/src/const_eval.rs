@@ -64,7 +64,12 @@ pub fn eval_const(e: &Expr) -> Option<ConstVal> {
         ExprKind::Int(n) => Some(Int(*n)),
         ExprKind::Float(f) => Some(Float(*f)),
         ExprKind::Str(b) => Some(Str(b.clone())),
-        ExprKind::Name(n) => match n.text.trim_start_matches('\\').to_ascii_lowercase().as_str() {
+        ExprKind::Name(n) => match n
+            .text
+            .trim_start_matches('\\')
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "true" => Some(Bool(true)),
             "false" => Some(Bool(false)),
             "null" => Some(Null),
@@ -228,8 +233,12 @@ mod tests {
         assert!(!r.has_errors(), "parse error: {src}");
         // The first expression statement's RHS.
         let stmt = r.program.stmts.first()?;
-        let php_ast::StmtKind::Expr(e) = &stmt.kind else { return None };
-        let ExprKind::Assign { rhs, .. } = &e.kind else { return None };
+        let php_ast::StmtKind::Expr(e) = &stmt.kind else {
+            return None;
+        };
+        let ExprKind::Assign { rhs, .. } = &e.kind else {
+            return None;
+        };
         eval_const(rhs)
     }
 

@@ -14,34 +14,30 @@
 //!   delimiter, or a non-letter trailing the closing delimiter where a modifier
 //!   is expected). When in any doubt the pattern is left alone — zero false
 //!   positives is the contract here.
-//!
-//! Deferred:
-//! - `RegularExpressionQuotingRule` (`argument.invalidPregQuote`, level 5) —
-//!   flags `preg_quote($x)` (no 2nd delimiter arg) interpolated into a pattern
-//!   built by string concatenation. Faithfully replicating it requires
-//!   `RegexExpressionHelper::getPatternDelimiters` (resolve the delimiter from a
-//!   `Concat` whose leftmost constant piece is the pattern opener) plus
-//!   `removeDefaultEscapedDelimiters` and argument normalization. Our AST models
-//!   concatenation, but deciding "this `preg_quote` result lands inside a pattern
-//!   with delimiter D" from a folded/partial concat is subtle and easy to get
-//!   wrong (false positives when the concat is not actually a pattern, or when
-//!   the delimiter is one preg_quote escapes by default). DEFERRED to stay
-//!   FP-safe — needs the delimiter-from-concat helper before it can be done
-//!   without over-reporting.
+//! - `argument.invalidPregQuote` (`RegularExpressionQuotingRule`, level 5) —
+//!   flags `preg_quote()` calls inside a concatenated regex pattern when the
+//!   quote delimiter is missing or contradicts the pattern delimiter.
 
-#![allow(unused_imports)]
 use crate::{FileAnalysis, RuleEntry};
-use php_ast::{Expr, ExprKind};
+use php_ast::{Arg, BinOp, Expr, ExprKind};
 use php_diagnostics::Diagnostic;
 use php_infer::{eval_const, ConstVal};
 use php_resolve::{Resolution, ResolvedRef};
+use php_types::Type;
 use std::collections::HashMap;
 
-pub(crate) static RULES: &[RuleEntry] = &[RuleEntry {
-    name: "regexp.pattern",
-    level: 0,
-    run: run_pattern,
-}];
+pub(crate) static RULES: &[RuleEntry] = &[
+    RuleEntry {
+        name: "regexp.pattern",
+        level: 0,
+        run: run_pattern,
+    },
+    RuleEntry {
+        name: "argument.invalidPregQuote",
+        level: 5,
+        run: run_quoting,
+    },
+];
 
 /// Build a span→resolution map for function references (callee names).
 fn function_refs(refs: &[ResolvedRef]) -> HashMap<(u32, u32), &ResolvedRef> {
@@ -103,9 +99,15 @@ fn run_pattern(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let fmap = function_refs(fa.resolved_refs);
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Call { callee, args } = &e.kind else { return };
-        let Some(r) = resolved_callee(callee, &fmap) else { return };
-        let Some(tail) = global_tail_lower(r) else { return };
+        let ExprKind::Call { callee, args } = &e.kind else {
+            return;
+        };
+        let Some(r) = resolved_callee(callee, &fmap) else {
+            return;
+        };
+        let Some(tail) = global_tail_lower(r) else {
+            return;
+        };
         // Every preg_* function takes the pattern as the first argument. Match
         // any `preg_`-prefixed global function (phpstan does the same), but only
         // the ones whose first arg is the pattern string. `preg_quote` /
@@ -130,7 +132,9 @@ fn run_pattern(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
         // Fold the pattern to a constant string. Only a constant string can be
         // validated; anything dynamic is left alone.
-        let Some(ConstVal::Str(bytes)) = eval_const(&arg0.value) else { return };
+        let Some(ConstVal::Str(bytes)) = eval_const(&arg0.value) else {
+            return;
+        };
         if let Some(msg) = invalid_pattern_reason(&bytes) {
             out.push(
                 Diagnostic::error(arg0.value.span, format!("Regex pattern is invalid: {msg}"))
@@ -139,6 +143,306 @@ fn run_pattern(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
     });
     out
+}
+
+/// `RegularExpressionQuotingRule` (`argument.invalidPregQuote`). phpstan only
+/// checks patterns built by concatenation; the delimiter is read from the
+/// leftmost constant piece of the concat.
+fn run_quoting(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let fmap = function_refs(fa.resolved_refs);
+    let mut out = Vec::new();
+    crate::walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Call { callee, args } = &e.kind else {
+            return;
+        };
+        let Some(r) = resolved_callee(callee, &fmap) else {
+            return;
+        };
+        let Some(tail) = global_tail_lower(r) else {
+            return;
+        };
+        if !is_regex_pattern_function(&tail) || !is_global_preg(fa, r, &tail) {
+            return;
+        }
+
+        let Some(pattern) = pattern_arg(args, fa.interner, &tail) else {
+            return;
+        };
+        if !is_concat(pattern) {
+            return;
+        }
+
+        let mut pattern_delimiters = pattern_delimiters_from_concat(fa, pattern);
+        pattern_delimiters = remove_default_escaped(pattern_delimiters);
+        if pattern_delimiters.is_empty() {
+            return;
+        }
+
+        validate_quote_delimiters(fa, &fmap, pattern, &pattern_delimiters, &mut out);
+    });
+    out
+}
+
+fn is_regex_pattern_function(tail: &str) -> bool {
+    matches!(
+        tail,
+        "preg_match"
+            | "preg_match_all"
+            | "preg_filter"
+            | "preg_grep"
+            | "preg_replace"
+            | "preg_replace_callback"
+            | "preg_split"
+    )
+}
+
+fn is_concat(e: &Expr) -> bool {
+    matches!(
+        e.kind,
+        ExprKind::Binary {
+            op: BinOp::Concat,
+            ..
+        }
+    )
+}
+
+fn pattern_arg<'a>(
+    args: &'a [Arg],
+    interner: &php_intern::Interner,
+    _tail: &str,
+) -> Option<&'a Expr> {
+    // PHP 8 named-arg spelling, e.g. preg_split(subject: $s, pattern: '...').
+    for arg in args {
+        if arg.spread || arg.placeholder {
+            continue;
+        }
+        if let Some(name) = arg.name {
+            if interner.resolve(name) == "pattern" {
+                return Some(&arg.value);
+            }
+        }
+    }
+
+    let arg0 = args.first()?;
+    if arg0.spread || arg0.placeholder || arg0.name.is_some() {
+        return None;
+    }
+    Some(&arg0.value)
+}
+
+fn preg_quote_delimiter_arg<'a>(
+    args: &'a [Arg],
+    interner: &php_intern::Interner,
+) -> Option<Option<&'a Expr>> {
+    for arg in args {
+        if arg.spread || arg.placeholder {
+            return None;
+        }
+        if let Some(name) = arg.name {
+            if interner.resolve(name) == "delimiter" {
+                return Some(Some(&arg.value));
+            }
+        }
+    }
+
+    let positional = args.iter().filter(|a| a.name.is_none()).collect::<Vec<_>>();
+    if positional.iter().any(|a| a.spread || a.placeholder) {
+        return None;
+    }
+    Some(positional.get(1).map(|a| &a.value))
+}
+
+fn validate_quote_delimiters(
+    fa: &FileAnalysis,
+    fmap: &HashMap<(u32, u32), &ResolvedRef>,
+    e: &Expr,
+    pattern_delimiters: &[String],
+    out: &mut Vec<Diagnostic>,
+) {
+    let ExprKind::Binary {
+        op: BinOp::Concat,
+        lhs,
+        rhs,
+    } = &e.kind
+    else {
+        return;
+    };
+
+    validate_quote_expr(fa, fmap, lhs, pattern_delimiters, out);
+    validate_quote_expr(fa, fmap, rhs, pattern_delimiters, out);
+}
+
+fn validate_quote_expr(
+    fa: &FileAnalysis,
+    fmap: &HashMap<(u32, u32), &ResolvedRef>,
+    e: &Expr,
+    pattern_delimiters: &[String],
+    out: &mut Vec<Diagnostic>,
+) {
+    if is_concat(e) {
+        validate_quote_delimiters(fa, fmap, e, pattern_delimiters, out);
+        return;
+    }
+
+    let ExprKind::Call { callee, args } = &e.kind else {
+        return;
+    };
+    let Some(r) = resolved_callee(callee, fmap) else {
+        return;
+    };
+    let Some(tail) = global_tail_lower(r) else {
+        return;
+    };
+    if tail != "preg_quote" || !is_global_preg(fa, r, "preg_quote") {
+        return;
+    }
+
+    let Some(delimiter_arg) = preg_quote_delimiter_arg(args, fa.interner) else {
+        return;
+    };
+    match delimiter_arg {
+        None => {
+            let msg = if pattern_delimiters.len() == 1 {
+                format!(
+                    "Call to preg_quote() is missing delimiter {} to be effective.",
+                    pattern_delimiters[0]
+                )
+            } else {
+                "Call to preg_quote() is missing delimiter parameter to be effective.".to_string()
+            };
+            out.push(Diagnostic::error(e.span, msg).with_code("argument.invalidPregQuote"));
+        }
+        Some(delimiter) => {
+            for quote_delimiter in remove_default_escaped(const_string_values(fa, delimiter)) {
+                if pattern_delimiters.iter().any(|d| d == &quote_delimiter) {
+                    continue;
+                }
+                let msg = if pattern_delimiters.len() == 1 {
+                    format!(
+                        "Call to preg_quote() uses invalid delimiter {} while pattern uses {}.",
+                        quote_delimiter, pattern_delimiters[0]
+                    )
+                } else {
+                    format!("Call to preg_quote() uses invalid delimiter {quote_delimiter}.")
+                };
+                out.push(Diagnostic::error(e.span, msg).with_code("argument.invalidPregQuote"));
+                return;
+            }
+        }
+    }
+}
+
+fn pattern_delimiters_from_concat(fa: &FileAnalysis, e: &Expr) -> Vec<String> {
+    let left = leftmost_concat_piece(e);
+    let mut out = Vec::new();
+    for value in const_string_values(fa, left) {
+        if let Some(delimiter) = pattern_delimiter(&value) {
+            if valid_pattern_delimiter(&delimiter) && !out.contains(&delimiter) {
+                out.push(delimiter);
+            }
+        }
+    }
+    out
+}
+
+fn leftmost_concat_piece(mut e: &Expr) -> &Expr {
+    while let ExprKind::Binary {
+        op: BinOp::Concat,
+        lhs,
+        ..
+    } = &e.kind
+    {
+        e = lhs;
+    }
+    e
+}
+
+fn const_string_values(fa: &FileAnalysis, e: &Expr) -> Vec<String> {
+    if let Some(ConstVal::Str(bytes)) = eval_const(e) {
+        if let Ok(s) = String::from_utf8(bytes) {
+            return vec![s];
+        }
+    }
+
+    let mut out = Vec::new();
+    collect_literal_strings(&fa.type_of(e), &mut out);
+    out
+}
+
+fn collect_literal_strings(t: &Type, out: &mut Vec<String>) {
+    match t {
+        Type::LiteralString(s) => {
+            if !out.contains(s) {
+                out.push(s.clone());
+            }
+        }
+        Type::Union(parts) => {
+            for p in parts {
+                collect_literal_strings(p, out);
+            }
+        }
+        Type::Nullable(inner) => collect_literal_strings(inner, out),
+        _ => {}
+    }
+}
+
+fn pattern_delimiter(regex: &str) -> Option<String> {
+    let trimmed = regex.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '\0');
+    let first = trimmed.chars().next()?;
+    Some(first.to_string())
+}
+
+fn valid_pattern_delimiter(delimiter: &str) -> bool {
+    let mut chars = delimiter.chars();
+    let Some(c) = chars.next() else {
+        return false;
+    };
+    if chars.next().is_some() {
+        return false;
+    }
+    !(c.is_ascii_alphanumeric() || c == '\\' || c.is_ascii_whitespace() || c == '\0')
+}
+
+fn remove_default_escaped(delimiters: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for delimiter in delimiters {
+        if is_default_escaped(&delimiter) {
+            continue;
+        }
+        if !out.contains(&delimiter) {
+            out.push(delimiter);
+        }
+    }
+    out
+}
+
+fn is_default_escaped(delimiter: &str) -> bool {
+    if delimiter.chars().count() != 1 {
+        return false;
+    }
+    matches!(
+        delimiter,
+        "." | "\\"
+            | "+"
+            | "*"
+            | "?"
+            | "["
+            | "^"
+            | "]"
+            | "$"
+            | "("
+            | ")"
+            | "{"
+            | "}"
+            | "="
+            | "!"
+            | "<"
+            | ">"
+            | "|"
+            | ":"
+            | "-"
+            | "#"
+    )
 }
 
 /// Conservatively decide whether `pattern` is a structurally-broken PCRE pattern,
@@ -332,5 +636,99 @@ mod tests {
         let src = r#"<?php namespace App; function preg_match($p){} preg_match('aaa');"#;
         // This resolves to App\preg_match (a user fn). It must not be flagged.
         assert!(codes(src, run_pattern).is_empty());
+    }
+
+    #[test]
+    fn preg_quote_missing_delimiter_flagged() {
+        let d = run(
+            r#"<?php preg_match('&' . preg_quote('&oops') . 'pattern&', $s);"#,
+            run_quoting,
+        );
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].code, Some("argument.invalidPregQuote"));
+        assert_eq!(
+            d[0].message,
+            "Call to preg_quote() is missing delimiter & to be effective."
+        );
+    }
+
+    #[test]
+    fn preg_quote_wrong_delimiter_flagged() {
+        let d = run(
+            r#"<?php preg_match('&' . preg_quote('&oops', '/') . 'pattern&', $s);"#,
+            run_quoting,
+        );
+        assert_eq!(d.len(), 1);
+        assert_eq!(
+            d[0].message,
+            "Call to preg_quote() uses invalid delimiter / while pattern uses &."
+        );
+    }
+
+    #[test]
+    fn preg_quote_walks_nested_concat() {
+        let c = codes(
+            r#"<?php preg_match('&' . preg_quote('&oops', '/') . preg_quote('&oops') . preg_quote('&ok', '&') . 'pattern&', $s);"#,
+            run_quoting,
+        );
+        assert_eq!(
+            c,
+            vec!["argument.invalidPregQuote", "argument.invalidPregQuote"]
+        );
+    }
+
+    #[test]
+    fn preg_quote_correct_delimiter_not_flagged() {
+        assert!(codes(
+            r#"<?php preg_match('&' . preg_quote('&oops', '&') . 'pattern&', $s);"#,
+            run_quoting,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn preg_quote_default_escaped_pattern_delimiter_not_flagged() {
+        assert!(codes(
+            r#"<?php preg_match('{' . preg_quote('&oops') . 'pattern}', $s);"#,
+            run_quoting,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn preg_quote_named_args_on_preg_split_are_checked() {
+        let d = run(
+            r#"<?php preg_split(subject: $s, pattern: '&' . preg_quote(delimiter: '/', str: '&oops') . 'pattern&');"#,
+            run_quoting,
+        );
+        assert_eq!(d.len(), 1);
+        assert_eq!(
+            d[0].message,
+            "Call to preg_quote() uses invalid delimiter / while pattern uses &."
+        );
+    }
+
+    #[test]
+    fn preg_quote_non_constant_delimiter_not_flagged() {
+        assert!(codes(
+            r#"<?php preg_match('&' . preg_quote('&oops', $delimiter) . 'pattern&', $s);"#,
+            run_quoting,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn preg_quote_dynamic_pattern_prefix_not_flagged() {
+        assert!(codes(
+            r#"<?php preg_match($prefix . preg_quote('&oops') . 'pattern&', $s);"#,
+            run_quoting,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn namespaced_user_preg_quote_not_flagged() {
+        let src = r#"<?php namespace App; function preg_quote($s){} preg_match('&' . preg_quote('&oops') . 'pattern&', $s);"#;
+        assert!(codes(src, run_quoting).is_empty());
     }
 }

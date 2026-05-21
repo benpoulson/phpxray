@@ -93,7 +93,11 @@ fn existing_names_in_group_use(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 };
                 // Reuse the per-kind check but on the combined FQN, keeping the
                 // element's own span for the diagnostic location.
-                let full = Name { span: item.name.span, fq: item.name.fq, text: combined };
+                let full = Name {
+                    span: item.name.span,
+                    fq: item.name.fq,
+                    text: combined,
+                };
                 if let Some(d) = check_item(fa, item.kind, &full) {
                     out.push(d);
                 }
@@ -125,10 +129,7 @@ mod tests {
 
     #[test]
     fn use_const_unknown_flagged() {
-        let c = codes(
-            "<?php use const Foo\\MISSING_CONST;",
-            existing_names_in_use,
-        );
+        let c = codes("<?php use const Foo\\MISSING_CONST;", existing_names_in_use);
         assert_eq!(c, vec!["constant.notFound"]);
     }
 
@@ -174,14 +175,20 @@ mod tests {
             "<?php namespace App; function helper() {} use function App\\helper;",
             existing_names_in_use,
         );
-        assert!(c.is_empty(), "declared function import must not flag: {c:?}");
+        assert!(
+            c.is_empty(),
+            "declared function import must not flag: {c:?}"
+        );
     }
 
     #[test]
     fn leading_backslash_normalized() {
         // `use const \PHP_EOL;` is the same symbol; must not flag.
         let c = codes("<?php use const \\PHP_EOL;", existing_names_in_use);
-        assert!(c.is_empty(), "leading-backslash builtin const must not flag: {c:?}");
+        assert!(
+            c.is_empty(),
+            "leading-backslash builtin const must not flag: {c:?}"
+        );
     }
 
     #[test]
@@ -215,11 +222,11 @@ mod tests {
 
     #[test]
     fn group_use_class_not_flagged() {
-        let c = codes(
-            "<?php use Foo\\{Bar, Baz};",
-            existing_names_in_group_use,
+        let c = codes("<?php use Foo\\{Bar, Baz};", existing_names_in_group_use);
+        assert!(
+            c.is_empty(),
+            "group class imports must not flag existence: {c:?}"
         );
-        assert!(c.is_empty(), "group class imports must not flag existence: {c:?}");
     }
 
     #[test]
@@ -248,6 +255,9 @@ mod tests {
             "<?php namespace App; const FOO = 1; use const App\\{FOO};",
             existing_names_in_group_use,
         );
-        assert!(c.is_empty(), "declared const group import must not flag: {c:?}");
+        assert!(
+            c.is_empty(),
+            "declared const group import must not flag: {c:?}"
+        );
     }
 }

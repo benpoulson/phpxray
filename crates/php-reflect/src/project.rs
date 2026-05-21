@@ -10,10 +10,10 @@
 //! type args as the walk ascends.
 
 use crate::{
-    reflect_class, reflect_function, ClassReflection, ConstReflection, FunctionReflection, MethodReflection,
-    PropertyReflection,
+    reflect_class, reflect_function, ClassReflection, ConstReflection, FunctionReflection,
+    MethodReflection, PropertyReflection,
 };
-use php_ast::{ClassDecl, Member, Program, Stmt, StmtKind};
+use php_ast::{ClassDecl, ClassKind, Member, Program, Stmt, StmtKind};
 use php_intern::Interner;
 use php_resolve::{for_each_region, Scope};
 use php_types::{CallableSig, ShapeField, Type};
@@ -21,6 +21,15 @@ use std::collections::HashMap;
 
 /// A map from `@template` names to the types bound for them along a hierarchy walk.
 type Subst = HashMap<String, Type>;
+
+/// How a parsed file participates in reflection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    /// User-facing analyzed source. May shadow a built-in reflection.
+    Analyzed,
+    /// Symbol-provider-only source. Must not shadow curated built-ins.
+    Scan,
+}
 
 /// A member found via hierarchy lookup, plus the class that declared it. Member
 /// types have generic template variables substituted for the query's bindings.
@@ -60,15 +69,24 @@ impl ReflectionIndex {
         for fr in crate::builtins::builtin_functions() {
             idx.functions.insert(key(&fr.fqn), fr);
         }
+        for cr in crate::builtins::builtin_classes() {
+            idx.classes.insert(key(&cr.fqn), cr);
+        }
         idx
     }
 
     /// Reflect every class and function in a parsed file and add them to the
     /// index. Later definitions of the same FQN overwrite earlier ones.
     pub fn add_file(&mut self, program: &Program, interner: &Interner) {
+        self.add_file_as(program, interner, SourceKind::Analyzed);
+    }
+
+    /// Reflect every class and function in a parsed file, with scan-only files
+    /// prevented from replacing curated built-in reflections.
+    pub fn add_file_as(&mut self, program: &Program, interner: &Interner, kind: SourceKind) {
         for_each_region(&program.stmts, interner, |scope, region| {
             for st in region {
-                self.collect_stmt(scope, interner, st);
+                self.collect_stmt(scope, interner, st, kind);
             }
         });
     }
@@ -106,7 +124,9 @@ impl ReflectionIndex {
             return false;
         }
         visited.push(sub_key.to_string());
-        let Some(c) = self.classes.get(sub_key) else { return false };
+        let Some(c) = self.classes.get(sub_key) else {
+            return false;
+        };
         c.parents
             .iter()
             .chain(&c.interfaces)
@@ -123,36 +143,99 @@ impl ReflectionIndex {
     /// case-insensitively. Returns the method with generic args substituted.
     pub fn find_method(&self, class_fqn: &str, name: &str) -> Option<Found<MethodReflection>> {
         let mut visited = Vec::new();
-        self.ascend(class_fqn, Subst::new(), &mut visited, &mut |class, subst| {
-            class.methods.iter().find(|m| m.name.eq_ignore_ascii_case(name)).map(|m| Found {
-                member: subst_method(m, subst),
-                declaring_class: class.fqn.clone(),
-            })
-        })
+        self.ascend(
+            class_fqn,
+            Subst::new(),
+            &mut visited,
+            &mut |class, subst| {
+                class
+                    .methods
+                    .iter()
+                    .find(|m| m.name.eq_ignore_ascii_case(name))
+                    .map(|m| Found {
+                        member: subst_method(m, subst),
+                        declaring_class: class.fqn.clone(),
+                    })
+            },
+        )
+    }
+
+    /// Whether every known concrete descendant of an abstract class/interface is
+    /// final and exposes `method`. This is an intentionally narrow escape hatch
+    /// for member-existence checks on abstract receiver types: if a library's
+    /// hierarchy is closed by final leaf classes, a call may be valid even when
+    /// the abstract parent does not declare the method.
+    pub fn final_concrete_descendants_have_method(&self, class_fqn: &str, method: &str) -> bool {
+        let Some(base) = self.class(class_fqn) else {
+            return false;
+        };
+        if !base.is_abstract && !matches!(base.kind, ClassKind::Interface) {
+            return false;
+        }
+
+        let base_key = key(class_fqn);
+        let mut saw_concrete = false;
+        for class in self.classes.values() {
+            if key(&class.fqn) == base_key || !self.is_subclass_of(&class.fqn, class_fqn) {
+                continue;
+            }
+            if !matches!(class.kind, ClassKind::Class | ClassKind::Enum) || class.is_abstract {
+                continue;
+            }
+            saw_concrete = true;
+            if !class.is_final || self.find_method(&class.fqn, method).is_none() {
+                return false;
+            }
+        }
+        saw_concrete
     }
 
     /// Resolve a property by name (without `$`) through the hierarchy. Property
     /// names are case-sensitive.
     pub fn find_property(&self, class_fqn: &str, name: &str) -> Option<Found<PropertyReflection>> {
         let mut visited = Vec::new();
-        self.ascend(class_fqn, Subst::new(), &mut visited, &mut |class, subst| {
-            class.properties.iter().find(|p| p.name == name).map(|p| Found {
-                member: PropertyReflection { ty: subst_type(&p.ty, subst), ..p.clone() },
-                declaring_class: class.fqn.clone(),
-            })
-        })
+        self.ascend(
+            class_fqn,
+            Subst::new(),
+            &mut visited,
+            &mut |class, subst| {
+                class
+                    .properties
+                    .iter()
+                    .find(|p| p.name == name)
+                    .map(|p| Found {
+                        member: PropertyReflection {
+                            ty: subst_type(&p.ty, subst),
+                            ..p.clone()
+                        },
+                        declaring_class: class.fqn.clone(),
+                    })
+            },
+        )
     }
 
     /// Resolve a class constant by name through the hierarchy. Constant names are
     /// case-sensitive.
     pub fn find_constant(&self, class_fqn: &str, name: &str) -> Option<Found<ConstReflection>> {
         let mut visited = Vec::new();
-        self.ascend(class_fqn, Subst::new(), &mut visited, &mut |class, subst| {
-            class.constants.iter().find(|c| c.name == name).map(|c| Found {
-                member: ConstReflection { ty: subst_type(&c.ty, subst), ..c.clone() },
-                declaring_class: class.fqn.clone(),
-            })
-        })
+        self.ascend(
+            class_fqn,
+            Subst::new(),
+            &mut visited,
+            &mut |class, subst| {
+                class
+                    .constants
+                    .iter()
+                    .find(|c| c.name == name)
+                    .map(|c| Found {
+                        member: ConstReflection {
+                            ty: subst_type(&c.ty, subst),
+                            ..c.clone()
+                        },
+                        declaring_class: class.fqn.clone(),
+                    })
+            },
+        )
     }
 
     /// Walk `fqn` and its ancestors in PHP member-resolution order, calling `f`
@@ -175,7 +258,12 @@ impl ReflectionIndex {
             return Some(found);
         }
         // Traits, then the parent class, then interfaces, then mixins.
-        let parents = class.traits.iter().chain(&class.parents).chain(&class.interfaces).chain(&class.mixins);
+        let parents = class
+            .traits
+            .iter()
+            .chain(&class.parents)
+            .chain(&class.interfaces)
+            .chain(&class.mixins);
         for parent in parents {
             if let Type::Named { fqn: pf, args } = parent {
                 let psubst = self.compose(pf, args, &subst);
@@ -200,66 +288,96 @@ impl ReflectionIndex {
         map
     }
 
-    fn collect_stmt(&mut self, scope: &Scope, interner: &Interner, st: &php_ast::Stmt) {
+    fn collect_stmt(
+        &mut self,
+        scope: &Scope,
+        interner: &Interner,
+        st: &php_ast::Stmt,
+        kind: SourceKind,
+    ) {
         match &st.kind {
-            StmtKind::Class(c) => self.add_class(scope, interner, c),
+            StmtKind::Class(c) => self.add_class(scope, interner, c, kind),
             StmtKind::Function(f) => {
                 let r = reflect_function(scope, interner, f);
-                self.bodies.insert(key(&r.fqn), (f.body.clone(), scope.clone()));
+                if kind == SourceKind::Scan
+                    && self.functions.get(&key(&r.fqn)).is_some_and(|f| f.builtin)
+                {
+                    return;
+                }
+                self.bodies
+                    .insert(key(&r.fqn), (f.body.clone(), scope.clone()));
                 self.functions.insert(key(&r.fqn), r);
             }
             // Descend into nested/conditional declarations, mirroring the symbol
             // indexer so conditionally-declared classes are reflected too.
-            StmtKind::Block(b) => self.collect_all(scope, interner, b),
-            StmtKind::If { then, elseifs, els, .. } => {
-                self.collect_stmt(scope, interner, then);
+            StmtKind::Block(b) => self.collect_all(scope, interner, b, kind),
+            StmtKind::If {
+                then, elseifs, els, ..
+            } => {
+                self.collect_stmt(scope, interner, then, kind);
                 for e in elseifs {
-                    self.collect_stmt(scope, interner, &e.body);
+                    self.collect_stmt(scope, interner, &e.body, kind);
                 }
                 if let Some(e) = els {
-                    self.collect_stmt(scope, interner, e);
+                    self.collect_stmt(scope, interner, e, kind);
                 }
             }
             StmtKind::While { body, .. }
             | StmtKind::DoWhile { body, .. }
             | StmtKind::For { body, .. }
-            | StmtKind::Foreach { body, .. } => self.collect_stmt(scope, interner, body),
-            StmtKind::Try { body, catches, finally } => {
-                self.collect_all(scope, interner, body);
+            | StmtKind::Foreach { body, .. } => self.collect_stmt(scope, interner, body, kind),
+            StmtKind::Try {
+                body,
+                catches,
+                finally,
+            } => {
+                self.collect_all(scope, interner, body, kind);
                 for c in catches {
-                    self.collect_all(scope, interner, &c.body);
+                    self.collect_all(scope, interner, &c.body, kind);
                 }
                 if let Some(fin) = finally {
-                    self.collect_all(scope, interner, fin);
+                    self.collect_all(scope, interner, fin, kind);
                 }
             }
             StmtKind::Switch { cases, .. } => {
                 for case in cases {
-                    self.collect_all(scope, interner, &case.body);
+                    self.collect_all(scope, interner, &case.body, kind);
                 }
             }
-            StmtKind::Declare { body: Some(b), .. } => self.collect_stmt(scope, interner, b),
+            StmtKind::Declare { body: Some(b), .. } => self.collect_stmt(scope, interner, b, kind),
             _ => {}
         }
     }
 
-    fn collect_all(&mut self, scope: &Scope, interner: &Interner, stmts: &[php_ast::Stmt]) {
+    fn collect_all(
+        &mut self,
+        scope: &Scope,
+        interner: &Interner,
+        stmts: &[php_ast::Stmt],
+        kind: SourceKind,
+    ) {
         for st in stmts {
-            self.collect_stmt(scope, interner, st);
+            self.collect_stmt(scope, interner, st, kind);
         }
     }
 
-    fn add_class(&mut self, scope: &Scope, interner: &Interner, c: &ClassDecl) {
+    fn add_class(&mut self, scope: &Scope, interner: &Interner, c: &ClassDecl, kind: SourceKind) {
         // Anonymous classes have no FQN.
         let Some(name) = c.name else { return };
         let fqn = scope.qualify(interner.resolve(name));
+        if kind == SourceKind::Scan && self.classes.get(&key(&fqn)).is_some_and(|c| c.builtin) {
+            return;
+        }
         let r = reflect_class(scope, interner, &fqn, c);
         // Store method bodies (+ the class's scope) for interprocedural inference.
         for m in &c.members {
             if let Member::Method(md) = m {
                 if let Some(body) = &md.body {
                     let mname = interner.resolve(md.name).to_ascii_lowercase();
-                    self.bodies.insert(format!("{}::{}", key(&fqn), mname), (body.clone(), scope.clone()));
+                    self.bodies.insert(
+                        format!("{}::{}", key(&fqn), mname),
+                        (body.clone(), scope.clone()),
+                    );
                 }
             }
         }
@@ -276,7 +394,11 @@ impl ReflectionIndex {
     /// `declaring_class` from [`find_method`](Self::find_method), not the receiver).
     pub fn method_body(&self, declaring_class: &str, name: &str) -> Option<(&[Stmt], &Scope)> {
         self.bodies
-            .get(&format!("{}::{}", key(declaring_class), name.to_ascii_lowercase()))
+            .get(&format!(
+                "{}::{}",
+                key(declaring_class),
+                name.to_ascii_lowercase()
+            ))
             .map(|(b, s)| (b.as_slice(), s))
     }
 }
@@ -308,16 +430,25 @@ fn subst_type(ty: &Type, subst: &Subst) -> Type {
         Type::TemplateVar(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
         Type::Nullable(inner) => Type::Nullable(Box::new(subst_type(inner, subst))),
         Type::Union(parts) => Type::union(parts.iter().map(|p| subst_type(p, subst)).collect()),
-        Type::Intersection(parts) => Type::intersection(parts.iter().map(|p| subst_type(p, subst)).collect()),
+        Type::Intersection(parts) => {
+            Type::intersection(parts.iter().map(|p| subst_type(p, subst)).collect())
+        }
         Type::List(inner) => Type::List(Box::new(subst_type(inner, subst))),
-        Type::Array(Some(kv)) => Type::Array(Some(Box::new((subst_type(&kv.0, subst), subst_type(&kv.1, subst))))),
-        Type::Iterable(Some(kv)) => {
-            Type::Iterable(Some(Box::new((subst_type(&kv.0, subst), subst_type(&kv.1, subst)))))
+        Type::Array(Some(kv)) => Type::Array(Some(Box::new((
+            subst_type(&kv.0, subst),
+            subst_type(&kv.1, subst),
+        )))),
+        Type::Iterable(Some(kv)) => Type::Iterable(Some(Box::new((
+            subst_type(&kv.0, subst),
+            subst_type(&kv.1, subst),
+        )))),
+        Type::ClassString(Some(inner)) => {
+            Type::ClassString(Some(Box::new(subst_type(inner, subst))))
         }
-        Type::ClassString(Some(inner)) => Type::ClassString(Some(Box::new(subst_type(inner, subst)))),
-        Type::Named { fqn, args } => {
-            Type::Named { fqn: fqn.clone(), args: args.iter().map(|a| subst_type(a, subst)).collect() }
-        }
+        Type::Named { fqn, args } => Type::Named {
+            fqn: fqn.clone(),
+            args: args.iter().map(|a| subst_type(a, subst)).collect(),
+        },
         Type::Callable(Some(sig)) => Type::Callable(Some(Box::new(CallableSig {
             params: sig.params.iter().map(|p| subst_type(p, subst)).collect(),
             ret: subst_type(&sig.ret, subst),
@@ -325,11 +456,21 @@ fn subst_type(ty: &Type, subst: &Subst) -> Type {
         Type::Shape { fields, sealed } => Type::Shape {
             fields: fields
                 .iter()
-                .map(|f| ShapeField { key: f.key.clone(), optional: f.optional, ty: subst_type(&f.ty, subst) })
+                .map(|f| ShapeField {
+                    key: f.key.clone(),
+                    optional: f.optional,
+                    ty: subst_type(&f.ty, subst),
+                })
                 .collect(),
             sealed: *sealed,
         },
-        Type::Conditional { subject, negated, target, then, els } => Type::Conditional {
+        Type::Conditional {
+            subject,
+            negated,
+            target,
+            then,
+            els,
+        } => Type::Conditional {
             subject: subject.clone(),
             negated: *negated,
             target: Box::new(subst_type(target, subst)),
@@ -440,9 +581,21 @@ mod tests {
         );
         let add = idx.find_method("Users", "add").unwrap();
         assert_eq!(add.declaring_class, "Collection");
-        assert_eq!(add.member.params[0].ty, Type::Named { fqn: "User".into(), args: vec![] });
+        assert_eq!(
+            add.member.params[0].ty,
+            Type::Named {
+                fqn: "User".into(),
+                args: vec![]
+            }
+        );
         let first = idx.find_method("Users", "first").unwrap();
-        assert_eq!(first.member.return_type, Type::Named { fqn: "User".into(), args: vec![] });
+        assert_eq!(
+            first.member.return_type,
+            Type::Named {
+                fqn: "User".into(),
+                args: vec![]
+            }
+        );
     }
 
     #[test]
@@ -479,5 +632,65 @@ mod tests {
             class B extends A {}"#,
         );
         assert!(idx.find_method("A", "whatever").is_none());
+    }
+
+    #[test]
+    fn enum_magic_members_are_reflected() {
+        let idx = index(
+            r#"<?php
+            enum Suit: string { case Hearts = 'H'; }"#,
+        );
+        assert_eq!(
+            idx.find_property("Suit", "name").unwrap().member.ty,
+            Type::String
+        );
+        assert_eq!(
+            idx.find_property("Suit", "value").unwrap().member.ty,
+            Type::String
+        );
+        assert_eq!(
+            idx.find_method("Suit", "cases")
+                .unwrap()
+                .member
+                .return_type
+                .to_string(),
+            "list<static>"
+        );
+        assert_eq!(
+            idx.find_method("Suit", "tryFrom")
+                .unwrap()
+                .member
+                .return_type
+                .to_string(),
+            "?static"
+        );
+    }
+
+    #[test]
+    fn builtin_class_members_are_loaded() {
+        let idx = ReflectionIndex::with_builtins();
+        assert_eq!(
+            idx.find_method("DateTimeImmutable", "format")
+                .unwrap()
+                .member
+                .return_type,
+            Type::String
+        );
+        assert_eq!(
+            idx.find_method("DateTimeZone", "getName")
+                .unwrap()
+                .member
+                .return_type,
+            Type::String
+        );
+    }
+
+    #[test]
+    fn scan_file_does_not_override_builtin_function() {
+        let r = php_parser::parse("<?php function strlen(): bool {}");
+        assert!(!r.has_errors(), "parse errors");
+        let mut idx = ReflectionIndex::with_builtins();
+        idx.add_file_as(&r.program, &r.interner, SourceKind::Scan);
+        assert_eq!(idx.function("strlen").unwrap().return_type, Type::Int);
     }
 }

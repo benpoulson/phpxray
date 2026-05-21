@@ -16,7 +16,7 @@
 //! positives (the project's rule for the whole type layer).
 
 use php_ast::{
-    ArrowFn, BinOp, ClosureExpr, Expr, ExprKind, FunctionDecl, MethodDecl, Member, Param, Stmt,
+    ArrowFn, BinOp, ClosureExpr, Expr, ExprKind, FunctionDecl, Member, MethodDecl, Param, Stmt,
     StmtKind,
 };
 use php_intern::Interner;
@@ -42,19 +42,39 @@ pub struct UndefVar {
 
 /// PHP superglobals + always-available variables — never reported.
 const ALWAYS_DEFINED: &[&str] = &[
-    "GLOBALS", "_SERVER", "_GET", "_POST", "_FILES", "_COOKIE", "_SESSION", "_REQUEST", "_ENV",
-    "this", "http_response_header", "argc", "argv", "php_errormsg",
+    "GLOBALS",
+    "_SERVER",
+    "_GET",
+    "_POST",
+    "_FILES",
+    "_COOKIE",
+    "_SESSION",
+    "_REQUEST",
+    "_ENV",
+    "this",
+    "http_response_header",
+    "argc",
+    "argv",
+    "php_errormsg",
 ];
 
 /// Function names whose presence means we can't reason about definedness in the
 /// enclosing scope (they can introduce or require arbitrary variables).
 const ESCAPE_FUNCTIONS: &[&str] = &[
-    "extract", "parse_str", "mb_parse_str", "get_defined_vars", "compact", "eval",
+    "extract",
+    "parse_str",
+    "mb_parse_str",
+    "get_defined_vars",
+    "compact",
+    "eval",
 ];
 
 /// Analyse a whole program and return the possibly-undefined variable reads.
 pub fn undefined_variables(program: &php_ast::Program, interner: &Interner) -> Vec<UndefVar> {
-    let mut a = Analyzer { interner, out: Vec::new() };
+    let mut a = Analyzer {
+        interner,
+        out: Vec::new(),
+    };
     // The global region is its own scope; nested function/class decls recurse.
     a.analyze_scope(&program.stmts, Env::new());
     a.out
@@ -127,7 +147,12 @@ impl Analyzer<'_> {
             StmtKind::Echo(es) => es.iter().for_each(|e| self.read_expr(e, env)),
             StmtKind::Return(Some(e)) => self.read_expr(e, env),
             StmtKind::Block(b) => self.exec_block(b, env),
-            StmtKind::If { cond, then, elseifs, els } => {
+            StmtKind::If {
+                cond,
+                then,
+                elseifs,
+                els,
+            } => {
                 self.read_expr(cond, env);
                 self.exec_if(then, elseifs, els.as_deref(), env);
             }
@@ -140,7 +165,12 @@ impl Analyzer<'_> {
                 self.exec_stmt(body, env);
                 self.read_expr(cond, env);
             }
-            StmtKind::For { init, cond, update, body } => {
+            StmtKind::For {
+                init,
+                cond,
+                update,
+                body,
+            } => {
                 for e in init {
                     self.read_expr(e, env);
                 }
@@ -149,7 +179,13 @@ impl Analyzer<'_> {
                 }
                 self.exec_loop(body, env);
             }
-            StmtKind::Foreach { subject, key, value, body, .. } => {
+            StmtKind::Foreach {
+                subject,
+                key,
+                value,
+                body,
+                ..
+            } => {
                 self.read_expr(subject, env);
                 // The loop may run zero times: variables bound here and in the body
                 // are only `Maybe` afterwards.
@@ -175,7 +211,11 @@ impl Analyzer<'_> {
                 }
                 *env = merge(envs);
             }
-            StmtKind::Try { body, catches, finally } => {
+            StmtKind::Try {
+                body,
+                catches,
+                finally,
+            } => {
                 self.exec_block(body, env);
                 for c in catches {
                     let mut ce = env.clone();
@@ -214,7 +254,13 @@ impl Analyzer<'_> {
         }
     }
 
-    fn exec_if(&mut self, then: &Stmt, elseifs: &[php_ast::ElseIf], els: Option<&Stmt>, env: &mut Env) {
+    fn exec_if(
+        &mut self,
+        then: &Stmt,
+        elseifs: &[php_ast::ElseIf],
+        els: Option<&Stmt>,
+        env: &mut Env,
+    ) {
         let base = env.clone();
         let mut envs: Vec<Env> = Vec::new();
 
@@ -288,7 +334,10 @@ impl Analyzer<'_> {
             }
             // `$x++`/`--$x` on an undefined var auto-vivifies it (PHP warns, but
             // to stay false-positive-safe on later reads we treat it as a define).
-            ExprKind::PreInc(t) | ExprKind::PreDec(t) | ExprKind::PostInc(t) | ExprKind::PostDec(t) => {
+            ExprKind::PreInc(t)
+            | ExprKind::PreDec(t)
+            | ExprKind::PostInc(t)
+            | ExprKind::PostDec(t) => {
                 self.bind(t, env);
             }
             // `$arr[]` (append) only ever appears in a write/by-ref context and
@@ -384,10 +433,16 @@ impl Analyzer<'_> {
         }
         match env.get(name) {
             Some(Def::Definite) => {}
-            Some(Def::Maybe) => {
-                self.out.push(UndefVar { span, name: name.to_string(), definite: false })
-            }
-            None => self.out.push(UndefVar { span, name: name.to_string(), definite: true }),
+            Some(Def::Maybe) => self.out.push(UndefVar {
+                span,
+                name: name.to_string(),
+                definite: false,
+            }),
+            None => self.out.push(UndefVar {
+                span,
+                name: name.to_string(),
+                definite: true,
+            }),
         }
     }
 
@@ -450,7 +505,11 @@ fn merge(envs: Vec<Env>) -> Env {
     }
     let mut out = Env::new();
     for (name, (present_count, definite_count)) in present {
-        let d = if present_count == n && definite_count == n { Def::Definite } else { Def::Maybe };
+        let d = if present_count == n && definite_count == n {
+            Def::Definite
+        } else {
+            Def::Maybe
+        };
         out.insert(name, d);
     }
     out
@@ -459,10 +518,17 @@ fn merge(envs: Vec<Env>) -> Env {
 /// Whether `s` always leaves the current block (so its env doesn't flow past it).
 fn always_terminates(s: &Stmt) -> bool {
     match &s.kind {
-        StmtKind::Return(_) | StmtKind::Break(_) | StmtKind::Continue(_) | StmtKind::Goto(_) => true,
+        StmtKind::Return(_) | StmtKind::Break(_) | StmtKind::Continue(_) | StmtKind::Goto(_) => {
+            true
+        }
         StmtKind::Expr(e) => matches!(&e.kind, ExprKind::Throw(_) | ExprKind::Exit(_)),
         StmtKind::Block(b) => b.last().is_some_and(always_terminates),
-        StmtKind::If { then, elseifs, els: Some(els), .. } => {
+        StmtKind::If {
+            then,
+            elseifs,
+            els: Some(els),
+            ..
+        } => {
             always_terminates(then)
                 && elseifs.iter().all(|ei| always_terminates(&ei.body))
                 && always_terminates(els)
@@ -499,10 +565,18 @@ fn stmt_escape(s: &Stmt, interner: &Interner) -> bool {
 fn expr_escape(e: &Expr, interner: &Interner) -> bool {
     match &e.kind {
         // Dynamic variables and eval/include can define arbitrary names.
-        ExprKind::VariableVariable(_) | ExprKind::DollarBrace(_) | ExprKind::Eval(_) | ExprKind::Include { .. } => true,
+        ExprKind::VariableVariable(_)
+        | ExprKind::DollarBrace(_)
+        | ExprKind::Eval(_)
+        | ExprKind::Include { .. } => true,
         ExprKind::Call { callee, .. } => {
             if let ExprKind::Name(n) = &callee.kind {
-                let last = n.text.rsplit('\\').next().unwrap_or(&n.text).to_ascii_lowercase();
+                let last = n
+                    .text
+                    .rsplit('\\')
+                    .next()
+                    .unwrap_or(&n.text)
+                    .to_ascii_lowercase();
                 if ESCAPE_FUNCTIONS.contains(&last.as_str()) {
                     return true;
                 }
@@ -537,9 +611,20 @@ fn walk_children(e: &Expr, f: &mut dyn FnMut(&Expr)) {
             f(lhs);
             f(rhs);
         }
-        Unary { expr, .. } | Cast { expr, .. } | Clone(expr) | Print(expr) | Throw(expr)
-        | ErrorSuppress(expr) | Empty(expr) | Paren(expr) | PreInc(expr) | PreDec(expr)
-        | PostInc(expr) | PostDec(expr) | DollarBrace(expr) | VariableVariable(expr) => f(expr),
+        Unary { expr, .. }
+        | Cast { expr, .. }
+        | Clone(expr)
+        | Print(expr)
+        | Throw(expr)
+        | ErrorSuppress(expr)
+        | Empty(expr)
+        | Paren(expr)
+        | PreInc(expr)
+        | PreDec(expr)
+        | PostInc(expr)
+        | PostDec(expr)
+        | DollarBrace(expr)
+        | VariableVariable(expr) => f(expr),
         Assign { target, rhs } | AssignRef { target, rhs } => {
             f(target);
             f(rhs);
@@ -637,7 +722,12 @@ fn walk_stmt_nodes(s: &Stmt, f: &mut dyn FnMut(Node)) {
         Expr(e) | Return(Some(e)) => f(Node::Expr(e)),
         Echo(es) => es.iter().for_each(|e| f(Node::Expr(e))),
         Block(b) => f(Node::Block(b)),
-        If { cond, then, elseifs, els } => {
+        If {
+            cond,
+            then,
+            elseifs,
+            els,
+        } => {
             f(Node::Expr(cond));
             f(Node::Block(one(then)));
             for ei in elseifs {
@@ -656,11 +746,25 @@ fn walk_stmt_nodes(s: &Stmt, f: &mut dyn FnMut(Node)) {
             f(Node::Block(one(body)));
             f(Node::Expr(cond));
         }
-        For { init, cond, update, body } => {
-            init.iter().chain(cond).chain(update).for_each(|e| f(Node::Expr(e)));
+        For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            init.iter()
+                .chain(cond)
+                .chain(update)
+                .for_each(|e| f(Node::Expr(e)));
             f(Node::Block(one(body)));
         }
-        Foreach { subject, key, value, body, .. } => {
+        Foreach {
+            subject,
+            key,
+            value,
+            body,
+            ..
+        } => {
             f(Node::Expr(subject));
             if let Some(k) = key {
                 f(Node::Expr(k));
@@ -677,7 +781,11 @@ fn walk_stmt_nodes(s: &Stmt, f: &mut dyn FnMut(Node)) {
                 f(Node::Block(&c.body));
             }
         }
-        Try { body, catches, finally } => {
+        Try {
+            body,
+            catches,
+            finally,
+        } => {
             f(Node::Block(body));
             for c in catches {
                 f(Node::Block(&c.body));
@@ -687,7 +795,10 @@ fn walk_stmt_nodes(s: &Stmt, f: &mut dyn FnMut(Node)) {
             }
         }
         Global(es) | Unset(es) => es.iter().for_each(|e| f(Node::Expr(e))),
-        StaticVars(vs) => vs.iter().filter_map(|v| v.default.as_ref()).for_each(|e| f(Node::Expr(e))),
+        StaticVars(vs) => vs
+            .iter()
+            .filter_map(|v| v.default.as_ref())
+            .for_each(|e| f(Node::Expr(e))),
         Namespace { body: Some(b), .. } => f(Node::Block(b)),
         Declare { body: Some(b), .. } => f(Node::Block(one(b))),
         _ => {}

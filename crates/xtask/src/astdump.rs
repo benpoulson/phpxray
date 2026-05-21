@@ -35,7 +35,11 @@ fn render(c: &C, ind: usize, out: &mut Vec<u8>) {
         C::N(head, kids) => {
             out.extend_from_slice(format!("{p}({head}\n").as_bytes());
             for (k, child) in kids {
-                let key = if k.is_empty() { String::new() } else { format!("{k}=") };
+                let key = if k.is_empty() {
+                    String::new()
+                } else {
+                    format!("{k}=")
+                };
                 out.extend_from_slice(format!("{p}  {key}\n").as_bytes());
                 render(child, ind + 2, out);
             }
@@ -69,7 +73,11 @@ fn fmt_float(v: f64) -> String {
     if let Some(epos) = s.find(['e', 'E']) {
         let (mant, rest) = s.split_at(epos);
         let exp = &rest[1..];
-        let mant = if mant.contains('.') { mant.to_string() } else { format!("{mant}.0") };
+        let mant = if mant.contains('.') {
+            mant.to_string()
+        } else {
+            format!("{mant}.0")
+        };
         let (sign, digits) = match exp.strip_prefix('-') {
             Some(d) => ("-", d),
             None => ("+", exp.strip_prefix('+').unwrap_or(exp)),
@@ -99,7 +107,11 @@ fn node(head: &str, kids: Vec<(&'static str, C)>) -> C {
     C::N(head.to_string(), kids)
 }
 fn head(name: &str, flag: u32) -> String {
-    if flag != 0 { format!("{name}#{flag}") } else { name.to_string() }
+    if flag != 0 {
+        format!("{name}#{flag}")
+    } else {
+        name.to_string()
+    }
 }
 
 struct Dumper<'a> {
@@ -127,25 +139,39 @@ impl<'a> Dumper<'a> {
     fn body(&self, s: &Stmt) -> C {
         match &s.kind {
             StmtKind::Block(b) => C::N("STMT_LIST".into(), self.stmt_list(b)),
-            _ => C::N("STMT_LIST".into(), self.stmt(s).into_iter().map(|c| ("", c)).collect()),
+            _ => C::N(
+                "STMT_LIST".into(),
+                self.stmt(s).into_iter().map(|c| ("", c)).collect(),
+            ),
         }
     }
 
     fn stmt(&self, s: &Stmt) -> Vec<C> {
         match &s.kind {
             StmtKind::Expr(e) => vec![self.expr(e)],
-            StmtKind::Echo(es) => es.iter().map(|e| node("ECHO", vec![("expr", self.expr(e))])).collect(),
+            StmtKind::Echo(es) => es
+                .iter()
+                .map(|e| node("ECHO", vec![("expr", self.expr(e))]))
+                .collect(),
             StmtKind::Return(v) => vec![node("RETURN", vec![("expr", self.opt(v.as_ref()))])],
             // A bare `{ ... }` block is purely syntactic: PHP inlines its
             // statements into the enclosing list rather than emitting a node.
             StmtKind::Block(b) => self.stmt_list(b).into_iter().map(|(_, c)| c).collect(),
             StmtKind::Nop => vec![],
             StmtKind::InlineHtml(s) => vec![node("ECHO", vec![("expr", C::Str(s.clone()))])],
-            StmtKind::HaltCompiler(off) => vec![node("HALT_COMPILER", vec![("offset", C::Int(*off as i64))])],
+            StmtKind::HaltCompiler(off) => {
+                vec![node("HALT_COMPILER", vec![("offset", C::Int(*off as i64))])]
+            }
             StmtKind::Break(l) => vec![node("BREAK", vec![("depth", self.opt(l.as_ref()))])],
             StmtKind::Continue(l) => vec![node("CONTINUE", vec![("depth", self.opt(l.as_ref()))])],
-            StmtKind::Global(vs) => vs.iter().map(|v| node("GLOBAL", vec![("var", self.expr(v))])).collect(),
-            StmtKind::Unset(vs) => vs.iter().map(|v| node("UNSET", vec![("var", self.expr(v))])).collect(),
+            StmtKind::Global(vs) => vs
+                .iter()
+                .map(|v| node("GLOBAL", vec![("var", self.expr(v))]))
+                .collect(),
+            StmtKind::Unset(vs) => vs
+                .iter()
+                .map(|v| node("UNSET", vec![("var", self.expr(v))]))
+                .collect(),
             StmtKind::StaticVars(vs) => vs
                 .iter()
                 .map(|v| {
@@ -153,34 +179,67 @@ impl<'a> Dumper<'a> {
                         "STATIC",
                         vec![
                             ("var", node("VAR", vec![("name", C::Str(self.sym(v.name)))])),
-                            ("default", v.default.as_ref().map(|d| self.expr(d)).unwrap_or(C::Null)),
+                            (
+                                "default",
+                                v.default.as_ref().map(|d| self.expr(d)).unwrap_or(C::Null),
+                            ),
                         ],
                     )
                 })
                 .collect(),
             StmtKind::Goto(l) => vec![node("GOTO", vec![("label", C::Str(self.sym(*l)))])],
             StmtKind::Label(l) => vec![node("LABEL", vec![("name", C::Str(self.sym(*l)))])],
-            StmtKind::If { cond, then, elseifs, els } => {
-                let mut elems =
-                    vec![("", node("IF_ELEM", vec![("cond", self.expr(cond)), ("stmts", self.body(then))]))];
+            StmtKind::If {
+                cond,
+                then,
+                elseifs,
+                els,
+            } => {
+                let mut elems = vec![(
+                    "",
+                    node(
+                        "IF_ELEM",
+                        vec![("cond", self.expr(cond)), ("stmts", self.body(then))],
+                    ),
+                )];
                 for ei in elseifs {
                     elems.push((
                         "",
-                        node("IF_ELEM", vec![("cond", self.expr(&ei.cond)), ("stmts", self.body(&ei.body))]),
+                        node(
+                            "IF_ELEM",
+                            vec![
+                                ("cond", self.expr(&ei.cond)),
+                                ("stmts", self.body(&ei.body)),
+                            ],
+                        ),
                     ));
                 }
                 if let Some(e) = els {
-                    elems.push(("", node("IF_ELEM", vec![("cond", C::Null), ("stmts", self.body(e))])));
+                    elems.push((
+                        "",
+                        node("IF_ELEM", vec![("cond", C::Null), ("stmts", self.body(e))]),
+                    ));
                 }
                 vec![C::N("IF".into(), elems)]
             }
             StmtKind::While { cond, body } => {
-                vec![node("WHILE", vec![("cond", self.expr(cond)), ("stmts", self.body(body))])]
+                vec![node(
+                    "WHILE",
+                    vec![("cond", self.expr(cond)), ("stmts", self.body(body))],
+                )]
             }
             StmtKind::DoWhile { body, cond } => {
-                vec![node("DO_WHILE", vec![("stmts", self.body(body)), ("cond", self.expr(cond))])]
+                vec![node(
+                    "DO_WHILE",
+                    vec![("stmts", self.body(body)), ("cond", self.expr(cond))],
+                )]
             }
-            StmtKind::For { init, cond, update, body } => vec![node(
+            StmtKind::For {
+                init,
+                cond,
+                update,
+                body,
+            } => vec![node(
                 "FOR",
                 vec![
                     ("init", self.expr_list(init)),
@@ -189,8 +248,19 @@ impl<'a> Dumper<'a> {
                     ("stmts", self.body(body)),
                 ],
             )],
-            StmtKind::Foreach { subject, key, value, by_ref, key_by_ref, body } => {
-                let val = if *by_ref { node("REF", vec![("var", self.expr(value))]) } else { self.expr(value) };
+            StmtKind::Foreach {
+                subject,
+                key,
+                value,
+                by_ref,
+                key_by_ref,
+                body,
+            } => {
+                let val = if *by_ref {
+                    node("REF", vec![("var", self.expr(value))])
+                } else {
+                    self.expr(value)
+                };
                 let key = match key {
                     Some(k) if *key_by_ref => node("REF", vec![("var", self.expr(k))]),
                     Some(k) => self.expr(k),
@@ -215,7 +285,10 @@ impl<'a> Dumper<'a> {
                             node(
                                 "SWITCH_CASE",
                                 vec![
-                                    ("cond", c.test.as_ref().map(|e| self.expr(e)).unwrap_or(C::Null)),
+                                    (
+                                        "cond",
+                                        c.test.as_ref().map(|e| self.expr(e)).unwrap_or(C::Null),
+                                    ),
                                     ("stmts", C::N("STMT_LIST".into(), self.stmt_list(&c.body))),
                                 ],
                             ),
@@ -224,21 +297,36 @@ impl<'a> Dumper<'a> {
                     .collect();
                 vec![node(
                     "SWITCH",
-                    vec![("cond", self.expr(subject)), ("stmts", C::N("SWITCH_LIST".into(), arms))],
+                    vec![
+                        ("cond", self.expr(subject)),
+                        ("stmts", C::N("SWITCH_LIST".into(), arms)),
+                    ],
                 )]
             }
-            StmtKind::Try { body, catches, finally } => {
+            StmtKind::Try {
+                body,
+                catches,
+                finally,
+            } => {
                 let cs: Vec<_> = catches
                     .iter()
                     .map(|c| {
-                        let names: Vec<_> = c.types.iter().map(|t| ("", self.name_ref(t))).collect();
+                        let names: Vec<_> =
+                            c.types.iter().map(|t| ("", self.name_ref(t))).collect();
                         (
                             "",
                             node(
                                 "CATCH",
                                 vec![
                                     ("class", C::N("NAME_LIST".into(), names)),
-                                    ("var", c.var.map(|v| node("VAR", vec![("name", C::Str(self.sym(v)))])).unwrap_or(C::Null)),
+                                    (
+                                        "var",
+                                        c.var
+                                            .map(|v| {
+                                                node("VAR", vec![("name", C::Str(self.sym(v)))])
+                                            })
+                                            .unwrap_or(C::Null),
+                                    ),
                                     ("stmts", C::N("STMT_LIST".into(), self.stmt_list(&c.body))),
                                 ],
                             ),
@@ -250,21 +338,48 @@ impl<'a> Dumper<'a> {
                     vec![
                         ("try", C::N("STMT_LIST".into(), self.stmt_list(body))),
                         ("catches", C::N("CATCH_LIST".into(), cs)),
-                        ("finally", finally.as_ref().map(|f| C::N("STMT_LIST".into(), self.stmt_list(f))).unwrap_or(C::Null)),
+                        (
+                            "finally",
+                            finally
+                                .as_ref()
+                                .map(|f| C::N("STMT_LIST".into(), self.stmt_list(f)))
+                                .unwrap_or(C::Null),
+                        ),
                     ],
                 )]
             }
             StmtKind::Namespace { name, body } => vec![node(
                 "NAMESPACE",
                 vec![
-                    ("name", name.as_ref().map(|n| C::Str(n.text.trim_start_matches('\\').to_string())).unwrap_or(C::Null)),
-                    ("stmts", body.as_ref().map(|b| C::N("STMT_LIST".into(), self.stmt_list(b))).unwrap_or(C::Null)),
+                    (
+                        "name",
+                        name.as_ref()
+                            .map(|n| C::Str(n.text.trim_start_matches('\\').to_string()))
+                            .unwrap_or(C::Null),
+                    ),
+                    (
+                        "stmts",
+                        body.as_ref()
+                            .map(|b| C::N("STMT_LIST".into(), self.stmt_list(b)))
+                            .unwrap_or(C::Null),
+                    ),
                 ],
             )],
             StmtKind::ConstDecl { consts, attrs } => {
                 let mut cs: Vec<_> = consts
                     .iter()
-                    .map(|e| ("", node("CONST_ELEM", vec![("name", C::Str(self.sym(e.name))), ("value", self.expr(&e.value))])))
+                    .map(|e| {
+                        (
+                            "",
+                            node(
+                                "CONST_ELEM",
+                                vec![
+                                    ("name", C::Str(self.sym(e.name))),
+                                    ("value", self.expr(&e.value)),
+                                ],
+                            ),
+                        )
+                    })
                     .collect();
                 if !attrs.is_empty() {
                     cs.push(("", self.attrs(attrs)));
@@ -274,18 +389,33 @@ impl<'a> Dumper<'a> {
             StmtKind::Declare { directives, body } => {
                 let ds: Vec<_> = directives
                     .iter()
-                    .map(|(n, v)| ("", node("CONST_ELEM", vec![("name", C::Str(self.sym(*n))), ("value", self.expr(v))])))
+                    .map(|(n, v)| {
+                        (
+                            "",
+                            node(
+                                "CONST_ELEM",
+                                vec![("name", C::Str(self.sym(*n))), ("value", self.expr(v))],
+                            ),
+                        )
+                    })
                     .collect();
                 vec![node(
                     "DECLARE",
                     vec![
                         ("declares", C::N("CONST_DECL".into(), ds)),
-                        ("stmts", body.as_ref().map(|b| self.body(b)).unwrap_or(C::Null)),
+                        (
+                            "stmts",
+                            body.as_ref().map(|b| self.body(b)).unwrap_or(C::Null),
+                        ),
                     ],
                 )]
             }
             StmtKind::Use(items) => self.use_decls(items),
-            StmtKind::GroupUse { prefix, kind, items } => vec![self.group_use(prefix, *kind, items)],
+            StmtKind::GroupUse {
+                prefix,
+                kind,
+                items,
+            } => vec![self.group_use(prefix, *kind, items)],
             StmtKind::Function(f) => vec![self.func_decl(f)],
             StmtKind::Class(c) => vec![self.class_decl(c)],
             _ => vec![node("UNMAPPED_STMT", vec![])],
@@ -305,10 +435,22 @@ impl<'a> Dumper<'a> {
         let elems: Vec<_> = items
             .iter()
             .map(|it| {
-                ("", node("USE_ELEM", vec![
-                    ("name", C::Str(it.name.text.trim_start_matches('\\').to_string())),
-                    ("alias", it.alias.map(|a| C::Str(self.sym(a))).unwrap_or(C::Null)),
-                ]))
+                (
+                    "",
+                    node(
+                        "USE_ELEM",
+                        vec![
+                            (
+                                "name",
+                                C::Str(it.name.text.trim_start_matches('\\').to_string()),
+                            ),
+                            (
+                                "alias",
+                                it.alias.map(|a| C::Str(self.sym(a))).unwrap_or(C::Null),
+                            ),
+                        ],
+                    ),
+                )
             })
             .collect();
         let flag = items.first().map(|i| kind_flag(i.kind)).unwrap_or(1);
@@ -330,14 +472,24 @@ impl<'a> Dumper<'a> {
             .map(|it| {
                 // In a typed group, elements inherit the group type (flag 0); in
                 // an untyped group each element carries its own type.
-                let elem_flag = if kind.is_some() { 0 } else { kind_flag(it.kind) };
+                let elem_flag = if kind.is_some() {
+                    0
+                } else {
+                    kind_flag(it.kind)
+                };
                 (
                     "",
                     C::N(
                         head("USE_ELEM", elem_flag),
                         vec![
-                            ("name", C::Str(it.name.text.trim_start_matches('\\').to_string())),
-                            ("alias", it.alias.map(|a| C::Str(self.sym(a))).unwrap_or(C::Null)),
+                            (
+                                "name",
+                                C::Str(it.name.text.trim_start_matches('\\').to_string()),
+                            ),
+                            (
+                                "alias",
+                                it.alias.map(|a| C::Str(self.sym(a))).unwrap_or(C::Null),
+                            ),
                         ],
                     ),
                 )
@@ -346,7 +498,10 @@ impl<'a> Dumper<'a> {
         C::N(
             head("GROUP_USE", group_flag),
             vec![
-                ("prefix", C::Str(prefix.text.trim_start_matches('\\').to_string())),
+                (
+                    "prefix",
+                    C::Str(prefix.text.trim_start_matches('\\').to_string()),
+                ),
                 ("uses", C::N("USE".into(), elems)),
             ],
         )
@@ -372,20 +527,36 @@ impl<'a> Dumper<'a> {
             if ns.is_empty() {
                 C::Null
             } else {
-                C::N("NAME_LIST".into(), ns.iter().map(|n| ("", this.name_ref(n))).collect())
+                C::N(
+                    "NAME_LIST".into(),
+                    ns.iter().map(|n| ("", this.name_ref(n))).collect(),
+                )
             }
         };
         // php-ast puts interface parents in `implements` (extends stays null).
         let (extends, implements) = if c.kind == ClassKind::Interface {
             (C::Null, name_list(self, &c.extends))
         } else {
-            (c.extends.first().map(|n| self.name_ref(n)).unwrap_or(C::Null), name_list(self, &c.implements))
+            (
+                c.extends
+                    .first()
+                    .map(|n| self.name_ref(n))
+                    .unwrap_or(C::Null),
+                name_list(self, &c.implements),
+            )
         };
-        let members: Vec<_> = c.members.iter().map(|m| ("", self.member_decl(m))).collect();
+        let members: Vec<_> = c
+            .members
+            .iter()
+            .map(|m| ("", self.member_decl(m)))
+            .collect();
         C::N(
             head("CLASS", flag),
             vec![
-                ("name", c.name.map(|n| C::Str(self.sym(n))).unwrap_or(C::Null)),
+                (
+                    "name",
+                    c.name.map(|n| C::Str(self.sym(n))).unwrap_or(C::Null),
+                ),
                 ("extends", extends),
                 ("implements", implements),
                 ("stmts", C::N("STMT_LIST".into(), members)),
@@ -399,13 +570,20 @@ impl<'a> Dumper<'a> {
         match m {
             Member::Method(d) => {
                 let gen = d.body.as_deref().map(gen_flag).unwrap_or(0);
-                let flag = modifiers_flag(&d.modifiers, true) | if d.by_ref { 4096 } else { 0 } | gen;
+                let flag =
+                    modifiers_flag(&d.modifiers, true) | if d.by_ref { 4096 } else { 0 } | gen;
                 C::N(
                     head("METHOD", flag),
                     vec![
                         ("name", C::Str(self.sym(d.name))),
                         ("params", self.params(&d.params)),
-                        ("stmts", d.body.as_ref().map(|b| C::N("STMT_LIST".into(), self.stmt_list(b))).unwrap_or(C::Null)),
+                        (
+                            "stmts",
+                            d.body
+                                .as_ref()
+                                .map(|b| C::N("STMT_LIST".into(), self.stmt_list(b)))
+                                .unwrap_or(C::Null),
+                        ),
                         ("returnType", self.opt_type(&d.return_type)),
                         ("attributes", self.attrs(&d.attrs)),
                     ],
@@ -418,15 +596,29 @@ impl<'a> Dumper<'a> {
                     .map(|p| {
                         (
                             "",
-                            node("PROP_ELEM", vec![
-                                ("name", C::Str(self.sym(p.name))),
-                                ("default", p.default.as_ref().map(|e| self.expr(e)).unwrap_or(C::Null)),
-                                // A present hook block (even empty `{}`) is a STMT_LIST; no block is null.
-                                ("hooks", match &p.hooks {
-                                    None => C::Null,
-                                    Some(v) => C::N("STMT_LIST".into(), v.iter().map(|h| ("", self.property_hook(h))).collect()),
-                                }),
-                            ]),
+                            node(
+                                "PROP_ELEM",
+                                vec![
+                                    ("name", C::Str(self.sym(p.name))),
+                                    (
+                                        "default",
+                                        p.default.as_ref().map(|e| self.expr(e)).unwrap_or(C::Null),
+                                    ),
+                                    // A present hook block (even empty `{}`) is a STMT_LIST; no block is null.
+                                    (
+                                        "hooks",
+                                        match &p.hooks {
+                                            None => C::Null,
+                                            Some(v) => C::N(
+                                                "STMT_LIST".into(),
+                                                v.iter()
+                                                    .map(|h| ("", self.property_hook(h)))
+                                                    .collect(),
+                                            ),
+                                        },
+                                    ),
+                                ],
+                            ),
                         )
                     })
                     .collect();
@@ -443,7 +635,18 @@ impl<'a> Dumper<'a> {
                 let elems: Vec<_> = d
                     .consts
                     .iter()
-                    .map(|c| ("", node("CONST_ELEM", vec![("name", C::Str(self.sym(c.name))), ("value", self.expr(&c.value))])))
+                    .map(|c| {
+                        (
+                            "",
+                            node(
+                                "CONST_ELEM",
+                                vec![
+                                    ("name", C::Str(self.sym(c.name))),
+                                    ("value", self.expr(&c.value)),
+                                ],
+                            ),
+                        )
+                    })
                     .collect();
                 C::N(
                     head("CLASS_CONST_GROUP", modifiers_flag(&d.modifiers, true)),
@@ -458,7 +661,10 @@ impl<'a> Dumper<'a> {
                 "ENUM_CASE",
                 vec![
                     ("name", C::Str(self.sym(d.name))),
-                    ("expr", d.value.as_ref().map(|e| self.expr(e)).unwrap_or(C::Null)),
+                    (
+                        "expr",
+                        d.value.as_ref().map(|e| self.expr(e)).unwrap_or(C::Null),
+                    ),
                     ("attributes", self.attrs(&d.attrs)),
                 ],
             ),
@@ -469,12 +675,18 @@ impl<'a> Dumper<'a> {
                 } else {
                     C::N(
                         "TRAIT_ADAPTATIONS".into(),
-                        d.adaptations.iter().map(|a| ("", self.trait_adaptation(a))).collect(),
+                        d.adaptations
+                            .iter()
+                            .map(|a| ("", self.trait_adaptation(a)))
+                            .collect(),
                     )
                 };
                 node(
                     "USE_TRAIT",
-                    vec![("traits", C::N("NAME_LIST".into(), names)), ("adaptations", adaptations)],
+                    vec![
+                        ("traits", C::N("NAME_LIST".into(), names)),
+                        ("adaptations", adaptations),
+                    ],
                 )
             }
         }
@@ -498,7 +710,10 @@ impl<'a> Dumper<'a> {
                         vec![
                             ("type", self.opt_type(&p.ty)),
                             ("name", C::Str(self.sym(p.name))),
-                            ("default", p.default.as_ref().map(|e| self.expr(e)).unwrap_or(C::Null)),
+                            (
+                                "default",
+                                p.default.as_ref().map(|e| self.expr(e)).unwrap_or(C::Null),
+                            ),
                             ("attributes", self.attrs(&p.attrs)),
                             ("hooks", self.hooks(&p.hooks)),
                         ],
@@ -511,18 +726,48 @@ impl<'a> Dumper<'a> {
 
     fn trait_adaptation(&self, a: &TraitAdaptation) -> C {
         match a {
-            TraitAdaptation::Precedence { class, method, insteadof } => {
-                let mr = node("METHOD_REFERENCE", vec![("class", self.name_ref(class)), ("method", C::Str(self.sym(*method)))]);
+            TraitAdaptation::Precedence {
+                class,
+                method,
+                insteadof,
+            } => {
+                let mr = node(
+                    "METHOD_REFERENCE",
+                    vec![
+                        ("class", self.name_ref(class)),
+                        ("method", C::Str(self.sym(*method))),
+                    ],
+                );
                 let names: Vec<_> = insteadof.iter().map(|n| ("", self.name_ref(n))).collect();
-                node("TRAIT_PRECEDENCE", vec![("method", mr), ("insteadof", C::N("NAME_LIST".into(), names))])
+                node(
+                    "TRAIT_PRECEDENCE",
+                    vec![
+                        ("method", mr),
+                        ("insteadof", C::N("NAME_LIST".into(), names)),
+                    ],
+                )
             }
-            TraitAdaptation::Alias { class, method, modifiers, alias } => {
+            TraitAdaptation::Alias {
+                class,
+                method,
+                modifiers,
+                alias,
+            } => {
                 let cls = class.as_ref().map(|c| self.name_ref(c)).unwrap_or(C::Null);
-                let mr = node("METHOD_REFERENCE", vec![("class", cls), ("method", C::Str(self.sym(*method)))]);
+                let mr = node(
+                    "METHOD_REFERENCE",
+                    vec![("class", cls), ("method", C::Str(self.sym(*method)))],
+                );
                 let flag = modifiers_flag(modifiers, false);
                 C::N(
                     head("TRAIT_ALIAS", flag),
-                    vec![("method", mr), ("alias", alias.map(|a| C::Str(self.sym(a))).unwrap_or(C::Null))],
+                    vec![
+                        ("method", mr),
+                        (
+                            "alias",
+                            alias.map(|a| C::Str(self.sym(a))).unwrap_or(C::Null),
+                        ),
+                    ],
                 )
             }
         }
@@ -532,7 +777,10 @@ impl<'a> Dumper<'a> {
         if hooks.is_empty() {
             return C::Null;
         }
-        C::N("STMT_LIST".into(), hooks.iter().map(|h| ("", self.property_hook(h))).collect())
+        C::N(
+            "STMT_LIST".into(),
+            hooks.iter().map(|h| ("", self.property_hook(h))).collect(),
+        )
     }
 
     fn property_hook(&self, h: &PropertyHook) -> C {
@@ -551,7 +799,10 @@ impl<'a> Dumper<'a> {
             head("PROPERTY_HOOK", flag),
             vec![
                 ("name", C::Str(self.sym(h.name))),
-                ("params", h.params.as_ref().map(|p| self.params(p)).unwrap_or(C::Null)),
+                (
+                    "params",
+                    h.params.as_ref().map(|p| self.params(p)).unwrap_or(C::Null),
+                ),
                 ("stmts", stmts),
                 ("attributes", self.attrs(&h.attrs)),
             ],
@@ -573,7 +824,13 @@ impl<'a> Dumper<'a> {
                             Some(a) => self.args(a),
                             None => C::Null,
                         };
-                        ("", node("ATTRIBUTE", vec![("class", self.name_ref(&at.name)), ("args", args)]))
+                        (
+                            "",
+                            node(
+                                "ATTRIBUTE",
+                                vec![("class", self.name_ref(&at.name)), ("args", args)],
+                            ),
+                        )
                     })
                     .collect();
                 ("", C::N("ATTRIBUTE_GROUP".into(), a))
@@ -600,24 +857,38 @@ impl<'a> Dumper<'a> {
             ExprKind::Name(n) => self.const_or_magic(n),
             ExprKind::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs),
             ExprKind::Unary { op, expr } => self.unary(*op, expr),
-            ExprKind::Assign { target, rhs } => node("ASSIGN", vec![("var", self.expr(target)), ("expr", self.expr(rhs))]),
-            ExprKind::AssignRef { target, rhs } => node("ASSIGN_REF", vec![("var", self.expr(target)), ("expr", self.expr(rhs))]),
-            ExprKind::AssignOp { op, target, rhs } => {
-                C::N(head("ASSIGN_OP", binop_flag(*op)), vec![("var", self.expr(target)), ("expr", self.expr(rhs))])
-            }
-            ExprKind::Coalesce { lhs, rhs } => {
-                C::N(head("BINARY_OP", 260), vec![("left", self.expr(lhs)), ("right", self.expr(rhs))])
-            }
+            ExprKind::Assign { target, rhs } => node(
+                "ASSIGN",
+                vec![("var", self.expr(target)), ("expr", self.expr(rhs))],
+            ),
+            ExprKind::AssignRef { target, rhs } => node(
+                "ASSIGN_REF",
+                vec![("var", self.expr(target)), ("expr", self.expr(rhs))],
+            ),
+            ExprKind::AssignOp { op, target, rhs } => C::N(
+                head("ASSIGN_OP", binop_flag(*op)),
+                vec![("var", self.expr(target)), ("expr", self.expr(rhs))],
+            ),
+            ExprKind::Coalesce { lhs, rhs } => C::N(
+                head("BINARY_OP", 260),
+                vec![("left", self.expr(lhs)), ("right", self.expr(rhs))],
+            ),
             ExprKind::Ternary { cond, then, els } => node(
                 "CONDITIONAL",
-                vec![("cond", self.expr(cond)), ("true", self.opt(then.as_deref())), ("false", self.expr(els))],
+                vec![
+                    ("cond", self.expr(cond)),
+                    ("true", self.opt(then.as_deref())),
+                    ("false", self.expr(els)),
+                ],
             ),
             ExprKind::Call { callee, args } => {
                 // `\clone($x)` — the fully-qualified clone keyword is the clone
                 // construct (a single positional arg), not a function call.
                 if let ExprKind::Name(n) = &callee.kind {
                     if n.fq == NameFq::Fq
-                        && n.text.trim_start_matches('\\').eq_ignore_ascii_case("clone")
+                        && n.text
+                            .trim_start_matches('\\')
+                            .eq_ignore_ascii_case("clone")
                         && args.len() == 1
                         && !args[0].spread
                         && args[0].name.is_none()
@@ -626,18 +897,52 @@ impl<'a> Dumper<'a> {
                         return node("CLONE", vec![("expr", self.expr(&args[0].value))]);
                     }
                 }
-                node("CALL", vec![("expr", self.callee(callee)), ("args", self.args(args))])
+                node(
+                    "CALL",
+                    vec![("expr", self.callee(callee)), ("args", self.args(args))],
+                )
             }
-            ExprKind::MethodCall { recv, nullsafe, method, args } => node(
-                if *nullsafe { "NULLSAFE_METHOD_CALL" } else { "METHOD_CALL" },
-                vec![("expr", self.deref(recv)), ("method", self.member(method)), ("args", self.args(args))],
+            ExprKind::MethodCall {
+                recv,
+                nullsafe,
+                method,
+                args,
+            } => node(
+                if *nullsafe {
+                    "NULLSAFE_METHOD_CALL"
+                } else {
+                    "METHOD_CALL"
+                },
+                vec![
+                    ("expr", self.deref(recv)),
+                    ("method", self.member(method)),
+                    ("args", self.args(args)),
+                ],
             ),
-            ExprKind::StaticCall { class, method, args } => node(
+            ExprKind::StaticCall {
+                class,
+                method,
+                args,
+            } => node(
                 "STATIC_CALL",
-                vec![("class", self.deref_class(class)), ("method", self.member(method)), ("args", self.args(args))],
+                vec![
+                    ("class", self.deref_class(class)),
+                    ("method", self.member(method)),
+                    ("args", self.args(args)),
+                ],
             ),
-            ExprKind::Index { base, index } => node("DIM", vec![("expr", self.deref(base)), ("dim", self.opt(index.as_deref()))]),
-            ExprKind::Prop { base, nullsafe, name } => node(
+            ExprKind::Index { base, index } => node(
+                "DIM",
+                vec![
+                    ("expr", self.deref(base)),
+                    ("dim", self.opt(index.as_deref())),
+                ],
+            ),
+            ExprKind::Prop {
+                base,
+                nullsafe,
+                name,
+            } => node(
                 if *nullsafe { "NULLSAFE_PROP" } else { "PROP" },
                 vec![("expr", self.deref(base)), ("prop", self.member(name))],
             ),
@@ -647,7 +952,10 @@ impl<'a> Dumper<'a> {
                     MemberName::Var(s) | MemberName::Ident(s) => C::Str(self.sym(*s)),
                     MemberName::Expr(e) => self.expr(e),
                 };
-                node("STATIC_PROP", vec![("class", self.deref_class(class)), ("prop", prop)])
+                node(
+                    "STATIC_PROP",
+                    vec![("class", self.deref_class(class)), ("prop", prop)],
+                )
             }
             ExprKind::ClassConst { class, name } => {
                 if let MemberName::Ident(s) = name {
@@ -655,10 +963,25 @@ impl<'a> Dumper<'a> {
                         return node("CLASS_NAME", vec![("class", self.deref_class(class))]);
                     }
                 }
-                node("CLASS_CONST", vec![("class", self.deref_class(class)), ("const", self.member(name))])
+                node(
+                    "CLASS_CONST",
+                    vec![
+                        ("class", self.deref_class(class)),
+                        ("const", self.member(name)),
+                    ],
+                )
             }
-            ExprKind::New { class, args } => node("NEW", vec![("class", self.class_or_name(class)), ("args", self.args(args))]),
-            ExprKind::NewAnon { class, args } => node("NEW", vec![("class", self.class_decl(class)), ("args", self.args(args))]),
+            ExprKind::New { class, args } => node(
+                "NEW",
+                vec![
+                    ("class", self.class_or_name(class)),
+                    ("args", self.args(args)),
+                ],
+            ),
+            ExprKind::NewAnon { class, args } => node(
+                "NEW",
+                vec![("class", self.class_decl(class)), ("args", self.args(args))],
+            ),
             ExprKind::Array { items, syntax } => self.array(items, *syntax),
             ExprKind::Clone(e) => node("CLONE", vec![("expr", self.expr(e))]),
             ExprKind::Print(e) => node("PRINT", vec![("expr", self.expr(e))]),
@@ -673,7 +996,10 @@ impl<'a> Dumper<'a> {
                 let mut acc = node("ISSET", vec![("var", self.expr(first))]);
                 for v in it {
                     let right = node("ISSET", vec![("var", self.expr(v))]);
-                    acc = C::N(head("BINARY_OP", 259), vec![("left", acc), ("right", right)]);
+                    acc = C::N(
+                        head("BINARY_OP", 259),
+                        vec![("left", acc), ("right", right)],
+                    );
                 }
                 acc
             }
@@ -681,31 +1007,71 @@ impl<'a> Dumper<'a> {
             ExprKind::PreDec(e) => node("PRE_DEC", vec![("var", self.expr(e))]),
             ExprKind::PostInc(e) => node("POST_INC", vec![("var", self.expr(e))]),
             ExprKind::PostDec(e) => node("POST_DEC", vec![("var", self.expr(e))]),
-            ExprKind::Cast { kind, expr } => C::N(head("CAST", cast_code(*kind)), vec![("expr", self.expr(expr))]),
-            ExprKind::Instanceof { expr, class } => node("INSTANCEOF", vec![("expr", self.expr(expr)), ("class", self.class_or_name(class))]),
+            ExprKind::Cast { kind, expr } => C::N(
+                head("CAST", cast_code(*kind)),
+                vec![("expr", self.expr(expr))],
+            ),
+            ExprKind::Instanceof { expr, class } => node(
+                "INSTANCEOF",
+                vec![
+                    ("expr", self.expr(expr)),
+                    ("class", self.class_or_name(class)),
+                ],
+            ),
             ExprKind::Interpolated(parts) => self.encaps_or_string(parts),
-            ExprKind::ShellExec(parts) => node("SHELL_EXEC", vec![("expr", self.encaps_or_string(parts))]),
+            ExprKind::ShellExec(parts) => {
+                node("SHELL_EXEC", vec![("expr", self.encaps_or_string(parts))])
+            }
             ExprKind::Match { subject, arms } => {
                 let a: Vec<_> = arms
                     .iter()
                     .map(|arm| {
                         let cond = match &arm.conds {
-                            Some(cs) => C::N("EXPR_LIST".into(), cs.iter().map(|c| ("", self.expr(c))).collect()),
+                            Some(cs) => C::N(
+                                "EXPR_LIST".into(),
+                                cs.iter().map(|c| ("", self.expr(c))).collect(),
+                            ),
                             None => C::Null,
                         };
-                        ("", node("MATCH_ARM", vec![("cond", cond), ("expr", self.expr(&arm.body))]))
+                        (
+                            "",
+                            node(
+                                "MATCH_ARM",
+                                vec![("cond", cond), ("expr", self.expr(&arm.body))],
+                            ),
+                        )
                     })
                     .collect();
-                node("MATCH", vec![("cond", self.expr(subject)), ("stmts", C::N("MATCH_ARM_LIST".into(), a))])
+                node(
+                    "MATCH",
+                    vec![
+                        ("cond", self.expr(subject)),
+                        ("stmts", C::N("MATCH_ARM_LIST".into(), a)),
+                    ],
+                )
             }
             ExprKind::Closure(c) => {
-                let flag = if c.is_static { 16 } else { 0 } | if c.by_ref { 4096 } else { 0 } | gen_flag(&c.body);
+                let flag = if c.is_static { 16 } else { 0 }
+                    | if c.by_ref { 4096 } else { 0 }
+                    | gen_flag(&c.body);
                 let uses = if c.uses.is_empty() {
                     C::Null
                 } else {
-                    C::N("CLOSURE_USES".into(), c.uses.iter().map(|u| {
-                        ("", C::N(head("CLOSURE_VAR", if u.by_ref { 1 } else { 0 }), vec![("name", C::Str(self.sym(u.name)))]))
-                    }).collect())
+                    C::N(
+                        "CLOSURE_USES".into(),
+                        c.uses
+                            .iter()
+                            .map(|u| {
+                                (
+                                    "",
+                                    C::N(
+                                        head("CLOSURE_VAR", if u.by_ref { 1 } else { 0 }),
+                                        vec![("name", C::Str(self.sym(u.name)))],
+                                    ),
+                                )
+                            })
+                            .collect(),
+                    )
                 };
                 C::N(
                     head("CLOSURE", flag),
@@ -757,7 +1123,10 @@ impl<'a> Dumper<'a> {
             },
             ExprKind::Yield { key, value } => node(
                 "YIELD",
-                vec![("value", self.opt(value.as_deref())), ("key", self.opt(key.as_deref()))],
+                vec![
+                    ("value", self.opt(value.as_deref())),
+                    ("key", self.opt(key.as_deref())),
+                ],
             ),
             ExprKind::YieldFrom(e) => node("YIELD_FROM", vec![("expr", self.expr(e))]),
             ExprKind::Paren(inner) => self.paren(inner),
@@ -773,7 +1142,11 @@ impl<'a> Dumper<'a> {
         match &inner.kind {
             ExprKind::Ternary { cond, then, els } => C::N(
                 head("CONDITIONAL", 1),
-                vec![("cond", self.expr(cond)), ("true", self.opt(then.as_deref())), ("false", self.expr(els))],
+                vec![
+                    ("cond", self.expr(cond)),
+                    ("true", self.opt(then.as_deref())),
+                    ("false", self.expr(els)),
+                ],
             ),
             ExprKind::Name(n) => self.const_or_magic(n),
             _ => self.expr(inner),
@@ -791,7 +1164,10 @@ impl<'a> Dumper<'a> {
                     MemberName::Var(s) | MemberName::Ident(s) => C::Str(self.sym(*s)),
                     MemberName::Expr(ex) => self.expr(ex),
                 };
-                return C::N(head("STATIC_PROP", 1), vec![("class", self.class_or_name(class)), ("prop", prop)]);
+                return C::N(
+                    head("STATIC_PROP", 1),
+                    vec![("class", self.class_or_name(class)), ("prop", prop)],
+                );
             }
         }
         self.expr(e)
@@ -831,7 +1207,9 @@ impl<'a> Dumper<'a> {
         if let Some(s) = callee_const_string(e) {
             // A function name is an identifier; constant-string callees are
             // effectively always ASCII, so a lossy decode is safe here.
-            let name = String::from_utf8_lossy(&s).trim_start_matches('\\').to_string();
+            let name = String::from_utf8_lossy(&s)
+                .trim_start_matches('\\')
+                .to_string();
             return node("NAME", vec![("name", C::Str(name))]);
         }
         match &e.kind {
@@ -845,13 +1223,22 @@ impl<'a> Dumper<'a> {
             NameFq::Fq => (0, n.text.trim_start_matches('\\').to_string()),
             NameFq::NotFq => (1, n.text.clone()),
             // php-ast strips the leading `namespace\` from relative names.
-            NameFq::Relative => {
-                (2, n.text.split_once('\\').map(|(_, r)| r).unwrap_or(&n.text).to_string())
-            }
+            NameFq::Relative => (
+                2,
+                n.text
+                    .split_once('\\')
+                    .map(|(_, r)| r)
+                    .unwrap_or(&n.text)
+                    .to_string(),
+            ),
         };
         // The reserved `static` keyword is normalized to lowercase by the lexer
         // (`self`/`parent` are plain identifiers and keep their case).
-        let text = if text.eq_ignore_ascii_case("static") { "static".to_string() } else { text };
+        let text = if text.eq_ignore_ascii_case("static") {
+            "static".to_string()
+        } else {
+            text
+        };
         C::N(head("NAME", flag), vec![("name", C::Str(text))])
     }
 
@@ -866,7 +1253,10 @@ impl<'a> Dumper<'a> {
             }
         }
         // php-ast represents every binary operator as BINARY_OP#flag.
-        C::N(head("BINARY_OP", binop_flag(op)), vec![("left", self.expr(lhs)), ("right", self.expr(rhs))])
+        C::N(
+            head("BINARY_OP", binop_flag(op)),
+            vec![("left", self.expr(lhs)), ("right", self.expr(rhs))],
+        )
     }
 
     fn unary(&self, op: UnOp, e: &Expr) -> C {
@@ -897,7 +1287,13 @@ impl<'a> Dumper<'a> {
                 let v = if a.spread {
                     node("UNPACK", vec![("expr", self.expr(&a.value))])
                 } else if let Some(name) = a.name {
-                    node("NAMED_ARG", vec![("name", C::Str(self.sym(name))), ("expr", self.expr(&a.value))])
+                    node(
+                        "NAMED_ARG",
+                        vec![
+                            ("name", C::Str(self.sym(name))),
+                            ("expr", self.expr(&a.value)),
+                        ],
+                    )
                 } else {
                     self.expr(&a.value)
                 };
@@ -916,7 +1312,13 @@ impl<'a> Dumper<'a> {
                     Some(v) if it.spread => node("UNPACK", vec![("expr", self.expr(v))]),
                     Some(v) => C::N(
                         head("ARRAY_ELEM", if it.by_ref { 1 } else { 0 }),
-                        vec![("value", self.expr(v)), ("key", it.key.as_ref().map(|k| self.expr(k)).unwrap_or(C::Null))],
+                        vec![
+                            ("value", self.expr(v)),
+                            (
+                                "key",
+                                it.key.as_ref().map(|k| self.expr(k)).unwrap_or(C::Null),
+                            ),
+                        ],
                     ),
                 };
                 ("", c)
@@ -936,7 +1338,10 @@ impl<'a> Dumper<'a> {
         match parts {
             [] => C::BStr(Vec::new()),
             [one] if matches!(one.kind, ExprKind::Str(_)) => self.encaps_part(one),
-            _ => C::N("ENCAPS_LIST".into(), parts.iter().map(|p| ("", self.encaps_part(p))).collect()),
+            _ => C::N(
+                "ENCAPS_LIST".into(),
+                parts.iter().map(|p| ("", self.encaps_part(p))).collect(),
+            ),
         }
     }
 
@@ -951,7 +1356,10 @@ impl<'a> Dumper<'a> {
                 ExprKind::Variable(s) => C::N(head("VAR", 1), vec![("name", C::Str(self.sym(*s)))]),
                 ExprKind::Index { base, index } => C::N(
                     head("DIM", 1),
-                    vec![("expr", self.expr(base)), ("dim", self.opt(index.as_deref()))],
+                    vec![
+                        ("expr", self.expr(base)),
+                        ("dim", self.opt(index.as_deref())),
+                    ],
                 ),
                 // `"${ expr }"` → VAR#2 with the expression as the computed name.
                 ExprKind::VariableVariable(v) => C::N(head("VAR", 2), vec![("name", self.expr(v))]),
@@ -965,7 +1373,10 @@ impl<'a> Dumper<'a> {
         if es.is_empty() {
             C::Null
         } else {
-            C::N("EXPR_LIST".into(), es.iter().map(|e| ("", self.expr(e))).collect())
+            C::N(
+                "EXPR_LIST".into(),
+                es.iter().map(|e| ("", self.expr(e))).collect(),
+            )
         }
     }
 
@@ -979,8 +1390,14 @@ impl<'a> Dumper<'a> {
         match &t.kind {
             TypeKind::Simple(n) => self.type_name(n),
             TypeKind::Nullable(inner) => node("NULLABLE_TYPE", vec![("type", self.ty(inner))]),
-            TypeKind::Union(parts) => C::N("TYPE_UNION".into(), parts.iter().map(|p| ("", self.ty(p))).collect()),
-            TypeKind::Intersection(parts) => C::N("TYPE_INTERSECTION".into(), parts.iter().map(|p| ("", self.ty(p))).collect()),
+            TypeKind::Union(parts) => C::N(
+                "TYPE_UNION".into(),
+                parts.iter().map(|p| ("", self.ty(p))).collect(),
+            ),
+            TypeKind::Intersection(parts) => C::N(
+                "TYPE_INTERSECTION".into(),
+                parts.iter().map(|p| ("", self.ty(p))).collect(),
+            ),
         }
     }
 
@@ -1053,7 +1470,9 @@ fn callee_const_string(e: &Expr) -> Option<Vec<u8>> {
     match &e.kind {
         ExprKind::Str(s) => Some(s.clone()),
         ExprKind::Paren(inner) => callee_const_string(inner),
-        ExprKind::Binary { op: BinOp::Concat, .. } => fold_zval_str(e),
+        ExprKind::Binary {
+            op: BinOp::Concat, ..
+        } => fold_zval_str(e),
         _ => None,
     }
 }
@@ -1067,7 +1486,11 @@ fn fold_zval_str(e: &Expr) -> Option<Vec<u8>> {
         ExprKind::Str(s) => Some(s.clone()),
         ExprKind::Int(i) => Some(i.to_string().into_bytes()),
         ExprKind::Float(f) => Some(php_runtime_float(*f).into_bytes()),
-        ExprKind::Binary { op: BinOp::Concat, lhs, rhs } => {
+        ExprKind::Binary {
+            op: BinOp::Concat,
+            lhs,
+            rhs,
+        } => {
             let mut a = fold_zval_str(lhs)?;
             a.extend_from_slice(&fold_zval_str(rhs)?);
             Some(a)
@@ -1089,7 +1512,11 @@ fn php_runtime_float(f: f64) -> String {
         return if f > 0.0 { "INF".into() } else { "-INF".into() };
     }
     if f == 0.0 {
-        return if f.is_sign_negative() { "-0".into() } else { "0".into() };
+        return if f.is_sign_negative() {
+            "-0".into()
+        } else {
+            "0".into()
+        };
     }
     const P: i32 = 14;
     // Read the true decimal exponent from a scientific rendering.
@@ -1131,11 +1558,32 @@ fn php_runtime_float(f: f64) -> String {
 fn binop_flag(op: BinOp) -> u32 {
     use BinOp::*;
     match op {
-        Add => 1, Sub => 2, Mul => 3, Div => 4, Mod => 5, Shl => 6, Shr => 7, Concat => 8,
-        BitOr => 9, BitAnd => 10, BitXor => 11, Pow => 12, LogicalXor => 15,
-        Identical => 16, NotIdentical => 17, Eq => 18, NotEq => 19, Lt => 20, LtEq => 21,
-        Spaceship => 170, Gt => 256, GtEq => 257,
-        BoolOr | LogicalOr => 258, BoolAnd | LogicalAnd => 259, Coalesce => 260, Pipe => 261,
+        Add => 1,
+        Sub => 2,
+        Mul => 3,
+        Div => 4,
+        Mod => 5,
+        Shl => 6,
+        Shr => 7,
+        Concat => 8,
+        BitOr => 9,
+        BitAnd => 10,
+        BitXor => 11,
+        Pow => 12,
+        LogicalXor => 15,
+        Identical => 16,
+        NotIdentical => 17,
+        Eq => 18,
+        NotEq => 19,
+        Lt => 20,
+        LtEq => 21,
+        Spaceship => 170,
+        Gt => 256,
+        GtEq => 257,
+        BoolOr | LogicalOr => 258,
+        BoolAnd | LogicalAnd => 259,
+        Coalesce => 260,
+        Pipe => 261,
     }
 }
 
@@ -1168,19 +1616,35 @@ fn stmt_yields(s: &Stmt) -> bool {
         StmtKind::Echo(es) => es.iter().any(expr_yields),
         StmtKind::Return(v) => v.as_ref().is_some_and(expr_yields),
         StmtKind::Block(b) => b.iter().any(stmt_yields),
-        StmtKind::If { cond, then, elseifs, els } => {
+        StmtKind::If {
+            cond,
+            then,
+            elseifs,
+            els,
+        } => {
             expr_yields(cond)
                 || stmt_yields(then)
-                || elseifs.iter().any(|e| expr_yields(&e.cond) || stmt_yields(&e.body))
+                || elseifs
+                    .iter()
+                    .any(|e| expr_yields(&e.cond) || stmt_yields(&e.body))
                 || els.as_deref().is_some_and(stmt_yields)
         }
         StmtKind::While { cond, body } | StmtKind::DoWhile { body, cond } => {
             expr_yields(cond) || stmt_yields(body)
         }
-        StmtKind::For { init, cond, update, body } => {
-            init.iter().chain(cond).chain(update).any(expr_yields) || stmt_yields(body)
-        }
-        StmtKind::Foreach { subject, key, value, body, .. } => {
+        StmtKind::For {
+            init,
+            cond,
+            update,
+            body,
+        } => init.iter().chain(cond).chain(update).any(expr_yields) || stmt_yields(body),
+        StmtKind::Foreach {
+            subject,
+            key,
+            value,
+            body,
+            ..
+        } => {
             expr_yields(subject)
                 || key.as_ref().is_some_and(expr_yields)
                 || expr_yields(value)
@@ -1188,16 +1652,24 @@ fn stmt_yields(s: &Stmt) -> bool {
         }
         StmtKind::Switch { subject, cases } => {
             expr_yields(subject)
-                || cases.iter().any(|c| c.test.as_ref().is_some_and(expr_yields) || c.body.iter().any(stmt_yields))
+                || cases.iter().any(|c| {
+                    c.test.as_ref().is_some_and(expr_yields) || c.body.iter().any(stmt_yields)
+                })
         }
-        StmtKind::Try { body, catches, finally } => {
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
             body.iter().any(stmt_yields)
                 || catches.iter().any(|c| c.body.iter().any(stmt_yields))
                 || finally.as_ref().is_some_and(|f| f.iter().any(stmt_yields))
         }
         StmtKind::Break(e) | StmtKind::Continue(e) => e.as_ref().is_some_and(expr_yields),
         StmtKind::Global(vs) | StmtKind::Unset(vs) => vs.iter().any(expr_yields),
-        StmtKind::StaticVars(vs) => vs.iter().any(|v| v.default.as_ref().is_some_and(expr_yields)),
+        StmtKind::StaticVars(vs) => vs
+            .iter()
+            .any(|v| v.default.as_ref().is_some_and(expr_yields)),
         // Declarations introduce a new scope (or contain no yields): don't descend.
         _ => false,
     }
@@ -1209,7 +1681,9 @@ fn expr_yields(e: &Expr) -> bool {
         ExprKind::Binary { lhs, rhs, .. }
         | ExprKind::Assign { target: lhs, rhs }
         | ExprKind::AssignRef { target: lhs, rhs }
-        | ExprKind::AssignOp { target: lhs, rhs, .. }
+        | ExprKind::AssignOp {
+            target: lhs, rhs, ..
+        }
         | ExprKind::Coalesce { lhs, rhs } => expr_yields(lhs) || expr_yields(rhs),
         ExprKind::Unary { expr, .. }
         | ExprKind::Cast { expr, .. }
@@ -1225,11 +1699,21 @@ fn expr_yields(e: &Expr) -> bool {
         ExprKind::Ternary { cond, then, els } => {
             expr_yields(cond) || then.as_deref().is_some_and(expr_yields) || expr_yields(els)
         }
-        ExprKind::Call { callee, args } => expr_yields(callee) || args.iter().any(|a| expr_yields(&a.value)),
-        ExprKind::MethodCall { recv, args, .. } => expr_yields(recv) || args.iter().any(|a| expr_yields(&a.value)),
-        ExprKind::StaticCall { class, args, .. } => expr_yields(class) || args.iter().any(|a| expr_yields(&a.value)),
-        ExprKind::New { class, args } => expr_yields(class) || args.iter().any(|a| expr_yields(&a.value)),
-        ExprKind::Index { base, index } => expr_yields(base) || index.as_deref().is_some_and(expr_yields),
+        ExprKind::Call { callee, args } => {
+            expr_yields(callee) || args.iter().any(|a| expr_yields(&a.value))
+        }
+        ExprKind::MethodCall { recv, args, .. } => {
+            expr_yields(recv) || args.iter().any(|a| expr_yields(&a.value))
+        }
+        ExprKind::StaticCall { class, args, .. } => {
+            expr_yields(class) || args.iter().any(|a| expr_yields(&a.value))
+        }
+        ExprKind::New { class, args } => {
+            expr_yields(class) || args.iter().any(|a| expr_yields(&a.value))
+        }
+        ExprKind::Index { base, index } => {
+            expr_yields(base) || index.as_deref().is_some_and(expr_yields)
+        }
         ExprKind::Prop { base, .. } => expr_yields(base),
         ExprKind::StaticProp { class, .. } => expr_yields(class),
         ExprKind::Instanceof { expr, class } => expr_yields(expr) || expr_yields(class),
@@ -1240,7 +1724,10 @@ fn expr_yields(e: &Expr) -> bool {
         ExprKind::Match { subject, arms } => {
             expr_yields(subject)
                 || arms.iter().any(|a| {
-                    a.conds.as_ref().is_some_and(|cs| cs.iter().any(expr_yields)) || expr_yields(&a.body)
+                    a.conds
+                        .as_ref()
+                        .is_some_and(|cs| cs.iter().any(expr_yields))
+                        || expr_yields(&a.body)
                 })
         }
         ExprKind::Interpolated(parts) => parts.iter().any(expr_yields),
@@ -1287,4 +1774,3 @@ fn magic_const_flag(name: &str) -> Option<u32> {
         _ => return None,
     })
 }
-

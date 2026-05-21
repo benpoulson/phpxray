@@ -127,7 +127,10 @@ pub fn parse(text: &str) -> Result<Vec<GoldenToken>, ParseError> {
 }
 
 fn err(line: usize, message: &str) -> ParseError {
-    ParseError { line, message: message.to_string() }
+    ParseError {
+        line,
+        message: message.to_string(),
+    }
 }
 
 fn parse_span(s: &str) -> Option<Span> {
@@ -189,14 +192,22 @@ mod tests {
     use super::*;
 
     fn tok(name: &str, start: u32, end: u32, text: &str) -> GoldenToken {
-        GoldenToken { name: name.into(), span: Span::new(start, end), text: text.into() }
+        GoldenToken {
+            name: name.into(),
+            span: Span::new(start, end),
+            text: text.into(),
+        }
     }
 
     #[test]
     fn escape_round_trips() {
         let cases = ["plain", "tab\there", "line\nbreak", "back\\slash", "\r\n"];
         for c in cases {
-            assert_eq!(unescape_text(&escape_text(c)), c, "round-trip failed for {c:?}");
+            assert_eq!(
+                unescape_text(&escape_text(c)),
+                c,
+                "round-trip failed for {c:?}"
+            );
         }
     }
 

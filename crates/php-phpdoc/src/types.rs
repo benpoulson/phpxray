@@ -35,9 +35,17 @@ pub enum DocType {
     /// `base<args>` — generics, incl. `array<K, V>`, `list<T>`, `int<0, 100>`.
     Generic { base: String, args: Vec<DocType> },
     /// `base{fields}` — an array/object shape; `sealed` is false when it ends `…, ...`.
-    Shape { base: String, fields: Vec<ShapeField>, sealed: bool },
+    Shape {
+        base: String,
+        fields: Vec<ShapeField>,
+        sealed: bool,
+    },
     /// `base(params): ret` — a callable signature (`callable`/`Closure`).
-    Callable { base: String, params: Vec<DocType>, ret: Option<Box<DocType>> },
+    Callable {
+        base: String,
+        params: Vec<DocType>,
+        ret: Option<Box<DocType>>,
+    },
     /// A literal string type (`'a'|'b'`), value without quotes.
     ConstString(String),
     /// A literal integer type (`0`, `-1`).
@@ -127,26 +135,72 @@ fn lex(s: &str) -> Vec<Tok> {
             continue;
         }
         match c {
-            b'|' => { push(Tk::Pipe, i + 1, &mut out); i += 1; }
-            b'&' => { push(Tk::Amp, i + 1, &mut out); i += 1; }
-            b'?' => { push(Tk::Question, i + 1, &mut out); i += 1; }
-            b'<' => { push(Tk::Lt, i + 1, &mut out); i += 1; }
-            b'>' => { push(Tk::Gt, i + 1, &mut out); i += 1; }
-            b'(' => { push(Tk::LParen, i + 1, &mut out); i += 1; }
-            b')' => { push(Tk::RParen, i + 1, &mut out); i += 1; }
-            b'{' => { push(Tk::LBrace, i + 1, &mut out); i += 1; }
-            b'}' => { push(Tk::RBrace, i + 1, &mut out); i += 1; }
-            b'[' => { push(Tk::LBracket, i + 1, &mut out); i += 1; }
-            b']' => { push(Tk::RBracket, i + 1, &mut out); i += 1; }
-            b',' => { push(Tk::Comma, i + 1, &mut out); i += 1; }
-            b':' => { push(Tk::Colon, i + 1, &mut out); i += 1; }
-            b'.' if b[i..].starts_with(b"...") => { push(Tk::Ellipsis, i + 3, &mut out); i += 3; }
+            b'|' => {
+                push(Tk::Pipe, i + 1, &mut out);
+                i += 1;
+            }
+            b'&' => {
+                push(Tk::Amp, i + 1, &mut out);
+                i += 1;
+            }
+            b'?' => {
+                push(Tk::Question, i + 1, &mut out);
+                i += 1;
+            }
+            b'<' => {
+                push(Tk::Lt, i + 1, &mut out);
+                i += 1;
+            }
+            b'>' => {
+                push(Tk::Gt, i + 1, &mut out);
+                i += 1;
+            }
+            b'(' => {
+                push(Tk::LParen, i + 1, &mut out);
+                i += 1;
+            }
+            b')' => {
+                push(Tk::RParen, i + 1, &mut out);
+                i += 1;
+            }
+            b'{' => {
+                push(Tk::LBrace, i + 1, &mut out);
+                i += 1;
+            }
+            b'}' => {
+                push(Tk::RBrace, i + 1, &mut out);
+                i += 1;
+            }
+            b'[' => {
+                push(Tk::LBracket, i + 1, &mut out);
+                i += 1;
+            }
+            b']' => {
+                push(Tk::RBracket, i + 1, &mut out);
+                i += 1;
+            }
+            b',' => {
+                push(Tk::Comma, i + 1, &mut out);
+                i += 1;
+            }
+            b':' => {
+                push(Tk::Colon, i + 1, &mut out);
+                i += 1;
+            }
+            b'.' if b[i..].starts_with(b"...") => {
+                push(Tk::Ellipsis, i + 3, &mut out);
+                i += 3;
+            }
             b'\'' | b'"' => {
                 let quote = c;
                 let mut j = i + 1;
                 while j < b.len() && b[j] != quote {
                     // Skip an escaped char.
-                    j += if b[j] == b'\\' && j + 1 < b.len() { 2 } else { 1 };
+                    j += if b[j] == b'\\' && j + 1 < b.len() {
+                        2
+                    } else {
+                        1
+                    };
                 }
                 let inner = s[i + 1..j.min(b.len())].to_string();
                 let end = (j + 1).min(b.len());
@@ -180,7 +234,10 @@ fn lex(s: &str) -> Vec<Tok> {
             _ => break,
         }
     }
-    out.push(Tok { kind: Tk::Eof, end: i });
+    out.push(Tok {
+        kind: Tk::Eof,
+        end: i,
+    });
     out
 }
 
@@ -226,7 +283,11 @@ impl Parser {
         while self.eat(Tk::Pipe) {
             parts.push(self.intersection()?);
         }
-        Some(if parts.len() == 1 { parts.pop().unwrap() } else { DocType::Union(parts) })
+        Some(if parts.len() == 1 {
+            parts.pop().unwrap()
+        } else {
+            DocType::Union(parts)
+        })
     }
 
     fn intersection(&mut self) -> Option<DocType> {
@@ -238,7 +299,11 @@ impl Parser {
             self.bump();
             parts.push(self.postfix()?);
         }
-        Some(if parts.len() == 1 { parts.pop().unwrap() } else { DocType::Intersection(parts) })
+        Some(if parts.len() == 1 {
+            parts.pop().unwrap()
+        } else {
+            DocType::Intersection(parts)
+        })
     }
 
     /// Whether the `&` at the current position joins another type (vs. preceding
@@ -256,7 +321,10 @@ impl Parser {
         // `T[]` only — a `[` not immediately closed (e.g. `[readonly]` prose in a
         // description) is not part of the type; stop and leave it to the caller.
         while self.at(Tk::LBracket)
-            && matches!(self.toks.get(self.pos + 1).map(|x| &x.kind), Some(Tk::RBracket))
+            && matches!(
+                self.toks.get(self.pos + 1).map(|x| &x.kind),
+                Some(Tk::RBracket)
+            )
         {
             self.bump();
             self.bump();
@@ -404,7 +472,11 @@ impl Parser {
                 break;
             }
         }
-        self.eat(Tk::RBrace).then_some(DocType::Shape { base, fields, sealed })
+        self.eat(Tk::RBrace).then_some(DocType::Shape {
+            base,
+            fields,
+            sealed,
+        })
     }
 
     fn shape_field(&mut self) -> Option<ShapeField> {
@@ -424,7 +496,11 @@ impl Parser {
             }
             self.pos = start; // not a keyed field; rewind
         }
-        Some(ShapeField { key: None, optional: false, ty: self.union()? })
+        Some(ShapeField {
+            key: None,
+            optional: false,
+            ty: self.union()?,
+        })
     }
 
     fn callable(&mut self, base: String) -> Option<DocType> {
@@ -447,7 +523,11 @@ impl Parser {
         if !self.eat(Tk::RParen) {
             return None;
         }
-        let ret = if self.eat(Tk::Colon) { Some(Box::new(self.union()?)) } else { None };
+        let ret = if self.eat(Tk::Colon) {
+            Some(Box::new(self.union()?))
+        } else {
+            None
+        };
         Some(DocType::Callable { base, params, ret })
     }
 }
@@ -480,7 +560,10 @@ mod tests {
     #[test]
     fn class_constant_types() {
         assert_eq!(p("Foo\\Bar::BAZ"), ClassConst("Foo\\Bar".to_string()));
-        assert_eq!(p("Stmt\\Use_::TYPE_*"), ClassConst("Stmt\\Use_".to_string()));
+        assert_eq!(
+            p("Stmt\\Use_::TYPE_*"),
+            ClassConst("Stmt\\Use_".to_string())
+        );
         // A union with a class-constant still parses.
         assert_eq!(
             p("int|Foo::BAR"),
@@ -491,45 +574,81 @@ mod tests {
     #[test]
     fn nullable_union_intersection() {
         assert_eq!(p("?int"), Nullable(Box::new(named("int"))));
-        assert_eq!(p("int|string|null"), Union(vec![named("int"), named("string"), named("null")]));
+        assert_eq!(
+            p("int|string|null"),
+            Union(vec![named("int"), named("string"), named("null")])
+        );
         assert_eq!(p("A&B"), Intersection(vec![named("A"), named("B")]));
         // `&` binds tighter than `|`.
-        assert_eq!(p("A&B|C"), Union(vec![Intersection(vec![named("A"), named("B")]), named("C")]));
+        assert_eq!(
+            p("A&B|C"),
+            Union(vec![Intersection(vec![named("A"), named("B")]), named("C")])
+        );
     }
 
     #[test]
     fn array_suffix() {
         assert_eq!(p("int[]"), Array(Box::new(named("int"))));
         assert_eq!(p("int[][]"), Array(Box::new(Array(Box::new(named("int"))))));
-        assert_eq!(p("(A|B)[]"), Array(Box::new(Union(vec![named("A"), named("B")]))));
+        assert_eq!(
+            p("(A|B)[]"),
+            Array(Box::new(Union(vec![named("A"), named("B")])))
+        );
     }
 
     #[test]
     fn generics() {
-        assert_eq!(p("array<int>"), Generic { base: "array".into(), args: vec![named("int")] });
+        assert_eq!(
+            p("array<int>"),
+            Generic {
+                base: "array".into(),
+                args: vec![named("int")]
+            }
+        );
         assert_eq!(
             p("array<string, User>"),
-            Generic { base: "array".into(), args: vec![named("string"), named("User")] }
+            Generic {
+                base: "array".into(),
+                args: vec![named("string"), named("User")]
+            }
         );
         assert_eq!(
             p("array<int, array<string>>"),
             Generic {
                 base: "array".into(),
-                args: vec![named("int"), Generic { base: "array".into(), args: vec![named("string")] }]
+                args: vec![
+                    named("int"),
+                    Generic {
+                        base: "array".into(),
+                        args: vec![named("string")]
+                    }
+                ]
             }
         );
-        assert_eq!(p("list<int>"), Generic { base: "list".into(), args: vec![named("int")] });
+        assert_eq!(
+            p("list<int>"),
+            Generic {
+                base: "list".into(),
+                args: vec![named("int")]
+            }
+        );
     }
 
     #[test]
     fn int_ranges_are_generics() {
         assert_eq!(
             p("int<0, 100>"),
-            Generic { base: "int".into(), args: vec![ConstInt("0".into()), ConstInt("100".into())] }
+            Generic {
+                base: "int".into(),
+                args: vec![ConstInt("0".into()), ConstInt("100".into())]
+            }
         );
         assert_eq!(
             p("int<min, max>"),
-            Generic { base: "int".into(), args: vec![named("min"), named("max")] }
+            Generic {
+                base: "int".into(),
+                args: vec![named("min"), named("max")]
+            }
         );
     }
 
@@ -537,9 +656,19 @@ mod tests {
     fn literal_unions() {
         assert_eq!(
             p("'draft'|'published'"),
-            Union(vec![ConstString("draft".into()), ConstString("published".into())])
+            Union(vec![
+                ConstString("draft".into()),
+                ConstString("published".into())
+            ])
         );
-        assert_eq!(p("1|2|3"), Union(vec![ConstInt("1".into()), ConstInt("2".into()), ConstInt("3".into())]));
+        assert_eq!(
+            p("1|2|3"),
+            Union(vec![
+                ConstInt("1".into()),
+                ConstInt("2".into()),
+                ConstInt("3".into())
+            ])
+        );
     }
 
     #[test]
@@ -550,8 +679,16 @@ mod tests {
                 base: "array".into(),
                 sealed: true,
                 fields: vec![
-                    ShapeField { key: Some("id".into()), optional: false, ty: named("int") },
-                    ShapeField { key: Some("name".into()), optional: false, ty: named("string") },
+                    ShapeField {
+                        key: Some("id".into()),
+                        optional: false,
+                        ty: named("int")
+                    },
+                    ShapeField {
+                        key: Some("name".into()),
+                        optional: false,
+                        ty: named("string")
+                    },
                 ],
             }
         );
@@ -565,8 +702,16 @@ mod tests {
                 base: "array".into(),
                 sealed: false,
                 fields: vec![
-                    ShapeField { key: Some("foo".into()), optional: true, ty: named("int") },
-                    ShapeField { key: None, optional: false, ty: named("string") },
+                    ShapeField {
+                        key: Some("foo".into()),
+                        optional: true,
+                        ty: named("int")
+                    },
+                    ShapeField {
+                        key: None,
+                        optional: false,
+                        ty: named("string")
+                    },
                 ],
             }
         );
@@ -584,7 +729,11 @@ mod tests {
         );
         assert_eq!(
             p("Closure(): void"),
-            Callable { base: "Closure".into(), params: vec![], ret: Some(Box::new(named("void"))) }
+            Callable {
+                base: "Closure".into(),
+                params: vec![],
+                ret: Some(Box::new(named("void")))
+            }
         );
     }
 
@@ -592,7 +741,13 @@ mod tests {
     fn prefix_reports_consumed_length() {
         // `@param` style: type then `$var description`.
         let (t, n) = parse_type_prefix("array<int> $items the items").unwrap();
-        assert_eq!(t, Generic { base: "array".into(), args: vec![named("int")] });
+        assert_eq!(
+            t,
+            Generic {
+                base: "array".into(),
+                args: vec![named("int")]
+            }
+        );
         assert_eq!(&"array<int> $items the items"[n..], " $items the items");
     }
 
@@ -626,7 +781,10 @@ mod tests {
             }
         );
         // A plain parenthesised union still works (not a conditional).
-        assert_eq!(p("(int|string)"), Union(vec![named("int"), named("string")]));
+        assert_eq!(
+            p("(int|string)"),
+            Union(vec![named("int"), named("string")])
+        );
     }
 
     #[test]
@@ -635,7 +793,10 @@ mod tests {
         // shape/array — the leading type is still recovered.
         let (t, n) = parse_type_prefix("bool {@see true} on success").unwrap();
         assert_eq!(t, named("bool"));
-        assert_eq!(&"bool {@see true} on success"[n..], " {@see true} on success");
+        assert_eq!(
+            &"bool {@see true} on success"[n..],
+            " {@see true} on success"
+        );
 
         let (t, n) = parse_type_prefix("string [readonly] the name").unwrap();
         assert_eq!(t, named("string"));

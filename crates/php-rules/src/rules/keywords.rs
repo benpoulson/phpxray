@@ -13,20 +13,13 @@
 //! - `goto.labelUndefined` (`GotoUndefinedLabelRule`) — `goto` to a label that is
 //!   not defined anywhere in the file.
 //! - `label.unused` (`UnusedLabelRule`) — a `label:` that no `goto` references.
-//!
-//! Deferred:
-//! - `RequireFileExistsRule` (`*.fileNotFound`) — needs the type system (the
-//!   constant-string value of the `include`/`require` operand) plus filesystem
-//!   access (resolve the path against CWD / include_path). Not syntactic.
 
 use crate::{walk, FileAnalysis, RuleEntry};
-use php_ast::{Expr, ExprKind, Member, Param, Stmt, StmtKind};
+use php_ast::{Expr, ExprKind, IncludeKind, Member, Param, Stmt, StmtKind};
 use php_diagnostics::Diagnostic;
 use php_intern::Symbol;
 use std::collections::HashSet;
-
-// DEFERRED: RequireFileExistsRule — requires the type system (constant-string
-// value of the include operand) and filesystem access to resolve the path.
+use std::path::Path;
 
 /// `continue` / `break` used outside of a loop or switch.
 ///
@@ -71,7 +64,11 @@ fn check_cb_stmt(s: &Stmt, depth: u32, out: &mut Vec<Diagnostic>) {
                         s.span,
                         format!("Keyword {kw} used outside of a loop or a switch statement."),
                     )
-                    .with_code(if is_continue { "continue.outOfLoop" } else { "break.outOfLoop" }),
+                    .with_code(if is_continue {
+                        "continue.outOfLoop"
+                    } else {
+                        "break.outOfLoop"
+                    }),
                 );
             }
         }
@@ -84,13 +81,24 @@ fn check_cb_stmt(s: &Stmt, depth: u32, out: &mut Vec<Diagnostic>) {
             check_cb_stmt(body, depth + 1, out);
             check_cb_in_expr(cond, out);
         }
-        StmtKind::For { init, cond, update, body } => {
+        StmtKind::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
             for e in init.iter().chain(cond).chain(update) {
                 check_cb_in_expr(e, out);
             }
             check_cb_stmt(body, depth + 1, out);
         }
-        StmtKind::Foreach { subject, key, value, body, .. } => {
+        StmtKind::Foreach {
+            subject,
+            key,
+            value,
+            body,
+            ..
+        } => {
             check_cb_in_expr(subject, out);
             if let Some(k) = key {
                 check_cb_in_expr(k, out);
@@ -108,7 +116,12 @@ fn check_cb_stmt(s: &Stmt, depth: u32, out: &mut Vec<Diagnostic>) {
             }
         }
         // Branching / grouping constructs are transparent: depth is unchanged.
-        StmtKind::If { cond, then, elseifs, els } => {
+        StmtKind::If {
+            cond,
+            then,
+            elseifs,
+            els,
+        } => {
             check_cb_in_expr(cond, out);
             check_cb_stmt(then, depth, out);
             for ei in elseifs {
@@ -120,7 +133,11 @@ fn check_cb_stmt(s: &Stmt, depth: u32, out: &mut Vec<Diagnostic>) {
             }
         }
         StmtKind::Block(b) => check_cb(b, depth, out),
-        StmtKind::Try { body, catches, finally } => {
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
             check_cb(body, depth, out);
             for c in catches {
                 check_cb(&c.body, depth, out);
@@ -250,7 +267,9 @@ fn collect_closures<'a>(e: &'a Expr, found: &mut Vec<&'a Expr>) {
         Unary { expr, .. } | Cast { expr, .. } => collect_closures(expr, found),
         Binary { lhs, rhs, .. }
         | Assign { target: lhs, rhs }
-        | AssignOp { target: lhs, rhs, .. }
+        | AssignOp {
+            target: lhs, rhs, ..
+        }
         | AssignRef { target: lhs, rhs }
         | Coalesce { lhs, rhs } => {
             collect_closures(lhs, found);
@@ -304,7 +323,9 @@ fn collect_closures<'a>(e: &'a Expr, found: &mut Vec<&'a Expr>) {
 fn run_declare_strict_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for (i, s) in fa.program.stmts.iter().enumerate() {
-        let StmtKind::Declare { directives, .. } = &s.kind else { continue };
+        let StmtKind::Declare { directives, .. } = &s.kind else {
+            continue;
+        };
         for (key, value) in directives {
             if fa.interner.resolve(*key) != "strict_types" {
                 continue;
@@ -312,15 +333,21 @@ fn run_declare_strict_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
             let is_valid = matches!(&value.kind, ExprKind::Int(v) if *v == 0 || *v == 1);
             if !is_valid {
                 out.push(
-                    Diagnostic::error(value.span, "Declare strict_types must have 0 or 1 as its value.")
-                        .with_code("declareStrictTypes.value"),
+                    Diagnostic::error(
+                        value.span,
+                        "Declare strict_types must have 0 or 1 as its value.",
+                    )
+                    .with_code("declareStrictTypes.value"),
                 );
                 return out;
             }
             if i != 0 {
                 out.push(
-                    Diagnostic::error(s.span, "Declare strict_types must be the very first statement.")
-                        .with_code("declareStrictTypes.notFirst"),
+                    Diagnostic::error(
+                        s.span,
+                        "Declare strict_types must be the very first statement.",
+                    )
+                    .with_code("declareStrictTypes.notFirst"),
                 );
             }
             return out;
@@ -380,11 +407,78 @@ fn run_unused_label(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
+/// `require`, `require_once`, `include`, and `include_once` with a literal
+/// absolute path that does not name an existing file. Relative paths are left
+/// alone because matching PHPStan's answer requires PHP's include_path and the
+/// analyzed file's execution context.
+fn run_require_file_exists(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Include { kind, expr } = &e.kind else {
+            return;
+        };
+        let Some(path) = literal_string(expr) else {
+            return;
+        };
+        let p = Path::new(&path);
+        if !p.is_absolute() || p.is_file() {
+            return;
+        }
+        let (name, code) = include_name_and_code(*kind);
+        out.push(
+            Diagnostic::error(
+                e.span,
+                format!("Path in {name}() \"{path}\" is not a file or it does not exist."),
+            )
+            .with_code(code),
+        );
+    });
+    out
+}
+
+fn literal_string(e: &Expr) -> Option<String> {
+    match &e.kind {
+        ExprKind::Str(bytes) => std::str::from_utf8(bytes).ok().map(str::to_string),
+        ExprKind::Paren(inner) => literal_string(inner),
+        _ => None,
+    }
+}
+
+fn include_name_and_code(kind: IncludeKind) -> (&'static str, &'static str) {
+    match kind {
+        IncludeKind::Require => ("require", "require.fileNotFound"),
+        IncludeKind::RequireOnce => ("require_once", "requireOnce.fileNotFound"),
+        IncludeKind::Include => ("include", "include.fileNotFound"),
+        IncludeKind::IncludeOnce => ("include_once", "includeOnce.fileNotFound"),
+    }
+}
+
 pub(crate) static RULES: &[RuleEntry] = &[
-    RuleEntry { name: "continue-break.outOfLoop", level: 0, run: run_continue_break_in_loop },
-    RuleEntry { name: "declareStrictTypes", level: 0, run: run_declare_strict_types },
-    RuleEntry { name: "goto.labelUndefined", level: 0, run: run_goto_undefined_label },
-    RuleEntry { name: "label.unused", level: 0, run: run_unused_label },
+    RuleEntry {
+        name: "continue-break.outOfLoop",
+        level: 0,
+        run: run_continue_break_in_loop,
+    },
+    RuleEntry {
+        name: "declareStrictTypes",
+        level: 0,
+        run: run_declare_strict_types,
+    },
+    RuleEntry {
+        name: "goto.labelUndefined",
+        level: 0,
+        run: run_goto_undefined_label,
+    },
+    RuleEntry {
+        name: "label.unused",
+        level: 0,
+        run: run_unused_label,
+    },
+    RuleEntry {
+        name: "keyword.requireFileExists",
+        level: 0,
+        run: run_require_file_exists,
+    },
 ];
 
 #[cfg(test)]
@@ -396,10 +490,26 @@ mod tests {
 
     #[test]
     fn break_in_loop_is_clean() {
-        assert!(codes("<?php for ($i=0;$i<3;$i++) { break; }", run_continue_break_in_loop).is_empty());
-        assert!(codes("<?php while (true) { continue; }", run_continue_break_in_loop).is_empty());
-        assert!(codes("<?php foreach ($a as $x) { break; }", run_continue_break_in_loop).is_empty());
-        assert!(codes("<?php do { continue; } while (true);", run_continue_break_in_loop).is_empty());
+        assert!(codes(
+            "<?php for ($i=0;$i<3;$i++) { break; }",
+            run_continue_break_in_loop
+        )
+        .is_empty());
+        assert!(codes(
+            "<?php while (true) { continue; }",
+            run_continue_break_in_loop
+        )
+        .is_empty());
+        assert!(codes(
+            "<?php foreach ($a as $x) { break; }",
+            run_continue_break_in_loop
+        )
+        .is_empty());
+        assert!(codes(
+            "<?php do { continue; } while (true);",
+            run_continue_break_in_loop
+        )
+        .is_empty());
     }
 
     #[test]
@@ -410,20 +520,32 @@ mod tests {
 
     #[test]
     fn break_outside_loop_is_flagged() {
-        assert_eq!(codes("<?php break;", run_continue_break_in_loop), ["break.outOfLoop"]);
-        assert_eq!(codes("<?php continue;", run_continue_break_in_loop), ["continue.outOfLoop"]);
+        assert_eq!(
+            codes("<?php break;", run_continue_break_in_loop),
+            ["break.outOfLoop"]
+        );
+        assert_eq!(
+            codes("<?php continue;", run_continue_break_in_loop),
+            ["continue.outOfLoop"]
+        );
     }
 
     #[test]
     fn break_in_if_outside_loop_is_flagged() {
-        assert_eq!(codes("<?php if ($x) { break; }", run_continue_break_in_loop), ["break.outOfLoop"]);
+        assert_eq!(
+            codes("<?php if ($x) { break; }", run_continue_break_in_loop),
+            ["break.outOfLoop"]
+        );
     }
 
     #[test]
     fn break_too_deep_is_flagged() {
         // One loop, but `break 2;` wants two — escapes the only loop.
         assert_eq!(
-            codes("<?php for ($i=0;$i<3;$i++) { break 2; }", run_continue_break_in_loop),
+            codes(
+                "<?php for ($i=0;$i<3;$i++) { break 2; }",
+                run_continue_break_in_loop
+            ),
             ["break.outOfLoop"]
         );
     }
@@ -473,7 +595,10 @@ mod tests {
     #[test]
     fn declare_strict_types_not_first_is_flagged() {
         let src = "<?php $x = 1; declare(strict_types=1);";
-        assert_eq!(codes(src, run_declare_strict_types), ["declareStrictTypes.notFirst"]);
+        assert_eq!(
+            codes(src, run_declare_strict_types),
+            ["declareStrictTypes.notFirst"]
+        );
     }
 
     #[test]
@@ -492,7 +617,10 @@ mod tests {
     #[test]
     fn goto_to_undefined_label_is_flagged() {
         let src = "<?php goto nowhere;";
-        assert_eq!(codes(src, run_goto_undefined_label), ["goto.labelUndefined"]);
+        assert_eq!(
+            codes(src, run_goto_undefined_label),
+            ["goto.labelUndefined"]
+        );
     }
 
     #[test]
@@ -505,5 +633,42 @@ mod tests {
     fn unused_label_is_flagged() {
         let src = "<?php here: echo 1;";
         assert_eq!(codes(src, run_unused_label), ["label.unused"]);
+    }
+
+    // --- include / require file existence --------------------------------
+
+    #[test]
+    fn missing_absolute_require_path_is_flagged() {
+        let src = "<?php require '/definitely/missing/php-analyzer-test-file.php';";
+        assert_eq!(
+            codes(src, run_require_file_exists),
+            ["require.fileNotFound"]
+        );
+    }
+
+    #[test]
+    fn missing_absolute_include_once_path_uses_specific_identifier() {
+        let src = "<?php include_once '/definitely/missing/php-analyzer-test-file.php';";
+        assert_eq!(
+            codes(src, run_require_file_exists),
+            ["includeOnce.fileNotFound"]
+        );
+    }
+
+    #[test]
+    fn existing_absolute_require_path_is_clean() {
+        let path = std::env::current_dir()
+            .unwrap()
+            .join("Cargo.toml")
+            .display()
+            .to_string();
+        let src = format!("<?php require '{path}';");
+        assert!(codes(&src, run_require_file_exists).is_empty());
+    }
+
+    #[test]
+    fn relative_require_path_is_skipped() {
+        let src = "<?php require 'missing-relative-file.php';";
+        assert!(codes(src, run_require_file_exists).is_empty());
     }
 }

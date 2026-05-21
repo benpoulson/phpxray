@@ -15,6 +15,11 @@
 //!   closure with a declared union return type.
 //! - **TooWideArrowFunctionReturnTypehintRule** — likewise for an `fn () => …`
 //!   arrow function with a declared union return type.
+//! - **TooWidePropertyTypeRule** — a private, non-promoted property whose
+//!   declared native *union* type contains a member that is never assigned by its
+//!   default value or by any directly-resolvable write in the declaring class.
+//! - **TooWideFunctionParameterOutTypeRule** / **TooWideMethodParameterOutTypeRule**
+//!   — explicit `@param-out` tags only, straight-line bodies only.
 //!
 //! The shared engine ([`check_returns`]) mirrors phpstan's `TooWideTypeCheck`:
 //! collect every returned value's type, and for each member of the declared
@@ -31,24 +36,25 @@
 //! incompatible).
 //!
 //! Deferred (need analysis we don't expose):
-//! - `TooWidePropertyTypeRule` — needs the set of every assignment to a private
-//!   property across the class body unioned with its default; our type map does
-//!   not track per-property assigned-type aggregation. DEFERRED.
-//! - `TooWideFunctionParameterOutTypeRule` / `TooWideMethodParameterOutTypeRule` /
-//!   `TooWidePropertyHookParameterType*` — need `@param-out` / by-ref end-of-body
-//!   variable types, which the rules layer does not surface. DEFERRED.
+//! - `TooWideFunctionParameterOutTypeRule` / `TooWideMethodParameterOutTypeRule`
+//!   fallback by-ref type branch and inherited/public method branch — need full
+//!   final-scope/inheritance semantics to match phpstan without FPs.
+//! - `TooWidePropertyHookParameterType*` — needs hook-specific param-out tracking.
 
-#![allow(unused_imports)]
 use crate::{walk, FileAnalysis, RuleEntry};
 use php_ast::{
-    ArrowFn, ClassDecl, ClosureExpr, Expr, ExprKind, FunctionDecl, Member, MethodDecl, Param,
-    Program, Stmt, StmtKind, Type as AstType, TypeKind,
+    ArrowFn, ClassDecl, ClosureExpr, Expr, ExprKind, FunctionDecl, HookBody, Member, MemberName,
+    MethodDecl, Param, Program, PropElem, PropertyDecl, PropertyHook, Stmt, StmtKind,
+    Type as AstType, TypeKind,
 };
 use php_diagnostics::Diagnostic;
 use php_infer::TypeCtx;
-use php_reflect::resolve_ast_type;
-use php_resolve::{for_each_region, Scope};
+use php_reflect::{
+    reflect_class, reflect_function, resolve_ast_type, resolve_doc_type, ParamReflection,
+};
+use php_resolve::{for_each_region, Resolution, Scope};
 use php_types::Type;
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Shared return-type engine
@@ -69,7 +75,7 @@ fn union_members(scope: &Scope, ty: &AstType) -> Option<Vec<Type>> {
 
 /// Whether `t` is too imprecise to reason about (forces a bail).
 fn is_unknown_ish(t: &Type) -> bool {
-    matches!(t, Type::Mixed | Type::Unknown(_))
+    matches!(t, Type::Mixed | Type::ExplicitMixed | Type::Unknown(_))
 }
 
 /// Whether `t` (a *declared union member*) is the `null` type.
@@ -130,6 +136,21 @@ fn flag_unused_members(
     out
 }
 
+fn flatten_type_atoms(ty: &Type, out: &mut Vec<Type>) {
+    match ty {
+        Type::Union(parts) => {
+            for p in parts {
+                flatten_type_atoms(p, out);
+            }
+        }
+        Type::Nullable(inner) => {
+            flatten_type_atoms(inner, out);
+            out.push(Type::Null);
+        }
+        other => out.push(other.clone()),
+    }
+}
+
 /// Analyze one function-like body against a declared union return type. Returns
 /// `None` (no diagnostics, skip) on any FP-risk condition; otherwise the list of
 /// unused-member diagnostics.
@@ -142,7 +163,9 @@ fn check_returns(
     span: php_span::Span,
 ) -> Vec<Diagnostic> {
     // phpstan only fires on a declared *union* return type.
-    let Some(members) = union_members(scope, declared) else { return Vec::new() };
+    let Some(members) = union_members(scope, declared) else {
+        return Vec::new();
+    };
 
     // Generators are typed by their yields, not their returns — bail.
     if body_has_yield(body) {
@@ -162,7 +185,14 @@ fn check_returns(
     }
 
     let may_fall_through = bare_return || !always_terminates(body);
-    flag_unused_members(fa.reflection, &members, &return_types, may_fall_through, description, span)
+    flag_unused_members(
+        fa.reflection,
+        &members,
+        &return_types,
+        may_fall_through,
+        description,
+        span,
+    )
 }
 
 /// Collect the inferred type (via the file type map) of every `return <expr>;` in
@@ -179,7 +209,9 @@ fn collect_returns_stmt(s: &Stmt, fa: &FileAnalysis, out: &mut Vec<Type>, bare_r
         StmtKind::Return(Some(e)) => out.push(fa.type_of(e)),
         StmtKind::Return(None) => *bare_return = true,
         StmtKind::Block(b) => collect_returns(b, fa, out, bare_return),
-        StmtKind::If { then, elseifs, els, .. } => {
+        StmtKind::If {
+            then, elseifs, els, ..
+        } => {
             collect_returns_stmt(then, fa, out, bare_return);
             for ei in elseifs {
                 collect_returns_stmt(&ei.body, fa, out, bare_return);
@@ -197,7 +229,11 @@ fn collect_returns_stmt(s: &Stmt, fa: &FileAnalysis, out: &mut Vec<Type>, bare_r
                 collect_returns(&c.body, fa, out, bare_return);
             }
         }
-        StmtKind::Try { body, catches, finally } => {
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
             collect_returns(body, fa, out, bare_return);
             for c in catches {
                 collect_returns(&c.body, fa, out, bare_return);
@@ -243,7 +279,12 @@ fn stmt_always_terminates(s: &Stmt) -> bool {
         // `throw`/`exit` are expressions in PHP, used as expression statements.
         StmtKind::Expr(e) => matches!(e.kind, ExprKind::Throw(_) | ExprKind::Exit(_)),
         StmtKind::Block(b) => always_terminates(b),
-        StmtKind::If { then, elseifs, els: Some(els), .. } => {
+        StmtKind::If {
+            then,
+            elseifs,
+            els: Some(els),
+            ..
+        } => {
             stmt_always_terminates(then)
                 && elseifs.iter().all(|ei| stmt_always_terminates(&ei.body))
                 && stmt_always_terminates(els)
@@ -251,7 +292,9 @@ fn stmt_always_terminates(s: &Stmt) -> bool {
         StmtKind::Switch { cases, .. } => {
             // Every branch (including a default) terminates.
             cases.iter().any(|c| c.test.is_none())
-                && cases.iter().all(|c| c.body.last().is_some_and(stmt_always_terminates))
+                && cases
+                    .iter()
+                    .all(|c| c.body.last().is_some_and(stmt_always_terminates))
         }
         _ => false,
     }
@@ -285,7 +328,9 @@ fn collect_function_decls(st: &Stmt, fa: &FileAnalysis, scope: &Scope, out: &mut
                 collect_function_decls(s, fa, scope, out);
             }
         }
-        StmtKind::If { then, elseifs, els, .. } => {
+        StmtKind::If {
+            then, elseifs, els, ..
+        } => {
             collect_function_decls(then, fa, scope, out);
             for ei in elseifs {
                 collect_function_decls(&ei.body, fa, scope, out);
@@ -298,7 +343,11 @@ fn collect_function_decls(st: &Stmt, fa: &FileAnalysis, scope: &Scope, out: &mut
         | StmtKind::DoWhile { body, .. }
         | StmtKind::For { body, .. }
         | StmtKind::Foreach { body, .. } => collect_function_decls(body, fa, scope, out),
-        StmtKind::Try { body, catches, finally } => {
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
             for s in body {
                 collect_function_decls(s, fa, scope, out);
             }
@@ -317,7 +366,12 @@ fn collect_function_decls(st: &Stmt, fa: &FileAnalysis, scope: &Scope, out: &mut
     }
 }
 
-fn check_named_function(f: &FunctionDecl, fa: &FileAnalysis, scope: &Scope, out: &mut Vec<Diagnostic>) {
+fn check_named_function(
+    f: &FunctionDecl,
+    fa: &FileAnalysis,
+    scope: &Scope,
+    out: &mut Vec<Diagnostic>,
+) {
     let Some(ret) = &f.return_type else { return };
     let name = fa.interner.resolve(f.name);
     let desc = format!("Function {name}()");
@@ -346,7 +400,9 @@ fn collect_method_decls(st: &Stmt, fa: &FileAnalysis, scope: &Scope, out: &mut V
                 collect_method_decls(s, fa, scope, out);
             }
         }
-        StmtKind::If { then, elseifs, els, .. } => {
+        StmtKind::If {
+            then, elseifs, els, ..
+        } => {
             collect_method_decls(then, fa, scope, out);
             for ei in elseifs {
                 collect_method_decls(&ei.body, fa, scope, out);
@@ -379,7 +435,13 @@ fn check_class_methods(c: &ClassDecl, fa: &FileAnalysis, scope: &Scope, out: &mu
     }
 }
 
-fn check_method(md: &MethodDecl, class_desc: &str, fa: &FileAnalysis, scope: &Scope, out: &mut Vec<Diagnostic>) {
+fn check_method(
+    md: &MethodDecl,
+    class_desc: &str,
+    fa: &FileAnalysis,
+    scope: &Scope,
+    out: &mut Vec<Diagnostic>,
+) {
     // Only private methods are FP-safe without the full inheritance chain:
     // a protected/public method's prototype may be wider in an ancestor, and
     // phpstan gates those behind `checkProtectedAndPublicMethods` /
@@ -401,7 +463,9 @@ fn check_method(md: &MethodDecl, class_desc: &str, fa: &FileAnalysis, scope: &Sc
 fn run_closure_return(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
-        let prog = Program { stmts: region.to_vec() };
+        let prog = Program {
+            stmts: region.to_vec(),
+        };
         walk::for_each_expr(&prog, &mut |e| {
             if let ExprKind::Closure(cl) = &e.kind {
                 check_closure(cl, fa, scope, e.span, &mut out);
@@ -411,9 +475,17 @@ fn run_closure_return(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
-fn check_closure(cl: &ClosureExpr, fa: &FileAnalysis, scope: &Scope, span: php_span::Span, out: &mut Vec<Diagnostic>) {
+fn check_closure(
+    cl: &ClosureExpr,
+    fa: &FileAnalysis,
+    scope: &Scope,
+    span: php_span::Span,
+    out: &mut Vec<Diagnostic>,
+) {
     let Some(ret) = &cl.return_type else { return };
-    let Some(members) = union_members(scope, ret) else { return };
+    let Some(members) = union_members(scope, ret) else {
+        return;
+    };
     if body_has_yield(&cl.body) {
         return;
     }
@@ -429,7 +501,14 @@ fn check_closure(cl: &ClosureExpr, fa: &FileAnalysis, scope: &Scope, span: php_s
         return;
     }
     let may_fall_through = bare_return || !always_terminates(&cl.body);
-    out.extend(flag_unused_members(fa.reflection, &members, &return_types, may_fall_through, "Anonymous function", span));
+    out.extend(flag_unused_members(
+        fa.reflection,
+        &members,
+        &return_types,
+        may_fall_through,
+        "Anonymous function",
+        span,
+    ));
 }
 
 /// A fresh inference context seeded with `params`' declared types (untyped →
@@ -437,7 +516,10 @@ fn check_closure(cl: &ClosureExpr, fa: &FileAnalysis, scope: &Scope, span: php_s
 fn local_ctx<'a>(fa: &'a FileAnalysis, scope: &'a Scope, params: &[Param]) -> TypeCtx<'a> {
     let mut ctx = TypeCtx::new(fa.reflection, scope, fa.interner);
     for p in params {
-        let ty = p.ty.as_ref().map(|t| resolve_ast_type(scope, t)).unwrap_or(Type::Mixed);
+        let ty =
+            p.ty.as_ref()
+                .map(|t| resolve_ast_type(scope, t))
+                .unwrap_or(Type::Mixed);
         ctx.vars.insert(fa.interner.resolve(p.name).to_string(), ty);
     }
     ctx
@@ -445,13 +527,23 @@ fn local_ctx<'a>(fa: &'a FileAnalysis, scope: &'a Scope, params: &[Param]) -> Ty
 
 /// Collect returned types from a closure body, threading the flow environment so
 /// a returned local carries its assigned type (mirrors `return_type.rs`).
-fn collect_returns_ctx(body: &[Stmt], ctx: &mut TypeCtx, out: &mut Vec<Type>, bare_return: &mut bool) {
+fn collect_returns_ctx(
+    body: &[Stmt],
+    ctx: &mut TypeCtx,
+    out: &mut Vec<Type>,
+    bare_return: &mut bool,
+) {
     for st in body {
         collect_returns_ctx_stmt(st, ctx, out, bare_return);
     }
 }
 
-fn collect_returns_ctx_stmt(st: &Stmt, ctx: &mut TypeCtx, out: &mut Vec<Type>, bare_return: &mut bool) {
+fn collect_returns_ctx_stmt(
+    st: &Stmt,
+    ctx: &mut TypeCtx,
+    out: &mut Vec<Type>,
+    bare_return: &mut bool,
+) {
     match &st.kind {
         StmtKind::Return(Some(e)) => out.push(ctx.infer(e)),
         StmtKind::Return(None) => *bare_return = true,
@@ -459,7 +551,12 @@ fn collect_returns_ctx_stmt(st: &Stmt, ctx: &mut TypeCtx, out: &mut Vec<Type>, b
             ctx.apply_expr(e);
         }
         StmtKind::Block(b) => collect_returns_ctx(b, ctx, out, bare_return),
-        StmtKind::If { cond, then, elseifs, els } => {
+        StmtKind::If {
+            cond,
+            then,
+            elseifs,
+            els,
+        } => {
             ctx.apply_expr(cond);
             let base = ctx.vars.clone();
             collect_returns_ctx_stmt(then, ctx, out, bare_return);
@@ -493,7 +590,11 @@ fn collect_returns_ctx_stmt(st: &Stmt, ctx: &mut TypeCtx, out: &mut Vec<Type>, b
             ctx.vars = base;
             ctx.exec_stmt(st);
         }
-        StmtKind::Try { body, catches, finally } => {
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
             let base = ctx.vars.clone();
             collect_returns_ctx(body, ctx, out, bare_return);
             for c in catches {
@@ -520,7 +621,9 @@ fn collect_returns_ctx_stmt(st: &Stmt, ctx: &mut TypeCtx, out: &mut Vec<Type>, b
 fn run_arrow_return(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
-        let prog = Program { stmts: region.to_vec() };
+        let prog = Program {
+            stmts: region.to_vec(),
+        };
         walk::for_each_expr(&prog, &mut |e| {
             if let ExprKind::ArrowFn(af) = &e.kind {
                 check_arrow(af, fa, scope, e.span, &mut out);
@@ -530,14 +633,25 @@ fn run_arrow_return(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
-fn check_arrow(af: &ArrowFn, fa: &FileAnalysis, scope: &Scope, span: php_span::Span, out: &mut Vec<Diagnostic>) {
+fn check_arrow(
+    af: &ArrowFn,
+    fa: &FileAnalysis,
+    scope: &Scope,
+    span: php_span::Span,
+    out: &mut Vec<Diagnostic>,
+) {
     let Some(ret) = &af.return_type else { return };
     // An arrow fn's body is a single expression that is its return value;
     // `yield`/`yield from` make it a generator — bail.
-    if matches!(af.body.kind, ExprKind::Yield { .. } | ExprKind::YieldFrom(_)) {
+    if matches!(
+        af.body.kind,
+        ExprKind::Yield { .. } | ExprKind::YieldFrom(_)
+    ) {
         return;
     }
-    let Some(members) = union_members(scope, ret) else { return };
+    let Some(members) = union_members(scope, ret) else {
+        return;
+    };
     // The type map doesn't reach inside arrow-fns; infer the body locally.
     let ctx = local_ctx(fa, scope, &af.params);
     let rt = ctx.infer(&af.body);
@@ -545,7 +659,965 @@ fn check_arrow(af: &ArrowFn, fa: &FileAnalysis, scope: &Scope, span: php_span::S
         return;
     }
     // An arrow fn always returns its expression (no fall-through, no bare return).
-    out.extend(flag_unused_members(fa.reflection, &members, &[rt], false, "Anonymous function", span));
+    out.extend(flag_unused_members(
+        fa.reflection,
+        &members,
+        &[rt],
+        false,
+        "Anonymous function",
+        span,
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// TooWidePropertyTypeRule (private properties, conservative assignment slice)
+// ---------------------------------------------------------------------------
+
+fn run_property_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            collect_property_decls(st, fa, scope, &mut out);
+        }
+    });
+    out
+}
+
+fn collect_property_decls(st: &Stmt, fa: &FileAnalysis, scope: &Scope, out: &mut Vec<Diagnostic>) {
+    match &st.kind {
+        StmtKind::Class(c) => check_class_properties(c, fa, scope, out),
+        StmtKind::Block(b) | StmtKind::Namespace { body: Some(b), .. } => {
+            for s in b {
+                collect_property_decls(s, fa, scope, out);
+            }
+        }
+        StmtKind::If {
+            then, elseifs, els, ..
+        } => {
+            collect_property_decls(then, fa, scope, out);
+            for ei in elseifs {
+                collect_property_decls(&ei.body, fa, scope, out);
+            }
+            if let Some(e) = els {
+                collect_property_decls(e, fa, scope, out);
+            }
+        }
+        StmtKind::Function(f) => {
+            for s in &f.body {
+                collect_property_decls(s, fa, scope, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn check_class_properties(
+    c: &ClassDecl,
+    fa: &FileAnalysis,
+    scope: &Scope,
+    out: &mut Vec<Diagnostic>,
+) {
+    // PHPStan's rule handles native class properties. Traits are skipped because
+    // the real declaring class is use-site dependent; interfaces/enums cannot
+    // have ordinary writable private properties in the same sense.
+    if c.kind != php_ast::ClassKind::Class {
+        return;
+    }
+    if c.members.iter().any(|m| matches!(m, Member::TraitUse(_))) {
+        return;
+    }
+
+    let Some(class_name) = c.name else {
+        return;
+    };
+    let class_fqn = scope.qualify(fa.interner.resolve(class_name));
+    for member in &c.members {
+        let Member::Property(pd) = member else {
+            continue;
+        };
+        check_property_decl(c, pd, &class_fqn, fa, scope, out);
+    }
+}
+
+fn check_property_decl(
+    c: &ClassDecl,
+    pd: &PropertyDecl,
+    class_fqn: &str,
+    fa: &FileAnalysis,
+    scope: &Scope,
+    out: &mut Vec<Diagnostic>,
+) {
+    if pd.modifiers.visibility != Some(php_ast::Visibility::Private) {
+        return;
+    }
+    let Some(declared) = &pd.ty else {
+        return;
+    };
+    let Some(members) = union_members(scope, declared) else {
+        return;
+    };
+
+    for elem in &pd.props {
+        check_property_elem(c, pd, elem, class_fqn, fa, scope, declared, &members, out);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_property_elem(
+    c: &ClassDecl,
+    pd: &PropertyDecl,
+    elem: &PropElem,
+    class_fqn: &str,
+    fa: &FileAnalysis,
+    scope: &Scope,
+    declared: &AstType,
+    members: &[Type],
+    out: &mut Vec<Diagnostic>,
+) {
+    // Property hooks and promoted properties have their own specialised
+    // PHPStan rules / reflection shape. Stay on plain declared properties here.
+    if elem.hooks.is_some() {
+        return;
+    }
+    let Some(default) = &elem.default else {
+        return;
+    };
+
+    let prop_name = fa.interner.resolve(elem.name);
+    let is_static = pd.modifiers.is_static;
+    let mut assigned = Vec::new();
+    let mut ctx = TypeCtx::new(fa.reflection, scope, fa.interner);
+    ctx.class = Some(class_fqn.to_string());
+    assigned.push(ctx.infer(default));
+
+    let Some(mut writes) = collect_property_writes(c, class_fqn, prop_name, is_static, fa, scope)
+    else {
+        return;
+    };
+    assigned.append(&mut writes);
+
+    if assigned
+        .iter()
+        .any(|t| is_unknown_ish(t) || matches!(t, Type::Never))
+    {
+        return;
+    }
+
+    let mut atoms = Vec::new();
+    for ty in &assigned {
+        flatten_type_atoms(ty, &mut atoms);
+    }
+
+    let kind = if is_static {
+        "Static property"
+    } else {
+        "Property"
+    };
+    let original = Type::union(members.to_vec());
+    for member in members {
+        let used = atoms
+            .iter()
+            .any(|assigned_ty| crate::is_assignable(fa.reflection, assigned_ty, member));
+        if used {
+            continue;
+        }
+        out.push(
+            Diagnostic::error(
+                declared.span,
+                format!(
+                    "{kind} {class_fqn}::${prop_name} ({original}) is never assigned {member} so it can be removed from the property type."
+                ),
+            )
+            .with_code("property.unusedType"),
+        );
+    }
+}
+
+fn collect_property_writes(
+    c: &ClassDecl,
+    class_fqn: &str,
+    prop_name: &str,
+    is_static: bool,
+    fa: &FileAnalysis,
+    scope: &Scope,
+) -> Option<Vec<Type>> {
+    let mut out = Vec::new();
+    let mut opaque = false;
+    let mut ctx = TypeCtx::new(fa.reflection, scope, fa.interner);
+    ctx.class = Some(class_fqn.to_string());
+
+    for member in &c.members {
+        match member {
+            Member::Method(md) => {
+                let Some(body) = &md.body else {
+                    continue;
+                };
+                for p in &md.params {
+                    let ty =
+                        p.ty.as_ref()
+                            .map(|t| resolve_ast_type(scope, t))
+                            .unwrap_or(Type::Mixed);
+                    ctx.vars.insert(fa.interner.resolve(p.name).to_string(), ty);
+                }
+                for st in body {
+                    scan_property_writes_stmt(
+                        st,
+                        class_fqn,
+                        prop_name,
+                        is_static,
+                        fa,
+                        &ctx,
+                        &mut out,
+                        &mut opaque,
+                    );
+                }
+                ctx.vars.clear();
+            }
+            Member::Property(pd) => {
+                for elem in &pd.props {
+                    if let Some(hooks) = &elem.hooks {
+                        for hook in hooks {
+                            scan_property_writes_hook(
+                                hook,
+                                class_fqn,
+                                prop_name,
+                                is_static,
+                                fa,
+                                &ctx,
+                                &mut out,
+                                &mut opaque,
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (!opaque).then_some(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_property_writes_stmt(
+    st: &Stmt,
+    class_fqn: &str,
+    prop_name: &str,
+    is_static: bool,
+    fa: &FileAnalysis,
+    ctx: &TypeCtx<'_>,
+    out: &mut Vec<Type>,
+    opaque: &mut bool,
+) {
+    walk::for_each_expr_in_scope(st, &mut |e| {
+        scan_property_write_expr(e, class_fqn, prop_name, is_static, fa, ctx, out, opaque);
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_property_writes_hook(
+    hook: &PropertyHook,
+    class_fqn: &str,
+    prop_name: &str,
+    is_static: bool,
+    fa: &FileAnalysis,
+    ctx: &TypeCtx<'_>,
+    out: &mut Vec<Type>,
+    opaque: &mut bool,
+) {
+    if let Some(params) = &hook.params {
+        if params
+            .iter()
+            .any(|p| fa.interner.resolve(p.name) == prop_name)
+        {
+            // A set hook parameter named like the property is harmless, but hook
+            // bodies are a separate PHPStan branch; stay conservative.
+            *opaque = true;
+            return;
+        }
+    }
+    match &hook.body {
+        HookBody::Block(stmts) => {
+            for st in stmts {
+                scan_property_writes_stmt(
+                    st, class_fqn, prop_name, is_static, fa, ctx, out, opaque,
+                );
+            }
+        }
+        HookBody::Short(e) => {
+            walk::for_each_subexpr(e, &mut |sub| {
+                scan_property_write_expr(
+                    sub, class_fqn, prop_name, is_static, fa, ctx, out, opaque,
+                );
+            });
+        }
+        HookBody::Abstract => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_property_write_expr(
+    e: &Expr,
+    class_fqn: &str,
+    prop_name: &str,
+    is_static: bool,
+    fa: &FileAnalysis,
+    ctx: &TypeCtx<'_>,
+    out: &mut Vec<Type>,
+    opaque: &mut bool,
+) {
+    if matches!(
+        e.kind,
+        ExprKind::Closure(_) | ExprKind::ArrowFn(_) | ExprKind::NewAnon { .. }
+    ) {
+        *opaque = true;
+        return;
+    }
+
+    match &e.kind {
+        ExprKind::Assign { target, rhs } => {
+            match property_write_match(target, class_fqn, prop_name, is_static, fa, ctx) {
+                WriteMatch::ThisProperty => out.push(fa.type_of(rhs)),
+                WriteMatch::MaybeThisProperty => *opaque = true,
+                WriteMatch::Other => {}
+            }
+        }
+        ExprKind::AssignRef { target, .. } | ExprKind::AssignOp { target, .. } => {
+            match property_write_match(target, class_fqn, prop_name, is_static, fa, ctx) {
+                WriteMatch::ThisProperty | WriteMatch::MaybeThisProperty => *opaque = true,
+                WriteMatch::Other => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriteMatch {
+    ThisProperty,
+    MaybeThisProperty,
+    Other,
+}
+
+fn property_write_match(
+    target: &Expr,
+    class_fqn: &str,
+    prop_name: &str,
+    is_static: bool,
+    fa: &FileAnalysis,
+    ctx: &TypeCtx<'_>,
+) -> WriteMatch {
+    match &target.kind {
+        ExprKind::Prop { base, name, .. } => {
+            let Some(written_name) = member_name_if_static(name, fa) else {
+                return if receiver_may_be_this(base, class_fqn, fa, ctx) {
+                    WriteMatch::MaybeThisProperty
+                } else {
+                    WriteMatch::Other
+                };
+            };
+            if written_name != prop_name {
+                return WriteMatch::Other;
+            }
+            if is_static {
+                return WriteMatch::MaybeThisProperty;
+            }
+            if receiver_is_this(base, class_fqn, fa, ctx) {
+                WriteMatch::ThisProperty
+            } else if receiver_may_be_this(base, class_fqn, fa, ctx) {
+                WriteMatch::MaybeThisProperty
+            } else {
+                WriteMatch::Other
+            }
+        }
+        ExprKind::StaticProp { class, name } => {
+            let Some(written_name) = static_property_name_if_static(name, fa) else {
+                return if static_class_may_be_current(class, class_fqn, ctx) {
+                    WriteMatch::MaybeThisProperty
+                } else {
+                    WriteMatch::Other
+                };
+            };
+            if written_name != prop_name {
+                return WriteMatch::Other;
+            }
+            if !is_static {
+                return WriteMatch::MaybeThisProperty;
+            }
+            match static_class_matches_current(class, class_fqn, ctx) {
+                Some(true) => WriteMatch::ThisProperty,
+                Some(false) => WriteMatch::Other,
+                None => WriteMatch::MaybeThisProperty,
+            }
+        }
+        _ => WriteMatch::Other,
+    }
+}
+
+fn member_name_if_static(name: &MemberName, fa: &FileAnalysis) -> Option<String> {
+    match name {
+        MemberName::Ident(sym) => Some(fa.interner.resolve(*sym).to_string()),
+        MemberName::Var(_) | MemberName::Expr(_) => None,
+    }
+}
+
+fn static_property_name_if_static(name: &MemberName, fa: &FileAnalysis) -> Option<String> {
+    match name {
+        // `C::$p` is usually `Var`, but some parser paths produce `Ident` for
+        // statically-known member names. Both are literal enough for this rule.
+        MemberName::Ident(sym) | MemberName::Var(sym) => {
+            Some(fa.interner.resolve(*sym).to_string())
+        }
+        MemberName::Expr(_) => None,
+    }
+}
+
+fn receiver_is_this(base: &Expr, class_fqn: &str, fa: &FileAnalysis, ctx: &TypeCtx<'_>) -> bool {
+    match &base.kind {
+        ExprKind::Variable(sym) if fa.interner.resolve(*sym) == "this" => true,
+        _ => sole_class(&ctx.infer(base)).is_some_and(|fqn| same_fqn(&fqn, class_fqn)),
+    }
+}
+
+fn receiver_may_be_this(
+    base: &Expr,
+    class_fqn: &str,
+    fa: &FileAnalysis,
+    ctx: &TypeCtx<'_>,
+) -> bool {
+    if receiver_is_this(base, class_fqn, fa, ctx) {
+        return true;
+    }
+    matches!(
+        ctx.infer(base),
+        Type::Mixed | Type::ExplicitMixed | Type::Unknown(_)
+    )
+}
+
+fn static_class_matches_current(class: &Expr, class_fqn: &str, ctx: &TypeCtx<'_>) -> Option<bool> {
+    match &class.kind {
+        ExprKind::Name(n) => match ctx.scope.resolve_class(n) {
+            Resolution::Fqn(fqn) => Some(same_fqn(&fqn, class_fqn)),
+            Resolution::LateStatic(s) if matches!(s.as_str(), "self" | "static") => Some(true),
+            Resolution::LateStatic(_) => Some(false),
+            Resolution::BuiltinType(_) | Resolution::Fallback { .. } => Some(false),
+        },
+        _ => None,
+    }
+}
+
+fn static_class_may_be_current(class: &Expr, class_fqn: &str, ctx: &TypeCtx<'_>) -> bool {
+    static_class_matches_current(class, class_fqn, ctx).unwrap_or(true)
+}
+
+fn sole_class(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Named { fqn, .. } => Some(fqn.clone()),
+        Type::Nullable(inner) => sole_class(inner),
+        _ => None,
+    }
+}
+
+fn same_fqn(a: &str, b: &str) -> bool {
+    a.trim_start_matches('\\')
+        .eq_ignore_ascii_case(b.trim_start_matches('\\'))
+}
+
+// ---------------------------------------------------------------------------
+// TooWideFunction/MethodParameterOutTypeRule — explicit @param-out subset
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct ParamOutType {
+    name: String,
+    ty: Type,
+}
+
+fn run_function_parameter_out_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            collect_function_param_out_decls(st, fa, scope, &mut out);
+        }
+    });
+    out
+}
+
+fn collect_function_param_out_decls(
+    st: &Stmt,
+    fa: &FileAnalysis,
+    scope: &Scope,
+    out: &mut Vec<Diagnostic>,
+) {
+    match &st.kind {
+        StmtKind::Function(f) => {
+            check_function_param_out(f, fa, scope, out);
+            for inner in &f.body {
+                collect_function_param_out_decls(inner, fa, scope, out);
+            }
+        }
+        StmtKind::Block(b) | StmtKind::Namespace { body: Some(b), .. } => {
+            for s in b {
+                collect_function_param_out_decls(s, fa, scope, out);
+            }
+        }
+        StmtKind::If {
+            then, elseifs, els, ..
+        } => {
+            collect_function_param_out_decls(then, fa, scope, out);
+            for ei in elseifs {
+                collect_function_param_out_decls(&ei.body, fa, scope, out);
+            }
+            if let Some(e) = els {
+                collect_function_param_out_decls(e, fa, scope, out);
+            }
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::DoWhile { body, .. }
+        | StmtKind::For { body, .. }
+        | StmtKind::Foreach { body, .. } => collect_function_param_out_decls(body, fa, scope, out),
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            for s in body {
+                collect_function_param_out_decls(s, fa, scope, out);
+            }
+            for c in catches {
+                for s in &c.body {
+                    collect_function_param_out_decls(s, fa, scope, out);
+                }
+            }
+            if let Some(f) = finally {
+                for s in f {
+                    collect_function_param_out_decls(s, fa, scope, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn check_function_param_out(
+    f: &FunctionDecl,
+    fa: &FileAnalysis,
+    scope: &Scope,
+    out: &mut Vec<Diagnostic>,
+) {
+    let refl = reflect_function(scope, fa.interner, f);
+    let templates = doc_templates(f.doc.as_deref());
+    let desc = format!("Function {}()", refl.fqn);
+    check_param_out_too_wide_body(
+        scope,
+        f.doc.as_deref(),
+        &templates,
+        &f.body,
+        &f.params,
+        &refl.params,
+        None,
+        &desc,
+        fa,
+        out,
+    );
+}
+
+fn run_method_parameter_out_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            collect_method_param_out_decls(st, fa, scope, &mut out);
+        }
+    });
+    out
+}
+
+fn collect_method_param_out_decls(
+    st: &Stmt,
+    fa: &FileAnalysis,
+    scope: &Scope,
+    out: &mut Vec<Diagnostic>,
+) {
+    match &st.kind {
+        StmtKind::Class(c) => check_class_param_out_methods(c, fa, scope, out),
+        StmtKind::Block(b) | StmtKind::Namespace { body: Some(b), .. } => {
+            for s in b {
+                collect_method_param_out_decls(s, fa, scope, out);
+            }
+        }
+        StmtKind::If {
+            then, elseifs, els, ..
+        } => {
+            collect_method_param_out_decls(then, fa, scope, out);
+            for ei in elseifs {
+                collect_method_param_out_decls(&ei.body, fa, scope, out);
+            }
+            if let Some(e) = els {
+                collect_method_param_out_decls(e, fa, scope, out);
+            }
+        }
+        StmtKind::Function(f) => {
+            for s in &f.body {
+                collect_method_param_out_decls(s, fa, scope, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn check_class_param_out_methods(
+    c: &ClassDecl,
+    fa: &FileAnalysis,
+    scope: &Scope,
+    out: &mut Vec<Diagnostic>,
+) {
+    if c.kind == php_ast::ClassKind::Trait {
+        return;
+    }
+    let Some(class_name) = c.name else {
+        return;
+    };
+    let class_fqn = scope.qualify(fa.interner.resolve(class_name));
+    let class_refl = reflect_class(scope, fa.interner, &class_fqn, c);
+    let class_templates = doc_templates(c.doc.as_deref());
+    for member in &c.members {
+        let Member::Method(md) = member else {
+            continue;
+        };
+        if md.modifiers.visibility != Some(php_ast::Visibility::Private) {
+            continue;
+        }
+        let Some(body) = &md.body else {
+            continue;
+        };
+        let method_name = fa.interner.resolve(md.name);
+        let Some(method_refl) = class_refl
+            .methods
+            .iter()
+            .find(|r| !r.magic && r.name.eq_ignore_ascii_case(method_name))
+        else {
+            continue;
+        };
+        let templates = combined_templates(&class_templates, md.doc.as_deref());
+        let desc = format!("Method {}::{}()", class_refl.fqn, method_refl.name);
+        check_param_out_too_wide_body(
+            scope,
+            md.doc.as_deref(),
+            &templates,
+            body,
+            &md.params,
+            &method_refl.params,
+            Some(class_refl.fqn.as_str()),
+            &desc,
+            fa,
+            out,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_param_out_too_wide_body(
+    scope: &Scope,
+    doc: Option<&str>,
+    templates: &[String],
+    body: &[Stmt],
+    ast_params: &[Param],
+    params: &[ParamReflection],
+    class_fqn: Option<&str>,
+    function_description: &str,
+    fa: &FileAnalysis,
+    out: &mut Vec<Diagnostic>,
+) {
+    let param_outs = param_out_types(scope, doc, templates);
+    if param_outs.is_empty() {
+        return;
+    }
+    let Some(final_vars) = straight_line_final_vars(body, params, scope, class_fqn, fa) else {
+        return;
+    };
+
+    for po in param_outs {
+        if type_is_uncertain(&po.ty) {
+            continue;
+        }
+        let Some(param) = params
+            .iter()
+            .find(|p| p.name == po.name && p.by_ref && !p.variadic)
+        else {
+            continue;
+        };
+        let Some(final_ty) = final_vars.get(&po.name) else {
+            continue;
+        };
+        if type_is_uncertain(final_ty) {
+            continue;
+        }
+        out.extend(param_out_unused_type_errors(
+            &po.ty,
+            final_ty,
+            function_description,
+            &param.name,
+            param_decl_span(ast_params, &param.name, fa.interner)
+                .unwrap_or_else(|| body.first().map_or(php_span::Span::at(0), |s| s.span)),
+            fa,
+        ));
+    }
+}
+
+fn param_out_unused_type_errors(
+    declared: &Type,
+    actual: &Type,
+    function_description: &str,
+    param_name: &str,
+    span: php_span::Span,
+    fa: &FileAnalysis,
+) -> Vec<Diagnostic> {
+    let mut atoms = Vec::new();
+    flatten_type_atoms(actual, &mut atoms);
+    if atoms.is_empty() || atoms.iter().any(type_is_uncertain) {
+        return Vec::new();
+    }
+
+    if matches!(declared, Type::Bool) {
+        let all_true = atoms.iter().all(|t| matches!(t, Type::True));
+        let all_false = atoms.iter().all(|t| matches!(t, Type::False));
+        let (never, narrowed) = if all_true {
+            ("false", "true")
+        } else if all_false {
+            ("true", "false")
+        } else {
+            return Vec::new();
+        };
+        return vec![
+            Diagnostic::error(
+                span,
+                format!(
+                    "{function_description} never assigns {never} to &${param_name} so the @param-out type can be changed to {narrowed}."
+                ),
+            )
+            .with_code("paramOut.tooWideBool"),
+        ];
+    }
+
+    let mut members = Vec::new();
+    flatten_type_atoms(declared, &mut members);
+    if members.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for member in members {
+        let used = atoms
+            .iter()
+            .any(|actual_ty| crate::is_assignable(fa.reflection, actual_ty, &member));
+        if used {
+            continue;
+        }
+        out.push(
+            Diagnostic::error(
+                span,
+                format!(
+                    "{function_description} never assigns {} to &${param_name} so it can be removed from the @param-out type.",
+                    phpstan_type(&member),
+                ),
+            )
+            .with_code("paramOut.unusedType"),
+        );
+    }
+    out
+}
+
+fn param_out_types(scope: &Scope, doc: Option<&str>, templates: &[String]) -> Vec<ParamOutType> {
+    let Some(raw) = doc else {
+        return Vec::new();
+    };
+    let mut out: Vec<(i8, ParamOutType)> = Vec::new();
+    for tag in php_phpdoc::parse_block(raw).tags {
+        let (base, pri) = doc_tag_base_priority(&tag.name);
+        if base != "param-out" || pri == 1 {
+            continue;
+        }
+        let parsed = php_phpdoc::parse(&format!("/** @param {} */", tag.value));
+        let Some(param) = parsed.params.first() else {
+            continue;
+        };
+        let (Some(name), Some(doc_ty)) = (&param.name, &param.ty) else {
+            continue;
+        };
+        let ty = resolve_doc_type(scope, templates, doc_ty);
+        if let Some(existing) = out.iter_mut().find(|(_, p)| p.name == *name) {
+            if pri >= existing.0 {
+                *existing = (
+                    pri,
+                    ParamOutType {
+                        name: name.clone(),
+                        ty,
+                    },
+                );
+            }
+        } else {
+            out.push((
+                pri,
+                ParamOutType {
+                    name: name.clone(),
+                    ty,
+                },
+            ));
+        }
+    }
+    out.into_iter().map(|(_, p)| p).collect()
+}
+
+fn doc_templates(doc: Option<&str>) -> Vec<String> {
+    doc.map(php_phpdoc::parse)
+        .unwrap_or_default()
+        .templates
+        .into_iter()
+        .map(|t| t.name)
+        .collect()
+}
+
+fn combined_templates(class_templates: &[String], method_doc: Option<&str>) -> Vec<String> {
+    let mut templates = class_templates.to_vec();
+    templates.extend(doc_templates(method_doc));
+    templates
+}
+
+fn doc_tag_base_priority(name: &str) -> (&str, i8) {
+    if let Some(rest) = name.strip_prefix("phpstan-") {
+        (rest, 2)
+    } else if let Some(rest) = name.strip_prefix("psalm-") {
+        (rest, 1)
+    } else {
+        (name, 0)
+    }
+}
+
+fn straight_line_final_vars(
+    body: &[Stmt],
+    params: &[ParamReflection],
+    scope: &Scope,
+    class_fqn: Option<&str>,
+    fa: &FileAnalysis,
+) -> Option<HashMap<String, Type>> {
+    let mut ctx = TypeCtx::new(fa.reflection, scope, fa.interner);
+    ctx.class = class_fqn.map(ToString::to_string);
+    for p in params {
+        ctx.vars.insert(p.name.clone(), p.local_type());
+    }
+
+    for st in body {
+        match &st.kind {
+            StmtKind::Nop => {}
+            StmtKind::Expr(e) => {
+                let (name, rhs) = direct_variable_assignment(e, fa)?;
+                if !rhs_is_obvious(rhs) {
+                    return None;
+                }
+                let ty = ctx.infer(rhs);
+                ctx.vars.insert(name, ty);
+            }
+            _ => return None,
+        }
+    }
+
+    Some(ctx.vars)
+}
+
+fn direct_variable_assignment<'a>(e: &'a Expr, fa: &FileAnalysis) -> Option<(String, &'a Expr)> {
+    match &e.kind {
+        ExprKind::Paren(inner) => direct_variable_assignment(inner, fa),
+        ExprKind::Assign { target, rhs } => match &target.kind {
+            ExprKind::Variable(sym) => Some((fa.interner.resolve(*sym).to_string(), rhs)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn rhs_is_obvious(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Paren(inner) => rhs_is_obvious(inner),
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Str(_) | ExprKind::Interpolated(_) => {
+            true
+        }
+        ExprKind::Variable(_) => true,
+        ExprKind::Name(n) => matches!(
+            n.text.to_ascii_lowercase().as_str(),
+            "true" | "false" | "null"
+        ),
+        ExprKind::Array { items, .. } => items.iter().all(|item| {
+            !item.by_ref
+                && !item.spread
+                && item.key.as_ref().is_none_or(rhs_is_obvious)
+                && item.value.as_ref().is_none_or(rhs_is_obvious)
+        }),
+        ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => rhs_is_obvious(expr),
+        ExprKind::Binary { lhs, rhs, .. } => rhs_is_obvious(lhs) && rhs_is_obvious(rhs),
+        _ => false,
+    }
+}
+
+fn type_is_uncertain(ty: &Type) -> bool {
+    match ty {
+        Type::Mixed
+        | Type::ExplicitMixed
+        | Type::Never
+        | Type::Void
+        | Type::SelfType
+        | Type::StaticType
+        | Type::Parent
+        | Type::TemplateVar(_)
+        | Type::Conditional { .. }
+        | Type::Unknown(_) => true,
+        Type::Nullable(inner) | Type::List(inner) | Type::ClassString(Some(inner)) => {
+            type_is_uncertain(inner)
+        }
+        Type::Union(parts) | Type::Intersection(parts) => parts.iter().any(type_is_uncertain),
+        Type::Array(Some(pair)) | Type::Iterable(Some(pair)) => {
+            type_is_uncertain(&pair.0) || type_is_uncertain(&pair.1)
+        }
+        Type::Shape { fields, .. } => fields.iter().any(|f| type_is_uncertain(&f.ty)),
+        Type::Callable(Some(sig)) => {
+            sig.params.iter().any(type_is_uncertain) || type_is_uncertain(&sig.ret)
+        }
+        Type::Named { args, .. } => args.iter().any(type_is_uncertain),
+        Type::Array(None)
+        | Type::Iterable(None)
+        | Type::Callable(None)
+        | Type::ClassString(None)
+        | Type::Null
+        | Type::Bool
+        | Type::True
+        | Type::False
+        | Type::Int
+        | Type::IntRange { .. }
+        | Type::Float
+        | Type::String
+        | Type::Object
+        | Type::Resource
+        | Type::LiteralInt(_)
+        | Type::LiteralString(_) => false,
+    }
+}
+
+fn phpstan_type(ty: &Type) -> String {
+    match ty {
+        Type::Nullable(inner) => format!("{}|null", phpstan_type(inner)),
+        Type::Union(parts) => parts.iter().map(phpstan_type).collect::<Vec<_>>().join("|"),
+        other => other.to_string(),
+    }
+}
+
+fn param_decl_span(
+    params: &[Param],
+    name: &str,
+    interner: &php_intern::Interner,
+) -> Option<php_span::Span> {
+    params
+        .iter()
+        .find(|p| interner.resolve(p.name) == name)
+        .map(|p| p.span)
 }
 
 // ---------------------------------------------------------------------------
@@ -553,10 +1625,41 @@ fn check_arrow(af: &ArrowFn, fa: &FileAnalysis, scope: &Scope, span: php_span::S
 // ---------------------------------------------------------------------------
 
 pub(crate) static RULES: &[RuleEntry] = &[
-    RuleEntry { name: "return.unusedType/function", level: 4, run: run_function_return },
-    RuleEntry { name: "return.unusedType/method", level: 4, run: run_method_return },
-    RuleEntry { name: "return.unusedType/closure", level: 4, run: run_closure_return },
-    RuleEntry { name: "return.unusedType/arrow", level: 4, run: run_arrow_return },
+    RuleEntry {
+        name: "property.unusedType",
+        level: 4,
+        run: run_property_type,
+    },
+    RuleEntry {
+        name: "paramOut.unusedType/function",
+        level: 4,
+        run: run_function_parameter_out_type,
+    },
+    RuleEntry {
+        name: "paramOut.unusedType/method",
+        level: 4,
+        run: run_method_parameter_out_type,
+    },
+    RuleEntry {
+        name: "return.unusedType/function",
+        level: 4,
+        run: run_function_return,
+    },
+    RuleEntry {
+        name: "return.unusedType/method",
+        level: 4,
+        run: run_method_return,
+    },
+    RuleEntry {
+        name: "return.unusedType/closure",
+        level: 4,
+        run: run_closure_return,
+    },
+    RuleEntry {
+        name: "return.unusedType/arrow",
+        level: 4,
+        run: run_arrow_return,
+    },
 ];
 
 #[cfg(test)]
@@ -635,11 +1738,149 @@ mod tests {
     #[test]
     fn function_in_branches_unions_returns() {
         // null only ever returned in one branch, int in another, never string.
-        let src = "<?php function f(bool $c): int|string|null { if ($c) { return 1; } return null; }";
+        let src =
+            "<?php function f(bool $c): int|string|null { if ($c) { return 1; } return null; }";
         assert_eq!(
             msgs(src, run_function_return),
             ["Function f() never returns string so it can be removed from the return type."]
         );
+    }
+
+    // --- parameter-out ---------------------------------------------------
+
+    #[test]
+    fn function_param_out_never_assigns_null_is_flagged() {
+        let src = "<?php /** @param-out string|null $out */ function f(?string &$out): void { $out = 'x'; }";
+        let diags = run(src, run_function_parameter_out_type);
+        assert_eq!(
+            diags
+                .iter()
+                .map(|d| d.code.unwrap_or(""))
+                .collect::<Vec<_>>(),
+            ["paramOut.unusedType"]
+        );
+        assert_eq!(
+            diags[0].message,
+            "Function f() never assigns null to &$out so it can be removed from the @param-out type."
+        );
+    }
+
+    #[test]
+    fn function_param_out_bool_can_be_narrowed_to_true() {
+        let src = "<?php /** @param-out bool $out */ function f(bool &$out): void { $out = true; }";
+        let diags = run(src, run_function_parameter_out_type);
+        assert_eq!(
+            diags
+                .iter()
+                .map(|d| d.code.unwrap_or(""))
+                .collect::<Vec<_>>(),
+            ["paramOut.tooWideBool"]
+        );
+        assert_eq!(
+            diags[0].message,
+            "Function f() never assigns false to &$out so the @param-out type can be changed to true."
+        );
+    }
+
+    #[test]
+    fn function_param_out_all_members_possible_is_clean() {
+        let src = "<?php /** @param-out string|null $out */ function f(?string &$out): void {}";
+        assert!(codes(src, run_function_parameter_out_type).is_empty());
+    }
+
+    #[test]
+    fn function_param_out_branch_is_deferred() {
+        let src = "<?php /** @param-out string|null $out */ function f(?string &$out, bool $c): void { if ($c) { $out = 'x'; } }";
+        assert!(codes(src, run_function_parameter_out_type).is_empty());
+    }
+
+    #[test]
+    fn method_param_out_private_never_assigns_null_is_flagged() {
+        let src = "<?php class C { /** @param-out string|null $out */ private function m(?string &$out): void { $out = 'x'; } }";
+        let diags = run(src, run_method_parameter_out_type);
+        assert_eq!(
+            diags
+                .iter()
+                .map(|d| d.code.unwrap_or(""))
+                .collect::<Vec<_>>(),
+            ["paramOut.unusedType"]
+        );
+        assert_eq!(
+            diags[0].message,
+            "Method C::m() never assigns null to &$out so it can be removed from the @param-out type."
+        );
+    }
+
+    #[test]
+    fn method_param_out_public_is_deferred() {
+        let src = "<?php class C { /** @param-out string|null $out */ public function m(?string &$out): void { $out = 'x'; } }";
+        assert!(codes(src, run_method_parameter_out_type).is_empty());
+    }
+
+    #[test]
+    fn method_param_out_variadic_is_deferred() {
+        let src = "<?php class C { /** @param-out string|null $out */ private function m(string &...$out): void { $out = ['x']; } }";
+        assert!(codes(src, run_method_parameter_out_type).is_empty());
+    }
+
+    // --- properties ------------------------------------------------------
+
+    #[test]
+    fn private_property_default_never_assigns_union_member_is_flagged() {
+        let src = "<?php class C { private int|string $p = 1; }";
+        assert_eq!(
+            msgs(src, run_property_type),
+            ["Property C::$p (int|string) is never assigned string so it can be removed from the property type."]
+        );
+    }
+
+    #[test]
+    fn private_property_direct_writes_are_counted() {
+        let src = "<?php class C { private int|string|null $p = 1; function set(): void { $this->p = 'x'; } }";
+        assert_eq!(
+            msgs(src, run_property_type),
+            ["Property C::$p (int|string|null) is never assigned null so it can be removed from the property type."]
+        );
+    }
+
+    #[test]
+    fn private_static_property_direct_writes_are_counted() {
+        let src =
+            "<?php class C { private static int|string|null $p = 1; function set(): void { self::$p = 'x'; } }";
+        assert_eq!(
+            msgs(src, run_property_type),
+            ["Static property C::$p (int|string|null) is never assigned null so it can be removed from the property type."]
+        );
+    }
+
+    #[test]
+    fn public_property_is_skipped() {
+        let src = "<?php class C { public int|string $p = 1; }";
+        assert!(codes(src, run_property_type).is_empty());
+    }
+
+    #[test]
+    fn property_without_default_is_skipped() {
+        let src = "<?php class C { private int|string $p; }";
+        assert!(codes(src, run_property_type).is_empty());
+    }
+
+    #[test]
+    fn dynamic_property_write_bails() {
+        let src = "<?php class C { private int|string $p = 1; function set(string $name): void { $this->{$name} = 'x'; } }";
+        assert!(codes(src, run_property_type).is_empty());
+    }
+
+    #[test]
+    fn opaque_closure_in_class_bails() {
+        let src = "<?php class C { private int|string $p = 1; function set(): void { $f = function (): void { $this->p = 'x'; }; } }";
+        assert!(codes(src, run_property_type).is_empty());
+    }
+
+    #[test]
+    fn class_using_trait_is_skipped() {
+        let src = "<?php trait T { function set(): void { $this->p = 'x'; } } class C { use T; private int|string $p = 1; }";
+        assert!(codes(src, run_property_type).is_empty());
     }
 
     // --- methods ---------------------------------------------------------
@@ -685,7 +1926,8 @@ mod tests {
 
     #[test]
     fn closure_all_members_used_is_clean() {
-        let src = "<?php $f = function (bool $c): int|string { if ($c) { return 1; } return 'x'; };";
+        let src =
+            "<?php $f = function (bool $c): int|string { if ($c) { return 1; } return 'x'; };";
         assert!(codes(src, run_closure_return).is_empty());
     }
 

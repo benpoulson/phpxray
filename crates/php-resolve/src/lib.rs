@@ -71,7 +71,10 @@ impl Scope {
 
     /// A scope in namespace `ns` (e.g. `"App\\Models"`) with no imports.
     pub fn in_namespace(ns: impl Into<String>) -> Self {
-        Self { namespace: Some(ns.into()), ..Self::default() }
+        Self {
+            namespace: Some(ns.into()),
+            ..Self::default()
+        }
     }
 
     /// The current namespace prefix, or `None` in the global namespace.
@@ -82,17 +85,20 @@ impl Scope {
     /// Register `use Target as alias;` (class import). `alias`/`target` carry no
     /// leading `\`.
     pub fn add_class_use(&mut self, alias: &str, target: &str) {
-        self.use_class.push((alias.to_ascii_lowercase(), strip(target).to_string()));
+        self.use_class
+            .push((alias.to_ascii_lowercase(), strip(target).to_string()));
     }
 
     /// Register `use function Target as alias;`.
     pub fn add_function_use(&mut self, alias: &str, target: &str) {
-        self.use_function.push((alias.to_ascii_lowercase(), strip(target).to_string()));
+        self.use_function
+            .push((alias.to_ascii_lowercase(), strip(target).to_string()));
     }
 
     /// Register `use const Target as alias;` (case-sensitive alias).
     pub fn add_const_use(&mut self, alias: &str, target: &str) {
-        self.use_const.push((alias.to_string(), strip(target).to_string()));
+        self.use_const
+            .push((alias.to_string(), strip(target).to_string()));
     }
 
     /// Resolve a name used as a **class-like** reference (`extends`, `new`, `::`,
@@ -145,7 +151,13 @@ impl Scope {
             NameFq::Fq => Resolution::Fqn(text.to_string()),
             NameFq::Relative => Resolution::Fqn(self.prefix(relative_tail(text))),
             NameFq::NotFq => {
-                let lookup = |name: &str| if ci { lookup_ci(imports, name) } else { lookup_cs(imports, name) };
+                let lookup = |name: &str| {
+                    if ci {
+                        lookup_ci(imports, name)
+                    } else {
+                        lookup_cs(imports, name)
+                    }
+                };
                 match split_first(text) {
                     // Unqualified: imported name wins; otherwise namespaced with a
                     // global fallback (just the global name when already global).
@@ -209,12 +221,20 @@ fn relative_tail(s: &str) -> &str {
 /// Case-insensitive import lookup (classes, functions).
 fn lookup_ci(imports: &[(String, String)], name: &str) -> Option<String> {
     let key = name.to_ascii_lowercase();
-    imports.iter().rev().find(|(a, _)| *a == key).map(|(_, f)| f.clone())
+    imports
+        .iter()
+        .rev()
+        .find(|(a, _)| *a == key)
+        .map(|(_, f)| f.clone())
 }
 
 /// Case-sensitive import lookup (constants).
 fn lookup_cs(imports: &[(String, String)], name: &str) -> Option<String> {
-    imports.iter().rev().find(|(a, _)| a == name).map(|(_, f)| f.clone())
+    imports
+        .iter()
+        .rev()
+        .find(|(a, _)| a == name)
+        .map(|(_, f)| f.clone())
 }
 
 /// `self` / `parent` / `static` — returned lowercased.
@@ -241,7 +261,11 @@ mod tests {
     use super::*;
 
     fn n(fq: NameFq, text: &str) -> Name {
-        Name { span: php_span::Span::at(0), fq, text: text.to_string() }
+        Name {
+            span: php_span::Span::at(0),
+            fq,
+            text: text.to_string(),
+        }
     }
     fn unq(text: &str) -> Name {
         n(NameFq::NotFq, text)
@@ -252,39 +276,57 @@ mod tests {
     #[test]
     fn unqualified_class_in_namespace_is_prefixed() {
         let s = Scope::in_namespace("App\\Models");
-        assert_eq!(s.resolve_class(&unq("User")), Resolution::Fqn("App\\Models\\User".into()));
+        assert_eq!(
+            s.resolve_class(&unq("User")),
+            Resolution::Fqn("App\\Models\\User".into())
+        );
     }
 
     #[test]
     fn unqualified_class_in_global_namespace() {
         let s = Scope::global();
-        assert_eq!(s.resolve_class(&unq("User")), Resolution::Fqn("User".into()));
+        assert_eq!(
+            s.resolve_class(&unq("User")),
+            Resolution::Fqn("User".into())
+        );
     }
 
     #[test]
     fn fully_qualified_class_strips_leading_backslash() {
         let s = Scope::in_namespace("App");
-        assert_eq!(s.resolve_class(&n(NameFq::Fq, "\\Other\\Thing")), Resolution::Fqn("Other\\Thing".into()));
+        assert_eq!(
+            s.resolve_class(&n(NameFq::Fq, "\\Other\\Thing")),
+            Resolution::Fqn("Other\\Thing".into())
+        );
     }
 
     #[test]
     fn relative_class_uses_current_namespace() {
         let s = Scope::in_namespace("App\\Models");
-        assert_eq!(s.resolve_class(&n(NameFq::Relative, "namespace\\User")), Resolution::Fqn("App\\Models\\User".into()));
+        assert_eq!(
+            s.resolve_class(&n(NameFq::Relative, "namespace\\User")),
+            Resolution::Fqn("App\\Models\\User".into())
+        );
     }
 
     #[test]
     fn imported_class_alias_wins() {
         let mut s = Scope::in_namespace("App\\Models");
         s.add_class_use("Id", "Ramsey\\Uuid\\Uuid");
-        assert_eq!(s.resolve_class(&unq("Id")), Resolution::Fqn("Ramsey\\Uuid\\Uuid".into()));
+        assert_eq!(
+            s.resolve_class(&unq("Id")),
+            Resolution::Fqn("Ramsey\\Uuid\\Uuid".into())
+        );
     }
 
     #[test]
     fn class_alias_matching_is_case_insensitive() {
         let mut s = Scope::in_namespace("App");
         s.add_class_use("Str", "App\\Support\\Str");
-        assert_eq!(s.resolve_class(&unq("STR")), Resolution::Fqn("App\\Support\\Str".into()));
+        assert_eq!(
+            s.resolve_class(&unq("STR")),
+            Resolution::Fqn("App\\Support\\Str".into())
+        );
     }
 
     #[test]
@@ -292,28 +334,49 @@ mod tests {
         // `use App\Support; Support\Str` → App\Support\Str
         let mut s = Scope::in_namespace("Other");
         s.add_class_use("Support", "App\\Support");
-        assert_eq!(s.resolve_class(&unq("Support\\Str")), Resolution::Fqn("App\\Support\\Str".into()));
+        assert_eq!(
+            s.resolve_class(&unq("Support\\Str")),
+            Resolution::Fqn("App\\Support\\Str".into())
+        );
     }
 
     #[test]
     fn qualified_class_without_alias_is_prefixed() {
         let s = Scope::in_namespace("App");
-        assert_eq!(s.resolve_class(&unq("Sub\\Thing")), Resolution::Fqn("App\\Sub\\Thing".into()));
+        assert_eq!(
+            s.resolve_class(&unq("Sub\\Thing")),
+            Resolution::Fqn("App\\Sub\\Thing".into())
+        );
     }
 
     #[test]
     fn self_parent_static_are_late_static() {
         let s = Scope::in_namespace("App");
-        assert_eq!(s.resolve_class(&unq("self")), Resolution::LateStatic("self".into()));
-        assert_eq!(s.resolve_class(&unq("Parent")), Resolution::LateStatic("parent".into()));
-        assert_eq!(s.resolve_class(&unq("STATIC")), Resolution::LateStatic("static".into()));
+        assert_eq!(
+            s.resolve_class(&unq("self")),
+            Resolution::LateStatic("self".into())
+        );
+        assert_eq!(
+            s.resolve_class(&unq("Parent")),
+            Resolution::LateStatic("parent".into())
+        );
+        assert_eq!(
+            s.resolve_class(&unq("STATIC")),
+            Resolution::LateStatic("static".into())
+        );
     }
 
     #[test]
     fn reserved_types_are_not_namespaced() {
         let s = Scope::in_namespace("App");
-        assert_eq!(s.resolve_class(&unq("int")), Resolution::BuiltinType("int".into()));
-        assert_eq!(s.resolve_class(&unq("STRING")), Resolution::BuiltinType("string".into()));
+        assert_eq!(
+            s.resolve_class(&unq("int")),
+            Resolution::BuiltinType("int".into())
+        );
+        assert_eq!(
+            s.resolve_class(&unq("STRING")),
+            Resolution::BuiltinType("string".into())
+        );
     }
 
     // --- functions -------------------------------------------------------
@@ -323,27 +386,39 @@ mod tests {
         let s = Scope::in_namespace("App");
         assert_eq!(
             s.resolve_function(&unq("strlen")),
-            Resolution::Fallback { namespaced: "App\\strlen".into(), global: "strlen".into() }
+            Resolution::Fallback {
+                namespaced: "App\\strlen".into(),
+                global: "strlen".into()
+            }
         );
     }
 
     #[test]
     fn unqualified_function_in_global_namespace_is_definite() {
         let s = Scope::global();
-        assert_eq!(s.resolve_function(&unq("strlen")), Resolution::Fqn("strlen".into()));
+        assert_eq!(
+            s.resolve_function(&unq("strlen")),
+            Resolution::Fqn("strlen".into())
+        );
     }
 
     #[test]
     fn imported_function_has_no_fallback() {
         let mut s = Scope::in_namespace("App");
         s.add_function_use("tap", "App\\helpers\\tap");
-        assert_eq!(s.resolve_function(&unq("tap")), Resolution::Fqn("App\\helpers\\tap".into()));
+        assert_eq!(
+            s.resolve_function(&unq("tap")),
+            Resolution::Fqn("App\\helpers\\tap".into())
+        );
     }
 
     #[test]
     fn qualified_function_is_prefixed() {
         let s = Scope::in_namespace("App");
-        assert_eq!(s.resolve_function(&unq("util\\f")), Resolution::Fqn("App\\util\\f".into()));
+        assert_eq!(
+            s.resolve_function(&unq("util\\f")),
+            Resolution::Fqn("App\\util\\f".into())
+        );
     }
 
     // --- constants -------------------------------------------------------
@@ -353,7 +428,10 @@ mod tests {
         let s = Scope::in_namespace("App");
         assert_eq!(
             s.resolve_const(&unq("PHP_EOL")),
-            Resolution::Fallback { namespaced: "App\\PHP_EOL".into(), global: "PHP_EOL".into() }
+            Resolution::Fallback {
+                namespaced: "App\\PHP_EOL".into(),
+                global: "PHP_EOL".into()
+            }
         );
     }
 
@@ -362,17 +440,29 @@ mod tests {
         let mut s = Scope::in_namespace("App");
         s.add_const_use("FOO", "Other\\FOO");
         // Exact match resolves; a different case does not.
-        assert_eq!(s.resolve_const(&unq("FOO")), Resolution::Fqn("Other\\FOO".into()));
+        assert_eq!(
+            s.resolve_const(&unq("FOO")),
+            Resolution::Fqn("Other\\FOO".into())
+        );
         assert_eq!(
             s.resolve_const(&unq("foo")),
-            Resolution::Fallback { namespaced: "App\\foo".into(), global: "foo".into() }
+            Resolution::Fallback {
+                namespaced: "App\\foo".into(),
+                global: "foo".into()
+            }
         );
     }
 
     #[test]
     fn fully_qualified_function_and_const() {
         let s = Scope::in_namespace("App");
-        assert_eq!(s.resolve_function(&n(NameFq::Fq, "\\strlen")), Resolution::Fqn("strlen".into()));
-        assert_eq!(s.resolve_const(&n(NameFq::Fq, "\\PHP_EOL")), Resolution::Fqn("PHP_EOL".into()));
+        assert_eq!(
+            s.resolve_function(&n(NameFq::Fq, "\\strlen")),
+            Resolution::Fqn("strlen".into())
+        );
+        assert_eq!(
+            s.resolve_const(&n(NameFq::Fq, "\\PHP_EOL")),
+            Resolution::Fqn("PHP_EOL".into())
+        );
     }
 }

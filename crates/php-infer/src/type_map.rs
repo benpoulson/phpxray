@@ -35,19 +35,39 @@ pub fn type_map(reflection: &ReflectionIndex, program: &Program, interner: &Inte
 /// Build the **native**-only type map: types inferred ignoring PHPDoc (member
 /// accesses use `native_ty`/`native_return`, arrays are untyped). Backs the
 /// `treatPhpDocTypesAsCertain: false` native-level checking.
-pub fn native_type_map(reflection: &ReflectionIndex, program: &Program, interner: &Interner) -> TypeMap {
+pub fn native_type_map(
+    reflection: &ReflectionIndex,
+    program: &Program,
+    interner: &Interner,
+) -> TypeMap {
     build(reflection, program, interner, true)
 }
 
-fn build(reflection: &ReflectionIndex, program: &Program, interner: &Interner, native: bool) -> TypeMap {
+fn build(
+    reflection: &ReflectionIndex,
+    program: &Program,
+    interner: &Interner,
+    native: bool,
+) -> TypeMap {
     let mut map = TypeMap::new();
     for_each_region(&program.stmts, interner, |scope, region| {
         // Global scope of this region.
-        record_scope(reflection, scope, interner, None, HashMap::new(), native, region, &mut map);
+        record_scope(
+            reflection,
+            scope,
+            interner,
+            None,
+            HashMap::new(),
+            native,
+            region,
+            &mut map,
+        );
         // Every function / method declared in the region (descending into nested
         // and conditional declarations; each is its own scope).
         for st in region {
-            walk::for_each_stmt_in_stmt(st, &mut |s| collect_scope(reflection, scope, interner, s, native, &mut map));
+            walk::for_each_stmt_in_stmt(st, &mut |s| {
+                collect_scope(reflection, scope, interner, s, native, &mut map)
+            });
         }
     });
     map
@@ -68,12 +88,25 @@ fn seed_type(p: &php_reflect::ParamReflection, native: bool) -> Type {
 
 /// If `s` declares a function or class, record types for each of its bodies in a
 /// fresh scope.
-fn collect_scope(reflection: &ReflectionIndex, scope: &Scope, interner: &Interner, s: &php_ast::Stmt, native: bool, map: &mut TypeMap) {
+fn collect_scope(
+    reflection: &ReflectionIndex,
+    scope: &Scope,
+    interner: &Interner,
+    s: &php_ast::Stmt,
+    native: bool,
+    map: &mut TypeMap,
+) {
     match &s.kind {
         StmtKind::Function(f) => {
             let refl = reflect_function(scope, interner, f);
-            let vars = refl.params.iter().map(|p| (p.name.clone(), seed_type(p, native))).collect();
-            record_scope(reflection, scope, interner, None, vars, native, &f.body, map);
+            let vars = refl
+                .params
+                .iter()
+                .map(|p| (p.name.clone(), seed_type(p, native)))
+                .collect();
+            record_scope(
+                reflection, scope, interner, None, vars, native, &f.body, map,
+            );
         }
         StmtKind::Class(c) => {
             let Some(name) = c.name else { return };
@@ -83,12 +116,35 @@ fn collect_scope(reflection: &ReflectionIndex, scope: &Scope, interner: &Interne
                 let Member::Method(md) = m else { continue };
                 let Some(body) = &md.body else { continue };
                 let mname = interner.resolve(md.name);
-                let Some(mr) = cls.methods.iter().find(|x| !x.magic && x.name.eq_ignore_ascii_case(mname)) else {
+                let Some(mr) = cls
+                    .methods
+                    .iter()
+                    .find(|x| !x.magic && x.name.eq_ignore_ascii_case(mname))
+                else {
                     continue;
                 };
-                let mut vars: HashMap<String, Type> = mr.params.iter().map(|p| (p.name.clone(), seed_type(p, native))).collect();
-                vars.insert("this".to_string(), Type::Named { fqn: fqn.clone(), args: Vec::new() });
-                record_scope(reflection, scope, interner, Some(fqn.clone()), vars, native, body, map);
+                let mut vars: HashMap<String, Type> = mr
+                    .params
+                    .iter()
+                    .map(|p| (p.name.clone(), seed_type(p, native)))
+                    .collect();
+                vars.insert(
+                    "this".to_string(),
+                    Type::Named {
+                        fqn: fqn.clone(),
+                        args: Vec::new(),
+                    },
+                );
+                record_scope(
+                    reflection,
+                    scope,
+                    interner,
+                    Some(fqn.clone()),
+                    vars,
+                    native,
+                    body,
+                    map,
+                );
             }
         }
         _ => {}
@@ -121,7 +177,7 @@ fn record_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use php_ast::{Expr, ExprKind};
+    use php_ast::{Expr, ExprKind, StmtKind};
 
     /// Build the type map for `src` (parsed + self-reflected).
     fn build(src: &str) -> (TypeMap, php_parser::ParseResult) {
@@ -140,7 +196,32 @@ mod tests {
         walk::for_each_expr(&r.program, &mut |e| {
             if found.is_none() && pred(e) {
                 let k = key(e.span);
-                found = Some(map.get(&k).map(|t| t.to_string()).unwrap_or_else(|| "<unmapped>".into()));
+                found = Some(
+                    map.get(&k)
+                        .map(|t| t.to_string())
+                        .unwrap_or_else(|| "<unmapped>".into()),
+                );
+            }
+        });
+        found.unwrap_or_else(|| "<not found>".into())
+    }
+
+    fn ty_of_last_method(src: &str, name: &str) -> String {
+        let (map, r) = build(src);
+        let mut found: Option<String> = None;
+        walk::for_each_expr(&r.program, &mut |e| {
+            let ExprKind::MethodCall {
+                method: php_ast::MemberName::Ident(sym),
+                ..
+            } = &e.kind
+            else {
+                return;
+            };
+            if r.interner.resolve(*sym).eq_ignore_ascii_case(name) {
+                found = map
+                    .get(&key(e.span))
+                    .map(|t| t.to_string())
+                    .or_else(|| Some("<unmapped>".into()));
             }
         });
         found.unwrap_or_else(|| "<not found>".into())
@@ -148,8 +229,14 @@ mod tests {
 
     #[test]
     fn literals() {
-        assert_eq!(ty_of("<?php 42;", |e| matches!(e.kind, ExprKind::Int(_))), "42");
-        assert_eq!(ty_of("<?php 'hi';", |e| matches!(&e.kind, ExprKind::Str(_))), "'hi'");
+        assert_eq!(
+            ty_of("<?php 42;", |e| matches!(e.kind, ExprKind::Int(_))),
+            "42"
+        );
+        assert_eq!(
+            ty_of("<?php 'hi';", |e| matches!(&e.kind, ExprKind::Str(_))),
+            "'hi'"
+        );
     }
 
     #[test]
@@ -160,10 +247,18 @@ mod tests {
         let mut tys = Vec::new();
         walk::for_each_expr(&r.program, &mut |e| {
             if matches!(&e.kind, ExprKind::Variable(_)) {
-                tys.push(map.get(&key(e.span)).map(|t| t.to_string()).unwrap_or_default());
+                tys.push(
+                    map.get(&key(e.span))
+                        .map(|t| t.to_string())
+                        .unwrap_or_default(),
+                );
             }
         });
-        assert_eq!(tys.last().map(String::as_str), Some("'hi'"), "echo $x should be the literal; got {tys:?}");
+        assert_eq!(
+            tys.last().map(String::as_str),
+            Some("'hi'"),
+            "echo $x should be the literal; got {tys:?}"
+        );
     }
 
     #[test]
@@ -173,22 +268,35 @@ mod tests {
         let mut tys = Vec::new();
         walk::for_each_expr(&r.program, &mut |e| {
             if matches!(&e.kind, ExprKind::Variable(_)) {
-                tys.push(map.get(&key(e.span)).map(|t| t.to_string()).unwrap_or_default());
+                tys.push(
+                    map.get(&key(e.span))
+                        .map(|t| t.to_string())
+                        .unwrap_or_default(),
+                );
             }
         });
-        assert!(tys.contains(&"int".to_string()), "the $n use should be int; got {tys:?}");
+        assert!(
+            tys.contains(&"int".to_string()),
+            "the $n use should be int; got {tys:?}"
+        );
     }
 
     #[test]
     fn call_return_type() {
         let src = "<?php function f(): string { return 'x'; } $r = f();";
-        assert_eq!(ty_of(src, |e| matches!(&e.kind, ExprKind::Call { .. })), "string");
+        assert_eq!(
+            ty_of(src, |e| matches!(&e.kind, ExprKind::Call { .. })),
+            "string"
+        );
     }
 
     #[test]
     fn this_property_type() {
         let src = "<?php class C { public int $age = 0; public function m() { $a = $this->age; } }";
-        assert_eq!(ty_of(src, |e| matches!(&e.kind, ExprKind::Prop { .. })), "int");
+        assert_eq!(
+            ty_of(src, |e| matches!(&e.kind, ExprKind::Prop { .. })),
+            "int"
+        );
     }
 
     #[test]
@@ -231,9 +339,18 @@ mod tests {
         let (map, r) = build(src);
         let mut tys = Vec::new();
         walk::for_each_expr(&r.program, &mut |e| {
-            if let ExprKind::Prop { base, name: php_ast::MemberName::Ident(_), .. } = &e.kind {
+            if let ExprKind::Prop {
+                base,
+                name: php_ast::MemberName::Ident(_),
+                ..
+            } = &e.kind
+            {
                 if matches!(&base.kind, ExprKind::Variable(_)) {
-                    tys.push(map.get(&key(e.span)).map(|t| t.to_string()).unwrap_or_default());
+                    tys.push(
+                        map.get(&key(e.span))
+                            .map(|t| t.to_string())
+                            .unwrap_or_default(),
+                    );
                 }
             }
         });
@@ -265,20 +382,59 @@ mod tests {
     #[test]
     fn max_of_ints_is_int() {
         let src = "<?php function f(int $a, int $b): bool { return max($a, $b) === 0; }";
-        assert_eq!(ty_of(src, |e| matches!(&e.kind, ExprKind::Call { .. })), "int");
+        assert_eq!(
+            ty_of(src, |e| matches!(&e.kind, ExprKind::Call { .. })),
+            "int"
+        );
     }
 
     #[test]
     fn array_values_preserves_element_type() {
         let src = "<?php /** @param array<int, string> $a */ function f(array $a): bool { return array_values($a) === []; }";
-        assert_eq!(ty_of(src, |e| matches!(&e.kind, ExprKind::Call { .. })), "list<string>");
+        assert_eq!(
+            ty_of(src, |e| matches!(&e.kind, ExprKind::Call { .. })),
+            "list<string>"
+        );
+    }
+
+    #[test]
+    fn inline_var_empty_shape_types_foreach_subject() {
+        let src = "<?php $a = []; /** @var array{} $a */ foreach ($a as $v) {}";
+        let (map, r) = build(src);
+        let mut found = None;
+        walk::for_each_stmt(&r.program, &mut |s| {
+            if let StmtKind::Foreach { subject, .. } = &s.kind {
+                found = map.get(&key(subject.span)).map(|t| t.to_string());
+            }
+        });
+        assert_eq!(found.as_deref(), Some("array{}"));
+    }
+
+    #[test]
+    fn inline_var_empty_shape_types_multiline_foreach_subject() {
+        let src = r#"<?php
+        $a = [];
+        /** @var array{} $a */
+        foreach ($a as $v) {}
+        "#;
+        let (map, r) = build(src);
+        let mut found = None;
+        walk::for_each_stmt(&r.program, &mut |s| {
+            if let StmtKind::Foreach { subject, .. } = &s.kind {
+                found = map.get(&key(subject.span)).map(|t| t.to_string());
+            }
+        });
+        assert_eq!(found.as_deref(), Some("array{}"));
     }
 
     #[test]
     fn str_replace_returns_string_for_string_subject() {
         // The stub says `string|array`; a string subject yields `string`.
         let src = "<?php function f(string $s): bool { return str_replace('a', 'b', $s) === 'x'; }";
-        assert_eq!(ty_of(src, |e| matches!(&e.kind, ExprKind::Call { .. })), "string");
+        assert_eq!(
+            ty_of(src, |e| matches!(&e.kind, ExprKind::Call { .. })),
+            "string"
+        );
     }
 
     #[test]
@@ -286,7 +442,10 @@ mod tests {
         // `$x instanceof A && $x->n` — the right operand sees $x narrowed to A.
         let src = "<?php interface I {} class A implements I { public int $n = 0; } \
             function f(I $x): bool { return $x instanceof A && $x->n > 0; }";
-        assert_eq!(ty_of(src, |e| matches!(&e.kind, ExprKind::Prop { .. })), "int");
+        assert_eq!(
+            ty_of(src, |e| matches!(&e.kind, ExprKind::Prop { .. })),
+            "int"
+        );
     }
 
     #[test]
@@ -299,13 +458,22 @@ mod tests {
         let (map, r) = build(src);
         let mut found = None;
         walk::for_each_expr(&r.program, &mut |e| {
-            if let ExprKind::Prop { base, name: php_ast::MemberName::Ident(_), .. } = &e.kind {
+            if let ExprKind::Prop {
+                base,
+                name: php_ast::MemberName::Ident(_),
+                ..
+            } = &e.kind
+            {
                 if matches!(&base.kind, ExprKind::Prop { .. }) && found.is_none() {
                     found = map.get(&key(base.span)).map(|t| t.to_string());
                 }
             }
         });
-        assert_eq!(found.as_deref(), Some("A"), "inner $this->dep should narrow to A");
+        assert_eq!(
+            found.as_deref(),
+            Some("A"),
+            "inner $this->dep should narrow to A"
+        );
     }
 
     #[test]
@@ -313,7 +481,13 @@ mod tests {
         let src = "<?php interface I {} class A implements I { public int $n = 0; } \
             class C { private I $dep; \
                 public function m() { if ($this->dep instanceof A) { $r = $this->dep->n; } } }";
-        assert_eq!(ty_of(src, |e| matches!(&e.kind, ExprKind::Prop { name: php_ast::MemberName::Ident(_), base, .. } if matches!(&base.kind, ExprKind::Prop{..}))), "int");
+        assert_eq!(
+            ty_of(
+                src,
+                |e| matches!(&e.kind, ExprKind::Prop { name: php_ast::MemberName::Ident(_), base, .. } if matches!(&base.kind, ExprKind::Prop{..}))
+            ),
+            "int"
+        );
     }
 
     #[test]
@@ -323,6 +497,65 @@ mod tests {
             interface I {} \
             class C implements I { public int $n = 0; } \
             function f(I $o) { if ($o instanceof C) { $r = $o->n; } }";
-        assert_eq!(ty_of(src, |e| matches!(&e.kind, ExprKind::Prop { .. })), "int");
+        assert_eq!(
+            ty_of(src, |e| matches!(&e.kind, ExprKind::Prop { .. })),
+            "int"
+        );
+    }
+
+    #[test]
+    fn first_class_method_callable_is_callable() {
+        let src = r#"<?php
+        class C {
+            public function cb(): bool { return true; }
+            public function f(): void { $this->cb(...); }
+        }
+        "#;
+        assert_eq!(ty_of_last_method(src, "cb"), "callable(): bool");
+    }
+
+    #[test]
+    fn inline_var_return_overrides_return_expression_type() {
+        let src = r#"<?php
+        interface ResponseInterface {}
+        class C {
+            public function getResponse(): ?ResponseInterface {}
+            public function f(): ResponseInterface {
+                /** @var ResponseInterface */
+                return $this->getResponse();
+            }
+        }
+        "#;
+        assert_eq!(ty_of_last_method(src, "getResponse"), "ResponseInterface");
+    }
+
+    #[test]
+    fn inline_var_assignment_binds_named_variable_after_assignment() {
+        let src = r#"<?php
+        interface NumberInterface {}
+        class IntegerObject implements NumberInterface { public function toHexadecimal(): string {} }
+        function make(): NumberInterface {}
+        function f(): void {
+            /** @var IntegerObject $uuidTime */
+            $uuidTime = make();
+            $uuidTime->toHexadecimal();
+        }
+        "#;
+        assert_eq!(ty_of_last_method(src, "toHexadecimal"), "string");
+    }
+
+    #[test]
+    fn repeated_no_arg_method_call_is_narrowed_after_instanceof() {
+        let src = r#"<?php
+        interface StreamInterface {}
+        class MultipartStream implements StreamInterface { public function getBoundary(): string {} }
+        class Request { public function getBody(): StreamInterface {} }
+        function f(Request $request): void {
+            if ($request->getBody() instanceof MultipartStream) {
+                $request->getBody()->getBoundary();
+            }
+        }
+        "#;
+        assert_eq!(ty_of_last_method(src, "getBoundary"), "string");
     }
 }

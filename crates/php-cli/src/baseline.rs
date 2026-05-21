@@ -33,7 +33,14 @@ pub fn entries(report: &Report) -> Vec<Entry> {
         let message = format!("#^{}$#", regex::escape(&f.message));
         *counts.entry((f.path.clone(), message)).or_default() += 1;
     }
-    counts.into_iter().map(|((path, message), count)| Entry { message, count, path }).collect()
+    counts
+        .into_iter()
+        .map(|((path, message), count)| Entry {
+            message,
+            count,
+            path,
+        })
+        .collect()
 }
 
 /// Serialize entries to a baseline YAML document (`ignore:` list).
@@ -54,7 +61,14 @@ mod tests {
     use std::collections::HashMap;
 
     fn finding(path: &str, line: u32, msg: &str, id: &'static str) -> Finding {
-        Finding { path: path.into(), line, column: 1, message: msg.into(), identifier: Some(id), severity: Severity::Error }
+        Finding {
+            path: path.into(),
+            line,
+            column: 1,
+            message: msg.into(),
+            identifier: Some(id),
+            severity: Severity::Error,
+        }
     }
 
     #[test]
@@ -81,7 +95,12 @@ mod tests {
         // it back to the same report -> everything is suppressed.
         let report = Report {
             findings: vec![
-                finding("src/A.php", 4, "should return int but returns string", "return.type"),
+                finding(
+                    "src/A.php",
+                    4,
+                    "should return int but returns string",
+                    "return.type",
+                ),
                 finding("src/B.php", 9, "unknown class `Foo`", "class.notFound"),
             ],
             files_analyzed: 2,
@@ -91,6 +110,10 @@ mod tests {
         assert_eq!(cfg.ignore.len(), 2);
 
         let out = suppress::apply(report, &cfg.ignore, false, &HashMap::new());
-        assert!(out.findings.is_empty(), "baseline should suppress all: {:?}", out.findings);
+        assert!(
+            out.findings.is_empty(),
+            "baseline should suppress all: {:?}",
+            out.findings
+        );
     }
 }

@@ -44,14 +44,18 @@ fn visit_stmt(stmt: &Stmt, out: &mut Vec<Diagnostic>) {
 
         // Containers that can hold further declarations.
         StmtKind::Block(stmts) => stmts.iter().for_each(|s| visit_stmt(s, out)),
-        StmtKind::Namespace { body: Some(body), .. } => {
-            body.iter().for_each(|s| visit_stmt(s, out))
-        }
-        StmtKind::Declare { body: Some(body), .. } => visit_stmt(body, out),
+        StmtKind::Namespace {
+            body: Some(body), ..
+        } => body.iter().for_each(|s| visit_stmt(s, out)),
+        StmtKind::Declare {
+            body: Some(body), ..
+        } => visit_stmt(body, out),
 
         // Conditional / nested declarations (PHP allows declaring a class inside
         // an `if`, a loop, a try, etc.).
-        StmtKind::If { then, elseifs, els, .. } => {
+        StmtKind::If {
+            then, elseifs, els, ..
+        } => {
             visit_stmt(then, out);
             for ei in elseifs {
                 visit_stmt(&ei.body, out);
@@ -69,7 +73,11 @@ fn visit_stmt(stmt: &Stmt, out: &mut Vec<Diagnostic>) {
                 c.body.iter().for_each(|s| visit_stmt(s, out));
             }
         }
-        StmtKind::Try { body, catches, finally } => {
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
             body.iter().for_each(|s| visit_stmt(s, out));
             for c in catches {
                 c.body.iter().for_each(|s| visit_stmt(s, out));
@@ -116,8 +124,11 @@ fn visit_class(class: &ClassDecl, class_span: Span, out: &mut Vec<Diagnostic>) {
     }
 }
 
-pub(crate) static RULES: &[RuleEntry] =
-    &[RuleEntry { name: "enum.caseOutsideOfEnum", level: 0, run: run_enum_case_outside_enum }];
+pub(crate) static RULES: &[RuleEntry] = &[RuleEntry {
+    name: "enum.caseOutsideOfEnum",
+    level: 0,
+    run: run_enum_case_outside_enum,
+}];
 
 #[cfg(test)]
 mod tests {
@@ -127,13 +138,19 @@ mod tests {
     #[test]
     fn case_in_plain_class_is_flagged() {
         let src = "<?php class C { case Foo; }";
-        assert_eq!(codes(src, run_enum_case_outside_enum), ["enum.caseOutsideOfEnum"]);
+        assert_eq!(
+            codes(src, run_enum_case_outside_enum),
+            ["enum.caseOutsideOfEnum"]
+        );
     }
 
     #[test]
     fn case_in_interface_is_flagged() {
         let src = "<?php interface I { case Foo; }";
-        assert_eq!(codes(src, run_enum_case_outside_enum), ["enum.caseOutsideOfEnum"]);
+        assert_eq!(
+            codes(src, run_enum_case_outside_enum),
+            ["enum.caseOutsideOfEnum"]
+        );
     }
 
     #[test]
@@ -173,12 +190,18 @@ mod tests {
     #[test]
     fn case_in_namespaced_class_is_flagged() {
         let src = "<?php namespace App; class C { case Foo; }";
-        assert_eq!(codes(src, run_enum_case_outside_enum), ["enum.caseOutsideOfEnum"]);
+        assert_eq!(
+            codes(src, run_enum_case_outside_enum),
+            ["enum.caseOutsideOfEnum"]
+        );
     }
 
     #[test]
     fn case_in_class_inside_function_is_flagged() {
         let src = "<?php function f() { class C { case Foo; } }";
-        assert_eq!(codes(src, run_enum_case_outside_enum), ["enum.caseOutsideOfEnum"]);
+        assert_eq!(
+            codes(src, run_enum_case_outside_enum),
+            ["enum.caseOutsideOfEnum"]
+        );
     }
 }

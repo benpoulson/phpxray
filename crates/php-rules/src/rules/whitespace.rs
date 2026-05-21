@@ -64,7 +64,9 @@ fn trailing_candidates(stmts: &[Stmt]) -> Vec<&Stmt> {
     let mut out: Vec<&Stmt> = Vec::new();
     for s in stmts {
         match &s.kind {
-            StmtKind::Declare { body: Some(body), .. } => {
+            StmtKind::Declare {
+                body: Some(body), ..
+            } => {
                 // A `declare(...) { ... }` block body — phpstan reads the body's
                 // last statement. Our body is a single `Stmt` (often a `Block`).
                 if let StmtKind::Block(inner) = &body.kind {
@@ -75,7 +77,9 @@ fn trailing_candidates(stmts: &[Stmt]) -> Vec<&Stmt> {
                     out.push(body);
                 }
             }
-            StmtKind::Namespace { body: Some(body), .. } => {
+            StmtKind::Namespace {
+                body: Some(body), ..
+            } => {
                 if let Some(last) = body.last() {
                     out.push(last);
                 }
@@ -95,8 +99,11 @@ fn is_all_whitespace(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_whitespace())
 }
 
-pub(crate) static RULES: &[RuleEntry] =
-    &[RuleEntry { name: "whitespace.file", level: 0, run: run_file_whitespace }];
+pub(crate) static RULES: &[RuleEntry] = &[RuleEntry {
+    name: "whitespace.file",
+    level: 0,
+    run: run_file_whitespace,
+}];
 
 #[cfg(test)]
 mod tests {

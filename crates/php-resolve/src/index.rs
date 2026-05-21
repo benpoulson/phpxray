@@ -45,7 +45,10 @@ pub struct ConstSymbol {
 
 /// Build the symbol table for one parsed file.
 pub fn index_file(program: &Program, interner: &Interner) -> FileIndex {
-    let mut indexer = Indexer { i: interner, out: FileIndex::default() };
+    let mut indexer = Indexer {
+        i: interner,
+        out: FileIndex::default(),
+    };
     for_each_region(&program.stmts, interner, |scope, region| {
         for st in region {
             indexer.collect_stmt(scope, st);
@@ -63,7 +66,10 @@ pub fn for_each_region(stmts: &[Stmt], i: &Interner, mut f: impl FnMut(&Scope, &
     while idx < stmts.len() {
         let (name, region, next) = match &stmts[idx].kind {
             // Braced `namespace X { … }`: the body is a self-contained region.
-            StmtKind::Namespace { name, body: Some(body) } => (name.as_ref(), &body[..], idx + 1),
+            StmtKind::Namespace {
+                name,
+                body: Some(body),
+            } => (name.as_ref(), &body[..], idx + 1),
             // Non-braced `namespace X;`: runs until the next namespace.
             StmtKind::Namespace { name, body: None } => {
                 let end = region_end(stmts, idx + 1);
@@ -132,17 +138,23 @@ impl Indexer<'_> {
     fn collect_stmt(&mut self, scope: &Scope, st: &Stmt) {
         match &st.kind {
             StmtKind::Function(f) => {
-                self.out.functions.push(FunctionSymbol { fqn: scope.qualify(self.i.resolve(f.name)) });
+                self.out.functions.push(FunctionSymbol {
+                    fqn: scope.qualify(self.i.resolve(f.name)),
+                });
             }
             StmtKind::Class(c) => self.collect_class(scope, c),
             StmtKind::ConstDecl { consts, .. } => {
                 for c in consts {
-                    self.out.constants.push(ConstSymbol { fqn: scope.qualify(self.i.resolve(c.name)) });
+                    self.out.constants.push(ConstSymbol {
+                        fqn: scope.qualify(self.i.resolve(c.name)),
+                    });
                 }
             }
             // Conditional / nested declarations.
             StmtKind::Block(b) => self.collect_all(scope, b),
-            StmtKind::If { then, elseifs, els, .. } => {
+            StmtKind::If {
+                then, elseifs, els, ..
+            } => {
                 self.collect_stmt(scope, then);
                 for e in elseifs {
                     self.collect_stmt(scope, &e.body);
@@ -155,7 +167,11 @@ impl Indexer<'_> {
             | StmtKind::DoWhile { body, .. }
             | StmtKind::For { body, .. }
             | StmtKind::Foreach { body, .. } => self.collect_stmt(scope, body),
-            StmtKind::Try { body, catches, finally } => {
+            StmtKind::Try {
+                body,
+                catches,
+                finally,
+            } => {
                 self.collect_all(scope, body);
                 for c in catches {
                     self.collect_all(scope, &c.body);
@@ -191,8 +207,16 @@ impl Indexer<'_> {
     fn collect_class(&mut self, scope: &Scope, c: &ClassDecl) {
         // Anonymous classes have no name and aren't file-level symbols.
         let Some(name) = c.name else { return };
-        let extends = c.extends.iter().filter_map(|n| resolved_fqn(scope, n)).collect();
-        let implements = c.implements.iter().filter_map(|n| resolved_fqn(scope, n)).collect();
+        let extends = c
+            .extends
+            .iter()
+            .filter_map(|n| resolved_fqn(scope, n))
+            .collect();
+        let implements = c
+            .implements
+            .iter()
+            .filter_map(|n| resolved_fqn(scope, n))
+            .collect();
         let mut uses_traits = Vec::new();
         for m in &c.members {
             if let Member::TraitUse(tu) = m {
@@ -218,17 +242,31 @@ fn resolved_fqn(scope: &Scope, name: &Name) -> Option<String> {
 /// If `e` is a `define("NAME", …)` call with a literal string name, the declared
 /// constant's FQN (taken verbatim — `define` ignores the active namespace).
 fn define_constant(e: &Expr) -> Option<String> {
-    let ExprKind::Call { callee, args } = &e.kind else { return None };
-    let ExprKind::Name(n) = &callee.kind else { return None };
-    if !n.text.trim_start_matches('\\').eq_ignore_ascii_case("define") {
+    let ExprKind::Call { callee, args } = &e.kind else {
+        return None;
+    };
+    let ExprKind::Name(n) = &callee.kind else {
+        return None;
+    };
+    if !n
+        .text
+        .trim_start_matches('\\')
+        .eq_ignore_ascii_case("define")
+    {
         return None;
     }
     let first = args.first()?;
     if first.spread || first.name.is_some() {
         return None;
     }
-    let ExprKind::Str(bytes) = &first.value.kind else { return None };
-    Some(String::from_utf8_lossy(bytes).trim_start_matches('\\').to_string())
+    let ExprKind::Str(bytes) = &first.value.kind else {
+        return None;
+    };
+    Some(
+        String::from_utf8_lossy(bytes)
+            .trim_start_matches('\\')
+            .to_string(),
+    )
 }
 
 /// The index one past the last statement of a region starting at `start`: the
@@ -262,7 +300,13 @@ mod tests {
             interface HasId {}
             "#,
         );
-        assert_eq!(idx.classes.iter().map(|c| c.fqn.as_str()).collect::<Vec<_>>(), ["App\\Models\\User", "App\\Models\\HasId"]);
+        assert_eq!(
+            idx.classes
+                .iter()
+                .map(|c| c.fqn.as_str())
+                .collect::<Vec<_>>(),
+            ["App\\Models\\User", "App\\Models\\HasId"]
+        );
         assert_eq!(idx.functions[0].fqn, "App\\Models\\helper");
         assert_eq!(idx.constants[0].fqn, "App\\Models\\VERSION");
     }
@@ -304,7 +348,10 @@ mod tests {
             class Model { use HasTimestamps, \Other\Loggable; }
             "#,
         );
-        assert_eq!(idx.classes[0].uses_traits, ["App\\Concerns\\HasTimestamps", "Other\\Loggable"]);
+        assert_eq!(
+            idx.classes[0].uses_traits,
+            ["App\\Concerns\\HasTimestamps", "Other\\Loggable"]
+        );
     }
 
     #[test]

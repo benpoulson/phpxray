@@ -55,7 +55,9 @@ fn render_type(ty: &Type) -> String {
         TypeKind::Simple(name) => name.text.clone(),
         TypeKind::Nullable(inner) => format!("?{}", render_type(inner)),
         TypeKind::Union(parts) => parts.iter().map(render_type).collect::<Vec<_>>().join("|"),
-        TypeKind::Intersection(parts) => parts.iter().map(render_type).collect::<Vec<_>>().join("&"),
+        TypeKind::Intersection(parts) => {
+            parts.iter().map(render_type).collect::<Vec<_>>().join("&")
+        }
     }
 }
 
@@ -111,7 +113,12 @@ fn stmt_terminates(fa: &FileAnalysis, st: &Stmt) -> bool {
         // (FP-safe: prevents a false "missing return").
         StmtKind::Goto(_) => true,
         StmtKind::Block(b) => always_terminates(fa, b),
-        StmtKind::If { cond: _, then, elseifs, els } => {
+        StmtKind::If {
+            cond: _,
+            then,
+            elseifs,
+            els,
+        } => {
             // Only terminating when there's a final `else` AND every branch
             // (then / each elseif / else) terminates.
             let Some(els) = els else { return false };
@@ -126,7 +133,11 @@ fn stmt_terminates(fa: &FileAnalysis, st: &Stmt) -> bool {
             stmt_terminates(fa, els)
         }
         StmtKind::Switch { cases, .. } => switch_terminates(fa, cases),
-        StmtKind::Try { body, catches, finally } => {
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
             // If `finally` always terminates, the whole try does.
             if let Some(fin) = finally {
                 if always_terminates(fa, fin) {
@@ -144,7 +155,8 @@ fn stmt_terminates(fa: &FileAnalysis, st: &Stmt) -> bool {
         StmtKind::DoWhile { cond, body } => is_truthy(cond) && !contains_break(body),
         StmtKind::For { cond, body, .. } => {
             // `for (;;)` / `for (; true; )` with no break.
-            (cond.is_empty() || cond.last().map(is_truthy).unwrap_or(false)) && !contains_break(body)
+            (cond.is_empty() || cond.last().map(is_truthy).unwrap_or(false))
+                && !contains_break(body)
         }
         _ => false,
     }
@@ -168,7 +180,13 @@ fn expr_terminates(fa: &FileAnalysis, e: &Expr) -> bool {
         e.kind,
         ExprKind::Call { .. } | ExprKind::MethodCall { .. } | ExprKind::StaticCall { .. }
     ) {
-        return matches!(fa.type_of(e), php_types::Type::Never | php_types::Type::Mixed | php_types::Type::Unknown(_));
+        return matches!(
+            fa.type_of(e),
+            php_types::Type::Never
+                | php_types::Type::Mixed
+                | php_types::Type::ExplicitMixed
+                | php_types::Type::Unknown(_)
+        );
     }
     false
 }
@@ -194,7 +212,9 @@ fn switch_terminates(fa: &FileAnalysis, cases: &[php_ast::SwitchCase]) -> bool {
             return false;
         }
         // Falls through: a later case must terminate.
-        let later_terminates = cases[i + 1..].iter().any(|n| always_terminates(fa, &n.body));
+        let later_terminates = cases[i + 1..]
+            .iter()
+            .any(|n| always_terminates(fa, &n.body));
         if !later_terminates {
             return false;
         }
@@ -232,7 +252,9 @@ fn scan_break(st: &Stmt, found: &mut bool) {
     match &st.kind {
         StmtKind::Break(_) | StmtKind::Continue(_) => *found = true,
         StmtKind::Block(b) => b.iter().for_each(|s| scan_break(s, found)),
-        StmtKind::If { then, elseifs, els, .. } => {
+        StmtKind::If {
+            then, elseifs, els, ..
+        } => {
             scan_break(then, found);
             for ei in elseifs {
                 scan_break(&ei.body, found);
@@ -241,7 +263,11 @@ fn scan_break(st: &Stmt, found: &mut bool) {
                 scan_break(e, found);
             }
         }
-        StmtKind::Try { body, catches, finally } => {
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
             body.iter().for_each(|s| scan_break(s, found));
             for c in catches {
                 c.body.iter().for_each(|s| scan_break(s, found));
@@ -285,7 +311,9 @@ fn check_body(
     rt: &Option<Type>,
     out: &mut Vec<Diagnostic>,
 ) {
-    let Some(type_str) = checkable_return(rt) else { return };
+    let Some(type_str) = checkable_return(rt) else {
+        return;
+    };
     // Generators are exempt.
     if contains_yield(body) {
         return;
@@ -320,18 +348,28 @@ fn has_return_in_loop(stmts: &[Stmt]) -> bool {
             | StmtKind::For { body, .. }
             | StmtKind::Foreach { body, .. } => walk(body, true),
             StmtKind::Block(b) => b.iter().any(|s| walk(s, in_loop)),
-            StmtKind::If { then, elseifs, els, .. } => {
+            StmtKind::If {
+                then, elseifs, els, ..
+            } => {
                 walk(then, in_loop)
                     || elseifs.iter().any(|ei| walk(&ei.body, in_loop))
                     || els.as_ref().is_some_and(|e| walk(e, in_loop))
             }
-            StmtKind::Switch { cases, .. } => {
-                cases.iter().any(|c| c.body.iter().any(|s| walk(s, in_loop)))
-            }
-            StmtKind::Try { body, catches, finally } => {
+            StmtKind::Switch { cases, .. } => cases
+                .iter()
+                .any(|c| c.body.iter().any(|s| walk(s, in_loop))),
+            StmtKind::Try {
+                body,
+                catches,
+                finally,
+            } => {
                 body.iter().any(|s| walk(s, in_loop))
-                    || catches.iter().any(|c| c.body.iter().any(|s| walk(s, in_loop)))
-                    || finally.as_ref().is_some_and(|f| f.iter().any(|s| walk(s, in_loop)))
+                    || catches
+                        .iter()
+                        .any(|c| c.body.iter().any(|s| walk(s, in_loop)))
+                    || finally
+                        .as_ref()
+                        .is_some_and(|f| f.iter().any(|s| walk(s, in_loop)))
             }
             StmtKind::Declare { body: Some(b), .. } => walk(b, in_loop),
             _ => false,
@@ -358,7 +396,14 @@ fn run_missing_return(fa: &FileAnalysis) -> Vec<Diagnostic> {
     // Closures and anonymous-class methods (expression position).
     walk::for_each_expr(fa.program, &mut |e| match &e.kind {
         ExprKind::Closure(c) => {
-            check_body(fa, "Anonymous function", e.span, &c.body, &c.return_type, &mut out);
+            check_body(
+                fa,
+                "Anonymous function",
+                e.span,
+                &c.body,
+                &c.return_type,
+                &mut out,
+            );
         }
         ExprKind::NewAnon { class, .. } => check_class_methods(fa, class, interner, &mut out),
         // Arrow functions always have an expression body that yields a value —
@@ -369,8 +414,16 @@ fn run_missing_return(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
-fn check_class_methods(fa: &FileAnalysis, c: &ClassDecl, interner: &Interner, out: &mut Vec<Diagnostic>) {
-    let class_name = c.name.map(|n| interner.resolve(n).to_string()).unwrap_or_else(|| "class@anonymous".to_string());
+fn check_class_methods(
+    fa: &FileAnalysis,
+    c: &ClassDecl,
+    interner: &Interner,
+    out: &mut Vec<Diagnostic>,
+) {
+    let class_name = c
+        .name
+        .map(|n| interner.resolve(n).to_string())
+        .unwrap_or_else(|| "class@anonymous".to_string());
     for m in &c.members {
         let Member::Method(md) = m else { continue };
         // Abstract/interface methods have no body — nothing to check.
@@ -378,7 +431,10 @@ fn check_class_methods(fa: &FileAnalysis, c: &ClassDecl, interner: &Interner, ou
         let label = format!("Method {}::{}()", class_name, interner.resolve(md.name));
         // The AST `MethodDecl` carries no span of its own; point at the first body
         // statement (best-effort), falling back to a zero span for empty bodies.
-        let span = body.first().map(|s| s.span).unwrap_or_else(|| Span::new(0, 0));
+        let span = body
+            .first()
+            .map(|s| s.span)
+            .unwrap_or_else(|| Span::new(0, 0));
         check_body(fa, &label, span, body, &md.return_type, out);
     }
 }
@@ -398,7 +454,10 @@ mod tests {
 
     #[test]
     fn empty_body_with_return_type_is_flagged() {
-        assert_eq!(codes("<?php function f(): int {}", run_missing_return), ["return.missing"]);
+        assert_eq!(
+            codes("<?php function f(): int {}", run_missing_return),
+            ["return.missing"]
+        );
     }
 
     #[test]
@@ -412,7 +471,10 @@ mod tests {
     #[test]
     fn if_without_else_is_flagged() {
         assert_eq!(
-            codes("<?php function f(): int { if (cond()) { return 1; } }", run_missing_return),
+            codes(
+                "<?php function f(): int { if (cond()) { return 1; } }",
+                run_missing_return
+            ),
             ["return.missing"]
         );
     }
@@ -420,7 +482,10 @@ mod tests {
     #[test]
     fn method_missing_return_is_flagged() {
         assert_eq!(
-            codes("<?php class C { function m(): string { $x = 1; } }", run_missing_return),
+            codes(
+                "<?php class C { function m(): string { $x = 1; } }",
+                run_missing_return
+            ),
             ["return.missing"]
         );
     }
@@ -475,7 +540,11 @@ mod tests {
 
     #[test]
     fn always_throws_is_ok() {
-        assert!(codes("<?php function f(): int { throw new E(); }", run_missing_return).is_empty());
+        assert!(codes(
+            "<?php function f(): int { throw new E(); }",
+            run_missing_return
+        )
+        .is_empty());
     }
 
     #[test]
@@ -539,7 +608,11 @@ mod tests {
 
     #[test]
     fn infinite_for_loop_is_ok() {
-        assert!(codes("<?php function f(): int { for (;;) { work(); } }", run_missing_return).is_empty());
+        assert!(codes(
+            "<?php function f(): int { for (;;) { work(); } }",
+            run_missing_return
+        )
+        .is_empty());
     }
 
     // --- negatives: generators & abstract -------------------------------------
@@ -573,7 +646,11 @@ mod tests {
 
     #[test]
     fn interface_method_is_ok() {
-        assert!(codes("<?php interface I { function m(): int; }", run_missing_return).is_empty());
+        assert!(codes(
+            "<?php interface I { function m(): int; }",
+            run_missing_return
+        )
+        .is_empty());
     }
 
     // --- closures & arrow fns -------------------------------------------------
@@ -581,14 +658,21 @@ mod tests {
     #[test]
     fn closure_missing_return_is_flagged() {
         assert_eq!(
-            codes("<?php $f = function (): int { $x = 1; };", run_missing_return),
+            codes(
+                "<?php $f = function (): int { $x = 1; };",
+                run_missing_return
+            ),
             ["return.missing"]
         );
     }
 
     #[test]
     fn closure_with_return_is_ok() {
-        assert!(codes("<?php $f = function (): int { return 1; };", run_missing_return).is_empty());
+        assert!(codes(
+            "<?php $f = function (): int { return 1; };",
+            run_missing_return
+        )
+        .is_empty());
     }
 
     #[test]

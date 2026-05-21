@@ -12,19 +12,22 @@
 //! TooWideTypehints→too_wide_typehints (7), Traits→traits (4), Keywords→keywords (4),
 //! Generators→generators (3), Regexp→regexp (2), Namespaces→namespaces (2),
 //! EnumCases→enum_cases (2), Pure→pure (2), Types→types (1), Names→names (1),
-//! Missing→missing (1), Whitespace→whitespace (1), (root)→misc (1).
+//! Missing→missing (1), Whitespace→whitespace (1), DateTimeInstantiation→datetime (1),
+//! (root)→misc (1).
 //!
 //! Skipped (phpstan-internal, not user-code analysis): **Api** (phpstan
 //! extension-development API) and **Ignore** (phpstan's own ignore-comment
 //! handling — we do suppression in `php-cli`).
 
-use crate::RuleEntry;
+use crate::{FileAnalysis, RuleEntry};
+use php_types::Type;
 
 mod arrays;
 mod cast;
 mod classes;
 mod comparison;
 mod constants;
+mod datetime;
 mod dead_code;
 mod enum_cases;
 mod exceptions;
@@ -55,6 +58,7 @@ pub(crate) static CATEGORY_RULES: &[&[RuleEntry]] = &[
     classes::RULES,
     comparison::RULES,
     constants::RULES,
+    datetime::RULES,
     dead_code::RULES,
     enum_cases::RULES,
     exceptions::RULES,
@@ -78,3 +82,65 @@ pub(crate) static CATEGORY_RULES: &[&[RuleEntry]] = &[
     variables::RULES,
     whitespace::RULES,
 ];
+
+pub(crate) fn type_contains_null(t: &Type) -> bool {
+    match t {
+        Type::Null | Type::Nullable(_) => true,
+        Type::Union(parts) => parts.iter().any(type_contains_null),
+        _ => false,
+    }
+}
+
+pub(crate) fn non_null_part(t: &Type) -> Option<Type> {
+    if !type_contains_null(t) || matches!(t, Type::Null) {
+        return None;
+    }
+    let stripped = php_infer::strip_null_lenient(t);
+    if matches!(stripped, Type::Null | Type::Never) {
+        None
+    } else {
+        Some(stripped)
+    }
+}
+
+pub(crate) fn nullable_type_display(t: &Type) -> String {
+    fn collect(t: &Type, shown: &mut Vec<String>) -> bool {
+        match t {
+            Type::Null => true,
+            Type::Nullable(inner) => {
+                collect(inner, shown);
+                true
+            }
+            Type::Union(parts) => {
+                let mut saw_null = false;
+                for part in parts {
+                    saw_null |= collect(part, shown);
+                }
+                saw_null
+            }
+            other => {
+                let s = other.to_string();
+                if !shown.contains(&s) {
+                    shown.push(s);
+                }
+                false
+            }
+        }
+    }
+
+    let mut shown = Vec::new();
+    let saw_null = collect(t, &mut shown);
+    if saw_null {
+        shown.push("null".to_string());
+    }
+    shown.join("|")
+}
+
+pub(crate) fn known_objectish_type(fa: &FileAnalysis, t: &Type) -> bool {
+    match t {
+        Type::Named { fqn, .. } => fa.project.has_class(fqn) || fa.reflection.class(fqn).is_some(),
+        Type::Union(parts) => !parts.is_empty() && parts.iter().all(|p| known_objectish_type(fa, p)),
+        Type::Intersection(parts) => parts.iter().any(|p| known_objectish_type(fa, p)),
+        _ => false,
+    }
+}

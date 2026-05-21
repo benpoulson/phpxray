@@ -89,41 +89,41 @@ pub enum TokenKind {
     NsSeparator, // a lone `\`
 
     // multi-character
-    Pow,           // **
-    Sl,            // <<
-    Sr,            // >>
-    Coalesce,      // ??
-    Inc,           // ++
-    Dec,           // --
-    Arrow,         // ->
-    NullsafeArrow, // ?->
-    DoubleArrow,   // =>
-    DoubleColon,   // ::
-    IsEqual,       // ==
-    IsNotEqual,    // != or <>
-    IsIdentical,   // ===
-    IsNotIdentical,// !==
-    LtEq,          // <=
-    GtEq,          // >=
-    Spaceship,     // <=>
-    BoolAnd,       // &&
-    BoolOr,        // ||
-    PlusEq,        // +=
-    MinusEq,       // -=
-    MulEq,         // *=
-    DivEq,         // /=
-    ConcatEq,      // .=
-    ModEq,         // %=
-    PowEq,         // **=
-    AndEq,         // &=
-    OrEq,          // |=
-    XorEq,         // ^=
-    SlEq,          // <<=
-    SrEq,          // >>=
-    CoalesceEq,    // ??=
-    Ellipsis,      // ...
-    Attribute,     // #[
-    PipeOp,        // |>
+    Pow,            // **
+    Sl,             // <<
+    Sr,             // >>
+    Coalesce,       // ??
+    Inc,            // ++
+    Dec,            // --
+    Arrow,          // ->
+    NullsafeArrow,  // ?->
+    DoubleArrow,    // =>
+    DoubleColon,    // ::
+    IsEqual,        // ==
+    IsNotEqual,     // != or <>
+    IsIdentical,    // ===
+    IsNotIdentical, // !==
+    LtEq,           // <=
+    GtEq,           // >=
+    Spaceship,      // <=>
+    BoolAnd,        // &&
+    BoolOr,         // ||
+    PlusEq,         // +=
+    MinusEq,        // -=
+    MulEq,          // *=
+    DivEq,          // /=
+    ConcatEq,       // .=
+    ModEq,          // %=
+    PowEq,          // **=
+    AndEq,          // &=
+    OrEq,           // |=
+    XorEq,          // ^=
+    SlEq,           // <<=
+    SrEq,           // >>=
+    CoalesceEq,     // ??=
+    Ellipsis,       // ...
+    Attribute,      // #[
+    PipeOp,         // |>
 
     // casts: `(int)`, `(float)`, ...
     IntCast,
@@ -272,17 +272,85 @@ impl TokenKind {
 /// expects an already-lowercased identifier.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kw {
-    Exit, Eval, Include, IncludeOnce, Require, RequireOnce,
-    LogicalOr, LogicalXor, LogicalAnd, Print, Yield, Instanceof, New, Clone,
-    If, Elseif, Else, Endif, Echo, Do, While, Endwhile,
-    For, Endfor, Foreach, Endforeach, Declare, Enddeclare, As,
-    Switch, Endswitch, Case, Default, Match, Break, Continue, Goto,
-    Function, Fn, Const, Return, Try, Catch, Finally, Throw,
-    Use, Insteadof, Global, Static, Abstract, Final,
-    Private, Protected, Public, Readonly, Var, Unset, Isset, Empty,
-    HaltCompiler, Class, Trait, Interface, Enum, Extends, Implements, Namespace,
-    List, Array, Callable,
-    Line, File, Dir, ClassC, TraitC, MethodC, FuncC, PropertyC, NsC,
+    Exit,
+    Eval,
+    Include,
+    IncludeOnce,
+    Require,
+    RequireOnce,
+    LogicalOr,
+    LogicalXor,
+    LogicalAnd,
+    Print,
+    Yield,
+    Instanceof,
+    New,
+    Clone,
+    If,
+    Elseif,
+    Else,
+    Endif,
+    Echo,
+    Do,
+    While,
+    Endwhile,
+    For,
+    Endfor,
+    Foreach,
+    Endforeach,
+    Declare,
+    Enddeclare,
+    As,
+    Switch,
+    Endswitch,
+    Case,
+    Default,
+    Match,
+    Break,
+    Continue,
+    Goto,
+    Function,
+    Fn,
+    Const,
+    Return,
+    Try,
+    Catch,
+    Finally,
+    Throw,
+    Use,
+    Insteadof,
+    Global,
+    Static,
+    Abstract,
+    Final,
+    Private,
+    Protected,
+    Public,
+    Readonly,
+    Var,
+    Unset,
+    Isset,
+    Empty,
+    HaltCompiler,
+    Class,
+    Trait,
+    Interface,
+    Enum,
+    Extends,
+    Implements,
+    Namespace,
+    List,
+    Array,
+    Callable,
+    Line,
+    File,
+    Dir,
+    ClassC,
+    TraitC,
+    MethodC,
+    FuncC,
+    PropertyC,
+    NsC,
 }
 
 impl Kw {

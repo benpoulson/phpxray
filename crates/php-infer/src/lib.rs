@@ -29,7 +29,7 @@ use php_ast::{BinOp, CastKind, Expr, ExprKind, MemberName, Name, UnOp};
 use php_intern::Interner;
 use php_reflect::ReflectionIndex;
 use php_resolve::{Resolution, Scope};
-use php_types::Type;
+use php_types::{CallableSig, Type};
 use std::collections::HashMap;
 
 /// The context an expression is typed in.
@@ -58,7 +58,15 @@ pub struct TypeCtx<'a> {
 impl<'a> TypeCtx<'a> {
     /// A context with no class and no known variables.
     pub fn new(index: &'a ReflectionIndex, scope: &'a Scope, interner: &'a Interner) -> Self {
-        TypeCtx { index, scope, interner, class: None, vars: HashMap::new(), depth: 0, native: false }
+        TypeCtx {
+            index,
+            scope,
+            interner,
+            class: None,
+            vars: HashMap::new(),
+            depth: 0,
+            native: false,
+        }
     }
 
     /// Infer the type of `e`.
@@ -80,13 +88,30 @@ impl<'a> TypeCtx<'a> {
             // --- composite ---
             ExprKind::Array { items, .. } => self.array_type(items),
             ExprKind::Call { callee, args } => self.call_type(callee, args),
-            ExprKind::MethodCall { recv, nullsafe, method, args, .. } => {
+            ExprKind::MethodCall {
+                recv,
+                nullsafe,
+                method,
+                args,
+                ..
+            } => {
+                if let Some(t) = self.place_key(e).and_then(|k| self.vars.get(&k).cloned()) {
+                    return t;
+                }
                 self.method_type(recv, *nullsafe, method, args)
             }
-            ExprKind::StaticCall { class, method, args } => self.static_call_type(class, method, args),
+            ExprKind::StaticCall {
+                class,
+                method,
+                args,
+            } => self.static_call_type(class, method, args),
             ExprKind::New { class, .. } => self.class_type(class).unwrap_or(Type::Object),
             ExprKind::NewAnon { .. } => Type::Object,
-            ExprKind::Prop { base, nullsafe, name } => {
+            ExprKind::Prop {
+                base,
+                nullsafe,
+                name,
+            } => {
                 // A flow-narrowed property place (`$this->prop` after a guard) wins
                 // over the declared property type.
                 if let Some(t) = self.place_key(e).and_then(|k| self.vars.get(&k).cloned()) {
@@ -113,10 +138,13 @@ impl<'a> TypeCtx<'a> {
                 };
                 Type::union(vec![then_ty, self.infer(els)])
             }
-            ExprKind::Coalesce { lhs, rhs } => Type::union(vec![strip_null(self.infer(lhs)), self.infer(rhs)]),
-            ExprKind::PreInc(e) | ExprKind::PreDec(e) | ExprKind::PostInc(e) | ExprKind::PostDec(e) => {
-                inc_dec_type(self.infer(e))
+            ExprKind::Coalesce { lhs, rhs } => {
+                Type::union(vec![strip_null(self.infer(lhs)), self.infer(rhs)])
             }
+            ExprKind::PreInc(e)
+            | ExprKind::PreDec(e)
+            | ExprKind::PostInc(e)
+            | ExprKind::PostDec(e) => inc_dec_type(self.infer(e)),
             ExprKind::Instanceof { .. } => Type::Bool,
             ExprKind::Clone(e) => self.infer(e),
             ExprKind::Print(_) => Type::Int,
@@ -128,7 +156,10 @@ impl<'a> TypeCtx<'a> {
             ExprKind::Paren(e) => self.infer(e),
 
             // --- control-flow-ish / not yet modelled ---
-            ExprKind::Closure(_) | ExprKind::ArrowFn(_) => Type::Named { fqn: "Closure".into(), args: vec![] },
+            ExprKind::Closure(_) | ExprKind::ArrowFn(_) => Type::Named {
+                fqn: "Closure".into(),
+                args: vec![],
+            },
             ExprKind::Throw(_) | ExprKind::Exit(_) => Type::Never,
             ExprKind::Yield { .. } | ExprKind::YieldFrom(_) => Type::Mixed,
             ExprKind::Include { .. } | ExprKind::Eval(_) => Type::Mixed,
@@ -141,7 +172,11 @@ impl<'a> TypeCtx<'a> {
     /// The type of variable `$name`.
     fn variable(&self, name: &str) -> Type {
         if name == "this" {
-            return self.class.clone().map(|fqn| Type::Named { fqn, args: vec![] }).unwrap_or(Type::Mixed);
+            return self
+                .class
+                .clone()
+                .map(|fqn| Type::Named { fqn, args: vec![] })
+                .unwrap_or(Type::Mixed);
         }
         self.vars.get(name).cloned().unwrap_or(Type::Mixed)
     }
@@ -181,7 +216,10 @@ impl<'a> TypeCtx<'a> {
         const MAX_SHAPE_FIELDS: usize = 64;
         if items.len() <= MAX_SHAPE_FIELDS {
             if let Some(fields) = self.shape_fields(items) {
-                return Type::Shape { fields, sealed: true };
+                return Type::Shape {
+                    fields,
+                    sealed: true,
+                };
             }
         }
         let mut keys = Vec::new();
@@ -195,7 +233,12 @@ impl<'a> TypeCtx<'a> {
                 }
                 None => keys.push(Type::Int), // list-style integer key
             }
-            vals.push(it.value.as_ref().map(|v| self.infer(v)).unwrap_or(Type::Mixed));
+            vals.push(
+                it.value
+                    .as_ref()
+                    .map(|v| self.infer(v))
+                    .unwrap_or(Type::Mixed),
+            );
         }
         // A literal with only positional (keyless) items is a `list<V>` — matches
         // phpstan, and is what user code assigns to `list<…>`-typed properties.
@@ -212,22 +255,51 @@ impl<'a> TypeCtx<'a> {
         let mut fields: Vec<php_types::ShapeField> = Vec::with_capacity(items.len());
         for it in items {
             let key = const_key(it.key.as_ref()?)?;
-            if fields.iter().any(|f| f.key.as_deref() == Some(key.as_str())) {
+            if fields
+                .iter()
+                .any(|f| f.key.as_deref() == Some(key.as_str()))
+            {
                 return None; // duplicate key — not a well-formed shape
             }
-            let ty = it.value.as_ref().map(|v| self.infer(v)).unwrap_or(Type::Mixed);
-            fields.push(php_types::ShapeField { key: Some(key), optional: false, ty });
+            let ty = it
+                .value
+                .as_ref()
+                .map(|v| self.infer(v))
+                .unwrap_or(Type::Mixed);
+            fields.push(php_types::ShapeField {
+                key: Some(key),
+                optional: false,
+                ty,
+            });
         }
         Some(fields)
     }
 
     /// Return type of a free function call `f(...)`.
     fn call_type(&self, callee: &Expr, args: &[php_ast::Arg]) -> Type {
-        let ExprKind::Name(n) = &callee.kind else { return Type::Mixed };
+        let ExprKind::Name(n) = &callee.kind else {
+            return if is_first_class_callable(args) {
+                Type::Callable(None)
+            } else {
+                Type::Mixed
+            };
+        };
+        if is_first_class_callable(args) {
+            return self
+                .function_reflection(n)
+                .map(|f| self.function_callable_type(f))
+                .unwrap_or(Type::Callable(None));
+        }
         // A few built-ins have argument-dependent return types that a static stub
         // can't express (it gives the worst-case union); model the common ones so
         // their result doesn't poison downstream type checks.
-        let fname = n.text.trim_start_matches('\\').rsplit('\\').next().unwrap_or(&n.text).to_ascii_lowercase();
+        let fname = n
+            .text
+            .trim_start_matches('\\')
+            .rsplit('\\')
+            .next()
+            .unwrap_or(&n.text)
+            .to_ascii_lowercase();
         if let Some(t) = self.dynamic_return(&fname, args) {
             return t;
         }
@@ -258,7 +330,9 @@ impl<'a> TypeCtx<'a> {
         args: &[php_ast::Arg],
         callee_class: Option<String>,
     ) -> Type {
-        let Some((body, callee_scope)) = body else { return declared.clone() };
+        let Some((body, callee_scope)) = body else {
+            return declared.clone();
+        };
         // Only refine a *concrete* nullable (`?T` / `T|null`) — where pruning a
         // guarded `return null` actually tightens the type. Bare `mixed` is left be.
         let refinable = matches!(declared, Type::Nullable(_))
@@ -306,18 +380,26 @@ impl<'a> TypeCtx<'a> {
             match &s.kind {
                 S::Return(Some(e)) => out.push(self.infer(e)),
                 S::Block(b) => self.collect_returns(b, out),
-                S::If { cond, then, elseifs, els } => {
-                    self.collect_if_returns(cond, then, elseifs, els.as_deref(), out)
-                }
-                S::While { body, .. } | S::DoWhile { body, .. } | S::For { body, .. } | S::Foreach { body, .. } => {
-                    self.collect_returns(std::slice::from_ref(body), out)
-                }
+                S::If {
+                    cond,
+                    then,
+                    elseifs,
+                    els,
+                } => self.collect_if_returns(cond, then, elseifs, els.as_deref(), out),
+                S::While { body, .. }
+                | S::DoWhile { body, .. }
+                | S::For { body, .. }
+                | S::Foreach { body, .. } => self.collect_returns(std::slice::from_ref(body), out),
                 S::Switch { cases, .. } => {
                     for c in cases {
                         self.collect_returns(&c.body, out);
                     }
                 }
-                S::Try { body, catches, finally } => {
+                S::Try {
+                    body,
+                    catches,
+                    finally,
+                } => {
                     self.collect_returns(body, out);
                     for c in catches {
                         self.collect_returns(&c.body, out);
@@ -368,22 +450,33 @@ impl<'a> TypeCtx<'a> {
     fn static_truth(&self, cond: &Expr) -> Option<bool> {
         match &cond.kind {
             ExprKind::Paren(inner) => self.static_truth(inner),
-            ExprKind::Unary { op: UnOp::Not, expr } => self.static_truth(expr).map(|b| !b),
-            ExprKind::Binary { op: BinOp::BoolAnd | BinOp::LogicalAnd, lhs, rhs } => {
-                match (self.static_truth(lhs), self.static_truth(rhs)) {
-                    (Some(false), _) | (_, Some(false)) => Some(false),
-                    (Some(true), Some(true)) => Some(true),
-                    _ => None,
-                }
-            }
-            ExprKind::Binary { op: BinOp::BoolOr | BinOp::LogicalOr, lhs, rhs } => {
-                match (self.static_truth(lhs), self.static_truth(rhs)) {
-                    (Some(true), _) | (_, Some(true)) => Some(true),
-                    (Some(false), Some(false)) => Some(false),
-                    _ => None,
-                }
-            }
-            ExprKind::Binary { op: op @ (BinOp::Identical | BinOp::Eq | BinOp::NotIdentical | BinOp::NotEq), lhs, rhs } => {
+            ExprKind::Unary {
+                op: UnOp::Not,
+                expr,
+            } => self.static_truth(expr).map(|b| !b),
+            ExprKind::Binary {
+                op: BinOp::BoolAnd | BinOp::LogicalAnd,
+                lhs,
+                rhs,
+            } => match (self.static_truth(lhs), self.static_truth(rhs)) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), Some(true)) => Some(true),
+                _ => None,
+            },
+            ExprKind::Binary {
+                op: BinOp::BoolOr | BinOp::LogicalOr,
+                lhs,
+                rhs,
+            } => match (self.static_truth(lhs), self.static_truth(rhs)) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            },
+            ExprKind::Binary {
+                op: op @ (BinOp::Identical | BinOp::Eq | BinOp::NotIdentical | BinOp::NotEq),
+                lhs,
+                rhs,
+            } => {
                 let eq = matches!(op, BinOp::Identical | BinOp::Eq);
                 // `$x === null` / `null === $x`: decided by whether the operand can be null.
                 if is_null_literal(lhs) || is_null_literal(rhs) {
@@ -392,7 +485,9 @@ impl<'a> TypeCtx<'a> {
                 }
                 // `$type === Foo::BAR` between two known literal ints (e.g. an enum-like
                 // class constant passed as an argument): compare the values.
-                if let (Type::LiteralInt(a), Type::LiteralInt(b)) = (self.infer(lhs), self.infer(rhs)) {
+                if let (Type::LiteralInt(a), Type::LiteralInt(b)) =
+                    (self.infer(lhs), self.infer(rhs))
+                {
                     let same = a == b;
                     return Some(if eq { same } else { !same });
                 }
@@ -401,14 +496,24 @@ impl<'a> TypeCtx<'a> {
             // `a < b` / `<=` / `>` / `>=` between int-valued operands, decided when
             // the operand ranges don't overlap (e.g. `1 < int<2, max>` is always
             // true) — drives loop-iteration proof.
-            ExprKind::Binary { op: op @ (BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq), lhs, rhs } => {
+            ExprKind::Binary {
+                op: op @ (BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq),
+                lhs,
+                rhs,
+            } => {
                 let a = int_bounds(&self.infer(lhs))?;
                 let b = int_bounds(&self.infer(rhs))?;
                 cmp_ranges(*op, a, b)
             }
             ExprKind::Call { callee, args } => {
-                let ExprKind::Name(n) = &callee.kind else { return None };
-                if !n.text.trim_start_matches('\\').eq_ignore_ascii_case("is_null") {
+                let ExprKind::Name(n) = &callee.kind else {
+                    return None;
+                };
+                if !n
+                    .text
+                    .trim_start_matches('\\')
+                    .eq_ignore_ascii_case("is_null")
+                {
                     return None;
                 }
                 null_truth(&self.infer(&args.first()?.value))
@@ -424,7 +529,10 @@ impl<'a> TypeCtx<'a> {
         // subject yields a string, an array subject an array. The stub can only
         // say `string|array`, which then poisons every downstream string use.
         if let Some(idx) = match fname {
-            "str_replace" | "str_ireplace" | "preg_replace" | "preg_replace_callback"
+            "str_replace"
+            | "str_ireplace"
+            | "preg_replace"
+            | "preg_replace_callback"
             | "preg_replace_callback_array" => Some(2),
             "substr_replace" => Some(0),
             _ => None,
@@ -519,16 +627,48 @@ impl<'a> TypeCtx<'a> {
     }
 
     /// Return type of `$recv->method(...)`.
-    fn method_type(&self, recv: &Expr, nullsafe: bool, method: &MemberName, args: &[php_ast::Arg]) -> Type {
+    fn method_type(
+        &self,
+        recv: &Expr,
+        nullsafe: bool,
+        method: &MemberName,
+        args: &[php_ast::Arg],
+    ) -> Type {
         let recv_ty = self.infer(recv);
-        let Some(name) = self.member_ident(method) else { return Type::Mixed };
-        let Some(fqn) = self.type_class_fqn(&recv_ty) else { return Type::Mixed };
+        let Some(name) = self.member_ident(method) else {
+            return if is_first_class_callable(args) {
+                Type::Callable(None)
+            } else {
+                Type::Mixed
+            };
+        };
+        let Some(fqn) = self.type_class_fqn(&recv_ty) else {
+            return if is_first_class_callable(args) {
+                Type::Callable(None)
+            } else {
+                Type::Mixed
+            };
+        };
+        if is_first_class_callable(args) {
+            return self
+                .index
+                .find_method(&fqn, &name)
+                .map(|found| self.method_callable_type(&found.member, &fqn))
+                .unwrap_or(Type::Callable(None));
+        }
         let ret = match self.index.find_method(&fqn, &name) {
             Some(found) if self.native => self.bind_relative(found.member.native_return, &fqn),
             Some(found) => {
-                let params: Vec<String> = found.member.params.iter().map(|p| p.name.clone()).collect();
+                let params: Vec<String> =
+                    found.member.params.iter().map(|p| p.name.clone()).collect();
                 let body = self.index.method_body(&found.declaring_class, &name);
-                let refined = self.refine_return(&found.member.return_type, body, &params, args, Some(fqn.clone()));
+                let refined = self.refine_return(
+                    &found.member.return_type,
+                    body,
+                    &params,
+                    args,
+                    Some(fqn.clone()),
+                );
                 self.bind_relative(refined, &fqn)
             }
             None => Type::Mixed,
@@ -542,16 +682,40 @@ impl<'a> TypeCtx<'a> {
 
     /// Return type of `Class::method(...)`.
     fn static_call_type(&self, class: &Expr, method: &MemberName, args: &[php_ast::Arg]) -> Type {
-        let Some(name) = self.member_ident(method) else { return Type::Mixed };
-        let Some(fqn) = self.class_type(class).and_then(|t| self.type_class_fqn(&t)) else {
-            return Type::Mixed;
+        let Some(name) = self.member_ident(method) else {
+            return if is_first_class_callable(args) {
+                Type::Callable(None)
+            } else {
+                Type::Mixed
+            };
         };
+        let Some(fqn) = self.class_type(class).and_then(|t| self.type_class_fqn(&t)) else {
+            return if is_first_class_callable(args) {
+                Type::Callable(None)
+            } else {
+                Type::Mixed
+            };
+        };
+        if is_first_class_callable(args) {
+            return self
+                .index
+                .find_method(&fqn, &name)
+                .map(|found| self.method_callable_type(&found.member, &fqn))
+                .unwrap_or(Type::Callable(None));
+        }
         match self.index.find_method(&fqn, &name) {
             Some(found) if self.native => self.bind_relative(found.member.native_return, &fqn),
             Some(found) => {
-                let params: Vec<String> = found.member.params.iter().map(|p| p.name.clone()).collect();
+                let params: Vec<String> =
+                    found.member.params.iter().map(|p| p.name.clone()).collect();
                 let body = self.index.method_body(&found.declaring_class, &name);
-                let refined = self.refine_return(&found.member.return_type, body, &params, args, Some(fqn.clone()));
+                let refined = self.refine_return(
+                    &found.member.return_type,
+                    body,
+                    &params,
+                    args,
+                    Some(fqn.clone()),
+                );
                 self.bind_relative(refined, &fqn)
             }
             None => Type::Mixed,
@@ -561,8 +725,12 @@ impl<'a> TypeCtx<'a> {
     /// Type of `$base->prop`.
     fn prop_type(&self, base: &Expr, nullsafe: bool, name: &MemberName) -> Type {
         let base_ty = self.infer(base);
-        let Some(prop) = self.member_ident(name) else { return Type::Mixed };
-        let Some(fqn) = self.type_class_fqn(&base_ty) else { return Type::Mixed };
+        let Some(prop) = self.member_ident(name) else {
+            return Type::Mixed;
+        };
+        let Some(fqn) = self.type_class_fqn(&base_ty) else {
+            return Type::Mixed;
+        };
         let ty = match self.index.find_property(&fqn, &prop) {
             Some(found) if self.native => found.member.native_ty,
             Some(found) => found.member.ty,
@@ -577,7 +745,9 @@ impl<'a> TypeCtx<'a> {
 
     /// Type of `Class::$prop`.
     fn static_prop_type(&self, class: &Expr, name: &MemberName) -> Type {
-        let Some(prop) = self.member_ident(name) else { return Type::Mixed };
+        let Some(prop) = self.member_ident(name) else {
+            return Type::Mixed;
+        };
         let Some(fqn) = self.class_type(class).and_then(|t| self.type_class_fqn(&t)) else {
             return Type::Mixed;
         };
@@ -672,7 +842,11 @@ impl<'a> TypeCtx<'a> {
             | LogicalAnd | LogicalOr | LogicalXor => Type::Bool,
             // The spaceship operator yields exactly `-1|0|1` (phpstan models it so,
             // which is why `@return -1|0|1` comparison methods type-check).
-            Spaceship => Type::union(vec![Type::LiteralInt(-1), Type::LiteralInt(0), Type::LiteralInt(1)]),
+            Spaceship => Type::union(vec![
+                Type::LiteralInt(-1),
+                Type::LiteralInt(0),
+                Type::LiteralInt(1),
+            ]),
             Coalesce => Type::union(vec![strip_null(self.infer(lhs)), self.infer(rhs)]),
             Add | Sub | Mul | Div | Pow => self.arith(op, self.infer(lhs), self.infer(rhs)),
             Pipe => Type::Mixed,
@@ -732,7 +906,9 @@ impl<'a> TypeCtx<'a> {
     }
 
     fn self_type(&self) -> Option<Type> {
-        self.class.clone().map(|fqn| Type::Named { fqn, args: vec![] })
+        self.class
+            .clone()
+            .map(|fqn| Type::Named { fqn, args: vec![] })
     }
 
     fn parent_type(&self) -> Option<Type> {
@@ -745,24 +921,40 @@ impl<'a> TypeCtx<'a> {
     /// returns `Factory`. Recurses through composite types.
     fn bind_relative(&self, ty: Type, bound: &str) -> Type {
         match ty {
-            Type::SelfType | Type::StaticType => Type::Named { fqn: bound.to_string(), args: vec![] },
+            Type::SelfType | Type::StaticType => Type::Named {
+                fqn: bound.to_string(),
+                args: vec![],
+            },
             Type::Parent => self
                 .index
                 .class(bound)
                 .and_then(|c| c.parents.first().cloned())
                 .unwrap_or(Type::Parent),
             Type::Nullable(inner) => self.bind_relative(*inner, bound).nullable(),
-            Type::Union(parts) => Type::union(parts.into_iter().map(|p| self.bind_relative(p, bound)).collect()),
-            Type::Intersection(parts) => {
-                Type::intersection(parts.into_iter().map(|p| self.bind_relative(p, bound)).collect())
-            }
-            Type::Array(Some(kv)) => {
-                Type::Array(Some(Box::new((self.bind_relative(kv.0, bound), self.bind_relative(kv.1, bound)))))
-            }
+            Type::Union(parts) => Type::union(
+                parts
+                    .into_iter()
+                    .map(|p| self.bind_relative(p, bound))
+                    .collect(),
+            ),
+            Type::Intersection(parts) => Type::intersection(
+                parts
+                    .into_iter()
+                    .map(|p| self.bind_relative(p, bound))
+                    .collect(),
+            ),
+            Type::Array(Some(kv)) => Type::Array(Some(Box::new((
+                self.bind_relative(kv.0, bound),
+                self.bind_relative(kv.1, bound),
+            )))),
             Type::List(inner) => Type::List(Box::new(self.bind_relative(*inner, bound))),
-            Type::Named { fqn, args } => {
-                Type::Named { fqn, args: args.into_iter().map(|a| self.bind_relative(a, bound)).collect() }
-            }
+            Type::Named { fqn, args } => Type::Named {
+                fqn,
+                args: args
+                    .into_iter()
+                    .map(|a| self.bind_relative(a, bound))
+                    .collect(),
+            },
             other => other,
         }
     }
@@ -791,11 +983,56 @@ impl<'a> TypeCtx<'a> {
     fn function_reflection(&self, n: &Name) -> Option<&php_reflect::FunctionReflection> {
         match self.scope.resolve_function(n) {
             Resolution::Fqn(fqn) => self.index.function(&fqn),
-            Resolution::Fallback { namespaced, global } => {
-                self.index.function(&namespaced).or_else(|| self.index.function(&global))
-            }
+            Resolution::Fallback { namespaced, global } => self
+                .index
+                .function(&namespaced)
+                .or_else(|| self.index.function(&global)),
             Resolution::LateStatic(_) | Resolution::BuiltinType(_) => None,
         }
+    }
+
+    fn function_callable_type(&self, f: &php_reflect::FunctionReflection) -> Type {
+        let params = f
+            .params
+            .iter()
+            .map(|p| {
+                if self.native {
+                    p.native_ty.clone()
+                } else {
+                    p.ty.clone()
+                }
+            })
+            .collect();
+        let ret = if self.native {
+            f.native_return.clone()
+        } else {
+            f.return_type.clone()
+        };
+        Type::Callable(Some(Box::new(CallableSig { params, ret })))
+    }
+
+    fn method_callable_type(&self, m: &php_reflect::MethodReflection, bound: &str) -> Type {
+        let params = m
+            .params
+            .iter()
+            .map(|p| {
+                let ty = if self.native {
+                    p.native_ty.clone()
+                } else {
+                    p.ty.clone()
+                };
+                self.bind_relative(ty, bound)
+            })
+            .collect();
+        let ret = if self.native {
+            m.native_return.clone()
+        } else {
+            m.return_type.clone()
+        };
+        Type::Callable(Some(Box::new(CallableSig {
+            params,
+            ret: self.bind_relative(ret, bound),
+        })))
     }
 }
 
@@ -811,6 +1048,10 @@ fn cast_type(kind: CastKind) -> Type {
         CastKind::Unset => Type::Null,
         CastKind::Void => Type::Void,
     }
+}
+
+fn is_first_class_callable(args: &[php_ast::Arg]) -> bool {
+    args.iter().any(|a| a.placeholder)
 }
 
 /// The type of a magic constant (`__LINE__`, `__FILE__`, …), if `name` is one.
@@ -840,9 +1081,13 @@ fn strip_falsy(t: Type) -> Type {
         Type::Null | Type::False => Type::Never,
         Type::Bool => Type::True,
         Type::Nullable(inner) => strip_falsy(*inner),
-        Type::Union(parts) => {
-            Type::union(parts.into_iter().filter(|p| !matches!(p, Type::Null | Type::False)).map(strip_falsy).collect())
-        }
+        Type::Union(parts) => Type::union(
+            parts
+                .into_iter()
+                .filter(|p| !matches!(p, Type::Null | Type::False))
+                .map(strip_falsy)
+                .collect(),
+        ),
         other => other,
     }
 }
@@ -910,7 +1155,7 @@ fn const_key(e: &Expr) -> Option<String> {
 fn null_truth(t: &Type) -> Option<bool> {
     match t {
         Type::Null => Some(true),
-        Type::Nullable(_) | Type::Mixed | Type::Unknown(_) => None,
+        Type::Nullable(_) | Type::Mixed | Type::ExplicitMixed | Type::Unknown(_) => None,
         Type::Union(parts) if parts.contains(&Type::Null) => None,
         _ => Some(false),
     }
@@ -942,7 +1187,7 @@ fn is_null_literal(e: &Expr) -> bool {
 /// Whether `t` is, or contains (within a union/nullable), `mixed`/`unknown`.
 fn contains_mixed(t: &Type) -> bool {
     match t {
-        Type::Mixed | Type::Unknown(_) => true,
+        Type::Mixed | Type::ExplicitMixed | Type::Unknown(_) => true,
         Type::Union(parts) => parts.iter().any(contains_mixed),
         Type::Nullable(inner) => contains_mixed(inner),
         _ => false,
@@ -966,7 +1211,11 @@ fn int_bounds(t: &Type) -> Option<(Option<i64>, Option<i64>)> {
 
 /// Statically decide `a OP b` between two integer ranges, when the ranges make it
 /// certain; `None` if they overlap. `a`/`b` are `(min, max)` with `None` = ±∞.
-fn cmp_ranges(op: BinOp, a: (Option<i64>, Option<i64>), b: (Option<i64>, Option<i64>)) -> Option<bool> {
+fn cmp_ranges(
+    op: BinOp,
+    a: (Option<i64>, Option<i64>),
+    b: (Option<i64>, Option<i64>),
+) -> Option<bool> {
     let (a_lo, a_hi) = a;
     let (b_lo, b_hi) = b;
     // `a < b` is always true iff max(a) < min(b); always false iff min(a) >= max(b).
@@ -1045,8 +1294,16 @@ mod tests {
     fn shape() -> Type {
         Type::Shape {
             fields: vec![
-                php_types::ShapeField { key: Some("a".into()), optional: false, ty: Type::Int },
-                php_types::ShapeField { key: Some("b".into()), optional: false, ty: Type::String },
+                php_types::ShapeField {
+                    key: Some("a".into()),
+                    optional: false,
+                    ty: Type::Int,
+                },
+                php_types::ShapeField {
+                    key: Some("b".into()),
+                    optional: false,
+                    ty: Type::String,
+                },
             ],
             sealed: true,
         }
@@ -1081,7 +1338,10 @@ mod tests {
         assert_eq!(infer("['a' => 1, 'b' => 2];"), "array{a: 1, b: 2}");
         assert_eq!(infer("[1, 'x'];"), "list<1|'x'>");
         // A dynamic key drops shape precision back to `array<K, V>`.
-        assert_eq!(infer_with("[$k => 1, 'b' => 2];", &[("k", Type::String)], None), "array<string, 1|2>");
+        assert_eq!(
+            infer_with("[$k => 1, 'b' => 2];", &[("k", Type::String)], None),
+            "array<string, 1|2>"
+        );
     }
 
     #[test]
@@ -1096,8 +1356,14 @@ mod tests {
             }
         }
         Name::concat($x, $y);";
-        let named = Type::Named { fqn: "Name".into(), args: vec![] };
-        assert_eq!(infer_with(src, &[("x", named.clone()), ("y", named)], None), "Name");
+        let named = Type::Named {
+            fqn: "Name".into(),
+            args: vec![],
+        };
+        assert_eq!(
+            infer_with(src, &[("x", named.clone()), ("y", named)], None),
+            "Name"
+        );
     }
 
     #[test]
@@ -1110,7 +1376,10 @@ mod tests {
             }
         }
         Name::concat($x, $y);";
-        let nn = Type::Nullable(Box::new(Type::Named { fqn: "Name".into(), args: vec![] }));
+        let nn = Type::Nullable(Box::new(Type::Named {
+            fqn: "Name".into(),
+            args: vec![],
+        }));
         let got = infer_with(src, &[("x", nn.clone()), ("y", nn)], None);
         assert!(got.contains("null"), "expected nullable, got {got}");
     }
@@ -1134,8 +1403,20 @@ mod tests {
         class Name {}
         $c->resolve($n, C::TYPE_NORMAL);";
         let vars = &[
-            ("c", Type::Named { fqn: "C".into(), args: vec![] }),
-            ("n", Type::Named { fqn: "Name".into(), args: vec![] }),
+            (
+                "c",
+                Type::Named {
+                    fqn: "C".into(),
+                    args: vec![],
+                },
+            ),
+            (
+                "n",
+                Type::Named {
+                    fqn: "Name".into(),
+                    args: vec![],
+                },
+            ),
         ];
         assert_eq!(infer_with(src, vars, None), "Name");
     }
@@ -1143,7 +1424,14 @@ mod tests {
     #[test]
     fn short_ternary_strips_falsy() {
         // `$x ?: 5` where `$x: ?int` yields `int` (falsy `null` stripped), not `?int`.
-        assert_eq!(infer_with("$x ?: 5;", &[("x", Type::Nullable(Box::new(Type::Int)))], None), "int");
+        assert_eq!(
+            infer_with(
+                "$x ?: 5;",
+                &[("x", Type::Nullable(Box::new(Type::Int)))],
+                None
+            ),
+            "int"
+        );
     }
 
     #[test]
@@ -1185,7 +1473,14 @@ mod tests {
     #[test]
     fn ternary_and_coalesce() {
         assert_eq!(infer("true ? 1 : 'x';"), "1|'x'");
-        assert_eq!(infer_with("$x ?? 0;", &[("x", Type::Nullable(Box::new(Type::String)))], None), "string|0");
+        assert_eq!(
+            infer_with(
+                "$x ?? 0;",
+                &[("x", Type::Nullable(Box::new(Type::String)))],
+                None
+            ),
+            "string|0"
+        );
     }
 
     #[test]
@@ -1229,11 +1524,31 @@ mod tests {
         "#;
         // `$u->name()` and `$u->age` with $u : User.
         assert_eq!(
-            infer_with(&format!("{src} $u->name();"), &[("u", Type::Named { fqn: "User".into(), args: vec![] })], None),
+            infer_with(
+                &format!("{src} $u->name();"),
+                &[(
+                    "u",
+                    Type::Named {
+                        fqn: "User".into(),
+                        args: vec![]
+                    }
+                )],
+                None
+            ),
             "string"
         );
         assert_eq!(
-            infer_with(&format!("{src} $u->age;"), &[("u", Type::Named { fqn: "User".into(), args: vec![] })], None),
+            infer_with(
+                &format!("{src} $u->age;"),
+                &[(
+                    "u",
+                    Type::Named {
+                        fqn: "User".into(),
+                        args: vec![]
+                    }
+                )],
+                None
+            ),
             "int"
         );
     }
@@ -1242,7 +1557,17 @@ mod tests {
     fn nullsafe_method_is_nullable() {
         let src = "class A { public function f(): int { return 1; } }";
         assert_eq!(
-            infer_with(&format!("{src} $a?->f();"), &[("a", Type::Named { fqn: "A".into(), args: vec![] })], None),
+            infer_with(
+                &format!("{src} $a?->f();"),
+                &[(
+                    "a",
+                    Type::Named {
+                        fqn: "A".into(),
+                        args: vec![]
+                    }
+                )],
+                None
+            ),
             "?int"
         );
     }
@@ -1256,7 +1581,10 @@ mod tests {
             }
         "#;
         assert_eq!(infer(&format!("{src} Factory::make();")), "Factory");
-        assert_eq!(infer(&format!("{src} Factory::class;")), "class-string<Factory>");
+        assert_eq!(
+            infer(&format!("{src} Factory::class;")),
+            "class-string<Factory>"
+        );
     }
 
     #[test]
@@ -1266,7 +1594,17 @@ mod tests {
             class User extends Base {}
         "#;
         assert_eq!(
-            infer_with(&format!("{src} $u->id();"), &[("u", Type::Named { fqn: "User".into(), args: vec![] })], None),
+            infer_with(
+                &format!("{src} $u->id();"),
+                &[(
+                    "u",
+                    Type::Named {
+                        fqn: "User".into(),
+                        args: vec![]
+                    }
+                )],
+                None
+            ),
             "int"
         );
     }

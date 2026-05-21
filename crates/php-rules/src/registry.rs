@@ -99,13 +99,19 @@ impl FileAnalysis<'_> {
     /// inside a closure body, which the type map leaves opaque for now).
     pub fn type_of(&self, e: &Expr) -> Type {
         let r = e.span.range();
-        self.types.get(&(r.start as u32, r.end as u32)).cloned().unwrap_or(Type::Mixed)
+        self.types
+            .get(&(r.start as u32, r.end as u32))
+            .cloned()
+            .unwrap_or(Type::Mixed)
     }
 
     /// The native-only inferred type of `e` (`mixed` if untyped/PHPDoc-only).
     pub fn native_type_of(&self, e: &Expr) -> Type {
         let r = e.span.range();
-        self.native_types.get(&(r.start as u32, r.end as u32)).cloned().unwrap_or(Type::Mixed)
+        self.native_types
+            .get(&(r.start as u32, r.end as u32))
+            .cloned()
+            .unwrap_or(Type::Mixed)
     }
 
     /// Whether expression `e` may be assigned/passed/returned where `target`
@@ -151,7 +157,9 @@ impl FileAnalysis<'_> {
                 return true;
             }
             seen.push(key);
-            let Some(c) = fa.reflection.class(fqn) else { return false };
+            let Some(c) = fa.reflection.class(fqn) else {
+                return false;
+            };
             c.parents
                 .iter()
                 .chain(&c.interfaces)
@@ -179,7 +187,10 @@ pub struct RuleEntry {
 /// The rules active at `level` (cumulative: every rule with `rule.level <= level`),
 /// gathered from every per-category module in [`crate::rules`].
 pub fn rules_for_level(level: u8) -> impl Iterator<Item = &'static RuleEntry> {
-    crate::rules::CATEGORY_RULES.iter().flat_map(|cat| cat.iter()).filter(move |r| r.level <= level)
+    crate::rules::CATEGORY_RULES
+        .iter()
+        .flat_map(|cat| cat.iter())
+        .filter(move |r| r.level <= level)
 }
 
 /// Run every rule active at `level` over one file and collect the diagnostics.
@@ -249,12 +260,18 @@ mod tests {
         };
 
         // Level 0: only the unknown-symbol rule fires.
-        let l0: Vec<_> = analyze_file(&fa, 0).into_iter().map(|d| d.code.unwrap_or("")).collect();
+        let l0: Vec<_> = analyze_file(&fa, 0)
+            .into_iter()
+            .map(|d| d.code.unwrap_or(""))
+            .collect();
         assert!(l0.contains(&"class.notFound"));
         assert!(!l0.contains(&"return.type"));
 
         // Level 3: both fire.
-        let l3: Vec<_> = analyze_file(&fa, 3).into_iter().map(|d| d.code.unwrap_or("")).collect();
+        let l3: Vec<_> = analyze_file(&fa, 3)
+            .into_iter()
+            .map(|d| d.code.unwrap_or(""))
+            .collect();
         assert!(l3.contains(&"class.notFound"));
         assert!(l3.contains(&"return.type"));
     }

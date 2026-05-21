@@ -1,7 +1,7 @@
 //! The `php-analyzer` command-line entry point.
 
 use clap::Parser;
-use php_cli::{baseline, report, run};
+use php_cli::{baseline, report, run_with_options, RunOptions};
 use php_config::{Config, Level};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -31,7 +31,9 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let _ = cli.no_progress; // accepted; no progress output yet
+    let run_options = RunOptions {
+        progress: !cli.no_progress,
+    };
 
     let (mut config, root) = match resolve_config(&cli) {
         Ok(cr) => cr,
@@ -60,7 +62,7 @@ fn main() -> ExitCode {
     // findings out, and exit. (The configured baseline is intentionally not
     // loaded so the snapshot captures the full current state.)
     if let Some(out) = &cli.generate_baseline {
-        let report = run(&config, &root);
+        let report = run_with_options(&config, &root, run_options);
         let entries = baseline::entries(&report);
         let yaml = baseline::to_yaml(&entries);
         let path = root.join(out);
@@ -68,7 +70,11 @@ fn main() -> ExitCode {
             eprintln!("error: writing baseline {}: {e}", path.display());
             return ExitCode::from(2);
         }
-        eprintln!("Wrote baseline with {} entries to {}", entries.len(), path.display());
+        eprintln!(
+            "Wrote baseline with {} entries to {}",
+            entries.len(),
+            path.display()
+        );
         return ExitCode::SUCCESS;
     }
 
@@ -83,7 +89,7 @@ fn main() -> ExitCode {
         }
     }
 
-    let report = run(&config, &root);
+    let report = run_with_options(&config, &root, run_options);
     let rendered = match report::render(&report, &cli.error_format) {
         Some(s) => s,
         None => {
@@ -111,7 +117,11 @@ fn resolve_config(cli: &Cli) -> Result<(Config, PathBuf), ExitCode> {
             eprintln!("error: {e}");
             ExitCode::from(2)
         })?;
-        let root = path.parent().filter(|p| !p.as_os_str().is_empty()).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+        let root = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
         return Ok((cfg, root));
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));

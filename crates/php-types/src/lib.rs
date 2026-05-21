@@ -13,8 +13,10 @@ use std::fmt;
 /// A resolved PHP type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
-    /// `mixed` — the top type.
+    /// Implicit `mixed` — an unknown value or missing type.
     Mixed,
+    /// Explicit `mixed` written in native/PHPDoc source.
+    ExplicitMixed,
     /// `never` — the bottom type.
     Never,
     /// `void` (a return type).
@@ -29,7 +31,10 @@ pub enum Type {
     /// A bounded integer `int<min, max>` (phpstan's integer-range type). `None`
     /// bounds are open (`int<2, max>` = `IntRange { min: Some(2), max: None }`).
     /// A fully-open range normalises to `Int` via [`Type::int_range`].
-    IntRange { min: Option<i64>, max: Option<i64> },
+    IntRange {
+        min: Option<i64>,
+        max: Option<i64>,
+    },
     Float,
     String,
     /// Bare `object`.
@@ -46,7 +51,10 @@ pub enum Type {
     /// `class-string` or `class-string<T>`.
     ClassString(Option<Box<Type>>),
     /// A class/interface/enum/trait, fully-qualified, with optional generic args.
-    Named { fqn: String, args: Vec<Type> },
+    Named {
+        fqn: String,
+        args: Vec<Type>,
+    },
     /// `self` / `static` / `parent` — resolved against the class context later.
     SelfType,
     StaticType,
@@ -58,7 +66,10 @@ pub enum Type {
     /// A literal-string type (`'draft'`).
     LiteralString(String),
     /// An array shape `array{id: int, name?: string}` (or unsealed `…, ...`).
-    Shape { fields: Vec<ShapeField>, sealed: bool },
+    Shape {
+        fields: Vec<ShapeField>,
+        sealed: bool,
+    },
     /// `T|null` shorthand.
     Nullable(Box<Type>),
     Union(Vec<Type>),
@@ -91,6 +102,66 @@ pub struct ShapeField {
 }
 
 impl Type {
+    pub fn is_mixed(&self) -> bool {
+        matches!(self, Type::Mixed | Type::ExplicitMixed)
+    }
+
+    pub fn contains_explicit_mixed(&self) -> bool {
+        match self {
+            Type::ExplicitMixed => true,
+            Type::Nullable(inner) => inner.contains_explicit_mixed(),
+            Type::Union(parts) | Type::Intersection(parts) => {
+                parts.iter().any(Type::contains_explicit_mixed)
+            }
+            Type::Array(Some(kv)) | Type::Iterable(Some(kv)) => {
+                kv.0.contains_explicit_mixed() || kv.1.contains_explicit_mixed()
+            }
+            Type::List(inner) | Type::ClassString(Some(inner)) => inner.contains_explicit_mixed(),
+            Type::Callable(Some(sig)) => {
+                sig.ret.contains_explicit_mixed()
+                    || sig.params.iter().any(Type::contains_explicit_mixed)
+            }
+            Type::Named { args, .. } => args.iter().any(Type::contains_explicit_mixed),
+            Type::Shape { fields, .. } => fields.iter().any(|f| f.ty.contains_explicit_mixed()),
+            Type::Conditional {
+                target, then, els, ..
+            } => {
+                target.contains_explicit_mixed()
+                    || then.contains_explicit_mixed()
+                    || els.contains_explicit_mixed()
+            }
+            _ => false,
+        }
+    }
+
+    pub fn contains_implicit_mixed(&self) -> bool {
+        match self {
+            Type::Mixed => true,
+            Type::Nullable(inner) => inner.contains_implicit_mixed(),
+            Type::Union(parts) | Type::Intersection(parts) => {
+                parts.iter().any(Type::contains_implicit_mixed)
+            }
+            Type::Array(Some(kv)) | Type::Iterable(Some(kv)) => {
+                kv.0.contains_implicit_mixed() || kv.1.contains_implicit_mixed()
+            }
+            Type::List(inner) | Type::ClassString(Some(inner)) => inner.contains_implicit_mixed(),
+            Type::Callable(Some(sig)) => {
+                sig.ret.contains_implicit_mixed()
+                    || sig.params.iter().any(Type::contains_implicit_mixed)
+            }
+            Type::Named { args, .. } => args.iter().any(Type::contains_implicit_mixed),
+            Type::Shape { fields, .. } => fields.iter().any(|f| f.ty.contains_implicit_mixed()),
+            Type::Conditional {
+                target, then, els, ..
+            } => {
+                target.contains_implicit_mixed()
+                    || then.contains_implicit_mixed()
+                    || els.contains_implicit_mixed()
+            }
+            _ => false,
+        }
+    }
+
     /// Wrap in nullability, flattening `?(?T)` and `?null`.
     pub fn nullable(self) -> Type {
         match self {
@@ -149,7 +220,9 @@ impl Type {
 /// `Nullable(X)` contributes `X`'s members plus `null`.
 fn collect_union_members(t: Type, out: &mut Vec<Type>) {
     match t {
-        Type::Union(inner) => inner.into_iter().for_each(|q| collect_union_members(q, out)),
+        Type::Union(inner) => inner
+            .into_iter()
+            .for_each(|q| collect_union_members(q, out)),
         Type::Nullable(inner) => {
             collect_union_members(*inner, out);
             out.push(Type::Null);
@@ -190,7 +263,7 @@ fn dedup(types: &mut Vec<Type>) {
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Type::Mixed => f.write_str("mixed"),
+            Type::Mixed | Type::ExplicitMixed => f.write_str("mixed"),
             Type::Never => f.write_str("never"),
             Type::Void => f.write_str("void"),
             Type::Null => f.write_str("null"),
@@ -214,14 +287,23 @@ impl fmt::Display for Type {
             Type::List(t) => write!(f, "list<{t}>"),
             Type::Callable(None) => f.write_str("callable"),
             Type::Callable(Some(sig)) => {
-                let params = sig.params.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ");
+                let params = sig
+                    .params
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 write!(f, "callable({params}): {}", sig.ret)
             }
             Type::ClassString(None) => f.write_str("class-string"),
             Type::ClassString(Some(t)) => write!(f, "class-string<{t}>"),
             Type::Named { fqn, args } if args.is_empty() => f.write_str(fqn),
             Type::Named { fqn, args } => {
-                let a = args.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", ");
+                let a = args
+                    .iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 write!(f, "{fqn}<{a}>")
             }
             Type::SelfType => f.write_str("self"),
@@ -248,14 +330,28 @@ impl fmt::Display for Type {
             }
             Type::Nullable(t) => write!(f, "?{t}"),
             Type::Union(parts) => {
-                let s = parts.iter().map(|p| p.to_string()).collect::<Vec<_>>().join("|");
+                let s = parts
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join("|");
                 f.write_str(&s)
             }
             Type::Intersection(parts) => {
-                let s = parts.iter().map(|p| p.to_string()).collect::<Vec<_>>().join("&");
+                let s = parts
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join("&");
                 f.write_str(&s)
             }
-            Type::Conditional { subject, negated, target, then, els } => {
+            Type::Conditional {
+                subject,
+                negated,
+                target,
+                then,
+                els,
+            } => {
                 let not = if *negated { "not " } else { "" };
                 write!(f, "({subject} is {not}{target} ? {then} : {els})")
             }
@@ -271,7 +367,14 @@ mod tests {
     #[test]
     fn display_scalars_and_named() {
         assert_eq!(Type::Int.to_string(), "int");
-        assert_eq!(Type::Named { fqn: "App\\User".into(), args: vec![] }.to_string(), "App\\User");
+        assert_eq!(
+            Type::Named {
+                fqn: "App\\User".into(),
+                args: vec![]
+            }
+            .to_string(),
+            "App\\User"
+        );
         assert_eq!(Type::Array(None).to_string(), "array");
         assert_eq!(
             Type::Array(Some(Box::new((Type::String, Type::Int)))).to_string(),
@@ -283,9 +386,22 @@ mod tests {
     #[test]
     fn display_composite() {
         assert_eq!(Type::Nullable(Box::new(Type::Int)).to_string(), "?int");
-        assert_eq!(Type::Union(vec![Type::Int, Type::String]).to_string(), "int|string");
         assert_eq!(
-            Type::Named { fqn: "Collection".into(), args: vec![Type::Int, Type::Named { fqn: "User".into(), args: vec![] }] }.to_string(),
+            Type::Union(vec![Type::Int, Type::String]).to_string(),
+            "int|string"
+        );
+        assert_eq!(
+            Type::Named {
+                fqn: "Collection".into(),
+                args: vec![
+                    Type::Int,
+                    Type::Named {
+                        fqn: "User".into(),
+                        args: vec![]
+                    }
+                ]
+            }
+            .to_string(),
             "Collection<int, User>"
         );
     }
@@ -297,7 +413,10 @@ mod tests {
             Type::union(vec![Type::Int, Type::Union(vec![Type::String, Type::Int])]),
             Type::Union(vec![Type::Int, Type::String])
         );
-        assert_eq!(Type::Int.nullable().nullable(), Type::Nullable(Box::new(Type::Int)));
+        assert_eq!(
+            Type::Int.nullable().nullable(),
+            Type::Nullable(Box::new(Type::Int))
+        );
         assert_eq!(Type::Null.nullable(), Type::Null);
     }
 }

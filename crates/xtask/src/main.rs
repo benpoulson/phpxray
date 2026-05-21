@@ -114,10 +114,18 @@ fn cmd_difftokens(args: &[String]) -> ExitCode {
     let mut examples: Vec<String> = Vec::new();
 
     for path in files.into_iter().take(limit) {
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
-        let Some(source) = phpt::extract_file_section(&text) else { continue };
-        let Some(golden_text) = run_php_tokens(&helper, &source) else { continue };
-        let Ok(oracle) = golden::parse(&golden_text) else { continue };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some(source) = phpt::extract_file_section(&text) else {
+            continue;
+        };
+        let Some(golden_text) = run_php_tokens(&helper, &source) else {
+            continue;
+        };
+        let Ok(oracle) = golden::parse(&golden_text) else {
+            continue;
+        };
         let oracle = golden::filter_ignored(&oracle, DEFAULT_IGNORED);
 
         let ours = match catch_unwind(AssertUnwindSafe(|| {
@@ -140,7 +148,10 @@ fn cmd_difftokens(args: &[String]) -> ExitCode {
                     || o == "T_YIELD_FROM"
                     || (o == "T_STRING" && u == "T_ENUM");
                 if !deferred && examples.len() < 20 {
-                    examples.push(format!("  {}: oracle={o} ours={u}", path.file_name().unwrap().to_string_lossy()));
+                    examples.push(format!(
+                        "  {}: oracle={o} ours={u}",
+                        path.file_name().unwrap().to_string_lossy()
+                    ));
                 }
             }
         }
@@ -175,8 +186,14 @@ fn first_divergence(
         }
     }
     if ours.len() != oracle.len() {
-        let o = oracle.get(n).map(|t| t.name.clone()).unwrap_or_else(|| "<eof>".into());
-        let u = ours.get(n).map(|t| t.name.clone()).unwrap_or_else(|| "<eof>".into());
+        let o = oracle
+            .get(n)
+            .map(|t| t.name.clone())
+            .unwrap_or_else(|| "<eof>".into());
+        let u = ours
+            .get(n)
+            .map(|t| t.name.clone())
+            .unwrap_or_else(|| "<eof>".into());
         return Some((o, u));
     }
     None
@@ -227,9 +244,15 @@ fn astdiff_run(args: &[String]) -> ExitCode {
     let mut buckets: BTreeMap<String, (usize, String)> = BTreeMap::new();
 
     for path in files.into_iter().take(limit) {
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
-        let Some(source) = phpt::extract_file_section(&text) else { continue };
-        let Some(oracle) = run_php(&helper, &source) else { continue };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some(source) = phpt::extract_file_section(&text) else {
+            continue;
+        };
+        let Some(oracle) = run_php(&helper, &source) else {
+            continue;
+        };
         let oracle = oracle.trim_ascii_end();
         if oracle == b"<<PARSE_ERROR>>" {
             continue; // PHP rejects this source; not an AST-match candidate.
@@ -319,7 +342,9 @@ fn run_php_tokens(helper: &Path, source: &str) -> Option<String> {
         .ok()?;
     child.stdin.take()?.write_all(source.as_bytes()).ok()?;
     let out = child.wait_with_output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 #[derive(Default)]
@@ -346,8 +371,12 @@ fn cmd_resolve(dir: Option<PathBuf>) -> ExitCode {
         if entry.path().extension().and_then(|e| e.to_str()) != Some("phpt") {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
-        let Some(source) = phpt::extract_file_section(&text) else { continue };
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Some(source) = phpt::extract_file_section(&text) else {
+            continue;
+        };
         files += 1;
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let r = php_parser::parse(&source);
@@ -393,10 +422,19 @@ fn cmd_index(dir: Option<PathBuf>) -> ExitCode {
         if entry.path().extension().and_then(|e| e.to_str()) != Some("phpt") {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
-        let Some(source) = phpt::extract_file_section(&text) else { continue };
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Some(source) = phpt::extract_file_section(&text) else {
+            continue;
+        };
         files += 1;
-        let label = entry.path().strip_prefix(&dir).unwrap_or(entry.path()).display().to_string();
+        let label = entry
+            .path()
+            .strip_prefix(&dir)
+            .unwrap_or(entry.path())
+            .display()
+            .to_string();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let r = php_parser::parse(&source);
             php_resolve::index_file(&r.program, &r.interner)
@@ -432,8 +470,12 @@ fn cmd_reflect(dir: Option<PathBuf>) -> ExitCode {
         if entry.path().extension().and_then(|e| e.to_str()) != Some("phpt") {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
-        let Some(source) = phpt::extract_file_section(&text) else { continue };
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Some(source) = phpt::extract_file_section(&text) else {
+            continue;
+        };
         files += 1;
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let r = php_parser::parse(&source);
@@ -444,7 +486,10 @@ fn cmd_reflect(dir: Option<PathBuf>) -> ExitCode {
             eprintln!("REFLECT PANIC on {}", entry.path().display());
         }
     }
-    println!("reflected {files} files: {} classes, {panics} panics", index.class_count());
+    println!(
+        "reflected {files} files: {} classes, {panics} panics",
+        index.class_count()
+    );
     if panics == 0 {
         ExitCode::SUCCESS
     } else {
@@ -477,8 +522,12 @@ fn cmd_infer(dir: Option<PathBuf>) -> ExitCode {
         if entry.path().extension().and_then(|e| e.to_str()) != Some("phpt") {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
-        let Some(source) = phpt::extract_file_section(&text) else { continue };
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Some(source) = phpt::extract_file_section(&text) else {
+            continue;
+        };
         let label = entry.path().display().to_string();
         let r = php_parser::parse(&source);
         index.add_file(&r.program, &r.interner);
@@ -487,7 +536,13 @@ fn cmd_infer(dir: Option<PathBuf>) -> ExitCode {
 
     // Recursive descent: analyse each function/method body, descending into
     // nested/conditional declarations.
-    fn infer_stmt(idx: &ReflectionIndex, scope: &Scope, i: &php_intern::Interner, st: &Stmt, bodies: &mut u64) {
+    fn infer_stmt(
+        idx: &ReflectionIndex,
+        scope: &Scope,
+        i: &php_intern::Interner,
+        st: &Stmt,
+        bodies: &mut u64,
+    ) {
         match &st.kind {
             StmtKind::Function(f) => {
                 let mut ctx = TypeCtx::new(idx, scope, i);
@@ -503,7 +558,10 @@ fn cmd_infer(dir: Option<PathBuf>) -> ExitCode {
                     let mut ctx = TypeCtx::new(idx, scope, i);
                     ctx.class = fqn.clone();
                     for p in &md.params {
-                        let ty = p.ty.as_ref().map(|t| resolve_ast_type(scope, t)).unwrap_or(Type::Mixed);
+                        let ty =
+                            p.ty.as_ref()
+                                .map(|t| resolve_ast_type(scope, t))
+                                .unwrap_or(Type::Mixed);
                         ctx.vars.insert(i.resolve(p.name).to_string(), ty);
                     }
                     ctx.exec_block(body);
@@ -512,7 +570,9 @@ fn cmd_infer(dir: Option<PathBuf>) -> ExitCode {
                 }
             }
             StmtKind::Block(b) => infer_all(idx, scope, i, b, bodies),
-            StmtKind::If { then, elseifs, els, .. } => {
+            StmtKind::If {
+                then, elseifs, els, ..
+            } => {
                 infer_stmt(idx, scope, i, then, bodies);
                 for e in elseifs {
                     infer_stmt(idx, scope, i, &e.body, bodies);
@@ -525,7 +585,11 @@ fn cmd_infer(dir: Option<PathBuf>) -> ExitCode {
             | StmtKind::DoWhile { body, .. }
             | StmtKind::For { body, .. }
             | StmtKind::Foreach { body, .. } => infer_stmt(idx, scope, i, body, bodies),
-            StmtKind::Try { body, catches, finally } => {
+            StmtKind::Try {
+                body,
+                catches,
+                finally,
+            } => {
                 infer_all(idx, scope, i, body, bodies);
                 for c in catches {
                     infer_all(idx, scope, i, &c.body, bodies);
@@ -543,7 +607,13 @@ fn cmd_infer(dir: Option<PathBuf>) -> ExitCode {
             _ => {}
         }
     }
-    fn infer_all(idx: &ReflectionIndex, scope: &Scope, i: &php_intern::Interner, stmts: &[Stmt], bodies: &mut u64) {
+    fn infer_all(
+        idx: &ReflectionIndex,
+        scope: &Scope,
+        i: &php_intern::Interner,
+        stmts: &[Stmt],
+        bodies: &mut u64,
+    ) {
         for st in stmts {
             infer_stmt(idx, scope, i, st, bodies);
         }
@@ -569,7 +639,9 @@ fn cmd_infer(dir: Option<PathBuf>) -> ExitCode {
             }
         }
     }
-    println!("inferred over {files} files: {bodies} function/method bodies analysed, {panics} panics");
+    println!(
+        "inferred over {files} files: {bodies} function/method bodies analysed, {panics} panics"
+    );
     if panics == 0 {
         ExitCode::SUCCESS
     } else {
@@ -615,8 +687,12 @@ fn cmd_check_run(dir: Option<PathBuf>) -> ExitCode {
         if entry.path().extension().and_then(|e| e.to_str()) != Some("phpt") {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
-        let Some(source) = phpt::extract_file_section(&text) else { continue };
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Some(source) = phpt::extract_file_section(&text) else {
+            continue;
+        };
         let label = entry.path().display().to_string();
         let (program, _diags) = php_parser::parse_into(&source, &mut interner);
         project.add_file(&label, &index_file(&program, &interner));
@@ -687,7 +763,10 @@ fn cmd_phpdoc(dir: Option<PathBuf>) -> ExitCode {
     use std::collections::HashMap;
     let dir = dir.unwrap_or_else(|| workspace_root().join("vendor/phpstorm-stubs"));
     if !dir.is_dir() {
-        eprintln!("corpus dir not found: {} (try `git submodule update --init`)", dir.display());
+        eprintln!(
+            "corpus dir not found: {} (try `git submodule update --init`)",
+            dir.display()
+        );
         return ExitCode::FAILURE;
     }
     let type_tags = ["param", "return", "var", "throws"];
@@ -703,9 +782,14 @@ fn cmd_phpdoc(dir: Option<PathBuf>) -> ExitCode {
         if path.to_string_lossy().contains("/tests/") {
             continue;
         }
-        let Ok(source) = std::fs::read_to_string(path) else { continue };
+        let Ok(source) = std::fs::read_to_string(path) else {
+            continue;
+        };
         let (tokens, _) = php_lexer::tokenize(&source);
-        for t in tokens.iter().filter(|t| t.kind == php_lexer::TokenKind::DocComment) {
+        for t in tokens
+            .iter()
+            .filter(|t| t.kind == php_lexer::TokenKind::DocComment)
+        {
             let raw = t.span.text(&source);
             let outcome = catch_unwind(AssertUnwindSafe(|| {
                 // Exercise the full typed parse (incl. @method/@property/@mixin/
@@ -753,7 +837,11 @@ fn cmd_phpdoc(dir: Option<PathBuf>) -> ExitCode {
         }
     }
 
-    let pct = if total == 0 { 100.0 } else { 100.0 * parsed as f64 / total as f64 };
+    let pct = if total == 0 {
+        100.0
+    } else {
+        100.0 * parsed as f64 / total as f64
+    };
     println!(
         "\nPHPDoc sweep: {blocks} docblocks, {total} type operands, {parsed} parsed ({pct:.2}%); {panics} panics"
     );
@@ -827,12 +915,18 @@ fn cmd_corpus(dir: Option<PathBuf>) -> ExitCode {
     println!("\ncorpus results:");
     println!("  .phpt files scanned : {}", s.total);
     println!("  with --FILE--       : {}", s.total - s.no_file);
-    println!("  lexed ok            : {}", (s.total - s.no_file) - s.lex_panicked);
+    println!(
+        "  lexed ok            : {}",
+        (s.total - s.no_file) - s.lex_panicked
+    );
     println!("  LEX PANICKED        : {}", s.lex_panicked);
     println!("  parsed (no errors)  : {}", s.parsed_clean);
     println!("  parsed (w/ errors)  : {}", s.parsed_with_errors);
     println!("  PARSE PANICKED      : {}", s.panicked);
-    println!("  assert parse error  : {} (error-recovery subset)", s.expects_error);
+    println!(
+        "  assert parse error  : {} (error-recovery subset)",
+        s.expects_error
+    );
 
     // The hard invariant: neither lexer nor parser may ever panic.
     if s.panicked == 0 && s.lex_panicked == 0 {
@@ -853,11 +947,15 @@ fn cmd_triage(dir: Option<PathBuf>) -> ExitCode {
         if entry.path().extension().and_then(|e| e.to_str()) != Some("phpt") {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
         if phpt::expects_parse_error(&text) {
             continue; // intentional error — not our worklist
         }
-        let Some(source) = phpt::extract_file_section(&text) else { continue };
+        let Some(source) = phpt::extract_file_section(&text) else {
+            continue;
+        };
         let Ok(result) = catch_unwind(AssertUnwindSafe(|| php_parser::parse(&source))) else {
             continue;
         };
@@ -865,7 +963,12 @@ fn cmd_triage(dir: Option<PathBuf>) -> ExitCode {
             continue;
         };
         total += 1;
-        let name = entry.path().file_name().unwrap().to_string_lossy().into_owned();
+        let name = entry
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let bucket = by_msg.entry(first.message.clone()).or_default();
         bucket.0 += 1;
         if bucket.1.len() < 3 {
@@ -903,7 +1006,11 @@ fn cmd_diag(path: Option<PathBuf>) -> ExitCode {
     for d in &r.diagnostics {
         let s = d.primary.start as usize;
         let e = (d.primary.end as usize).min(source.len());
-        let line = source[..s.min(source.len())].bytes().filter(|&b| b == b'\n').count() + 1;
+        let line = source[..s.min(source.len())]
+            .bytes()
+            .filter(|&b| b == b'\n')
+            .count()
+            + 1;
         let slice = source.get(s..e).unwrap_or("");
         println!("  line {line}: {} — {:?}", d.message, slice);
     }
@@ -945,7 +1052,10 @@ fn cmd_gen_stubs() -> ExitCode {
     let stubs = root.join("vendor/phpstorm-stubs");
     let dest = root.join("crates/php-index/stubs/builtins.txt");
     if !stubs.is_dir() {
-        eprintln!("phpstorm-stubs not present: {} (run `git submodule update --init`)", stubs.display());
+        eprintln!(
+            "phpstorm-stubs not present: {} (run `git submodule update --init`)",
+            stubs.display()
+        );
         return ExitCode::FAILURE;
     }
     let (mut functions, mut classes, mut interfaces, mut traits, mut enums, mut constants) = (
@@ -958,6 +1068,7 @@ fn cmd_gen_stubs() -> ExitCode {
     );
     // Cap #4: typed function signatures, fqn (lowercased key) -> serialized line.
     let mut typed_fns: BTreeMap<String, String> = BTreeMap::new();
+    let mut typed_classes: BTreeMap<String, String> = BTreeMap::new();
     let (mut files, mut parse_errors) = (0u64, 0u64);
     for entry in WalkDir::new(&stubs).into_iter().filter_map(Result::ok) {
         let path = entry.path();
@@ -966,10 +1077,14 @@ fn cmd_gen_stubs() -> ExitCode {
         }
         // Skip the test suite and the generated stubs-map meta file.
         let s = path.to_string_lossy();
-        if s.contains("/tests/") || path.file_name().and_then(|f| f.to_str()) == Some("PhpStormStubsMap.php") {
+        if s.contains("/tests/")
+            || path.file_name().and_then(|f| f.to_str()) == Some("PhpStormStubsMap.php")
+        {
             continue;
         }
-        let Ok(source) = std::fs::read_to_string(path) else { continue };
+        let Ok(source) = std::fs::read_to_string(path) else {
+            continue;
+        };
         files += 1;
         let parsed = match catch_unwind(AssertUnwindSafe(|| php_parser::parse(&source))) {
             Ok(p) => p,
@@ -994,19 +1109,33 @@ fn cmd_gen_stubs() -> ExitCode {
         functions.extend(idx.functions.into_iter().map(|f| f.fqn));
         constants.extend(idx.constants.into_iter().map(|k| k.fqn));
 
-        // Cap #4: reflect each function to capture its (native + PHPDoc) signature.
+        // Cap #4: reflect each function/class to capture typed signatures.
         php_resolve::for_each_region(&parsed.program.stmts, &parsed.interner, |scope, region| {
             for st in region {
-                if let php_ast::StmtKind::Function(f) = &st.kind {
-                    let fr = php_reflect::reflect_function(scope, &parsed.interner, f);
-                    typed_fns.insert(fr.fqn.to_ascii_lowercase(), serialize_fn(f, &fr, &parsed.interner));
+                match &st.kind {
+                    php_ast::StmtKind::Function(f) => {
+                        let fr = php_reflect::reflect_function(scope, &parsed.interner, f);
+                        typed_fns.insert(
+                            fr.fqn.to_ascii_lowercase(),
+                            serialize_fn(f, &fr, &parsed.interner),
+                        );
+                    }
+                    php_ast::StmtKind::Class(c) => {
+                        let Some(name) = c.name else { continue };
+                        let fqn = scope.qualify(parsed.interner.resolve(name));
+                        let cr = php_reflect::reflect_class(scope, &parsed.interner, &fqn, c);
+                        typed_classes.insert(fqn.to_ascii_lowercase(), serialize_class(&cr));
+                    }
+                    _ => {}
                 }
             }
         });
     }
 
     let mut out = String::new();
-    out.push_str("# Built-in symbol names from JetBrains/phpstorm-stubs (submodule) — existence only.\n");
+    out.push_str(
+        "# Built-in symbol names from JetBrains/phpstorm-stubs (submodule) — existence only.\n",
+    );
     out.push_str("# Generated by `xtask gen-stubs`; do not edit. Names are version-stable;\n");
     out.push_str("# signatures/types are version-dependent and come from the stubs later.\n");
     let section = |out: &mut String, name: &str, items: &BTreeSet<String>| {
@@ -1051,8 +1180,36 @@ fn cmd_gen_stubs() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    let class_dest = root.join("crates/php-reflect/stubs/builtin-classes.txt");
+    let mut class_out = String::new();
+    class_out
+        .push_str("# Built-in class/interface member signatures from JetBrains/phpstorm-stubs.\n");
+    class_out.push_str("# Generated by `xtask gen-stubs`; do not edit.\n");
+    class_out.push_str("# Format:\n");
+    class_out
+        .push_str("# class<TAB>kind<TAB>fqn<TAB>parents<TAB>interfaces<TAB>traits<TAB>flags\n");
+    class_out.push_str(
+        "# method<TAB>class<TAB>name<TAB>visibility<TAB>flags<TAB>return<TAB>native_return<TAB>params\n",
+    );
+    class_out.push_str(
+        "# property<TAB>class<TAB>name<TAB>visibility<TAB>flags<TAB>type<TAB>native_type\n",
+    );
+    class_out.push_str(
+        "# constant<TAB>class<TAB>name<TAB>visibility<TAB>flags<TAB>type<TAB>int_value\n",
+    );
+    for line in typed_classes.values() {
+        class_out.push_str(line);
+    }
+    if let Some(parent) = class_dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&class_dest, &class_out) {
+        eprintln!("write failed {}: {e}", class_dest.display());
+        return ExitCode::FAILURE;
+    }
+
     println!(
-        "parsed {files} stub files ({parse_errors} with parse errors) -> {}: {} functions, {} classes, {} interfaces, {} traits, {} enums, {} constants; {} typed fn signatures -> {}",
+        "parsed {files} stub files ({parse_errors} with parse errors) -> {}: {} functions, {} classes, {} interfaces, {} traits, {} enums, {} constants; {} typed fn signatures -> {}; {} typed classes -> {}",
         dest.strip_prefix(&root).unwrap_or(&dest).display(),
         functions.len(),
         classes.len(),
@@ -1062,6 +1219,8 @@ fn cmd_gen_stubs() -> ExitCode {
         constants.len(),
         typed_fns.len(),
         fn_dest.strip_prefix(&root).unwrap_or(&fn_dest).display(),
+        typed_classes.len(),
+        class_dest.strip_prefix(&root).unwrap_or(&class_dest).display(),
     );
     ExitCode::SUCCESS
 }
@@ -1075,8 +1234,7 @@ fn serialize_fn(
     fr: &php_reflect::FunctionReflection,
     interner: &php_intern::Interner,
 ) -> String {
-    let ret = level_aware_type(&f.attrs, interner)
-        .unwrap_or_else(|| ty_str(&fr.return_type));
+    let ret = level_aware_type(&f.attrs, interner).unwrap_or_else(|| ty_str(&fr.return_type));
 
     let params: Vec<String> = fr
         .params
@@ -1106,8 +1264,155 @@ fn serialize_fn(
     format!("{}\t{}\t{}", fr.fqn, ret, params.join(";"))
 }
 
+fn serialize_class(cr: &php_reflect::ClassReflection) -> String {
+    let mut out = String::new();
+    let mut flags = String::new();
+    if cr.is_abstract {
+        flags.push('a');
+    }
+    if cr.is_final {
+        flags.push('f');
+    }
+    if cr.is_readonly {
+        flags.push('r');
+    }
+    if cr.attribute.is_some() {
+        flags.push('A');
+    }
+    out.push_str(&format!(
+        "class\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        class_kind_str(cr.kind),
+        cr.fqn,
+        named_list(&cr.parents),
+        named_list(&cr.interfaces),
+        named_list(&cr.traits),
+        flags
+    ));
+    for m in &cr.methods {
+        if m.magic {
+            continue;
+        }
+        let mut flags = String::new();
+        if m.is_static {
+            flags.push('s');
+        }
+        if m.is_abstract {
+            flags.push('a');
+        }
+        if m.is_final {
+            flags.push('f');
+        }
+        if m.pure {
+            flags.push('p');
+        }
+        if m.must_use_return_value {
+            flags.push('u');
+        }
+        let params = m
+            .params
+            .iter()
+            .map(|p| serialize_param(p, &p.ty))
+            .collect::<Vec<_>>()
+            .join(";");
+        out.push_str(&format!(
+            "method\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            cr.fqn,
+            m.name,
+            vis_str(m.visibility),
+            flags,
+            ty_str(&m.return_type),
+            ty_str(&m.native_return),
+            params
+        ));
+    }
+    for p in &cr.properties {
+        if p.magic {
+            continue;
+        }
+        let mut flags = String::new();
+        if p.is_static {
+            flags.push('s');
+        }
+        if p.is_readonly {
+            flags.push('r');
+        }
+        out.push_str(&format!(
+            "property\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            cr.fqn,
+            p.name,
+            vis_str(p.visibility),
+            flags,
+            ty_str(&p.ty),
+            ty_str(&p.native_ty)
+        ));
+    }
+    for c in &cr.constants {
+        let mut flags = String::new();
+        if c.is_final {
+            flags.push('f');
+        }
+        let int_value = c.int_value.map(|v| v.to_string()).unwrap_or_default();
+        out.push_str(&format!(
+            "constant\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            cr.fqn,
+            c.name,
+            vis_str(c.visibility),
+            flags,
+            ty_str(&c.ty),
+            int_value
+        ));
+    }
+    out
+}
+
+fn serialize_param(p: &php_reflect::ParamReflection, ty: &php_types::Type) -> String {
+    let mut flags = String::new();
+    if p.by_ref {
+        flags.push('r');
+    }
+    if p.variadic {
+        flags.push('v');
+    }
+    if p.optional {
+        flags.push('o');
+    }
+    format!("{}#{}#{}", p.name, ty_str(ty), flags)
+}
+
+fn named_list(types: &[php_types::Type]) -> String {
+    types
+        .iter()
+        .filter_map(|t| match t {
+            php_types::Type::Named { fqn, .. } => Some(fqn.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn class_kind_str(kind: php_ast::ClassKind) -> &'static str {
+    match kind {
+        php_ast::ClassKind::Class => "class",
+        php_ast::ClassKind::Interface => "interface",
+        php_ast::ClassKind::Trait => "trait",
+        php_ast::ClassKind::Enum => "enum",
+    }
+}
+
+fn vis_str(vis: php_ast::Visibility) -> &'static str {
+    match vis {
+        php_ast::Visibility::Public => "public",
+        php_ast::Visibility::Protected => "protected",
+        php_ast::Visibility::Private => "private",
+    }
+}
+
 fn ty_str(t: &php_types::Type) -> String {
-    if *t == php_types::Type::Mixed { String::new() } else { t.to_string() }
+    if *t == php_types::Type::Mixed {
+        String::new()
+    } else {
+        t.to_string()
+    }
 }
 
 /// Our target PHP version for resolving `#[LanguageLevelTypeAware]` entries.
@@ -1116,7 +1421,10 @@ const TARGET_PHP: (u32, u32) = (8, 6);
 /// If `attrs` contains a `#[LanguageLevelTypeAware(["V" => "T", …], default: "U")]`,
 /// return the type string for [`TARGET_PHP`]: the value of the highest version
 /// key `≤ target`, else the `default:`.
-fn level_aware_type(attrs: &[php_ast::AttributeGroup], interner: &php_intern::Interner) -> Option<String> {
+fn level_aware_type(
+    attrs: &[php_ast::AttributeGroup],
+    interner: &php_intern::Interner,
+) -> Option<String> {
     use php_ast::ExprKind;
     for g in attrs {
         for a in &g.attrs {
@@ -1137,8 +1445,12 @@ fn level_aware_type(attrs: &[php_ast::AttributeGroup], interner: &php_intern::In
                 }
                 if let ExprKind::Array { items, .. } = &arg.value.kind {
                     for it in items {
-                        let (Some(k), Some(v)) = (&it.key, &it.value) else { continue };
-                        let (ExprKind::Str(kb), ExprKind::Str(vb)) = (&k.kind, &v.kind) else { continue };
+                        let (Some(k), Some(v)) = (&it.key, &it.value) else {
+                            continue;
+                        };
+                        let (ExprKind::Str(kb), ExprKind::Str(vb)) = (&k.kind, &v.kind) else {
+                            continue;
+                        };
                         let ver = parse_ver(&String::from_utf8_lossy(kb));
                         let Some(ver) = ver else { continue };
                         if ver <= TARGET_PHP && best.as_ref().is_none_or(|(bv, _)| ver >= *bv) {
@@ -1149,7 +1461,11 @@ fn level_aware_type(attrs: &[php_ast::AttributeGroup], interner: &php_intern::In
             }
             let chosen = best.map(|(_, t)| t).or(default)?;
             let chosen = chosen.trim();
-            return Some(if chosen.eq_ignore_ascii_case("mixed") { String::new() } else { chosen.to_string() });
+            return Some(if chosen.eq_ignore_ascii_case("mixed") {
+                String::new()
+            } else {
+                chosen.to_string()
+            });
         }
     }
     None
@@ -1222,7 +1538,10 @@ fn cmd_gen_tokens() -> ExitCode {
         println!("  {}", dest.strip_prefix(&root).unwrap_or(&dest).display());
     }
 
-    println!("generated {} fixture(s), {failures} failure(s)", sources.len() - failures);
+    println!(
+        "generated {} fixture(s), {failures} failure(s)",
+        sources.len() - failures
+    );
     if failures == 0 {
         ExitCode::SUCCESS
     } else {

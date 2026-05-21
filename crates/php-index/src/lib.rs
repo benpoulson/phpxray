@@ -32,6 +32,15 @@ pub struct SymbolEntry {
     pub sources: Vec<String>,
 }
 
+/// How a parsed file participates in the project index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    /// User-facing analyzed source. May shadow a built-in symbol.
+    Analyzed,
+    /// Symbol-provider-only source. Must not shadow curated built-ins.
+    Scan,
+}
+
 /// The aggregated symbol table for a whole project.
 #[derive(Debug, Default, Clone)]
 pub struct ProjectIndex {
@@ -87,18 +96,27 @@ impl ProjectIndex {
             }
             match sec {
                 Sec::Functions => {
-                    push_symbol(&mut self.functions, line.to_ascii_lowercase(), line, "<builtin>");
+                    push_symbol(
+                        &mut self.functions,
+                        line.to_ascii_lowercase(),
+                        line,
+                        "<builtin>",
+                    );
                 }
-                Sec::Constants => push_symbol(&mut self.constants, line.to_string(), line, "<builtin>"),
+                Sec::Constants => {
+                    push_symbol(&mut self.constants, line.to_string(), line, "<builtin>")
+                }
                 Sec::Classes(kind) => {
-                    self.classes.entry(line.to_ascii_lowercase()).or_insert_with(|| ClassEntry {
-                        fqn: line.to_string(),
-                        kind,
-                        extends: Vec::new(),
-                        implements: Vec::new(),
-                        uses_traits: Vec::new(),
-                        sources: vec!["<builtin>".to_string()],
-                    });
+                    self.classes
+                        .entry(line.to_ascii_lowercase())
+                        .or_insert_with(|| ClassEntry {
+                            fqn: line.to_string(),
+                            kind,
+                            extends: Vec::new(),
+                            implements: Vec::new(),
+                            uses_traits: Vec::new(),
+                            sources: vec!["<builtin>".to_string()],
+                        });
                 }
                 Sec::None => {}
             }
@@ -108,7 +126,22 @@ impl ProjectIndex {
     /// Merge one file's resolved declarations into the project index, labelling
     /// each declaration with `source` (e.g. a file path).
     pub fn add_file(&mut self, source: &str, file: &FileIndex) {
+        self.add_file_as(source, file, SourceKind::Analyzed);
+    }
+
+    /// Merge one file's declarations, distinguishing analyzed project files from
+    /// scan-only symbol providers. Scan-only declarations never replace or
+    /// duplicate a curated built-in.
+    pub fn add_file_as(&mut self, source: &str, file: &FileIndex, kind: SourceKind) {
         for c in &file.classes {
+            if kind == SourceKind::Scan
+                && self
+                    .classes
+                    .get(&c.fqn.to_ascii_lowercase())
+                    .is_some_and(is_builtin_class)
+            {
+                continue;
+            }
             match self.classes.entry(c.fqn.to_ascii_lowercase()) {
                 std::collections::hash_map::Entry::Occupied(mut e) => {
                     e.get_mut().sources.push(source.to_string());
@@ -126,9 +159,17 @@ impl ProjectIndex {
             }
         }
         for f in &file.functions {
-            push_symbol(&mut self.functions, f.fqn.to_ascii_lowercase(), &f.fqn, source);
+            let key = f.fqn.to_ascii_lowercase();
+            if kind == SourceKind::Scan && self.functions.get(&key).is_some_and(is_builtin_symbol) {
+                continue;
+            }
+            push_symbol(&mut self.functions, key, &f.fqn, source);
         }
         for k in &file.constants {
+            if kind == SourceKind::Scan && self.constants.get(&k.fqn).is_some_and(is_builtin_symbol)
+            {
+                continue;
+            }
             push_symbol(&mut self.constants, k.fqn.clone(), &k.fqn, source);
         }
     }
@@ -157,6 +198,10 @@ impl ProjectIndex {
 
     pub fn class_count(&self) -> usize {
         self.classes.len()
+    }
+    /// All indexed class-like symbols (classes, interfaces, traits, enums).
+    pub fn classes(&self) -> impl Iterator<Item = &ClassEntry> {
+        self.classes.values()
     }
     pub fn function_count(&self) -> usize {
         self.functions.len()
@@ -197,7 +242,9 @@ impl ProjectIndex {
         if normalize(sub).eq_ignore_ascii_case(sup) {
             return true;
         }
-        self.ancestors(sub).iter().any(|a| a.eq_ignore_ascii_case(sup))
+        self.ancestors(sub)
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(sup))
     }
 
     /// The direct supertypes of a known class (its extends + implements + used
@@ -216,10 +263,21 @@ impl ProjectIndex {
     }
 }
 
+fn is_builtin_class(e: &ClassEntry) -> bool {
+    e.sources.iter().any(|s| s == "<builtin>")
+}
+
+fn is_builtin_symbol(e: &SymbolEntry) -> bool {
+    e.sources.iter().any(|s| s == "<builtin>")
+}
+
 fn push_symbol(map: &mut HashMap<String, SymbolEntry>, key: String, fqn: &str, source: &str) {
     map.entry(key)
         .and_modify(|e| e.sources.push(source.to_string()))
-        .or_insert_with(|| SymbolEntry { fqn: fqn.to_string(), sources: vec![source.to_string()] });
+        .or_insert_with(|| SymbolEntry {
+            fqn: fqn.to_string(),
+            sources: vec![source.to_string()],
+        });
 }
 
 /// Drop a single leading namespace separator so `\App\X` and `App\X` are one key.
@@ -246,7 +304,10 @@ mod tests {
     #[test]
     fn aggregates_symbols_across_files() {
         let idx = project(&[
-            ("a.php", "<?php namespace App; class User {} function helper() {} const LIMIT = 1;"),
+            (
+                "a.php",
+                "<?php namespace App; class User {} function helper() {} const LIMIT = 1;",
+            ),
             ("b.php", "<?php namespace App\\Http; class Controller {}"),
         ]);
         assert!(idx.has_class("App\\User"));
@@ -258,7 +319,10 @@ mod tests {
 
     #[test]
     fn class_and_function_lookups_are_case_insensitive() {
-        let idx = project(&[("a.php", "<?php namespace App; class User {} function Helper() {}")]);
+        let idx = project(&[(
+            "a.php",
+            "<?php namespace App; class User {} function Helper() {}",
+        )]);
         assert!(idx.has_class("app\\user"));
         assert!(idx.has_class("APP\\USER"));
         assert!(idx.has_function("app\\HELPER"));
@@ -333,7 +397,11 @@ mod tests {
         // Nonsense isn't there.
         assert!(!idx.has_function("definitely_not_a_real_php_function"));
         // Sanity on scale.
-        assert!(idx.function_count() > 1000, "expected many builtins, got {}", idx.function_count());
+        assert!(
+            idx.function_count() > 1000,
+            "expected many builtins, got {}",
+            idx.function_count()
+        );
     }
 
     #[test]

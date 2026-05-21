@@ -31,7 +31,11 @@ impl ParseResult {
 pub fn parse(source: &str) -> ParseResult {
     let mut interner = Interner::new();
     let (program, diagnostics) = parser::Parser::new(source, &mut interner).parse();
-    ParseResult { program, diagnostics, interner }
+    ParseResult {
+        program,
+        diagnostics,
+        interner,
+    }
 }
 
 /// Parse PHP source, interning identifiers into the **shared** `interner` so the

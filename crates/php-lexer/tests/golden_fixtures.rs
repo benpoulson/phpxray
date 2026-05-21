@@ -35,7 +35,10 @@ fn lexer_matches_php_token_oracle() {
     for php in entries {
         let tokens_path = php.with_extension("tokens");
         let Ok(golden_text) = std::fs::read_to_string(&tokens_path) else {
-            panic!("missing golden {} (run `cargo run -p xtask -- gen-tokens`)", tokens_path.display());
+            panic!(
+                "missing golden {} (run `cargo run -p xtask -- gen-tokens`)",
+                tokens_path.display()
+            );
         };
         let source = std::fs::read_to_string(&php).unwrap();
 
@@ -49,7 +52,10 @@ fn lexer_matches_php_token_oracle() {
         match golden::compare(&ours, &oracle) {
             Ok(()) => checked += 1,
             Err(diff) => {
-                failures.push(format!("{}:\n{diff}", php.file_name().unwrap().to_string_lossy()));
+                failures.push(format!(
+                    "{}:\n{diff}",
+                    php.file_name().unwrap().to_string_lossy()
+                ));
             }
         }
     }

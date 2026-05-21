@@ -23,6 +23,8 @@
 //!   constant with a native type whose initializer value can never satisfy it.
 //!   Type-driven; only fires when both the native type and the value are concrete
 //!   and known-incompatible.
+//! - **ConstantAttributesRule** (`constant.attributesNotSupported`, L0) — global
+//!   constant attributes on target PHP versions below 8.5.
 //!
 //! Deferred:
 //! - **FinalConstantRule** (`classConstant.finalNotSupported`) &
@@ -31,9 +33,6 @@
 //!   all are pure PHP-version gates ("supported only on PHP 8.x and later"). Our
 //!   target is 8.6-dev, so these never fire — implementing them would require a
 //!   configurable `phpVersion` that always says "supported".
-//! - **ConstantAttributesRule** (`constant.attributesNotSupported`): also a
-//!   version gate (attributes on global constants need 8.5), plus the generic
-//!   AttributesCheck which is a separate cross-cutting facility.
 //! - **OverridingConstantRule** native-type/phpdoc covariance branches
 //!   (`classConstant.nativeType` / `classConstant.missingNativeType` /
 //!   `classConstant.type`): gated behind phpstan's `checkPhpDocMethodSignatures`
@@ -62,7 +61,11 @@ use php_types::Type;
 // (Mirrors classes.rs::for_each_class; kept local since that one is private.)
 // ---------------------------------------------------------------------------
 
-fn for_each_class(program: &php_ast::Program, interner: &Interner, mut f: impl FnMut(&Scope, &ClassDecl)) {
+fn for_each_class(
+    program: &php_ast::Program,
+    interner: &Interner,
+    mut f: impl FnMut(&Scope, &ClassDecl),
+) {
     fn visit(scope: &Scope, st: &Stmt, f: &mut impl FnMut(&Scope, &ClassDecl)) {
         match &st.kind {
             StmtKind::Class(c) => {
@@ -71,7 +74,9 @@ fn for_each_class(program: &php_ast::Program, interner: &Interner, mut f: impl F
                 // reached by the per-class member walks where needed, not here.
             }
             StmtKind::Block(b) => b.iter().for_each(|s| visit(scope, s, f)),
-            StmtKind::If { then, elseifs, els, .. } => {
+            StmtKind::If {
+                then, elseifs, els, ..
+            } => {
                 visit(scope, then, f);
                 for e in elseifs {
                     visit(scope, &e.body, f);
@@ -84,7 +89,11 @@ fn for_each_class(program: &php_ast::Program, interner: &Interner, mut f: impl F
             | StmtKind::DoWhile { body, .. }
             | StmtKind::For { body, .. }
             | StmtKind::Foreach { body, .. } => visit(scope, body, f),
-            StmtKind::Try { body, catches, finally } => {
+            StmtKind::Try {
+                body,
+                catches,
+                finally,
+            } => {
                 body.iter().for_each(|s| visit(scope, s, f));
                 for c in catches {
                     c.body.iter().for_each(|s| visit(scope, s, f));
@@ -199,6 +208,32 @@ fn run_native_typed_constant_version(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
+/// `ConstantAttributesRule` — attributes on global constants are PHP 8.5+.
+/// The target/repeatability checks for the attributes themselves are handled by
+/// the shared `attribute.usage` rule once the target version supports the syntax.
+fn run_constant_attributes_version(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    if fa.php_version.at_least(80500) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    walk::for_each_stmt(fa.program, &mut |st| {
+        let StmtKind::ConstDecl { attrs, .. } = &st.kind else {
+            return;
+        };
+        if attrs.is_empty() {
+            return;
+        }
+        out.push(
+            Diagnostic::error(
+                st.span,
+                "Attributes on global constants are supported only on PHP 8.5 and later.",
+            )
+            .with_code("constant.attributesNotSupported"),
+        );
+    });
+    out
+}
+
 /// `MissingClassConstantTypehintRule` (`missingType.iterableValue`): a class
 /// constant with a *native* type that is a bare `array`/`iterable` (no value
 /// type), e.g. `const array FOO = […]`. Conservative — only native-typed constants
@@ -220,7 +255,9 @@ fn run_missing_const_iterable_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 continue;
             }
             let resolved = php_reflect::resolve_ast_type(scope, ty);
-            let Some(word) = crate::rules::functions::bare_iterable_word(&resolved) else { continue };
+            let Some(word) = crate::rules::functions::bare_iterable_word(&resolved) else {
+                continue;
+            };
             for ce in &cd.consts {
                 let cname = fa.interner.resolve(ce.name);
                 out.push(
@@ -287,7 +324,10 @@ fn run_magic_constant_context(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     // Each namespace region carries whether we are inside a (non-global) namespace.
     for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
-        let ctx = MagicCtx { in_namespace: scope.namespace().is_some(), ..MagicCtx::default() };
+        let ctx = MagicCtx {
+            in_namespace: scope.namespace().is_some(),
+            ..MagicCtx::default()
+        };
         for st in region {
             visit_stmt(fa, st, ctx, &mut out);
         }
@@ -308,7 +348,10 @@ fn visit_stmt(fa: &FileAnalysis, st: &Stmt, ctx: MagicCtx, out: &mut Vec<Diagnos
             for m in &c.members {
                 match m {
                     Member::Method(md) => {
-                        let mctx = MagicCtx { in_function: true, ..inner };
+                        let mctx = MagicCtx {
+                            in_function: true,
+                            ..inner
+                        };
                         // Default values / attributes of params are evaluated in
                         // the class context but NOT the function context.
                         if let Some(body) = &md.body {
@@ -345,7 +388,12 @@ fn visit_stmt(fa: &FileAnalysis, st: &Stmt, ctx: MagicCtx, out: &mut Vec<Diagnos
             }
         }
         StmtKind::Function(f) => {
-            let inner = MagicCtx { in_function: true, in_class: false, in_trait: false, ..ctx };
+            let inner = MagicCtx {
+                in_function: true,
+                in_class: false,
+                in_trait: false,
+                ..ctx
+            };
             for s in &f.body {
                 visit_stmt(fa, s, inner, out);
             }
@@ -360,7 +408,12 @@ fn visit_stmt(fa: &FileAnalysis, st: &Stmt, ctx: MagicCtx, out: &mut Vec<Diagnos
         StmtKind::Echo(es) => es.iter().for_each(|e| visit_expr(fa, e, ctx, out)),
         StmtKind::Return(Some(e)) => visit_expr(fa, e, ctx, out),
         StmtKind::Block(b) => b.iter().for_each(|s| visit_stmt(fa, s, ctx, out)),
-        StmtKind::If { cond, then, elseifs, els } => {
+        StmtKind::If {
+            cond,
+            then,
+            elseifs,
+            els,
+        } => {
             visit_expr(fa, cond, ctx, out);
             visit_stmt(fa, then, ctx, out);
             for ei in elseifs {
@@ -379,11 +432,25 @@ fn visit_stmt(fa: &FileAnalysis, st: &Stmt, ctx: MagicCtx, out: &mut Vec<Diagnos
             visit_stmt(fa, body, ctx, out);
             visit_expr(fa, cond, ctx, out);
         }
-        StmtKind::For { init, cond, update, body } => {
-            init.iter().chain(cond).chain(update).for_each(|e| visit_expr(fa, e, ctx, out));
+        StmtKind::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            init.iter()
+                .chain(cond)
+                .chain(update)
+                .for_each(|e| visit_expr(fa, e, ctx, out));
             visit_stmt(fa, body, ctx, out);
         }
-        StmtKind::Foreach { subject, key, value, body, .. } => {
+        StmtKind::Foreach {
+            subject,
+            key,
+            value,
+            body,
+            ..
+        } => {
             visit_expr(fa, subject, ctx, out);
             if let Some(k) = key {
                 visit_expr(fa, k, ctx, out);
@@ -400,7 +467,11 @@ fn visit_stmt(fa: &FileAnalysis, st: &Stmt, ctx: MagicCtx, out: &mut Vec<Diagnos
                 c.body.iter().for_each(|s| visit_stmt(fa, s, ctx, out));
             }
         }
-        StmtKind::Try { body, catches, finally } => {
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
             body.iter().for_each(|s| visit_stmt(fa, s, ctx, out));
             for c in catches {
                 c.body.iter().for_each(|s| visit_stmt(fa, s, ctx, out));
@@ -411,7 +482,9 @@ fn visit_stmt(fa: &FileAnalysis, st: &Stmt, ctx: MagicCtx, out: &mut Vec<Diagnos
         }
         StmtKind::Declare { body: Some(b), .. } => visit_stmt(fa, b, ctx, out),
         StmtKind::ConstDecl { consts, .. } => {
-            consts.iter().for_each(|ce| visit_expr(fa, &ce.value, ctx, out));
+            consts
+                .iter()
+                .for_each(|ce| visit_expr(fa, &ce.value, ctx, out));
         }
         _ => {}
     }
@@ -427,7 +500,10 @@ fn visit_expr(fa: &FileAnalysis, e: &Expr, ctx: MagicCtx, out: &mut Vec<Diagnost
             return; // a bare name has no children
         }
         ExprKind::Closure(cl) => {
-            let inner = MagicCtx { in_function: true, ..ctx };
+            let inner = MagicCtx {
+                in_function: true,
+                ..ctx
+            };
             for s in &cl.body {
                 visit_stmt(fa, s, inner, out);
             }
@@ -440,7 +516,10 @@ fn visit_expr(fa: &FileAnalysis, e: &Expr, ctx: MagicCtx, out: &mut Vec<Diagnost
             return;
         }
         ExprKind::ArrowFn(af) => {
-            let inner = MagicCtx { in_function: true, ..ctx };
+            let inner = MagicCtx {
+                in_function: true,
+                ..ctx
+            };
             visit_expr(fa, &af.body, inner, out);
             for p in &af.params {
                 if let Some(d) = &p.default {
@@ -462,9 +541,22 @@ fn each_child_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
     use ExprKind::*;
     match &e.kind {
         Interpolated(ps) | ShellExec(ps) => ps.iter().for_each(f),
-        VariableVariable(x) | DollarBrace(x) | Unary { expr: x, .. } | Cast { expr: x, .. }
-        | PreInc(x) | PreDec(x) | PostInc(x) | PostDec(x) | Clone(x) | Print(x) | Throw(x)
-        | ErrorSuppress(x) | YieldFrom(x) | Eval(x) | Empty(x) | Paren(x) => f(x),
+        VariableVariable(x)
+        | DollarBrace(x)
+        | Unary { expr: x, .. }
+        | Cast { expr: x, .. }
+        | PreInc(x)
+        | PreDec(x)
+        | PostInc(x)
+        | PostDec(x)
+        | Clone(x)
+        | Print(x)
+        | Throw(x)
+        | ErrorSuppress(x)
+        | YieldFrom(x)
+        | Eval(x)
+        | Empty(x)
+        | Paren(x) => f(x),
         Array { items, .. } => {
             for it in items {
                 if let Some(k) = &it.key {
@@ -479,14 +571,20 @@ fn each_child_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
             f(callee);
             args.iter().for_each(|a| f(&a.value));
         }
-        MethodCall { recv, method, args, .. } => {
+        MethodCall {
+            recv, method, args, ..
+        } => {
             f(recv);
             if let MemberName::Expr(x) = method {
                 f(x);
             }
             args.iter().for_each(|a| f(&a.value));
         }
-        StaticCall { class, method, args } => {
+        StaticCall {
+            class,
+            method,
+            args,
+        } => {
             f(class);
             if let MemberName::Expr(x) = method {
                 f(x);
@@ -521,8 +619,13 @@ fn each_child_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
                 f(x);
             }
         }
-        Binary { lhs, rhs, .. } | Assign { target: lhs, rhs } | AssignOp { target: lhs, rhs, .. }
-        | AssignRef { target: lhs, rhs } | Coalesce { lhs, rhs } => {
+        Binary { lhs, rhs, .. }
+        | Assign { target: lhs, rhs }
+        | AssignOp {
+            target: lhs, rhs, ..
+        }
+        | AssignRef { target: lhs, rhs }
+        | Coalesce { lhs, rhs } => {
             f(lhs);
             f(rhs);
         }
@@ -583,7 +686,11 @@ fn check_magic(n: &Name, ctx: MagicCtx, out: &mut Vec<Diagnostic>) {
                 return;
             }
             (
-                if t.eq_ignore_ascii_case("__METHOD__") { "__METHOD__" } else { "__FUNCTION__" },
+                if t.eq_ignore_ascii_case("__METHOD__") {
+                    "__METHOD__"
+                } else {
+                    "__FUNCTION__"
+                },
                 "magicConstant.outOfFunction",
                 "outside a function",
             )
@@ -592,13 +699,20 @@ fn check_magic(n: &Name, ctx: MagicCtx, out: &mut Vec<Diagnostic>) {
             if ctx.in_namespace {
                 return;
             }
-            ("__NAMESPACE__", "magicConstant.outOfNamespace", "in global namespace")
+            (
+                "__NAMESPACE__",
+                "magicConstant.outOfNamespace",
+                "in global namespace",
+            )
         }
         _ => return,
     };
     out.push(
-        Diagnostic::error(n.span, format!("Magic constant {kind} is always empty {msg}."))
-            .with_code(ident),
+        Diagnostic::error(
+            n.span,
+            format!("Magic constant {kind} is always empty {msg}."),
+        )
+        .with_code(ident),
     );
 }
 
@@ -627,7 +741,9 @@ fn run_overriding_constant(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 if name.eq_ignore_ascii_case("class") {
                     continue;
                 }
-                let Some(proto) = find_prototype(fa, c, scope, &fqn, name) else { continue };
+                let Some(proto) = find_prototype(fa, c, scope, &fqn, name) else {
+                    continue;
+                };
                 let own_vis = cd.modifiers.visibility.unwrap_or(Visibility::Public);
 
                 if proto.member.is_final {
@@ -647,7 +763,11 @@ fn run_overriding_constant(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 let proto_decl = proto.declaring_class.trim_start_matches('\\');
                 if proto.member.visibility == Visibility::Public {
                     if own_vis != Visibility::Public {
-                        let kw = if own_vis == Visibility::Private { "Private" } else { "Protected" };
+                        let kw = if own_vis == Visibility::Private {
+                            "Private"
+                        } else {
+                            "Protected"
+                        };
                         out.push(
                             Diagnostic::error(
                                 ce.value.span,
@@ -719,14 +839,20 @@ fn find_prototype(
 fn run_dynamic_class_constant_fetch(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::ClassConst { name, .. } = &e.kind else { return };
-        let MemberName::Expr(name_expr) = name else { return };
+        let ExprKind::ClassConst { name, .. } = &e.kind else {
+            return;
+        };
+        let MemberName::Expr(name_expr) = name else {
+            return;
+        };
         let t = fa.type_of(name_expr);
         if never_string(&t) {
             out.push(
                 Diagnostic::error(
                     e.span,
-                    format!("Class constant name in dynamic fetch can only be a string, {t} given."),
+                    format!(
+                        "Class constant name in dynamic fetch can only be a string, {t} given."
+                    ),
                 )
                 .with_code("classConstant.nameType"),
             );
@@ -775,7 +901,9 @@ fn run_value_assigned_to_class_constant(fa: &FileAnalysis) -> Vec<Diagnostic> {
             for ce in &cd.consts {
                 let name = fa.interner.resolve(ce.name);
                 // Resolve the constant's declared type via reflection (native).
-                let Some(found) = fa.reflection.find_constant(&fqn, name) else { continue };
+                let Some(found) = fa.reflection.find_constant(&fqn, name) else {
+                    continue;
+                };
                 let target = &found.member.ty;
                 if !is_concrete(target) {
                     continue;
@@ -843,15 +971,56 @@ fn is_concrete(t: &Type) -> bool {
 }
 
 pub(crate) static RULES: &[RuleEntry] = &[
-    RuleEntry { name: "missingType.iterableValue", level: 6, run: run_missing_const_iterable_value },
-    RuleEntry { name: "classConstant.class", level: 0, run: run_class_as_class_constant },
-    RuleEntry { name: "classConstant.finalPrivate", level: 0, run: run_final_private_constant },
-    RuleEntry { name: "magicConstant.context", level: 0, run: run_magic_constant_context },
-    RuleEntry { name: "classConstant.overriding", level: 0, run: run_overriding_constant },
-    RuleEntry { name: "classConstant.nameType", level: 0, run: run_dynamic_class_constant_fetch },
-    RuleEntry { name: "classConstant.value", level: 2, run: run_value_assigned_to_class_constant },
-    RuleEntry { name: "classConstant.finalNotSupported", level: 0, run: run_final_constant_version },
-    RuleEntry { name: "classConstant.nativeTypeNotSupported", level: 0, run: run_native_typed_constant_version },
+    RuleEntry {
+        name: "missingType.iterableValue",
+        level: 6,
+        run: run_missing_const_iterable_value,
+    },
+    RuleEntry {
+        name: "classConstant.class",
+        level: 0,
+        run: run_class_as_class_constant,
+    },
+    RuleEntry {
+        name: "classConstant.finalPrivate",
+        level: 0,
+        run: run_final_private_constant,
+    },
+    RuleEntry {
+        name: "magicConstant.context",
+        level: 0,
+        run: run_magic_constant_context,
+    },
+    RuleEntry {
+        name: "classConstant.overriding",
+        level: 0,
+        run: run_overriding_constant,
+    },
+    RuleEntry {
+        name: "classConstant.nameType",
+        level: 0,
+        run: run_dynamic_class_constant_fetch,
+    },
+    RuleEntry {
+        name: "classConstant.value",
+        level: 2,
+        run: run_value_assigned_to_class_constant,
+    },
+    RuleEntry {
+        name: "classConstant.finalNotSupported",
+        level: 0,
+        run: run_final_constant_version,
+    },
+    RuleEntry {
+        name: "classConstant.nativeTypeNotSupported",
+        level: 0,
+        run: run_native_typed_constant_version,
+    },
+    RuleEntry {
+        name: "constant.attributesNotSupported",
+        level: 0,
+        run: run_constant_attributes_version,
+    },
 ];
 
 #[cfg(test)]
@@ -865,7 +1034,10 @@ mod tests {
     #[test]
     fn bare_array_typed_const_flagged() {
         let src = r#"<?php class C { const array FOO = [1, 2]; }"#;
-        assert_eq!(codes(src, run_missing_const_iterable_value), ["missingType.iterableValue"]);
+        assert_eq!(
+            codes(src, run_missing_const_iterable_value),
+            ["missingType.iterableValue"]
+        );
     }
 
     #[test]
@@ -893,7 +1065,10 @@ mod tests {
     fn final_const_flagged_below_81() {
         let src = "<?php class C { final const X = 1; }";
         let v80 = PhpVersion::parse("8.0").unwrap();
-        assert_eq!(codes_version(src, run_final_constant_version, v80), ["classConstant.finalNotSupported"]);
+        assert_eq!(
+            codes_version(src, run_final_constant_version, v80),
+            ["classConstant.finalNotSupported"]
+        );
     }
 
     #[test]
@@ -919,18 +1094,48 @@ mod tests {
         assert!(codes(src, run_native_typed_constant_version).is_empty());
     }
 
+    #[test]
+    fn global_constant_attributes_flagged_below_85() {
+        let src = "<?php #[A] const X = 1;";
+        let v84 = PhpVersion::parse("8.4").unwrap();
+        assert_eq!(
+            codes_version(src, run_constant_attributes_version, v84),
+            ["constant.attributesNotSupported"]
+        );
+    }
+
+    #[test]
+    fn global_constant_attributes_clean_at_85() {
+        let src = "<?php #[A] const X = 1;";
+        let v85 = PhpVersion::parse("8.5").unwrap();
+        assert!(codes_version(src, run_constant_attributes_version, v85).is_empty());
+    }
+
+    #[test]
+    fn global_constant_without_attributes_is_clean_below_85() {
+        let src = "<?php const X = 1;";
+        let v84 = PhpVersion::parse("8.4").unwrap();
+        assert!(codes_version(src, run_constant_attributes_version, v84).is_empty());
+    }
+
     // --- ClassAsClassConstantRule --------------------------------------------
 
     #[test]
     fn class_named_class_is_flagged() {
         let src = "<?php class A { const class = 1; }";
-        assert_eq!(codes(src, run_class_as_class_constant), ["classConstant.class"]);
+        assert_eq!(
+            codes(src, run_class_as_class_constant),
+            ["classConstant.class"]
+        );
     }
 
     #[test]
     fn class_named_class_case_insensitive() {
         let src = "<?php class A { const CLASS = 1; }";
-        assert_eq!(codes(src, run_class_as_class_constant), ["classConstant.class"]);
+        assert_eq!(
+            codes(src, run_class_as_class_constant),
+            ["classConstant.class"]
+        );
     }
 
     #[test]
@@ -944,7 +1149,10 @@ mod tests {
     #[test]
     fn final_private_constant_is_flagged() {
         let src = "<?php class A { final private const X = 1; }";
-        assert_eq!(codes(src, run_final_private_constant), ["classConstant.finalPrivate"]);
+        assert_eq!(
+            codes(src, run_final_private_constant),
+            ["classConstant.finalPrivate"]
+        );
     }
 
     #[test]
@@ -972,7 +1180,10 @@ mod tests {
 
     #[test]
     fn class_magic_outside_class_is_flagged() {
-        assert_eq!(codes("<?php echo __CLASS__;", run_magic_constant_context), ["magicConstant.outOfClass"]);
+        assert_eq!(
+            codes("<?php echo __CLASS__;", run_magic_constant_context),
+            ["magicConstant.outOfClass"]
+        );
     }
 
     #[test]
@@ -992,7 +1203,10 @@ mod tests {
     fn trait_magic_outside_trait_is_flagged() {
         // Inside a class but not a trait → __TRAIT__ is empty.
         let src = "<?php class A { public function m() { return __TRAIT__; } }";
-        assert_eq!(codes(src, run_magic_constant_context), ["magicConstant.outOfTrait"]);
+        assert_eq!(
+            codes(src, run_magic_constant_context),
+            ["magicConstant.outOfTrait"]
+        );
     }
 
     #[test]
@@ -1026,7 +1240,11 @@ mod tests {
             run_magic_constant_context
         )
         .is_empty());
-        assert!(codes("<?php $f = fn() => __FUNCTION__;", run_magic_constant_context).is_empty());
+        assert!(codes(
+            "<?php $f = fn() => __FUNCTION__;",
+            run_magic_constant_context
+        )
+        .is_empty());
     }
 
     #[test]
@@ -1046,7 +1264,11 @@ mod tests {
     #[test]
     fn line_and_file_magic_never_flagged() {
         // __LINE__/__FILE__/__DIR__ are always meaningful — never flagged.
-        assert!(codes("<?php echo __LINE__, __FILE__, __DIR__;", run_magic_constant_context).is_empty());
+        assert!(codes(
+            "<?php echo __LINE__, __FILE__, __DIR__;",
+            run_magic_constant_context
+        )
+        .is_empty());
     }
 
     // --- OverridingConstantRule ----------------------------------------------
@@ -1065,26 +1287,36 @@ mod tests {
 
     #[test]
     fn narrowing_public_to_private_is_flagged() {
-        let src = "<?php class A { public const X = 1; } class B extends A { private const X = 2; }";
-        assert_eq!(codes(src, run_overriding_constant), ["classConstant.visibility"]);
+        let src =
+            "<?php class A { public const X = 1; } class B extends A { private const X = 2; }";
+        assert_eq!(
+            codes(src, run_overriding_constant),
+            ["classConstant.visibility"]
+        );
     }
 
     #[test]
     fn narrowing_protected_to_private_is_flagged() {
-        let src = "<?php class A { protected const X = 1; } class B extends A { private const X = 2; }";
-        assert_eq!(codes(src, run_overriding_constant), ["classConstant.visibility"]);
+        let src =
+            "<?php class A { protected const X = 1; } class B extends A { private const X = 2; }";
+        assert_eq!(
+            codes(src, run_overriding_constant),
+            ["classConstant.visibility"]
+        );
     }
 
     #[test]
     fn widening_visibility_is_ok() {
-        let src = "<?php class A { protected const X = 1; } class B extends A { public const X = 2; }";
+        let src =
+            "<?php class A { protected const X = 1; } class B extends A { public const X = 2; }";
         assert!(codes(src, run_overriding_constant).is_empty());
     }
 
     #[test]
     fn override_private_parent_constant_is_ok() {
         // A private parent constant is not inherited → no override relation.
-        let src = "<?php class A { private const X = 1; } class B extends A { private const X = 2; }";
+        let src =
+            "<?php class A { private const X = 1; } class B extends A { private const X = 2; }";
         assert!(codes(src, run_overriding_constant).is_empty());
     }
 
@@ -1106,7 +1338,10 @@ mod tests {
     #[test]
     fn dynamic_fetch_with_array_name_is_flagged() {
         let src = "<?php $a = [1]; echo Foo::{$a};";
-        assert_eq!(codes(src, run_dynamic_class_constant_fetch), ["classConstant.nameType"]);
+        assert_eq!(
+            codes(src, run_dynamic_class_constant_fetch),
+            ["classConstant.nameType"]
+        );
     }
 
     #[test]
@@ -1132,7 +1367,10 @@ mod tests {
     #[test]
     fn native_typed_constant_bad_value_is_flagged() {
         let src = "<?php class A { const int X = 'bad'; }";
-        assert_eq!(codes(src, run_value_assigned_to_class_constant), ["classConstant.value"]);
+        assert_eq!(
+            codes(src, run_value_assigned_to_class_constant),
+            ["classConstant.value"]
+        );
     }
 
     #[test]

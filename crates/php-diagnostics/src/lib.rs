@@ -23,7 +23,10 @@ pub struct Label {
 
 impl Label {
     pub fn new(span: Span, message: impl Into<String>) -> Label {
-        Label { span, message: message.into() }
+        Label {
+            span,
+            message: message.into(),
+        }
     }
 }
 

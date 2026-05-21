@@ -112,7 +112,10 @@ impl TypeCtx<'_> {
     fn collect_facts(&self, cond: &Expr, truthy: bool, out: &mut Vec<Fact>) {
         match &cond.kind {
             ExprKind::Paren(inner) => self.collect_facts(inner, truthy, out),
-            ExprKind::Unary { op: UnOp::Not, expr } => self.collect_facts(expr, !truthy, out),
+            ExprKind::Unary {
+                op: UnOp::Not,
+                expr,
+            } => self.collect_facts(expr, !truthy, out),
             ExprKind::Binary { op, lhs, rhs } => match op {
                 // `a && b` true ⇒ both true. `a || b` false ⇒ both false.
                 BinOp::BoolAnd | BinOp::LogicalAnd if truthy => {
@@ -154,7 +157,8 @@ impl TypeCtx<'_> {
                         // *confidently* subclasses of C (both indexed). Unknown
                         // members are kept (sound under-narrowing).
                         let cur = self.infer(expr);
-                        let narrowed = subtract_union(&cur, |m| confident_subclass(m, &t, self.index));
+                        let narrowed =
+                            subtract_union(&cur, |m| confident_subclass(m, &t, self.index));
                         if narrowed != cur {
                             out.push((place, narrowed));
                         }
@@ -211,7 +215,9 @@ impl TypeCtx<'_> {
         } else {
             return;
         };
-        let Some(place) = self.place_key(place_expr) else { return };
+        let Some(place) = self.place_key(place_expr) else {
+            return;
+        };
         // The effective op for this branch (negate when the condition is false).
         let eff = if truthy { op } else { negate_cmp(op) };
         // `place eff lit` ⇒ a half-bounded int range.
@@ -240,7 +246,9 @@ impl TypeCtx<'_> {
         } else {
             return;
         };
-        let Some(place) = self.place_key(operand) else { return };
+        let Some(place) = self.place_key(operand) else {
+            return;
+        };
         let t = match (lit, eq) {
             (Type::Null, true) => Type::Null,
             (Type::Null, false) => strip_null(&self.infer(operand)),
@@ -278,9 +286,29 @@ impl TypeCtx<'_> {
                 let n = self.interner.resolve(*sym);
                 (n != "this").then(|| n.to_string())
             }
-            ExprKind::Prop { base, name: php_ast::MemberName::Ident(p), nullsafe: false } => {
-                let ExprKind::Variable(b) = &base.kind else { return None };
-                Some(format!("{}->{}", self.interner.resolve(*b), self.interner.resolve(*p)))
+            ExprKind::Prop {
+                base,
+                name: php_ast::MemberName::Ident(p),
+                nullsafe: false,
+            } => {
+                let ExprKind::Variable(b) = &base.kind else {
+                    return None;
+                };
+                Some(format!(
+                    "{}->{}",
+                    self.interner.resolve(*b),
+                    self.interner.resolve(*p)
+                ))
+            }
+            ExprKind::MethodCall {
+                recv,
+                method: php_ast::MemberName::Ident(m),
+                args,
+                nullsafe: false,
+                ..
+            } if args.is_empty() => {
+                let base = self.place_key(recv)?;
+                Some(format!("{base}->{}()", self.interner.resolve(*m)))
             }
             _ => None,
         }
@@ -314,11 +342,17 @@ impl TypeCtx<'_> {
         match &e.kind {
             ExprKind::Paren(inner) => self.rec_here(inner, map),
             ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => self.rec_here(expr, map),
-            ExprKind::Clone(x) | ExprKind::Print(x) | ExprKind::Throw(x) | ExprKind::ErrorSuppress(x)
-            | ExprKind::YieldFrom(x) | ExprKind::Eval(x) | ExprKind::Empty(x)
-            | ExprKind::PreInc(x) | ExprKind::PreDec(x) | ExprKind::PostInc(x) | ExprKind::PostDec(x) => {
-                self.rec_here(x, map)
-            }
+            ExprKind::Clone(x)
+            | ExprKind::Print(x)
+            | ExprKind::Throw(x)
+            | ExprKind::ErrorSuppress(x)
+            | ExprKind::YieldFrom(x)
+            | ExprKind::Eval(x)
+            | ExprKind::Empty(x)
+            | ExprKind::PreInc(x)
+            | ExprKind::PreDec(x)
+            | ExprKind::PostInc(x)
+            | ExprKind::PostDec(x) => self.rec_here(x, map),
             ExprKind::Prop { base, name, .. } => {
                 self.rec_here(base, map);
                 self.rec_member(name, map);
@@ -336,17 +370,27 @@ impl TypeCtx<'_> {
             ExprKind::Instanceof { expr, .. } => self.rec_here(expr, map),
             // `a && b` records `b` under `a`'s truthy facts (short-circuit); `a || b`
             // under `a`'s false facts. Other binary ops just recurse both sides.
-            ExprKind::Binary { op: BinOp::BoolAnd | BinOp::LogicalAnd, lhs, rhs } => {
+            ExprKind::Binary {
+                op: BinOp::BoolAnd | BinOp::LogicalAnd,
+                lhs,
+                rhs,
+            } => {
                 self.rec_here(lhs, map);
                 self.rec_under(lhs, true, rhs, map);
             }
-            ExprKind::Binary { op: BinOp::BoolOr | BinOp::LogicalOr, lhs, rhs } => {
+            ExprKind::Binary {
+                op: BinOp::BoolOr | BinOp::LogicalOr,
+                lhs,
+                rhs,
+            } => {
                 self.rec_here(lhs, map);
                 self.rec_under(lhs, false, rhs, map);
             }
             ExprKind::Binary { lhs, rhs, .. }
             | ExprKind::Assign { target: lhs, rhs }
-            | ExprKind::AssignOp { target: lhs, rhs, .. }
+            | ExprKind::AssignOp {
+                target: lhs, rhs, ..
+            }
             | ExprKind::AssignRef { target: lhs, rhs }
             | ExprKind::Coalesce { lhs, rhs } => {
                 self.rec_here(lhs, map);
@@ -365,12 +409,18 @@ impl TypeCtx<'_> {
                 self.rec_here(callee, map);
                 self.rec_args(args, map);
             }
-            ExprKind::MethodCall { recv, method, args, .. } => {
+            ExprKind::MethodCall {
+                recv, method, args, ..
+            } => {
                 self.rec_here(recv, map);
                 self.rec_member(method, map);
                 self.rec_args(args, map);
             }
-            ExprKind::StaticCall { class, method, args } => {
+            ExprKind::StaticCall {
+                class,
+                method,
+                args,
+            } => {
                 self.rec_here(class, map);
                 self.rec_member(method, map);
                 self.rec_args(args, map);
@@ -448,7 +498,9 @@ impl TypeCtx<'_> {
     fn apply_inline_var(&mut self, s: &Stmt) {
         let Some(doc) = &s.doc else { return };
         for v in php_phpdoc::parse(doc).vars {
-            let (Some(name), Some(dt)) = (v.name, v.ty) else { continue };
+            let (Some(name), Some(dt)) = (v.name, v.ty) else {
+                continue;
+            };
             let t = php_reflect::resolve_doc_type(self.scope, &[], &dt);
             let cur = self.vars.get(&name).cloned().unwrap_or(Type::Mixed);
             let narrowed = narrow_to(&cur, &t, self.index);
@@ -456,13 +508,28 @@ impl TypeCtx<'_> {
         }
     }
 
+    fn unnamed_inline_var_type(&self, s: &Stmt) -> Option<Type> {
+        let doc = s.doc.as_ref()?;
+        php_phpdoc::parse(doc)
+            .vars
+            .into_iter()
+            .find_map(|v| match (v.name, v.ty) {
+                (None, Some(dt)) => Some(php_reflect::resolve_doc_type(self.scope, &[], &dt)),
+                _ => None,
+            })
+    }
+
     /// `assert($cond)` narrows the environment by the facts `$cond` implies (it
     /// holds for all following code, like a guard that always passes) — e.g.
     /// `assert($x !== false)` strips `false` from `$x`. Reuses the condition
     /// narrowing; only sound refinements are applied.
     fn apply_assert(&mut self, e: &Expr) {
-        let ExprKind::Call { callee, args } = &e.kind else { return };
-        let ExprKind::Name(n) = &callee.kind else { return };
+        let ExprKind::Call { callee, args } = &e.kind else {
+            return;
+        };
+        let ExprKind::Name(n) = &callee.kind else {
+            return;
+        };
         if !last_segment(&n.text).eq_ignore_ascii_case("assert") {
             return;
         }
@@ -477,6 +544,10 @@ impl TypeCtx<'_> {
             StmtKind::Expr(e) => {
                 self.rec_here(e, map);
                 self.apply_expr(e);
+                if let Some(t) = self.unnamed_inline_var_type(s) {
+                    self.bind_unnamed_inline_assignment(e, &t, map);
+                }
+                self.apply_inline_var(s);
                 self.apply_assert(e);
             }
             StmtKind::Echo(es) => {
@@ -484,13 +555,23 @@ impl TypeCtx<'_> {
                     self.rec_here(e, map);
                     self.apply_expr(e);
                 }
+                self.apply_inline_var(s);
             }
             StmtKind::Return(Some(e)) => {
                 self.rec_here(e, map);
+                if let Some(t) = self.unnamed_inline_var_type(s) {
+                    map.insert(span_key(e), t);
+                }
                 self.apply_expr(e);
+                self.apply_inline_var(s);
             }
             StmtKind::Block(b) => self.record_block(b, map),
-            StmtKind::If { cond, then, elseifs, els } => {
+            StmtKind::If {
+                cond,
+                then,
+                elseifs,
+                els,
+            } => {
                 self.rec_here(cond, map);
                 self.apply_expr(cond);
                 self.record_if(cond, then, elseifs, els.as_deref(), map);
@@ -505,7 +586,12 @@ impl TypeCtx<'_> {
                 self.rec_here(cond, map);
                 self.apply_expr(cond);
             }
-            StmtKind::For { init, cond, update, body } => {
+            StmtKind::For {
+                init,
+                cond,
+                update,
+                body,
+            } => {
                 for e in init {
                     self.rec_here(e, map);
                     self.apply_expr(e);
@@ -514,7 +600,9 @@ impl TypeCtx<'_> {
                 // least once, so its body's assignments are definite (post-loop env
                 // = post-body, not merged with the pre-loop env). PHP uses the *last*
                 // condition expression; check it before `update` advances the loop var.
-                let definite = cond.last().is_some_and(|c| self.static_truth(c) == Some(true));
+                let definite = cond
+                    .last()
+                    .is_some_and(|c| self.static_truth(c) == Some(true));
                 for e in cond.iter().chain(update) {
                     self.rec_here(e, map);
                     self.apply_expr(e);
@@ -525,7 +613,13 @@ impl TypeCtx<'_> {
                     self.record_maybe(body, map);
                 }
             }
-            StmtKind::Foreach { subject, key, value, body, .. } => {
+            StmtKind::Foreach {
+                subject,
+                key,
+                value,
+                body,
+                ..
+            } => {
                 self.record_foreach(subject, key.as_ref(), value, body, map);
             }
             StmtKind::Switch { subject, cases } => {
@@ -543,7 +637,11 @@ impl TypeCtx<'_> {
                 }
                 self.vars = merge(envs);
             }
-            StmtKind::Try { body, catches, finally } => {
+            StmtKind::Try {
+                body,
+                catches,
+                finally,
+            } => {
                 self.record_block(body, map);
                 for c in catches {
                     self.record_block(&c.body, map);
@@ -562,6 +660,15 @@ impl TypeCtx<'_> {
                 });
             }
         }
+    }
+
+    fn bind_unnamed_inline_assignment(&mut self, e: &Expr, ty: &Type, map: &mut RecMap) {
+        let (ExprKind::Assign { target, .. } | ExprKind::AssignRef { target, .. }) = &e.kind else {
+            return;
+        };
+        self.bind_target(target, ty);
+        map.insert(span_key(target), ty.clone());
+        map.insert(span_key(e), ty.clone());
     }
 
     fn record_if(
@@ -729,7 +836,11 @@ fn strip_null(t: &Type) -> Type {
         Type::Nullable(inner) => (**inner).clone(),
         Type::Null => Type::Never,
         Type::Union(parts) => {
-            let kept: Vec<Type> = parts.iter().filter(|p| !matches!(p, Type::Null)).cloned().collect();
+            let kept: Vec<Type> = parts
+                .iter()
+                .filter(|p| !matches!(p, Type::Null))
+                .cloned()
+                .collect();
             Type::union(kept)
         }
         other => other.clone(),
@@ -764,7 +875,11 @@ fn strip_false(t: &Type) -> Type {
         Type::False => Type::Never,
         Type::Bool => Type::True,
         Type::Union(parts) => {
-            let kept: Vec<Type> = parts.iter().filter(|p| !matches!(p, Type::False)).cloned().collect();
+            let kept: Vec<Type> = parts
+                .iter()
+                .filter(|p| !matches!(p, Type::False))
+                .cloned()
+                .collect();
             Type::union(kept)
         }
         Type::Nullable(inner) => Type::Nullable(Box::new(strip_false(inner))),
@@ -793,7 +908,9 @@ fn predicate_type(fname: &str) -> Option<Type> {
 /// if `cur` is not a union, or removal would drop every member, returns `cur`
 /// unchanged (sound under-narrowing — we never assert a place is `never`).
 fn subtract_union(cur: &Type, mut remove: impl FnMut(&Type) -> bool) -> Type {
-    let Type::Union(parts) = cur else { return cur.clone() };
+    let Type::Union(parts) = cur else {
+        return cur.clone();
+    };
     let kept: Vec<Type> = parts.iter().filter(|p| !remove(p)).cloned().collect();
     if kept.is_empty() || kept.len() == parts.len() {
         cur.clone()
@@ -824,7 +941,9 @@ fn predicate_matches(m: &Type, t: &Type) -> bool {
 /// Whether union member `m` is a *confident* subclass of class type `t` — both are
 /// indexed classes and the subtype relation holds. Used for `!($x instanceof C)`.
 fn confident_subclass(m: &Type, t: &Type, index: &php_reflect::ReflectionIndex) -> bool {
-    let (Type::Named { fqn: mf, .. }, Type::Named { fqn: tf, .. }) = (m, t) else { return false };
+    let (Type::Named { fqn: mf, .. }, Type::Named { fqn: tf, .. }) = (m, t) else {
+        return false;
+    };
     if mf.eq_ignore_ascii_case(tf) {
         return true;
     }
@@ -836,8 +955,14 @@ fn int_lit(e: &Expr) -> Option<i64> {
     match &e.kind {
         ExprKind::Int(n) => Some(*n),
         ExprKind::Paren(inner) => int_lit(inner),
-        ExprKind::Unary { op: UnOp::Minus, expr } => int_lit(expr).map(|n| n.wrapping_neg()),
-        ExprKind::Unary { op: UnOp::Plus, expr } => int_lit(expr),
+        ExprKind::Unary {
+            op: UnOp::Minus,
+            expr,
+        } => int_lit(expr).map(|n| n.wrapping_neg()),
+        ExprKind::Unary {
+            op: UnOp::Plus,
+            expr,
+        } => int_lit(expr),
         _ => None,
     }
 }
@@ -885,10 +1010,17 @@ fn last_segment(name: &str) -> &str {
 /// flows past it)? Conservative — only unconditional terminators count.
 fn always_terminates(s: &Stmt) -> bool {
     match &s.kind {
-        StmtKind::Return(_) | StmtKind::Break(_) | StmtKind::Continue(_) | StmtKind::Goto(_) => true,
+        StmtKind::Return(_) | StmtKind::Break(_) | StmtKind::Continue(_) | StmtKind::Goto(_) => {
+            true
+        }
         StmtKind::Expr(e) => matches!(&e.kind, ExprKind::Throw(_) | ExprKind::Exit(_)),
         StmtKind::Block(b) => b.last().is_some_and(always_terminates),
-        StmtKind::If { then, elseifs, els: Some(els), .. } => {
+        StmtKind::If {
+            then,
+            elseifs,
+            els: Some(els),
+            ..
+        } => {
             always_terminates(then)
                 && elseifs.iter().all(|ei| always_terminates(&ei.body))
                 && always_terminates(els)
@@ -922,7 +1054,10 @@ fn merge(envs: Vec<Env>) -> Env {
     }
     let mut out = Env::new();
     for k in keys {
-        let parts: Vec<Type> = envs.iter().map(|e| e.get(&k).cloned().unwrap_or(Type::Mixed)).collect();
+        let parts: Vec<Type> = envs
+            .iter()
+            .map(|e| e.get(&k).cloned().unwrap_or(Type::Mixed))
+            .collect();
         out.insert(k, Type::union(parts));
     }
     out
@@ -953,7 +1088,10 @@ mod tests {
             Some(f) => ctx.analyze_function_body(f),
             None => ctx.exec_block(&r.program.stmts),
         }
-        ctx.vars.get(var).map(|t| t.to_string()).unwrap_or_else(|| "<unset>".into())
+        ctx.vars
+            .get(var)
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "<unset>".into())
     }
 
     #[test]
@@ -966,7 +1104,10 @@ mod tests {
 
     #[test]
     fn reassignment_updates_type() {
-        assert_eq!(var_after("$x = 1; $x = 'now a string';", "x"), "'now a string'");
+        assert_eq!(
+            var_after("$x = 1; $x = 'now a string';", "x"),
+            "'now a string'"
+        );
     }
 
     #[test]
@@ -1109,9 +1250,13 @@ mod tests {
     #[test]
     fn or_instanceof_chain_narrows_to_union() {
         // `$x instanceof A || $x instanceof B` ⇒ $x is A|B in the guarded body.
-        let src = "function f($x) { if (!($x instanceof A || $x instanceof B)) { return; } $y = $x; }";
+        let src =
+            "function f($x) { if (!($x instanceof A || $x instanceof B)) { return; } $y = $x; }";
         let got = var_after(src, "y");
-        assert!(got == "A|B" || got == "B|A", "expected A|B union, got {got}");
+        assert!(
+            got == "A|B" || got == "B|A",
+            "expected A|B union, got {got}"
+        );
     }
 
     #[test]

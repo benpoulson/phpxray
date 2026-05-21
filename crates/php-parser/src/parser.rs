@@ -6,7 +6,6 @@ use php_intern::{Interner, Symbol};
 use php_lexer::{Kw, Token, TokenKind as T};
 use php_span::Span;
 
-
 /// Recursion-depth cap for expression and block nesting. A hand-written
 /// recursive-descent parser recurses once per nesting level, so adversarial or
 /// machine-generated deeply-nested input can overflow the stack — and a stack
@@ -42,7 +41,15 @@ impl<'a> Parser<'a> {
                 tokens.push(t);
             }
         }
-        Parser { src: source, tokens, pos: 0, interner, diags, depth: 0, docs }
+        Parser {
+            src: source,
+            tokens,
+            pos: 0,
+            interner,
+            diags,
+            depth: 0,
+            docs,
+        }
     }
 
     /// The doc-comment immediately preceding `offset` (only whitespace between),
@@ -51,7 +58,10 @@ impl<'a> Parser<'a> {
         for (end, text) in self.docs.iter().rev() {
             if *end <= offset {
                 let gap = &self.src[*end as usize..offset as usize];
-                return gap.bytes().all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n')).then(|| text.clone());
+                return gap
+                    .bytes()
+                    .all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+                    .then(|| text.clone());
             }
         }
         None
@@ -80,7 +90,10 @@ impl<'a> Parser<'a> {
     }
     #[inline]
     fn nth(&self, n: usize) -> T {
-        self.tokens.get(self.pos + n).map(|t| t.kind).unwrap_or(T::Eof)
+        self.tokens
+            .get(self.pos + n)
+            .map(|t| t.kind)
+            .unwrap_or(T::Eof)
     }
     #[inline]
     fn at(&self, k: T) -> bool {
@@ -171,7 +184,10 @@ impl<'a> Parser<'a> {
             }
             T::InlineHtml => {
                 let t = self.bump();
-                Some(Stmt::new(t.span, StmtKind::InlineHtml(self.text(t).to_string())))
+                Some(Stmt::new(
+                    t.span,
+                    StmtKind::InlineHtml(self.text(t).to_string()),
+                ))
             }
             T::OpenTagEcho => {
                 let start = self.cur_start();
@@ -198,7 +214,10 @@ impl<'a> Parser<'a> {
         let doc = self.doc_before(start);
         // An inline `/** @var T $x */` is kept on the statement for flow analysis
         // (captured before `doc` is moved into a declaration parser below).
-        let inline_var = doc.as_ref().filter(|d| d.contains("@var")).map(|d| d.clone().into_boxed_str());
+        let inline_var = doc
+            .as_ref()
+            .filter(|d| d.contains("@var"))
+            .map(|d| d.clone().into_boxed_str());
         let kind = match self.peek() {
             T::Semicolon => {
                 self.bump();
@@ -213,7 +232,11 @@ impl<'a> Parser<'a> {
             }
             T::Keyword(Kw::Return) => {
                 self.bump();
-                let value = if self.at_stmt_end() { None } else { Some(self.parse_expr(0)) };
+                let value = if self.at_stmt_end() {
+                    None
+                } else {
+                    Some(self.parse_expr(0))
+                };
                 self.eat_stmt_end();
                 StmtKind::Return(value)
             }
@@ -276,7 +299,10 @@ impl<'a> Parser<'a> {
             T::Keyword(Kw::Const) => {
                 let consts = self.parse_const_elems();
                 self.eat_stmt_end();
-                StmtKind::ConstDecl { consts, attrs: Vec::new() }
+                StmtKind::ConstDecl {
+                    consts,
+                    attrs: Vec::new(),
+                }
             }
             T::Keyword(Kw::HaltCompiler) => {
                 self.bump();
@@ -395,7 +421,12 @@ impl<'a> Parser<'a> {
             };
             self.expect_kw(Kw::Endif, "`endif`");
             self.eat_stmt_end();
-            return StmtKind::If { cond, then: Box::new(then), elseifs, els };
+            return StmtKind::If {
+                cond,
+                then: Box::new(then),
+                elseifs,
+                els,
+            };
         }
 
         let then = Box::new(self.parse_statement());
@@ -415,7 +446,12 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        StmtKind::If { cond, then, elseifs, els }
+        StmtKind::If {
+            cond,
+            then,
+            elseifs,
+            els,
+        }
     }
 
     /// An alternative-syntax body: statements until one of `terms`, wrapped in a
@@ -456,7 +492,12 @@ impl<'a> Parser<'a> {
         let update = self.for_exprs(T::RParen);
         self.expect(T::RParen, "`)`");
         let body = self.parse_loop_body(Kw::Endfor);
-        StmtKind::For { init, cond, update, body }
+        StmtKind::For {
+            init,
+            cond,
+            update,
+            body,
+        }
     }
 
     /// A comma-separated (possibly empty) expression list up to `stop`.
@@ -491,7 +532,14 @@ impl<'a> Parser<'a> {
         };
         self.expect(T::RParen, "`)`");
         let body = self.parse_loop_body(Kw::Endforeach);
-        StmtKind::Foreach { subject, key, value, by_ref, key_by_ref, body }
+        StmtKind::Foreach {
+            subject,
+            key,
+            value,
+            by_ref,
+            key_by_ref,
+            body,
+        }
     }
 
     fn parse_switch(&mut self) -> StmtKind {
@@ -552,7 +600,11 @@ impl<'a> Parser<'a> {
             };
             self.expect(T::RParen, "`)`");
             let cbody = self.parse_brace_block();
-            catches.push(Catch { types, var, body: cbody });
+            catches.push(Catch {
+                types,
+                var,
+                body: cbody,
+            });
         }
         let finally = if self.at_kw(Kw::Finally) {
             self.bump();
@@ -560,12 +612,20 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        StmtKind::Try { body, catches, finally }
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        }
     }
 
     fn parse_break_continue(&mut self, is_break: bool) -> StmtKind {
         self.bump();
-        let level = if self.at_stmt_end() { None } else { Some(self.parse_expr(0)) };
+        let level = if self.at_stmt_end() {
+            None
+        } else {
+            Some(self.parse_expr(0))
+        };
         self.eat_stmt_end();
         if is_break {
             StmtKind::Break(level)
@@ -584,7 +644,11 @@ impl<'a> Parser<'a> {
                 self.error_here("expected variable");
                 self.interner.intern("")
             };
-            let default = if self.eat(T::Eq) { Some(self.parse_expr(0)) } else { None };
+            let default = if self.eat(T::Eq) {
+                Some(self.parse_expr(0))
+            } else {
+                None
+            };
             vars.push(StaticVar { name, default });
             if !self.eat(T::Comma) {
                 break;
@@ -636,7 +700,10 @@ impl<'a> Parser<'a> {
             let stmts = self.stmt_list_until(&[Kw::Enddeclare]);
             self.expect_kw(Kw::Enddeclare, "`enddeclare`");
             self.eat_stmt_end();
-            Some(Box::new(Stmt::new(self.span_to(start), StmtKind::Block(stmts))))
+            Some(Box::new(Stmt::new(
+                self.span_to(start),
+                StmtKind::Block(stmts),
+            )))
         } else {
             self.eat_stmt_end();
             None
@@ -649,7 +716,11 @@ impl<'a> Parser<'a> {
         // A reserved word may be a namespace-name segment (`namespace enum;`).
         let name = if matches!(
             self.peek(),
-            T::Identifier | T::NameQualified | T::NameFullyQualified | T::NameRelative | T::Keyword(_)
+            T::Identifier
+                | T::NameQualified
+                | T::NameFullyQualified
+                | T::NameRelative
+                | T::Keyword(_)
         ) {
             Some(self.parse_name())
         } else {
@@ -669,30 +740,46 @@ impl<'a> Parser<'a> {
         let group_kind = self.use_type();
         let mut items = Vec::new();
         loop {
-            let item_kind = self.use_type().unwrap_or(group_kind.unwrap_or(UseKind::Class));
+            let item_kind = self
+                .use_type()
+                .unwrap_or(group_kind.unwrap_or(UseKind::Class));
             let name = self.parse_name();
             // Group use: `use Prefix\{ ... }`. The `\` before `{` is a separate
             // namespace-separator token after the (qualified) prefix name.
-            let is_group = self.at(T::LBrace)
-                || (self.at(T::NsSeparator) && self.nth(1) == T::LBrace);
+            let is_group =
+                self.at(T::LBrace) || (self.at(T::NsSeparator) && self.nth(1) == T::LBrace);
             if is_group {
                 self.eat(T::NsSeparator);
                 self.expect(T::LBrace, "`{`");
                 let mut group_items = Vec::new();
                 while !self.at(T::RBrace) && !self.at_eof() {
-                    let sub_kind = self.use_type().unwrap_or(group_kind.unwrap_or(UseKind::Class));
+                    let sub_kind = self
+                        .use_type()
+                        .unwrap_or(group_kind.unwrap_or(UseKind::Class));
                     let sub = self.parse_name();
                     let alias = self.parse_use_alias();
-                    group_items.push(UseItem { kind: sub_kind, name: sub, alias });
+                    group_items.push(UseItem {
+                        kind: sub_kind,
+                        name: sub,
+                        alias,
+                    });
                     if !self.eat(T::Comma) {
                         break;
                     }
                 }
                 self.expect(T::RBrace, "`}`");
-                return StmtKind::GroupUse { prefix: name, kind: group_kind, items: group_items };
+                return StmtKind::GroupUse {
+                    prefix: name,
+                    kind: group_kind,
+                    items: group_items,
+                };
             }
             let alias = self.parse_use_alias();
-            items.push(UseItem { kind: item_kind, name, alias });
+            items.push(UseItem {
+                kind: item_kind,
+                name,
+                alias,
+            });
             if !self.eat(T::Comma) {
                 break;
             }
@@ -731,16 +818,28 @@ impl<'a> Parser<'a> {
                     T::NameRelative => NameFq::Relative,
                     _ => NameFq::NotFq,
                 };
-                Name { span: t.span, fq, text: self.text(t).to_string() }
+                Name {
+                    span: t.span,
+                    fq,
+                    text: self.text(t).to_string(),
+                }
             }
             T::Keyword(_) => {
                 // A reserved word used as a name segment (e.g. in `use`).
                 let t = self.bump();
-                Name { span: t.span, fq: NameFq::NotFq, text: self.text(t).to_string() }
+                Name {
+                    span: t.span,
+                    fq: NameFq::NotFq,
+                    text: self.text(t).to_string(),
+                }
             }
             _ => {
                 self.error_here("expected a name");
-                Name { span: Span::at(self.cur_start()), fq: NameFq::NotFq, text: String::new() }
+                Name {
+                    span: Span::at(self.cur_start()),
+                    fq: NameFq::NotFq,
+                    text: String::new(),
+                }
             }
         }
     }
@@ -826,7 +925,11 @@ impl<'a> Parser<'a> {
             let mut attrs = Vec::new();
             while !self.at(T::RBracket) && !self.at_eof() {
                 let name = self.parse_name();
-                let args = if self.at(T::LParen) { Some(self.parse_args()) } else { None };
+                let args = if self.at(T::LParen) {
+                    Some(self.parse_args())
+                } else {
+                    None
+                };
                 attrs.push(Attribute { name, args });
                 if !self.eat(T::Comma) {
                     break;
@@ -838,14 +941,30 @@ impl<'a> Parser<'a> {
         groups
     }
 
-    fn parse_function_decl(&mut self, attrs: Vec<AttributeGroup>, doc: Option<String>) -> FunctionDecl {
+    fn parse_function_decl(
+        &mut self,
+        attrs: Vec<AttributeGroup>,
+        doc: Option<String>,
+    ) -> FunctionDecl {
         self.bump(); // function
         let by_ref = self.eat_amp();
         let name = self.member_ident();
         let params = self.parse_param_list();
-        let return_type = if self.eat(T::Colon) { Some(self.parse_type()) } else { None };
+        let return_type = if self.eat(T::Colon) {
+            Some(self.parse_type())
+        } else {
+            None
+        };
         let body = self.parse_brace_block();
-        FunctionDecl { attrs, doc, name, by_ref, params, return_type, body }
+        FunctionDecl {
+            attrs,
+            doc,
+            name,
+            by_ref,
+            params,
+            return_type,
+            body,
+        }
     }
 
     fn parse_param_list(&mut self) -> Vec<Param> {
@@ -862,6 +981,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_param(&mut self) -> Param {
+        let start = self.cur_start();
         let attrs = self.parse_attributes();
         let modifiers = self.parse_modifiers();
         let ty = if matches!(
@@ -881,10 +1001,28 @@ impl<'a> Parser<'a> {
             self.error_here("expected parameter variable");
             self.interner.intern("")
         };
-        let default = if self.eat(T::Eq) { Some(self.parse_expr(0)) } else { None };
+        let default = if self.eat(T::Eq) {
+            Some(self.parse_expr(0))
+        } else {
+            None
+        };
         // Promoted property with hooks: `public $x { get => …; }`.
-        let hooks = if self.at(T::LBrace) { self.parse_property_hooks() } else { Vec::new() };
-        Param { attrs, modifiers, ty, by_ref, variadic, name, default, hooks }
+        let hooks = if self.at(T::LBrace) {
+            self.parse_property_hooks()
+        } else {
+            Vec::new()
+        };
+        Param {
+            span: self.span_to(start),
+            attrs,
+            modifiers,
+            ty,
+            by_ref,
+            variadic,
+            name,
+            default,
+            hooks,
+        }
     }
 
     fn parse_modifiers(&mut self) -> Modifiers {
@@ -950,11 +1088,28 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let extends = if self.eat(T::Keyword(Kw::Extends)) { self.name_list() } else { Vec::new() };
-        let implements =
-            if self.eat(T::Keyword(Kw::Implements)) { self.name_list() } else { Vec::new() };
+        let extends = if self.eat(T::Keyword(Kw::Extends)) {
+            self.name_list()
+        } else {
+            Vec::new()
+        };
+        let implements = if self.eat(T::Keyword(Kw::Implements)) {
+            self.name_list()
+        } else {
+            Vec::new()
+        };
         let members = self.parse_class_body();
-        ClassDecl { attrs, doc, kind, name, modifiers, extends, implements, backing, members }
+        ClassDecl {
+            attrs,
+            doc,
+            kind,
+            name,
+            modifiers,
+            extends,
+            implements,
+            backing,
+            members,
+        }
     }
 
     fn parse_class_body(&mut self) -> Vec<Member> {
@@ -976,7 +1131,10 @@ impl<'a> Parser<'a> {
         // `var` is a legacy public-property marker.
         if self.at(T::Keyword(Kw::Var)) {
             self.bump();
-            let m = Modifiers { visibility: Some(Visibility::Public), ..Default::default() };
+            let m = Modifiers {
+                visibility: Some(Visibility::Public),
+                ..Default::default()
+            };
             return Member::Property(self.parse_property(attrs, doc, m));
         }
         let modifiers = self.parse_modifiers();
@@ -1002,14 +1160,24 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.eat_stmt_end();
-                Member::ClassConst(ClassConstDecl { attrs, doc, modifiers, ty, consts })
+                Member::ClassConst(ClassConstDecl {
+                    attrs,
+                    doc,
+                    modifiers,
+                    ty,
+                    consts,
+                })
             }
             T::Keyword(Kw::Function) => {
                 self.bump();
                 let by_ref = self.eat_amp();
                 let name = self.member_ident();
                 let params = self.parse_param_list();
-                let return_type = if self.eat(T::Colon) { Some(self.parse_type()) } else { None };
+                let return_type = if self.eat(T::Colon) {
+                    Some(self.parse_type())
+                } else {
+                    None
+                };
                 let body = if self.at(T::LBrace) {
                     Some(self.parse_brace_block())
                 } else {
@@ -1030,9 +1198,18 @@ impl<'a> Parser<'a> {
             T::Keyword(Kw::Case) => {
                 self.bump();
                 let name = self.member_ident();
-                let value = if self.eat(T::Eq) { Some(self.parse_expr(0)) } else { None };
+                let value = if self.eat(T::Eq) {
+                    Some(self.parse_expr(0))
+                } else {
+                    None
+                };
                 self.eat_stmt_end();
-                Member::EnumCase(EnumCaseDecl { attrs, doc, name, value })
+                Member::EnumCase(EnumCaseDecl {
+                    attrs,
+                    doc,
+                    name,
+                    value,
+                })
             }
             T::Keyword(Kw::Use) => {
                 self.bump();
@@ -1043,7 +1220,10 @@ impl<'a> Parser<'a> {
                     self.eat_stmt_end();
                     Vec::new()
                 };
-                Member::TraitUse(TraitUseDecl { traits, adaptations })
+                Member::TraitUse(TraitUseDecl {
+                    traits,
+                    adaptations,
+                })
             }
             _ => Member::Property(self.parse_property(attrs, doc, modifiers)),
         }
@@ -1055,7 +1235,11 @@ impl<'a> Parser<'a> {
         doc: Option<String>,
         modifiers: Modifiers,
     ) -> PropertyDecl {
-        let ty = if self.at(T::Variable) { None } else { Some(self.parse_type()) };
+        let ty = if self.at(T::Variable) {
+            None
+        } else {
+            Some(self.parse_type())
+        };
         let mut props = Vec::new();
         let mut hooked = false;
         loop {
@@ -1066,7 +1250,11 @@ impl<'a> Parser<'a> {
                 self.error_here("expected property variable");
                 self.interner.intern("")
             };
-            let default = if self.eat(T::Eq) { Some(self.parse_expr(0)) } else { None };
+            let default = if self.eat(T::Eq) {
+                Some(self.parse_expr(0))
+            } else {
+                None
+            };
             // A hook block (`{ … }`, possibly empty) makes this a hooked property.
             let hooks = if self.at(T::LBrace) {
                 hooked = true;
@@ -1074,7 +1262,11 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
-            props.push(PropElem { name, default, hooks });
+            props.push(PropElem {
+                name,
+                default,
+                hooks,
+            });
             // A hooked property is a single declaration (no comma list).
             if hooked || !self.eat(T::Comma) {
                 break;
@@ -1083,7 +1275,13 @@ impl<'a> Parser<'a> {
         if !hooked {
             self.eat_stmt_end();
         }
-        PropertyDecl { attrs, doc, modifiers, ty, props }
+        PropertyDecl {
+            attrs,
+            doc,
+            modifiers,
+            ty,
+            props,
+        }
     }
 
     /// `{ get …; set …; }` — property hooks.
@@ -1092,11 +1290,17 @@ impl<'a> Parser<'a> {
         let mut hooks = Vec::new();
         while !self.at(T::RBrace) && !self.at_eof() {
             let before = self.pos;
+            let hstart = self.cur_start();
+            let doc = self.doc_before(hstart);
             let attrs = self.parse_attributes();
             let modifiers = self.parse_modifiers();
             let by_ref = self.eat_amp();
             let name = self.member_ident();
-            let params = if self.at(T::LParen) { Some(self.parse_param_list()) } else { None };
+            let params = if self.at(T::LParen) {
+                Some(self.parse_param_list())
+            } else {
+                None
+            };
             let body = if self.eat(T::Semicolon) {
                 HookBody::Abstract
             } else if self.eat(T::DoubleArrow) {
@@ -1109,7 +1313,15 @@ impl<'a> Parser<'a> {
                 self.error_here("expected hook body");
                 HookBody::Abstract
             };
-            hooks.push(PropertyHook { attrs, modifiers, by_ref, name, params, body });
+            hooks.push(PropertyHook {
+                attrs,
+                doc,
+                modifiers,
+                by_ref,
+                name,
+                params,
+                body,
+            });
             self.ensure_progress(before);
         }
         self.expect(T::RBrace, "`}`");
@@ -1131,8 +1343,16 @@ impl<'a> Parser<'a> {
             };
             if self.eat(T::Keyword(Kw::Insteadof)) {
                 let insteadof = self.name_list();
-                let class = class.unwrap_or(Name { span: Span::at(self.cur_start()), fq: NameFq::NotFq, text: String::new() });
-                out.push(TraitAdaptation::Precedence { class, method, insteadof });
+                let class = class.unwrap_or(Name {
+                    span: Span::at(self.cur_start()),
+                    fq: NameFq::NotFq,
+                    text: String::new(),
+                });
+                out.push(TraitAdaptation::Precedence {
+                    class,
+                    method,
+                    insteadof,
+                });
             } else if self.eat(T::Keyword(Kw::As)) {
                 // `as` may be followed by member modifiers (visibility, `final`,
                 // …) and/or a new name.
@@ -1143,7 +1363,12 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                out.push(TraitAdaptation::Alias { class, method, modifiers, alias });
+                out.push(TraitAdaptation::Alias {
+                    class,
+                    method,
+                    modifiers,
+                    alias,
+                });
             } else {
                 self.error_here("expected `insteadof` or `as`");
             }
@@ -1160,7 +1385,10 @@ impl<'a> Parser<'a> {
         let start = self.cur_start();
         if self.eat(T::Question) {
             let inner = self.parse_type_unit();
-            return Type { span: self.span_to(start), kind: TypeKind::Nullable(Box::new(inner)) };
+            return Type {
+                span: self.span_to(start),
+                kind: TypeKind::Nullable(Box::new(inner)),
+            };
         }
         let first = self.parse_type_unit();
         if self.at(T::Pipe) {
@@ -1168,13 +1396,19 @@ impl<'a> Parser<'a> {
             while self.eat(T::Pipe) {
                 parts.push(self.parse_type_unit());
             }
-            Type { span: self.span_to(start), kind: TypeKind::Union(parts) }
+            Type {
+                span: self.span_to(start),
+                kind: TypeKind::Union(parts),
+            }
         } else if self.at(T::AmpNotFollowedByVar) {
             let mut parts = vec![first];
             while self.eat(T::AmpNotFollowedByVar) {
                 parts.push(self.parse_type_unit());
             }
-            Type { span: self.span_to(start), kind: TypeKind::Intersection(parts) }
+            Type {
+                span: self.span_to(start),
+                kind: TypeKind::Intersection(parts),
+            }
         } else {
             first
         }
@@ -1189,7 +1423,10 @@ impl<'a> Parser<'a> {
                 parts.push(self.parse_type_name());
             }
             self.expect(T::RParen, "`)`");
-            return Type { span: self.span_to(start), kind: TypeKind::Intersection(parts) };
+            return Type {
+                span: self.span_to(start),
+                kind: TypeKind::Intersection(parts),
+            };
         }
         self.parse_type_name()
     }
@@ -1210,14 +1447,25 @@ impl<'a> Parser<'a> {
                     T::NameRelative => NameFq::Relative,
                     _ => NameFq::NotFq,
                 };
-                Name { span: t.span, fq, text: self.text(t).to_string() }
+                Name {
+                    span: t.span,
+                    fq,
+                    text: self.text(t).to_string(),
+                }
             }
             _ => {
                 self.error_here("expected a type");
-                Name { span: Span::at(self.cur_start()), fq: NameFq::NotFq, text: String::new() }
+                Name {
+                    span: Span::at(self.cur_start()),
+                    fq: NameFq::NotFq,
+                    text: String::new(),
+                }
             }
         };
-        Type { span: self.span_to(start), kind: TypeKind::Simple(name) }
+        Type {
+            span: self.span_to(start),
+            kind: TypeKind::Simple(name),
+        }
     }
 
     // --- closures / arrow functions / anonymous classes -------------------
@@ -1245,7 +1493,11 @@ impl<'a> Parser<'a> {
             }
             self.expect(T::RParen, "`)`");
         }
-        let return_type = if self.eat(T::Colon) { Some(self.parse_type()) } else { None };
+        let return_type = if self.eat(T::Colon) {
+            Some(self.parse_type())
+        } else {
+            None
+        };
         let body = self.parse_brace_block();
         self.node(
             start,
@@ -1265,7 +1517,11 @@ impl<'a> Parser<'a> {
         self.bump(); // fn
         let by_ref = self.eat_amp();
         let params = self.parse_param_list();
-        let return_type = if self.eat(T::Colon) { Some(self.parse_type()) } else { None };
+        let return_type = if self.eat(T::Colon) {
+            Some(self.parse_type())
+        } else {
+            None
+        };
         self.expect(T::DoubleArrow, "`=>`");
         let body = self.parse_expr(0);
         self.node(
@@ -1284,18 +1540,37 @@ impl<'a> Parser<'a> {
     /// Lookahead: optional class modifiers followed by `class`.
     fn is_anon_class_ahead(&self) -> bool {
         let mut k = 0;
-        while matches!(self.nth(k), T::Keyword(Kw::Readonly | Kw::Abstract | Kw::Final)) {
+        while matches!(
+            self.nth(k),
+            T::Keyword(Kw::Readonly | Kw::Abstract | Kw::Final)
+        ) {
             k += 1;
         }
         self.nth(k) == T::Keyword(Kw::Class)
     }
 
-    fn parse_anon_class(&mut self, start: u32, attrs: Vec<AttributeGroup>, modifiers: Modifiers) -> Expr {
+    fn parse_anon_class(
+        &mut self,
+        start: u32,
+        attrs: Vec<AttributeGroup>,
+        modifiers: Modifiers,
+    ) -> Expr {
         self.bump(); // class
-        let args = if self.at(T::LParen) { self.parse_args() } else { Vec::new() };
-        let extends = if self.eat(T::Keyword(Kw::Extends)) { vec![self.parse_name()] } else { Vec::new() };
-        let implements =
-            if self.eat(T::Keyword(Kw::Implements)) { self.name_list() } else { Vec::new() };
+        let args = if self.at(T::LParen) {
+            self.parse_args()
+        } else {
+            Vec::new()
+        };
+        let extends = if self.eat(T::Keyword(Kw::Extends)) {
+            vec![self.parse_name()]
+        } else {
+            Vec::new()
+        };
+        let implements = if self.eat(T::Keyword(Kw::Implements)) {
+            self.name_list()
+        } else {
+            Vec::new()
+        };
         let members = self.parse_class_body();
         let class = ClassDecl {
             attrs,
@@ -1308,7 +1583,13 @@ impl<'a> Parser<'a> {
             backing: None,
             members,
         };
-        self.node(start, ExprKind::NewAnon { class: Box::new(class), args })
+        self.node(
+            start,
+            ExprKind::NewAnon {
+                class: Box::new(class),
+                args,
+            },
+        )
     }
 
     fn at_stmt_end(&self) -> bool {
@@ -1359,7 +1640,9 @@ impl<'a> Parser<'a> {
         let mut lhs = self.parse_prefix();
         loop {
             let k = self.peek();
-            let Some((lbp, rbp)) = infix_power(k) else { break };
+            let Some((lbp, rbp)) = infix_power(k) else {
+                break;
+            };
             if lbp <= min_bp {
                 break;
             }
@@ -1387,12 +1670,24 @@ impl<'a> Parser<'a> {
             T::Coalesce => {
                 self.bump();
                 let rhs = self.parse_expr(rbp);
-                self.node(start, ExprKind::Coalesce { lhs: Box::new(lhs), rhs: Box::new(rhs) })
+                self.node(
+                    start,
+                    ExprKind::Coalesce {
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    },
+                )
             }
             T::Keyword(Kw::Instanceof) => {
                 self.bump();
                 let class = self.parse_class_ref();
-                self.node(start, ExprKind::Instanceof { expr: Box::new(lhs), class: Box::new(class) })
+                self.node(
+                    start,
+                    ExprKind::Instanceof {
+                        expr: Box::new(lhs),
+                        class: Box::new(class),
+                    },
+                )
             }
             T::Eq => {
                 self.bump();
@@ -1402,10 +1697,22 @@ impl<'a> Parser<'a> {
                     // all binary operators so only the variable (+ postfixes) is
                     // taken.
                     let rhs = self.parse_expr(BP_REF_RHS);
-                    self.node(start, ExprKind::AssignRef { target: Box::new(lhs), rhs: Box::new(rhs) })
+                    self.node(
+                        start,
+                        ExprKind::AssignRef {
+                            target: Box::new(lhs),
+                            rhs: Box::new(rhs),
+                        },
+                    )
                 } else {
                     let rhs = self.parse_expr(rbp);
-                    self.node(start, ExprKind::Assign { target: Box::new(lhs), rhs: Box::new(rhs) })
+                    self.node(
+                        start,
+                        ExprKind::Assign {
+                            target: Box::new(lhs),
+                            rhs: Box::new(rhs),
+                        },
+                    )
                 }
             }
             _ => {
@@ -1414,13 +1721,24 @@ impl<'a> Parser<'a> {
                     let rhs = self.parse_expr(rbp);
                     return self.node(
                         start,
-                        ExprKind::AssignOp { op, target: Box::new(lhs), rhs: Box::new(rhs) },
+                        ExprKind::AssignOp {
+                            op,
+                            target: Box::new(lhs),
+                            rhs: Box::new(rhs),
+                        },
                     );
                 }
                 let op = binop_of(k).expect("infix_power covers this token");
                 self.bump();
                 let rhs = self.parse_expr(rbp);
-                self.node(start, ExprKind::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) })
+                self.node(
+                    start,
+                    ExprKind::Binary {
+                        op,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    },
+                )
             }
         }
     }
@@ -1432,7 +1750,11 @@ impl<'a> Parser<'a> {
             let els = self.parse_expr(BP_TERNARY_RHS);
             return self.node(
                 start,
-                ExprKind::Ternary { cond: Box::new(cond), then: None, els: Box::new(els) },
+                ExprKind::Ternary {
+                    cond: Box::new(cond),
+                    then: None,
+                    els: Box::new(els),
+                },
             );
         }
         let then = self.parse_expr(0);
@@ -1440,7 +1762,11 @@ impl<'a> Parser<'a> {
         let els = self.parse_expr(BP_TERNARY_RHS);
         self.node(
             start,
-            ExprKind::Ternary { cond: Box::new(cond), then: Some(Box::new(then)), els: Box::new(els) },
+            ExprKind::Ternary {
+                cond: Box::new(cond),
+                then: Some(Box::new(then)),
+                els: Box::new(els),
+            },
         )
     }
 
@@ -1505,7 +1831,13 @@ impl<'a> Parser<'a> {
             k if cast_kind(k).is_some() => {
                 self.bump();
                 let e = self.parse_expr(BP_UNARY2);
-                self.node(start, ExprKind::Cast { kind: cast_kind(k).unwrap(), expr: Box::new(e) })
+                self.node(
+                    start,
+                    ExprKind::Cast {
+                        kind: cast_kind(k).unwrap(),
+                        expr: Box::new(e),
+                    },
+                )
             }
             T::Keyword(kw) => return self.parse_keyword_prefix(kw, start),
             // Attributes in expression position decorate a closure / arrow fn.
@@ -1538,7 +1870,13 @@ impl<'a> Parser<'a> {
         let start = self.cur_start();
         self.bump();
         let e = self.parse_expr(operand_bp);
-        self.node(start, ExprKind::Unary { op, expr: Box::new(e) })
+        self.node(
+            start,
+            ExprKind::Unary {
+                op,
+                expr: Box::new(e),
+            },
+        )
     }
 
     fn parse_keyword_prefix(&mut self, kw: Kw, start: u32) -> Expr {
@@ -1555,9 +1893,21 @@ impl<'a> Parser<'a> {
                 // with postfixes (`clone (new C)->x` is `clone ((new C)->x)`).
                 if self.at(T::LParen) && self.clone_uses_call_syntax() {
                     let args = self.parse_args();
-                    let callee =
-                        Expr::new(Span::at(start), ExprKind::Name(Name { span: Span::at(start), fq: NameFq::Fq, text: "clone".into() }));
-                    self.node(start, ExprKind::Call { callee: Box::new(callee), args })
+                    let callee = Expr::new(
+                        Span::at(start),
+                        ExprKind::Name(Name {
+                            span: Span::at(start),
+                            fq: NameFq::Fq,
+                            text: "clone".into(),
+                        }),
+                    );
+                    self.node(
+                        start,
+                        ExprKind::Call {
+                            callee: Box::new(callee),
+                            args,
+                        },
+                    )
                 } else {
                     let e = self.parse_expr(BP_CLONE);
                     self.node(start, ExprKind::Clone(Box::new(e)))
@@ -1613,20 +1963,48 @@ impl<'a> Parser<'a> {
             }
             Kw::Static => {
                 let t = self.bump();
-                self.node(start, ExprKind::Name(Name { span: t.span, fq: NameFq::NotFq, text: self.text(t).to_string() }))
+                self.node(
+                    start,
+                    ExprKind::Name(Name {
+                        span: t.span,
+                        fq: NameFq::NotFq,
+                        text: self.text(t).to_string(),
+                    }),
+                )
             }
             // `readonly` is usable as a function name (PHP grammar's dedicated
             // `T_READONLY '(' ... )` rule), which builds an unflagged NAME.
             Kw::Readonly => {
                 let t = self.bump();
-                self.node(start, ExprKind::Name(Name { span: t.span, fq: NameFq::Fq, text: self.text(t).to_string() }))
+                self.node(
+                    start,
+                    ExprKind::Name(Name {
+                        span: t.span,
+                        fq: NameFq::Fq,
+                        text: self.text(t).to_string(),
+                    }),
+                )
             }
             // Magic constants (`__LINE__`, `__DIR__`, …). Represented as plain
             // names for now; a dedicated node can come with const resolution.
-            Kw::Line | Kw::File | Kw::Dir | Kw::ClassC | Kw::TraitC | Kw::MethodC | Kw::FuncC
-            | Kw::PropertyC | Kw::NsC => {
+            Kw::Line
+            | Kw::File
+            | Kw::Dir
+            | Kw::ClassC
+            | Kw::TraitC
+            | Kw::MethodC
+            | Kw::FuncC
+            | Kw::PropertyC
+            | Kw::NsC => {
                 let t = self.bump();
-                self.node(start, ExprKind::Name(Name { span: t.span, fq: NameFq::NotFq, text: self.text(t).to_string() }))
+                self.node(
+                    start,
+                    ExprKind::Name(Name {
+                        span: t.span,
+                        fq: NameFq::NotFq,
+                        text: self.text(t).to_string(),
+                    }),
+                )
             }
             _ => {
                 // Deferred to later milestones (closures `function`/`fn`,
@@ -1644,7 +2022,13 @@ impl<'a> Parser<'a> {
         // `include`/`require` are very low precedence: `include $a or $b` binds
         // the whole `$a or $b` as the operand.
         let e = self.parse_expr(BP_INCLUDE);
-        self.node(start, ExprKind::Include { kind, expr: Box::new(e) })
+        self.node(
+            start,
+            ExprKind::Include {
+                kind,
+                expr: Box::new(e),
+            },
+        )
     }
 
     fn parse_match(&mut self, start: u32) -> Expr {
@@ -1676,7 +2060,13 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(T::RBrace, "`}`");
-        self.node(start, ExprKind::Match { subject: Box::new(subject), arms })
+        self.node(
+            start,
+            ExprKind::Match {
+                subject: Box::new(subject),
+                arms,
+            },
+        )
     }
 
     /// With `self.pos` at the `(` after `clone`, decide whether it is the
@@ -1715,12 +2105,28 @@ impl<'a> Parser<'a> {
             // `exit(...)` is a first-class callable to the `exit` function.
             if self.nth(1) == T::Ellipsis && self.nth(2) == T::RParen {
                 let args = self.parse_args();
-                let callee =
-                    Expr::new(Span::at(start), ExprKind::Name(Name { span: Span::at(start), fq: NameFq::Fq, text: "exit".into() }));
-                return self.node(start, ExprKind::Call { callee: Box::new(callee), args });
+                let callee = Expr::new(
+                    Span::at(start),
+                    ExprKind::Name(Name {
+                        span: Span::at(start),
+                        fq: NameFq::Fq,
+                        text: "exit".into(),
+                    }),
+                );
+                return self.node(
+                    start,
+                    ExprKind::Call {
+                        callee: Box::new(callee),
+                        args,
+                    },
+                );
             }
             self.bump(); // `(`
-            let arg = if self.at(T::RParen) { None } else { Some(Box::new(self.parse_expr(0))) };
+            let arg = if self.at(T::RParen) {
+                None
+            } else {
+                Some(Box::new(self.parse_expr(0)))
+            };
             self.expect(T::RParen, "`)`");
             self.node(start, ExprKind::Exit(arg))
         } else {
@@ -1730,22 +2136,41 @@ impl<'a> Parser<'a> {
 
     fn parse_yield(&mut self, start: u32) -> Expr {
         self.bump(); // yield
-        // `yield` has no operand when followed by a terminator, or by an infix
-        // operator that cannot also start an expression (so `yield * -1` parses
-        // as `(yield) * -1`, while `yield +1` yields `+1`).
+                     // `yield` has no operand when followed by a terminator, or by an infix
+                     // operator that cannot also start an expression (so `yield * -1` parses
+                     // as `(yield) * -1`, while `yield +1` yields `+1`).
         let no_operand = matches!(
             self.peek(),
             T::Semicolon | T::RParen | T::RBracket | T::RBrace | T::CloseTag | T::Eof | T::Comma
-        ) || (infix_power(self.peek()).is_some() && !matches!(self.peek(), T::Plus | T::Minus));
+        ) || (infix_power(self.peek()).is_some()
+            && !matches!(self.peek(), T::Plus | T::Minus));
         if no_operand {
-            return self.node(start, ExprKind::Yield { key: None, value: None });
+            return self.node(
+                start,
+                ExprKind::Yield {
+                    key: None,
+                    value: None,
+                },
+            );
         }
         let first = self.parse_expr(BP_YIELD);
         if self.eat(T::DoubleArrow) {
             let value = self.parse_expr(BP_YIELD);
-            self.node(start, ExprKind::Yield { key: Some(Box::new(first)), value: Some(Box::new(value)) })
+            self.node(
+                start,
+                ExprKind::Yield {
+                    key: Some(Box::new(first)),
+                    value: Some(Box::new(value)),
+                },
+            )
         } else {
-            self.node(start, ExprKind::Yield { key: None, value: Some(Box::new(first)) })
+            self.node(
+                start,
+                ExprKind::Yield {
+                    key: None,
+                    value: Some(Box::new(first)),
+                },
+            )
         }
     }
 
@@ -1757,7 +2182,14 @@ impl<'a> Parser<'a> {
             T::NameRelative => NameFq::Relative,
             _ => NameFq::NotFq,
         };
-        self.node(start, ExprKind::Name(Name { span: t.span, fq, text: self.text(t).to_string() }))
+        self.node(
+            start,
+            ExprKind::Name(Name {
+                span: t.span,
+                fq,
+                text: self.text(t).to_string(),
+            }),
+        )
     }
 
     fn parse_variable_variable(&mut self) -> Expr {
@@ -1792,7 +2224,13 @@ impl<'a> Parser<'a> {
             e = match self.peek() {
                 T::LParen => {
                     let args = self.parse_args();
-                    self.node(start, ExprKind::Call { callee: Box::new(e), args })
+                    self.node(
+                        start,
+                        ExprKind::Call {
+                            callee: Box::new(e),
+                            args,
+                        },
+                    )
                 }
                 T::LBracket => {
                     self.bump();
@@ -1802,7 +2240,13 @@ impl<'a> Parser<'a> {
                         Some(Box::new(self.parse_expr(0)))
                     };
                     self.expect(T::RBracket, "`]`");
-                    self.node(start, ExprKind::Index { base: Box::new(e), index })
+                    self.node(
+                        start,
+                        ExprKind::Index {
+                            base: Box::new(e),
+                            index,
+                        },
+                    )
                 }
                 T::Arrow | T::NullsafeArrow => {
                     let nullsafe = self.peek() == T::NullsafeArrow;
@@ -1810,9 +2254,24 @@ impl<'a> Parser<'a> {
                     let name = self.parse_member_name();
                     if self.at(T::LParen) {
                         let args = self.parse_args();
-                        self.node(start, ExprKind::MethodCall { recv: Box::new(e), nullsafe, method: name, args })
+                        self.node(
+                            start,
+                            ExprKind::MethodCall {
+                                recv: Box::new(e),
+                                nullsafe,
+                                method: name,
+                                args,
+                            },
+                        )
                     } else {
-                        self.node(start, ExprKind::Prop { base: Box::new(e), nullsafe, name })
+                        self.node(
+                            start,
+                            ExprKind::Prop {
+                                base: Box::new(e),
+                                nullsafe,
+                                name,
+                            },
+                        )
                     }
                 }
                 T::DoubleColon => self.parse_static_access(e, start),
@@ -1864,9 +2323,22 @@ impl<'a> Parser<'a> {
                 let name = MemberName::Var(self.intern_var(t));
                 if self.at(T::LParen) {
                     let args = self.parse_args();
-                    self.node(start, ExprKind::StaticCall { class: Box::new(class), method: name, args })
+                    self.node(
+                        start,
+                        ExprKind::StaticCall {
+                            class: Box::new(class),
+                            method: name,
+                            args,
+                        },
+                    )
                 } else {
-                    self.node(start, ExprKind::StaticProp { class: Box::new(class), name })
+                    self.node(
+                        start,
+                        ExprKind::StaticProp {
+                            class: Box::new(class),
+                            name,
+                        },
+                    )
                 }
             }
             // `Foo::$$var` / `Foo::${expr}` — a static member whose name is the
@@ -1879,10 +2351,23 @@ impl<'a> Parser<'a> {
                     let m = self.node(start, ExprKind::VariableVariable(Box::new(inner)));
                     let name = MemberName::Expr(Box::new(m));
                     let args = self.parse_args();
-                    self.node(start, ExprKind::StaticCall { class: Box::new(class), method: name, args })
+                    self.node(
+                        start,
+                        ExprKind::StaticCall {
+                            class: Box::new(class),
+                            method: name,
+                            args,
+                        },
+                    )
                 } else {
                     let name = MemberName::Expr(Box::new(inner));
-                    self.node(start, ExprKind::StaticProp { class: Box::new(class), name })
+                    self.node(
+                        start,
+                        ExprKind::StaticProp {
+                            class: Box::new(class),
+                            name,
+                        },
+                    )
                 }
             }
             T::LBrace => {
@@ -1892,9 +2377,22 @@ impl<'a> Parser<'a> {
                 let name = MemberName::Expr(Box::new(inner));
                 if self.at(T::LParen) {
                     let args = self.parse_args();
-                    self.node(start, ExprKind::StaticCall { class: Box::new(class), method: name, args })
+                    self.node(
+                        start,
+                        ExprKind::StaticCall {
+                            class: Box::new(class),
+                            method: name,
+                            args,
+                        },
+                    )
                 } else {
-                    self.node(start, ExprKind::ClassConst { class: Box::new(class), name })
+                    self.node(
+                        start,
+                        ExprKind::ClassConst {
+                            class: Box::new(class),
+                            name,
+                        },
+                    )
                 }
             }
             T::Identifier | T::Keyword(_) => {
@@ -1902,9 +2400,22 @@ impl<'a> Parser<'a> {
                 let name = MemberName::Ident(self.intern_tok(t));
                 if self.at(T::LParen) {
                     let args = self.parse_args();
-                    self.node(start, ExprKind::StaticCall { class: Box::new(class), method: name, args })
+                    self.node(
+                        start,
+                        ExprKind::StaticCall {
+                            class: Box::new(class),
+                            method: name,
+                            args,
+                        },
+                    )
                 } else {
-                    self.node(start, ExprKind::ClassConst { class: Box::new(class), name })
+                    self.node(
+                        start,
+                        ExprKind::ClassConst {
+                            class: Box::new(class),
+                            name,
+                        },
+                    )
                 }
             }
             _ => {
@@ -1973,7 +2484,13 @@ impl<'a> Parser<'a> {
             };
             let spread = self.eat(T::Ellipsis);
             let value = self.parse_expr(0);
-            args.push(Arg { span: self.span_to(astart), name, value, spread, placeholder: false });
+            args.push(Arg {
+                span: self.span_to(astart),
+                name,
+                value,
+                spread,
+                placeholder: false,
+            });
             if !self.eat(T::Comma) {
                 break;
             }
@@ -1998,7 +2515,13 @@ impl<'a> Parser<'a> {
         self.bump(); // `[`
         let items = self.parse_array_items(close);
         self.expect(close, "`]`");
-        self.node(start, ExprKind::Array { items, syntax: ArraySyntax::Short })
+        self.node(
+            start,
+            ExprKind::Array {
+                items,
+                syntax: ArraySyntax::Short,
+            },
+        )
     }
 
     fn parse_array_items(&mut self, close: T) -> Vec<ArrayItem> {
@@ -2068,8 +2591,8 @@ impl<'a> Parser<'a> {
 
     fn parse_new(&mut self, start: u32) -> Expr {
         self.bump(); // new
-        // `new #[Attr] readonly class {...}` — attributes/modifiers on an
-        // anonymous class.
+                     // `new #[Attr] readonly class {...}` — attributes/modifiers on an
+                     // anonymous class.
         let attrs = self.parse_attributes();
         // `new [modifiers] class { … }` — anonymous class. Modifiers like
         // `final`/duplicate `readonly` are accepted syntactically; their
@@ -2079,8 +2602,18 @@ impl<'a> Parser<'a> {
             return self.parse_anon_class(start, attrs, modifiers);
         }
         let class = self.parse_class_ref();
-        let args = if self.at(T::LParen) { self.parse_args() } else { Vec::new() };
-        self.node(start, ExprKind::New { class: Box::new(class), args })
+        let args = if self.at(T::LParen) {
+            self.parse_args()
+        } else {
+            Vec::new()
+        };
+        self.node(
+            start,
+            ExprKind::New {
+                class: Box::new(class),
+                args,
+            },
+        )
     }
 
     /// A class-name reference (for `new`, `instanceof`): a name, a variable, a
@@ -2094,7 +2627,14 @@ impl<'a> Parser<'a> {
             }
             T::Keyword(Kw::Static) => {
                 let t = self.bump();
-                self.node(start, ExprKind::Name(Name { span: t.span, fq: NameFq::NotFq, text: self.text(t).to_string() }))
+                self.node(
+                    start,
+                    ExprKind::Name(Name {
+                        span: t.span,
+                        fq: NameFq::NotFq,
+                        text: self.text(t).to_string(),
+                    }),
+                )
             }
             T::Variable => {
                 let t = self.bump();
@@ -2122,7 +2662,14 @@ impl<'a> Parser<'a> {
                     let nullsafe = self.peek() == T::NullsafeArrow;
                     self.bump();
                     let name = self.parse_member_name();
-                    self.node(start, ExprKind::Prop { base: Box::new(e), nullsafe, name })
+                    self.node(
+                        start,
+                        ExprKind::Prop {
+                            base: Box::new(e),
+                            nullsafe,
+                            name,
+                        },
+                    )
                 }
                 T::DoubleColon => {
                     self.bump();
@@ -2131,13 +2678,25 @@ impl<'a> Parser<'a> {
                         T::Variable => {
                             let t = self.bump();
                             let name = MemberName::Var(self.intern_var(t));
-                            self.node(start, ExprKind::StaticProp { class: Box::new(e), name })
+                            self.node(
+                                start,
+                                ExprKind::StaticProp {
+                                    class: Box::new(e),
+                                    name,
+                                },
+                            )
                         }
                         // `Class::$$x` / `Class::${expr}` — computed static prop.
                         T::Dollar => {
                             let inner = self.parse_static_prop_name();
                             let name = MemberName::Expr(Box::new(inner));
-                            self.node(start, ExprKind::StaticProp { class: Box::new(e), name })
+                            self.node(
+                                start,
+                                ExprKind::StaticProp {
+                                    class: Box::new(e),
+                                    name,
+                                },
+                            )
                         }
                         // `Class::{expr}` — computed class constant.
                         T::LBrace => {
@@ -2145,17 +2704,35 @@ impl<'a> Parser<'a> {
                             let inner = self.parse_expr(0);
                             self.expect(T::RBrace, "`}`");
                             let name = MemberName::Expr(Box::new(inner));
-                            self.node(start, ExprKind::ClassConst { class: Box::new(e), name })
+                            self.node(
+                                start,
+                                ExprKind::ClassConst {
+                                    class: Box::new(e),
+                                    name,
+                                },
+                            )
                         }
                         T::Identifier | T::Keyword(_) => {
                             let t = self.bump();
                             let name = MemberName::Ident(self.intern_tok(t));
-                            self.node(start, ExprKind::ClassConst { class: Box::new(e), name })
+                            self.node(
+                                start,
+                                ExprKind::ClassConst {
+                                    class: Box::new(e),
+                                    name,
+                                },
+                            )
                         }
                         _ => {
                             self.error_here("expected member after `::`");
                             let name = MemberName::Ident(self.interner.intern(""));
-                            self.node(start, ExprKind::ClassConst { class: Box::new(e), name })
+                            self.node(
+                                start,
+                                ExprKind::ClassConst {
+                                    class: Box::new(e),
+                                    name,
+                                },
+                            )
                         }
                     }
                 }
@@ -2167,7 +2744,13 @@ impl<'a> Parser<'a> {
                         Some(Box::new(self.parse_expr(0)))
                     };
                     self.expect(T::RBracket, "`]`");
-                    self.node(start, ExprKind::Index { base: Box::new(e), index })
+                    self.node(
+                        start,
+                        ExprKind::Index {
+                            base: Box::new(e),
+                            index,
+                        },
+                    )
                 }
                 _ => break,
             };
@@ -2192,8 +2775,8 @@ impl<'a> Parser<'a> {
     fn parse_heredoc(&mut self) -> Expr {
         let start = self.cur_start();
         let open = self.bump(); // T_START_HEREDOC
-        // A nowdoc opener quotes its label (`<<<'EOT'`); its body is taken
-        // verbatim with no escape processing.
+                                // A nowdoc opener quotes its label (`<<<'EOT'`); its body is taken
+                                // verbatim with no escape processing.
         let nowdoc = self.text(open).contains('\'');
         let mut parts = self.parse_interp_parts(T::EndHeredoc, nowdoc);
         // The closing marker's leading whitespace is stripped from every body
@@ -2235,7 +2818,11 @@ impl<'a> Parser<'a> {
                     let t = self.bump();
                     // Nowdoc bodies are literal; everything else applies
                     // double-quote escape rules.
-                    let s = if raw { self.text(t).as_bytes().to_vec() } else { decode_double(self.text(t), quote) };
+                    let s = if raw {
+                        self.text(t).as_bytes().to_vec()
+                    } else {
+                        decode_double(self.text(t), quote)
+                    };
                     parts.push(self.node(t.span.start, ExprKind::Str(s)));
                 }
                 T::Variable => parts.push(self.parse_simple_interp_var()),
@@ -2263,13 +2850,26 @@ impl<'a> Parser<'a> {
                 self.bump();
                 let nt = self.bump(); // Identifier
                 let name = MemberName::Ident(self.intern_tok(nt));
-                self.node(start, ExprKind::Prop { base: Box::new(var), nullsafe, name })
+                self.node(
+                    start,
+                    ExprKind::Prop {
+                        base: Box::new(var),
+                        nullsafe,
+                        name,
+                    },
+                )
             }
             T::LBracket => {
                 self.bump();
                 let index = self.parse_interp_offset();
                 self.expect(T::RBracket, "`]`");
-                self.node(start, ExprKind::Index { base: Box::new(var), index: Some(Box::new(index)) })
+                self.node(
+                    start,
+                    ExprKind::Index {
+                        base: Box::new(var),
+                        index: Some(Box::new(index)),
+                    },
+                )
             }
             _ => var,
         }
@@ -2330,7 +2930,13 @@ impl<'a> Parser<'a> {
             let inner = if self.eat(T::LBracket) {
                 let index = self.parse_expr(0);
                 self.expect(T::RBracket, "`]`");
-                self.node(start, ExprKind::Index { base: Box::new(var), index: Some(Box::new(index)) })
+                self.node(
+                    start,
+                    ExprKind::Index {
+                        base: Box::new(var),
+                        index: Some(Box::new(index)),
+                    },
+                )
             } else {
                 var
             };
@@ -2656,14 +3262,38 @@ fn decode_double(s: &str, quote: Option<u8>) -> Vec<u8> {
             continue;
         }
         match b[i] {
-            b'n' => { out.push(b'\n'); i += 1; }
-            b't' => { out.push(b'\t'); i += 1; }
-            b'r' => { out.push(b'\r'); i += 1; }
-            b'v' => { out.push(0x0b); i += 1; }
-            b'f' => { out.push(0x0c); i += 1; }
-            b'e' => { out.push(0x1b); i += 1; }
-            b'\\' => { out.push(b'\\'); i += 1; }
-            b'$' => { out.push(b'$'); i += 1; }
+            b'n' => {
+                out.push(b'\n');
+                i += 1;
+            }
+            b't' => {
+                out.push(b'\t');
+                i += 1;
+            }
+            b'r' => {
+                out.push(b'\r');
+                i += 1;
+            }
+            b'v' => {
+                out.push(0x0b);
+                i += 1;
+            }
+            b'f' => {
+                out.push(0x0c);
+                i += 1;
+            }
+            b'e' => {
+                out.push(0x1b);
+                i += 1;
+            }
+            b'\\' => {
+                out.push(b'\\');
+                i += 1;
+            }
+            b'$' => {
+                out.push(b'$');
+                i += 1;
+            }
             b'0'..=b'7' => {
                 let mut val = 0u32;
                 let mut n = 0;

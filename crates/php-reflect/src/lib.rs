@@ -19,7 +19,7 @@ pub use model::{
     attr_target, reflect_class, reflect_function, AttributeSpec, ClassReflection, ConstReflection,
     FunctionReflection, MethodReflection, ParamReflection, PropertyReflection,
 };
-pub use project::{Found, ReflectionIndex};
+pub use project::{Found, ReflectionIndex, SourceKind};
 
 /// Resolve a native PHP type declaration to a semantic [`Type`] in `scope`.
 pub fn resolve_ast_type(scope: &Scope, ty: &AstType) -> Type {
@@ -31,12 +31,20 @@ pub fn resolve_ast_type(scope: &Scope, ty: &AstType) -> Type {
                 "parent" => Type::Parent,
                 _ => Type::StaticType,
             },
-            Resolution::Fqn(fqn) => Type::Named { fqn, args: Vec::new() },
+            Resolution::Fqn(fqn) => Type::Named {
+                fqn,
+                args: Vec::new(),
+            },
             // Native type position never yields a fallback, but be total.
-            Resolution::Fallback { namespaced, .. } => Type::Named { fqn: namespaced, args: Vec::new() },
+            Resolution::Fallback { namespaced, .. } => Type::Named {
+                fqn: namespaced,
+                args: Vec::new(),
+            },
         },
         TypeKind::Nullable(inner) => resolve_ast_type(scope, inner).nullable(),
-        TypeKind::Union(parts) => Type::union(parts.iter().map(|p| resolve_ast_type(scope, p)).collect()),
+        TypeKind::Union(parts) => {
+            Type::union(parts.iter().map(|p| resolve_ast_type(scope, p)).collect())
+        }
         TypeKind::Intersection(parts) => {
             Type::intersection(parts.iter().map(|p| resolve_ast_type(scope, p)).collect())
         }
@@ -51,12 +59,18 @@ pub fn resolve_doc_type(scope: &Scope, templates: &[String], t: &DocType) -> Typ
     match t {
         DocType::Named(name) => doc_named(scope, templates, name),
         DocType::Nullable(inner) => resolve_doc_type(scope, templates, inner).nullable(),
-        DocType::Union(parts) => {
-            Type::union(parts.iter().map(|p| resolve_doc_type(scope, templates, p)).collect())
-        }
-        DocType::Intersection(parts) => {
-            Type::intersection(parts.iter().map(|p| resolve_doc_type(scope, templates, p)).collect())
-        }
+        DocType::Union(parts) => Type::union(
+            parts
+                .iter()
+                .map(|p| resolve_doc_type(scope, templates, p))
+                .collect(),
+        ),
+        DocType::Intersection(parts) => Type::intersection(
+            parts
+                .iter()
+                .map(|p| resolve_doc_type(scope, templates, p))
+                .collect(),
+        ),
         // `T[]` — array of `T`, keyed by `array-key`.
         DocType::Array(inner) => {
             let v = resolve_doc_type(scope, templates, inner);
@@ -75,8 +89,14 @@ pub fn resolve_doc_type(scope: &Scope, templates: &[String], t: &DocType) -> Typ
             sealed: *sealed,
         },
         DocType::Callable { params, ret, .. } => Type::Callable(Some(Box::new(CallableSig {
-            params: params.iter().map(|p| resolve_doc_type(scope, templates, p)).collect(),
-            ret: ret.as_ref().map(|r| resolve_doc_type(scope, templates, r)).unwrap_or(Type::Mixed),
+            params: params
+                .iter()
+                .map(|p| resolve_doc_type(scope, templates, p))
+                .collect(),
+            ret: ret
+                .as_ref()
+                .map(|r| resolve_doc_type(scope, templates, r))
+                .unwrap_or(Type::Mixed),
         }))),
         DocType::ConstString(s) => Type::LiteralString(s.clone()),
         DocType::ConstInt(s) => match s.parse::<i64>() {
@@ -86,7 +106,13 @@ pub fn resolve_doc_type(scope: &Scope, templates: &[String], t: &DocType) -> Typ
         // `Foo::BAR`/`Foo::BAR_*` — we don't resolve the constant's value type;
         // `mixed` is the lenient, false-positive-safe choice.
         DocType::ClassConst(_) => Type::Mixed,
-        DocType::Conditional { subject, negated, target, then, els } => Type::Conditional {
+        DocType::Conditional {
+            subject,
+            negated,
+            target,
+            then,
+            els,
+        } => Type::Conditional {
             subject: subject.clone(),
             negated: *negated,
             target: Box::new(resolve_doc_type(scope, templates, target)),
@@ -111,8 +137,14 @@ fn doc_named(scope: &Scope, templates: &[String], name: &str) -> Type {
                 "parent" => Type::Parent,
                 _ => Type::StaticType,
             },
-            Resolution::Fqn(fqn) => Type::Named { fqn, args: Vec::new() },
-            Resolution::Fallback { namespaced, .. } => Type::Named { fqn: namespaced, args: Vec::new() },
+            Resolution::Fqn(fqn) => Type::Named {
+                fqn,
+                args: Vec::new(),
+            },
+            Resolution::Fallback { namespaced, .. } => Type::Named {
+                fqn: namespaced,
+                args: Vec::new(),
+            },
         },
     }
 }
@@ -141,8 +173,13 @@ fn doc_keyword(name: &str) -> Option<Type> {
         | "non-zero-int" | "int-mask" | "integer" => Type::Int,
         "double" => Type::Float,
         "boolean" => Type::Bool,
-        "non-empty-string" | "non-falsy-string" | "truthy-string" | "numeric-string"
-        | "lowercase-string" | "literal-string" | "html-escaped-string" => Type::String,
+        "non-empty-string"
+        | "non-falsy-string"
+        | "truthy-string"
+        | "numeric-string"
+        | "lowercase-string"
+        | "literal-string"
+        | "html-escaped-string" => Type::String,
         "key-of" | "value-of" => Type::Mixed,
         "noreturn" | "no-return" => Type::Never,
         "empty" => Type::Unknown("empty".into()),
@@ -152,7 +189,10 @@ fn doc_keyword(name: &str) -> Option<Type> {
 
 /// Resolve a generic application `base<args>`.
 fn doc_generic(scope: &Scope, templates: &[String], base: &str, args: &[DocType]) -> Type {
-    let resolved: Vec<Type> = args.iter().map(|a| resolve_doc_type(scope, templates, a)).collect();
+    let resolved: Vec<Type> = args
+        .iter()
+        .map(|a| resolve_doc_type(scope, templates, a))
+        .collect();
     let lower = base.to_ascii_lowercase();
     match lower.as_str() {
         "array" => match resolved.as_slice() {
@@ -182,7 +222,10 @@ fn doc_generic(scope: &Scope, templates: &[String], base: &str, args: &[DocType]
         "key-of" | "value-of" | "int-mask-of" | "int-mask" => Type::Mixed,
         // A user/class generic, e.g. `Collection<int, User>`.
         _ => match doc_named(scope, templates, base) {
-            Type::Named { fqn, .. } => Type::Named { fqn, args: resolved },
+            Type::Named { fqn, .. } => Type::Named {
+                fqn,
+                args: resolved,
+            },
             // Template or keyword base with args (unusual): keep the base, drop args.
             other => other,
         },
@@ -204,7 +247,11 @@ fn name_from(text: &str) -> Name {
     } else {
         NameFq::NotFq
     };
-    Name { span: Span::at(0), fq, text: text.to_string() }
+    Name {
+        span: Span::at(0),
+        fq,
+        text: text.to_string(),
+    }
 }
 
 /// Map a reserved built-in type keyword (lowercased) to its semantic [`Type`].
@@ -219,7 +266,7 @@ fn builtin(kw: &str) -> Type {
         "void" => Type::Void,
         "null" => Type::Null,
         "never" => Type::Never,
-        "mixed" => Type::Mixed,
+        "mixed" => Type::ExplicitMixed,
         "object" => Type::Object,
         "array" => Type::Array(None),
         "iterable" => Type::Iterable(None),
@@ -237,17 +284,30 @@ mod tests {
     fn simple(fq: NameFq, text: &str) -> AstType {
         AstType {
             span: Span::at(0),
-            kind: TypeKind::Simple(Name { span: Span::at(0), fq, text: text.into() }),
+            kind: TypeKind::Simple(Name {
+                span: Span::at(0),
+                fq,
+                text: text.into(),
+            }),
         }
     }
     fn nullable(t: AstType) -> AstType {
-        AstType { span: Span::at(0), kind: TypeKind::Nullable(Box::new(t)) }
+        AstType {
+            span: Span::at(0),
+            kind: TypeKind::Nullable(Box::new(t)),
+        }
     }
     fn union(parts: Vec<AstType>) -> AstType {
-        AstType { span: Span::at(0), kind: TypeKind::Union(parts) }
+        AstType {
+            span: Span::at(0),
+            kind: TypeKind::Union(parts),
+        }
     }
     fn intersection(parts: Vec<AstType>) -> AstType {
-        AstType { span: Span::at(0), kind: TypeKind::Intersection(parts) }
+        AstType {
+            span: Span::at(0),
+            kind: TypeKind::Intersection(parts),
+        }
     }
 
     fn app_scope() -> Scope {
@@ -265,7 +325,7 @@ mod tests {
             ("bool", Type::Bool),
             ("float", Type::Float),
             ("void", Type::Void),
-            ("mixed", Type::Mixed),
+            ("mixed", Type::ExplicitMixed),
             ("never", Type::Never),
             ("object", Type::Object),
             ("array", Type::Array(None)),
@@ -283,38 +343,73 @@ mod tests {
         // Unqualified -> current namespace.
         assert_eq!(
             resolve_ast_type(&s, &simple(NameFq::NotFq, "User")),
-            Type::Named { fqn: "App\\User".into(), args: vec![] }
+            Type::Named {
+                fqn: "App\\User".into(),
+                args: vec![]
+            }
         );
         // Imported alias.
         assert_eq!(
             resolve_ast_type(&s, &simple(NameFq::NotFq, "Collection")),
-            Type::Named { fqn: "Illuminate\\Support\\Collection".into(), args: vec![] }
+            Type::Named {
+                fqn: "Illuminate\\Support\\Collection".into(),
+                args: vec![]
+            }
         );
         // Fully qualified -> leading backslash stripped.
         assert_eq!(
             resolve_ast_type(&s, &simple(NameFq::Fq, "\\DateTimeImmutable")),
-            Type::Named { fqn: "DateTimeImmutable".into(), args: vec![] }
+            Type::Named {
+                fqn: "DateTimeImmutable".into(),
+                args: vec![]
+            }
         );
     }
 
     #[test]
     fn self_parent_static() {
         let s = app_scope();
-        assert_eq!(resolve_ast_type(&s, &simple(NameFq::NotFq, "self")), Type::SelfType);
-        assert_eq!(resolve_ast_type(&s, &simple(NameFq::NotFq, "parent")), Type::Parent);
-        assert_eq!(resolve_ast_type(&s, &simple(NameFq::NotFq, "static")), Type::StaticType);
+        assert_eq!(
+            resolve_ast_type(&s, &simple(NameFq::NotFq, "self")),
+            Type::SelfType
+        );
+        assert_eq!(
+            resolve_ast_type(&s, &simple(NameFq::NotFq, "parent")),
+            Type::Parent
+        );
+        assert_eq!(
+            resolve_ast_type(&s, &simple(NameFq::NotFq, "static")),
+            Type::StaticType
+        );
     }
 
     #[test]
     fn nullable_union_intersection() {
         let s = app_scope();
-        assert_eq!(resolve_ast_type(&s, &nullable(simple(NameFq::NotFq, "int"))), Type::Nullable(Box::new(Type::Int)));
         assert_eq!(
-            resolve_ast_type(&s, &union(vec![simple(NameFq::NotFq, "User"), simple(NameFq::NotFq, "null")])).to_string(),
+            resolve_ast_type(&s, &nullable(simple(NameFq::NotFq, "int"))),
+            Type::Nullable(Box::new(Type::Int))
+        );
+        assert_eq!(
+            resolve_ast_type(
+                &s,
+                &union(vec![
+                    simple(NameFq::NotFq, "User"),
+                    simple(NameFq::NotFq, "null")
+                ])
+            )
+            .to_string(),
             "App\\User|null"
         );
         assert_eq!(
-            resolve_ast_type(&s, &intersection(vec![simple(NameFq::NotFq, "Countable"), simple(NameFq::NotFq, "Traversable")])).to_string(),
+            resolve_ast_type(
+                &s,
+                &intersection(vec![
+                    simple(NameFq::NotFq, "Countable"),
+                    simple(NameFq::NotFq, "Traversable")
+                ])
+            )
+            .to_string(),
             "App\\Countable&App\\Traversable"
         );
     }
@@ -335,7 +430,7 @@ mod tests {
         assert_eq!(doc(&s, &[], "integer"), Type::Int);
         assert_eq!(doc(&s, &[], "boolean"), Type::Bool);
         assert_eq!(doc(&s, &[], "double"), Type::Float);
-        assert_eq!(doc(&s, &[], "mixed"), Type::Mixed);
+        assert_eq!(doc(&s, &[], "mixed"), Type::ExplicitMixed);
         assert_eq!(doc(&s, &[], "void"), Type::Void);
     }
 
@@ -358,29 +453,62 @@ mod tests {
         let s = app_scope();
         assert_eq!(doc(&s, &["T"], "T"), Type::TemplateVar("T".into()));
         // A non-template name in the same scope resolves as a class.
-        assert_eq!(doc(&s, &["T"], "User"), Type::Named { fqn: "App\\User".into(), args: vec![] });
+        assert_eq!(
+            doc(&s, &["T"], "User"),
+            Type::Named {
+                fqn: "App\\User".into(),
+                args: vec![]
+            }
+        );
     }
 
     #[test]
     fn doc_class_names_resolve_to_fqns() {
         let s = app_scope();
-        assert_eq!(doc(&s, &[], "User"), Type::Named { fqn: "App\\User".into(), args: vec![] });
+        assert_eq!(
+            doc(&s, &[], "User"),
+            Type::Named {
+                fqn: "App\\User".into(),
+                args: vec![]
+            }
+        );
         assert_eq!(
             doc(&s, &[], "Collection"),
-            Type::Named { fqn: "Illuminate\\Support\\Collection".into(), args: vec![] }
+            Type::Named {
+                fqn: "Illuminate\\Support\\Collection".into(),
+                args: vec![]
+            }
         );
-        assert_eq!(doc(&s, &[], "\\DateTimeImmutable"), Type::Named { fqn: "DateTimeImmutable".into(), args: vec![] });
+        assert_eq!(
+            doc(&s, &[], "\\DateTimeImmutable"),
+            Type::Named {
+                fqn: "DateTimeImmutable".into(),
+                args: vec![]
+            }
+        );
     }
 
     #[test]
     fn doc_arrays_and_generics() {
         let s = app_scope();
         assert_eq!(doc(&s, &[], "int[]").to_string(), "array<int|string, int>");
-        assert_eq!(doc(&s, &[], "array<int>").to_string(), "array<int|string, int>");
-        assert_eq!(doc(&s, &[], "array<string, User>").to_string(), "array<string, App\\User>");
+        assert_eq!(
+            doc(&s, &[], "array<int>").to_string(),
+            "array<int|string, int>"
+        );
+        assert_eq!(
+            doc(&s, &[], "array<string, User>").to_string(),
+            "array<string, App\\User>"
+        );
         assert_eq!(doc(&s, &[], "list<int>"), Type::List(Box::new(Type::Int)));
-        assert_eq!(doc(&s, &[], "iterable<User>").to_string(), "iterable<int|string, App\\User>");
-        assert_eq!(doc(&s, &[], "class-string<User>").to_string(), "class-string<App\\User>");
+        assert_eq!(
+            doc(&s, &[], "iterable<User>").to_string(),
+            "iterable<int|string, App\\User>"
+        );
+        assert_eq!(
+            doc(&s, &[], "class-string<User>").to_string(),
+            "class-string<App\\User>"
+        );
         assert_eq!(doc(&s, &[], "int<0, 100>"), Type::Int);
     }
 
@@ -391,7 +519,13 @@ mod tests {
             doc(&s, &["TKey", "TValue"], "Collection<TKey, User>"),
             Type::Named {
                 fqn: "Illuminate\\Support\\Collection".into(),
-                args: vec![Type::TemplateVar("TKey".into()), Type::Named { fqn: "App\\User".into(), args: vec![] }],
+                args: vec![
+                    Type::TemplateVar("TKey".into()),
+                    Type::Named {
+                        fqn: "App\\User".into(),
+                        args: vec![]
+                    }
+                ],
             }
         );
     }
@@ -399,9 +533,18 @@ mod tests {
     #[test]
     fn doc_shapes_callables_literals_conditionals() {
         let s = Scope::global();
-        assert_eq!(doc(&s, &[], "array{id: int, name?: string}").to_string(), "array{id: int, name?: string}");
-        assert_eq!(doc(&s, &[], "callable(int, string): bool").to_string(), "callable(int, string): bool");
-        assert_eq!(doc(&s, &[], "'draft'|'published'").to_string(), "'draft'|'published'");
+        assert_eq!(
+            doc(&s, &[], "array{id: int, name?: string}").to_string(),
+            "array{id: int, name?: string}"
+        );
+        assert_eq!(
+            doc(&s, &[], "callable(int, string): bool").to_string(),
+            "callable(int, string): bool"
+        );
+        assert_eq!(
+            doc(&s, &[], "'draft'|'published'").to_string(),
+            "'draft'|'published'"
+        );
         assert_eq!(doc(&s, &[], "1|2|3").to_string(), "1|2|3");
         assert_eq!(
             doc(&s, &["T"], "(T is int ? string : bool)").to_string(),

@@ -97,7 +97,10 @@ pub struct Template {
 /// Parse a raw `/** … */` docblock into a typed [`Doc`].
 pub fn parse(raw: &str) -> Doc {
     let block = parse_block(raw);
-    let mut doc = Doc { description: block.description, ..Doc::default() };
+    let mut doc = Doc {
+        description: block.description,
+        ..Doc::default()
+    };
     // Param/return precedence: track the priority that set each.
     let mut return_pri: i8 = -1;
     let mut param_pri: Vec<i8> = Vec::new();
@@ -107,7 +110,12 @@ pub fn parse(raw: &str) -> Doc {
         // `@template-extends` etc. share handling with the bare generic tags.
         let gbase = base.strip_prefix("template-").unwrap_or(base);
         match base {
-            "param" => upsert_param(&mut doc.params, &mut param_pri, parse_param(&tag.value), pri),
+            "param" => upsert_param(
+                &mut doc.params,
+                &mut param_pri,
+                parse_param(&tag.value),
+                pri,
+            ),
             "return" => {
                 if pri >= return_pri {
                     let (ty, _) = split_type(&tag.value);
@@ -133,9 +141,15 @@ pub fn parse(raw: &str) -> Doc {
                     doc.methods.push(m);
                 }
             }
-            "property" => doc.properties.push(parse_property(&tag.value, PropertyAccess::ReadWrite)),
-            "property-read" => doc.properties.push(parse_property(&tag.value, PropertyAccess::ReadOnly)),
-            "property-write" => doc.properties.push(parse_property(&tag.value, PropertyAccess::WriteOnly)),
+            "property" => doc
+                .properties
+                .push(parse_property(&tag.value, PropertyAccess::ReadWrite)),
+            "property-read" => doc
+                .properties
+                .push(parse_property(&tag.value, PropertyAccess::ReadOnly)),
+            "property-write" => doc
+                .properties
+                .push(parse_property(&tag.value, PropertyAccess::WriteOnly)),
             "mixin" => {
                 if let Some((ty, _)) = parse_type_prefix(&tag.value) {
                     doc.mixins.push(ty);
@@ -196,19 +210,34 @@ fn parse_param(value: &str) -> Param {
         rest = rest[3..].trim_start();
     }
     let (name, description) = take_var_name(rest);
-    Param { name, ty, by_ref, variadic, description: description.to_string() }
+    Param {
+        name,
+        ty,
+        by_ref,
+        variadic,
+        description: description.to_string(),
+    }
 }
 
 fn parse_var(value: &str) -> Var {
     let (ty, rest) = split_type(value);
     let (name, description) = take_var_name(rest);
-    Var { name, ty, description: description.to_string() }
+    Var {
+        name,
+        ty,
+        description: description.to_string(),
+    }
 }
 
 fn parse_property(value: &str, access: PropertyAccess) -> PropertyTag {
     let (ty, rest) = split_type(value);
     let (name, description) = take_var_name(rest);
-    PropertyTag { name, ty, access, description: description.to_string() }
+    PropertyTag {
+        name,
+        ty,
+        access,
+        description: description.to_string(),
+    }
 }
 
 /// Parse a `@method [static] [returnType] name(params) [description]` signature.
@@ -226,16 +255,32 @@ fn parse_method(value: &str) -> Option<MethodTag> {
     // `[returnType] name` precedes the parameter list; the name is the trailing
     // identifier, the return type (if any) is everything before it.
     let head = v[..open].trim_end();
-    let name_start = head.rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map(|i| i + 1).unwrap_or(0);
+    let name_start = head
+        .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .map(|i| i + 1)
+        .unwrap_or(0);
     let name = head[name_start..].to_string();
     if name.is_empty() {
         return None;
     }
     let ret_str = head[..name_start].trim();
-    let return_type = if ret_str.is_empty() { None } else { parse_type(ret_str) };
-    let params = split_top_level(&v[open + 1..close], b',').iter().map(|p| parse_method_param(p)).collect();
+    let return_type = if ret_str.is_empty() {
+        None
+    } else {
+        parse_type(ret_str)
+    };
+    let params = split_top_level(&v[open + 1..close], b',')
+        .iter()
+        .map(|p| parse_method_param(p))
+        .collect();
     let description = v[close + 1..].trim().to_string();
-    Some(MethodTag { name, is_static, return_type, params, description })
+    Some(MethodTag {
+        name,
+        is_static,
+        return_type,
+        params,
+        description,
+    })
 }
 
 fn parse_method_param(s: &str) -> MethodParam {
@@ -253,7 +298,13 @@ fn parse_method_param(s: &str) -> MethodParam {
         rest = rest[3..].trim_start();
     }
     let (name, _) = take_var_name(rest);
-    MethodParam { name, ty, by_ref, variadic, default }
+    MethodParam {
+        name,
+        ty,
+        by_ref,
+        variadic,
+        default,
+    }
 }
 
 /// Find the matching close of the bracket at `open` (`()`/`[]`/`{}` nesting;
@@ -317,7 +368,9 @@ fn top_level_eq(s: &str) -> Option<usize> {
 
 fn parse_template(value: &str) -> Option<Template> {
     let value = value.trim();
-    let end = value.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(value.len());
+    let end = value
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(value.len());
     let name = value[..end].to_string();
     if name.is_empty() {
         return None;
@@ -336,7 +389,9 @@ fn parse_template(value: &str) -> Option<Template> {
 fn take_var_name(s: &str) -> (Option<String>, &str) {
     let s = s.trim_start();
     if let Some(after) = s.strip_prefix('$') {
-        let end = after.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(after.len());
+        let end = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(after.len());
         let name = after[..end].to_string();
         return (Some(name), after[end..].trim_start());
     }
@@ -370,7 +425,9 @@ mod tests {
 
     #[test]
     fn params_and_return() {
-        let d = parse("/**\n * @param int $count how many\n * @param string[] $names\n * @return Thing\n */");
+        let d = parse(
+            "/**\n * @param int $count how many\n * @param string[] $names\n * @return Thing\n */",
+        );
         assert_eq!(d.params.len(), 2);
         assert_eq!(d.params[0].name.as_deref(), Some("count"));
         assert_eq!(d.params[0].ty, Some(named("int")));
@@ -402,10 +459,19 @@ mod tests {
         // The phpstan-param wins for $items.
         assert_eq!(
             d.params[0].ty,
-            Some(Generic { base: "non-empty-list".into(), args: vec![named("User")] })
+            Some(Generic {
+                base: "non-empty-list".into(),
+                args: vec![named("User")]
+            })
         );
         // psalm-return overrides the plain `array`.
-        assert_eq!(d.returns, Some(Generic { base: "list".into(), args: vec![named("User")] }));
+        assert_eq!(
+            d.returns,
+            Some(Generic {
+                base: "list".into(),
+                args: vec![named("User")]
+            })
+        );
     }
 
     #[test]
@@ -413,22 +479,42 @@ mod tests {
         let d = parse(
             "/**\n * @var array<string, int> $map\n * @throws \\RuntimeException\n * @template T of Countable\n * @deprecated use Other\n */",
         );
-        assert_eq!(d.vars[0].ty, Some(Generic { base: "array".into(), args: vec![named("string"), named("int")] }));
+        assert_eq!(
+            d.vars[0].ty,
+            Some(Generic {
+                base: "array".into(),
+                args: vec![named("string"), named("int")]
+            })
+        );
         assert_eq!(d.vars[0].name.as_deref(), Some("map"));
         assert_eq!(d.throws, [named("\\RuntimeException")]);
-        assert_eq!(d.templates, [Template { name: "T".into(), bound: Some(named("Countable")) }]);
+        assert_eq!(
+            d.templates,
+            [Template {
+                name: "T".into(),
+                bound: Some(named("Countable"))
+            }]
+        );
         assert!(d.deprecated);
     }
 
     #[test]
     fn bare_template_has_no_bound() {
         let d = parse("/** @template TKey */");
-        assert_eq!(d.templates, [Template { name: "TKey".into(), bound: None }]);
+        assert_eq!(
+            d.templates,
+            [Template {
+                name: "TKey".into(),
+                bound: None
+            }]
+        );
     }
 
     #[test]
     fn method_with_static_return_and_params() {
-        let d = parse("/** @method static \\Builder where(string $column, mixed $value = null) finds rows */");
+        let d = parse(
+            "/** @method static \\Builder where(string $column, mixed $value = null) finds rows */",
+        );
         let m = &d.methods[0];
         assert_eq!(m.name, "where");
         assert!(m.is_static);
@@ -453,10 +539,18 @@ mod tests {
 
     #[test]
     fn method_params_with_generics_variadic_and_array_default() {
-        let d = parse("/** @method int sum(array<int, int> $nums, int ...$rest, array $opts = ['a' => 1]) */");
+        let d = parse(
+            "/** @method int sum(array<int, int> $nums, int ...$rest, array $opts = ['a' => 1]) */",
+        );
         let m = &d.methods[0];
         assert_eq!(m.params.len(), 3);
-        assert_eq!(m.params[0].ty, Some(Generic { base: "array".into(), args: vec![named("int"), named("int")] }));
+        assert_eq!(
+            m.params[0].ty,
+            Some(Generic {
+                base: "array".into(),
+                args: vec![named("int"), named("int")]
+            })
+        );
         assert!(m.params[1].variadic && m.params[1].name.as_deref() == Some("rest"));
         // The `=>` inside the array default must not split the param or default.
         assert_eq!(m.params[2].default.as_deref(), Some("['a' => 1]"));
@@ -482,8 +576,26 @@ mod tests {
             "/**\n * @mixin \\Eloquent\n * @extends Collection<int, User>\n * @implements ArrayAccess<int, User>\n * @template-use HasEvents<User>\n */",
         );
         assert_eq!(d.mixins, [named("\\Eloquent")]);
-        assert_eq!(d.extends, [Generic { base: "Collection".into(), args: vec![named("int"), named("User")] }]);
-        assert_eq!(d.implements, [Generic { base: "ArrayAccess".into(), args: vec![named("int"), named("User")] }]);
-        assert_eq!(d.uses, [Generic { base: "HasEvents".into(), args: vec![named("User")] }]);
+        assert_eq!(
+            d.extends,
+            [Generic {
+                base: "Collection".into(),
+                args: vec![named("int"), named("User")]
+            }]
+        );
+        assert_eq!(
+            d.implements,
+            [Generic {
+                base: "ArrayAccess".into(),
+                args: vec![named("int"), named("User")]
+            }]
+        );
+        assert_eq!(
+            d.uses,
+            [Generic {
+                base: "HasEvents".into(),
+                args: vec![named("User")]
+            }]
+        );
     }
 }

@@ -48,7 +48,11 @@ pub struct Stmt {
 
 impl Stmt {
     pub fn new(span: Span, kind: StmtKind) -> Stmt {
-        Stmt { span, kind, doc: None }
+        Stmt {
+            span,
+            kind,
+            doc: None,
+        }
     }
 }
 
@@ -229,6 +233,7 @@ pub struct PropElem {
 #[derive(Clone, PartialEq, Debug)]
 pub struct PropertyHook {
     pub attrs: Vec<AttributeGroup>,
+    pub doc: Option<String>,
     pub modifiers: Modifiers,
     /// `&get` — by-reference hook.
     pub by_ref: bool,
@@ -299,6 +304,7 @@ pub enum TraitAdaptation {
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Param {
+    pub span: Span,
     pub attrs: Vec<AttributeGroup>,
     /// Constructor property promotion modifiers (empty for plain params).
     pub modifiers: Modifiers,

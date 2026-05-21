@@ -18,6 +18,11 @@ pub struct Config {
     pub level: Level,
     /// Files/directories to analyze (relative to the config file / project root).
     pub paths: Vec<String>,
+    /// Files/directories to parse for symbols only. These files are indexed and
+    /// reflected, but diagnostics from them are not reported.
+    pub scan_paths: Vec<String>,
+    /// Individual files to parse for symbols only.
+    pub scan_files: Vec<String>,
     /// Glob patterns to exclude from analysis (`fnmatch`-style; `*`, `**`, `?`).
     pub exclude: Vec<String>,
     /// File extensions to analyze (without the dot). Defaults to `["php"]`.
@@ -43,6 +48,8 @@ impl Default for Config {
         Config {
             level: Level(0),
             paths: Vec::new(),
+            scan_paths: Vec::new(),
+            scan_files: Vec::new(),
             exclude: Vec::new(),
             extensions: vec!["php".to_string()],
             php_version: None,
@@ -69,7 +76,11 @@ impl Config {
     /// Find a config file in `dir`, trying the standard names in order.
     pub fn discover(dir: impl AsRef<std::path::Path>) -> Option<std::path::PathBuf> {
         let dir = dir.as_ref();
-        for name in ["phpanalyzer.yaml", "phpanalyzer.yml", "phpanalyzer.dist.yaml"] {
+        for name in [
+            "phpanalyzer.yaml",
+            "phpanalyzer.yml",
+            "phpanalyzer.dist.yaml",
+        ] {
             let p = dir.join(name);
             if p.is_file() {
                 return Some(p);
@@ -103,9 +114,13 @@ impl<'de> Deserialize<'de> for Level {
         }
         match Repr::deserialize(d)? {
             Repr::Int(n) if (0..=10).contains(&n) => Ok(Level(n as u8)),
-            Repr::Int(n) => Err(de::Error::custom(format!("level {n} is out of range (0–9 or \"max\")"))),
+            Repr::Int(n) => Err(de::Error::custom(format!(
+                "level {n} is out of range (0–9 or \"max\")"
+            ))),
             Repr::Str(s) if s.eq_ignore_ascii_case("max") => Ok(Level::MAX),
-            Repr::Str(s) => Err(de::Error::custom(format!("invalid level {s:?} (expected 0–9 or \"max\")"))),
+            Repr::Str(s) => Err(de::Error::custom(format!(
+                "invalid level {s:?} (expected 0–9 or \"max\")"
+            ))),
         }
     }
 }
@@ -145,7 +160,10 @@ impl<'de> Deserialize<'de> for IgnoreEntry {
             Map(Map),
         }
         Ok(match Repr::deserialize(d)? {
-            Repr::Str(s) => IgnoreEntry { message: Some(s), ..Default::default() },
+            Repr::Str(s) => IgnoreEntry {
+                message: Some(s),
+                ..Default::default()
+            },
             Repr::Map(m) => IgnoreEntry {
                 message: m.message,
                 identifier: m.identifier,
@@ -254,6 +272,10 @@ level: 6
 paths:
   - src
   - tests
+scanPaths:
+  - vendor
+scanFiles:
+  - generated/stubs.php
 exclude:
   - tests/fixtures
   - "**/generated/*"
@@ -266,12 +288,17 @@ ignore:
         .unwrap();
         assert_eq!(cfg.level, Level(6));
         assert_eq!(cfg.paths, ["src", "tests"]);
+        assert_eq!(cfg.scan_paths, ["vendor"]);
+        assert_eq!(cfg.scan_files, ["generated/stubs.php"]);
         assert_eq!(cfg.exclude, ["tests/fixtures", "**/generated/*"]);
         assert_eq!(cfg.extensions, ["php"]); // default
         assert_eq!(cfg.php_version.as_deref(), Some("8.4"));
         assert!(cfg.report_unmatched_ignored); // default true
         assert_eq!(cfg.ignore.len(), 2);
-        assert_eq!(cfg.ignore[0].message.as_deref(), Some("/Cannot call method .* on null/"));
+        assert_eq!(
+            cfg.ignore[0].message.as_deref(),
+            Some("/Cannot call method .* on null/")
+        );
         assert_eq!(cfg.ignore[1].identifier.as_deref(), Some("return.type"));
         assert_eq!(cfg.ignore[1].path.as_deref(), Some("src/Generated"));
     }
@@ -292,6 +319,8 @@ ignore:
         assert_eq!(cfg.extensions, ["php"]);
         assert!(cfg.report_unmatched_ignored);
         assert!(cfg.paths.is_empty());
+        assert!(cfg.scan_paths.is_empty());
+        assert!(cfg.scan_files.is_empty());
     }
 
     #[test]

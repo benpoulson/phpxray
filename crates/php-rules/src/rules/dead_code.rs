@@ -29,21 +29,36 @@
 //!   `match`, `@`, `clone`, shell-exec). The side-effect guard keeps this
 //!   FP-safe — the common `$cond && doThing()` idiom (where the right side has an
 //!   effect) is *not* flagged.
+//! - **CallToFunctionStatementWithoutImpurePointsRule**
+//!   (`function.resultUnused`) — conservative same-file subset: a discarded call
+//!   to a user function explicitly marked pure, with no by-ref params/asserts/
+//!   throws and whose body has no side effects except calls/new whose targets are
+//!   in the same proven-pure closure.
+//! - **CallToConstructorStatementWithoutImpurePointsRule**
+//!   (`new.resultUnused`) — same subset for discarded `new C()` where
+//!   `C::__construct()` is proven effect-free.
+//! - **CallToMethodStatementWithoutImpurePointsRule** /
+//!   **CallToStaticMethodStatementWithoutImpurePointsRule**
+//!   (`method.resultUnused`/`staticMethod.resultUnused`) — conservative same-file
+//!   subset for non-`@pure` methods whose bodies have no impure points; direct
+//!   `@pure` calls stay owned by `methods.rs` to avoid duplicate diagnostics.
 //!
 //! Deferred:
-//! - `CallTo*StatementWithoutImpurePointsRule` (and their purity collectors) —
-//!   need cross-function purity analysis (impure-point collection) we don't have.
+//! - Broader virtual-dispatch, argument, nullsafe, pipe-callable, inherited, and
+//!   cross-file purity cases for the `CallTo*StatementWithoutImpurePointsRule`
+//!   family.
 
-#![allow(unused_imports)]
 use crate::{walk, FileAnalysis, RuleEntry};
 use php_ast::{
-    BinOp, ClassConstDecl, ClassDecl, ClassKind, Expr, ExprKind, Member, MemberName, MethodDecl,
-    PropertyDecl, Stmt, StmtKind, Visibility,
+    BinOp, ClassDecl, ClassKind, Expr, ExprKind, FunctionDecl, Member, MemberName, MethodDecl,
+    Stmt, StmtKind, Visibility,
 };
 use php_diagnostics::Diagnostic;
 use php_intern::Interner;
-use php_resolve::for_each_region;
-use std::collections::HashSet;
+use php_reflect::{reflect_class, reflect_function, Found, MethodReflection};
+use php_resolve::{for_each_region, Resolution, Scope};
+use php_types::Type;
+use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
 // UnreachableStatementRule — `deadCode.unreachable`
@@ -71,8 +86,11 @@ fn check_stmt_list(stmts: &[Stmt], out: &mut Vec<Diagnostic>) {
     for s in stmts {
         if terminated && !is_ignorable_after_terminator(&s.kind) {
             out.push(
-                Diagnostic::error(s.span, "Unreachable statement - code above always terminates.")
-                    .with_code("deadCode.unreachable"),
+                Diagnostic::error(
+                    s.span,
+                    "Unreachable statement - code above always terminates.",
+                )
+                .with_code("deadCode.unreachable"),
             );
             terminated = false; // report only the first; keep scanning nested blocks
         }
@@ -100,10 +118,9 @@ fn is_ignorable_after_terminator(kind: &StmtKind) -> bool {
 /// Whether a statement unconditionally ends control flow of its enclosing block.
 fn terminates(kind: &StmtKind) -> bool {
     match kind {
-        StmtKind::Return(_)
-        | StmtKind::Break(_)
-        | StmtKind::Continue(_)
-        | StmtKind::Goto(_) => true,
+        StmtKind::Return(_) | StmtKind::Break(_) | StmtKind::Continue(_) | StmtKind::Goto(_) => {
+            true
+        }
         StmtKind::Expr(e) => matches!(e.kind, ExprKind::Throw(_) | ExprKind::Exit(_)),
         _ => false,
     }
@@ -114,7 +131,9 @@ fn terminates(kind: &StmtKind) -> bool {
 fn recurse_into_blocks(s: &Stmt, out: &mut Vec<Diagnostic>) {
     match &s.kind {
         StmtKind::Block(b) => check_stmt_list(b, out),
-        StmtKind::If { then, elseifs, els, .. } => {
+        StmtKind::If {
+            then, elseifs, els, ..
+        } => {
             check_one(then, out);
             for ei in elseifs {
                 check_one(&ei.body, out);
@@ -132,7 +151,11 @@ fn recurse_into_blocks(s: &Stmt, out: &mut Vec<Diagnostic>) {
                 check_stmt_list(&c.body, out);
             }
         }
-        StmtKind::Try { body, catches, finally } => {
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
             check_stmt_list(body, out);
             for c in catches {
                 check_stmt_list(&c.body, out);
@@ -202,14 +225,47 @@ fn collect_member_refs(c: &ClassDecl, interner: &Interner) -> MemberRefs {
     // Wrap the class in a one-statement program so the shared walker (which
     // crosses scopes) visits every nested expression, including closures.
     let prog = php_ast::Program {
-        stmts: vec![Stmt::new(php_span::Span::new(0, 0), StmtKind::Class(c.clone()))],
+        stmts: vec![Stmt::new(
+            php_span::Span::new(0, 0),
+            StmtKind::Class(c.clone()),
+        )],
     };
     walk::for_each_expr(&prog, &mut |e| match &e.kind {
-        ExprKind::MethodCall { method, .. } => record_member(method, &mut refs.method_names, interner, &mut refs.has_dynamic_member, true),
-        ExprKind::StaticCall { method, .. } => record_member(method, &mut refs.method_names, interner, &mut refs.has_dynamic_member, false),
-        ExprKind::Prop { name, .. } => record_member(name, &mut refs.prop_names, interner, &mut refs.has_dynamic_member, true),
-        ExprKind::StaticProp { name, .. } => record_member(name, &mut refs.prop_names, interner, &mut refs.has_dynamic_member, false),
-        ExprKind::ClassConst { name, .. } => record_member(name, &mut refs.const_names, interner, &mut refs.has_dynamic_member, false),
+        ExprKind::MethodCall { method, .. } => record_member(
+            method,
+            &mut refs.method_names,
+            interner,
+            &mut refs.has_dynamic_member,
+            true,
+        ),
+        ExprKind::StaticCall { method, .. } => record_member(
+            method,
+            &mut refs.method_names,
+            interner,
+            &mut refs.has_dynamic_member,
+            false,
+        ),
+        ExprKind::Prop { name, .. } => record_member(
+            name,
+            &mut refs.prop_names,
+            interner,
+            &mut refs.has_dynamic_member,
+            true,
+        ),
+        ExprKind::StaticProp { name, .. } => record_member(
+            name,
+            &mut refs.prop_names,
+            interner,
+            &mut refs.has_dynamic_member,
+            false,
+        ),
+        ExprKind::ClassConst { name, .. } => record_member(
+            name,
+            &mut refs.const_names,
+            interner,
+            &mut refs.has_dynamic_member,
+            false,
+        ),
         ExprKind::Str(bytes) => {
             if let Ok(s) = std::str::from_utf8(bytes) {
                 refs.string_literals.insert(s.to_string());
@@ -243,7 +299,9 @@ fn record_member(
 
 /// The display name phpstan uses for a class in dead-code messages.
 fn class_display(c: &ClassDecl, scope: &php_resolve::Scope, interner: &Interner) -> String {
-    c.name.map(|n| scope.qualify(interner.resolve(n))).unwrap_or_default()
+    c.name
+        .map(|n| scope.qualify(interner.resolve(n)))
+        .unwrap_or_default()
 }
 
 /// Visit each top-level class/enum declaration with its region scope. Unused
@@ -257,10 +315,16 @@ fn for_each_concrete_class(fa: &FileAnalysis, mut f: impl FnMut(&php_resolve::Sc
     });
 }
 
-fn collect_classes(st: &Stmt, scope: &php_resolve::Scope, f: &mut impl FnMut(&php_resolve::Scope, &ClassDecl)) {
+fn collect_classes(
+    st: &Stmt,
+    scope: &php_resolve::Scope,
+    f: &mut impl FnMut(&php_resolve::Scope, &ClassDecl),
+) {
     match &st.kind {
         StmtKind::Class(c) if matches!(c.kind, ClassKind::Class | ClassKind::Enum) => f(scope, c),
-        StmtKind::Namespace { body: Some(b), .. } => b.iter().for_each(|s| collect_classes(s, scope, f)),
+        StmtKind::Namespace { body: Some(b), .. } => {
+            b.iter().for_each(|s| collect_classes(s, scope, f))
+        }
         _ => {}
     }
 }
@@ -281,7 +345,11 @@ fn run_unused_private_method(fa: &FileAnalysis) -> Vec<Diagnostic> {
         if refs.has_dynamic_member {
             return; // can't prove anything unused
         }
-        let used: HashSet<String> = refs.method_names.iter().map(|s| s.to_ascii_lowercase()).collect();
+        let used: HashSet<String> = refs
+            .method_names
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
         let display = class_display(c, scope, fa.interner);
         for m in &c.members {
             let Member::Method(md) = m else { continue };
@@ -298,7 +366,11 @@ fn run_unused_private_method(fa: &FileAnalysis) -> Vec<Diagnostic> {
             if used.contains(&lower) || refs.string_literals.contains(&name) {
                 continue;
             }
-            let kind = if md.modifiers.is_static { "Static method" } else { "Method" };
+            let kind = if md.modifiers.is_static {
+                "Static method"
+            } else {
+                "Method"
+            };
             out.push(
                 Diagnostic::error(
                     method_span(md),
@@ -339,7 +411,11 @@ fn is_magic_method(lower: &str) -> bool {
 /// Best-effort span for a method (its body's first statement, else a zero span;
 /// `MethodDecl` carries no span of its own).
 fn method_span(md: &MethodDecl) -> php_span::Span {
-    md.body.as_ref().and_then(|b| b.first()).map(|s| s.span).unwrap_or(php_span::Span::new(0, 0))
+    md.body
+        .as_ref()
+        .and_then(|b| b.first())
+        .map(|s| s.span)
+        .unwrap_or(php_span::Span::new(0, 0))
 }
 
 // ---------------------------------------------------------------------------
@@ -412,8 +488,16 @@ fn run_unused_private_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 if refs.prop_names.contains(&name) || refs.string_literals.contains(&name) {
                     continue;
                 }
-                let kind = if pd.modifiers.is_static { "Static property" } else { "Property" };
-                let span = pe.default.as_ref().map(|d| d.span).unwrap_or(php_span::Span::new(0, 0));
+                let kind = if pd.modifiers.is_static {
+                    "Static property"
+                } else {
+                    "Property"
+                };
+                let span = pe
+                    .default
+                    .as_ref()
+                    .map(|d| d.span)
+                    .unwrap_or(php_span::Span::new(0, 0));
                 out.push(
                     Diagnostic::error(span, format!("{kind} {display}::${name} is unused."))
                         .with_code("property.unused"),
@@ -422,6 +506,727 @@ fn run_unused_private_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
     });
     out
+}
+
+// ---------------------------------------------------------------------------
+// CallToFunctionStatementWithoutImpurePointsRule — `function.resultUnused`
+// CallToConstructorStatementWithoutImpurePointsRule — `new.resultUnused`
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+enum CallableKey {
+    Function(String),
+    Method { class: String, method: String },
+}
+
+#[derive(Clone, Debug)]
+struct PureCandidate {
+    deps: HashSet<CallableKey>,
+    method: Option<PureMethodCandidate>,
+}
+
+#[derive(Clone, Debug)]
+struct PureMethodCandidate {
+    display: String,
+    declared_pure: bool,
+}
+
+/// Same-file, zero-FP subset of phpstan's transitive
+/// `CallTo*StatementWithoutImpurePointsRule` family.
+///
+/// PHPStan collects declarations whose "impure points" are only calls, then
+/// solves the transitive closure. We mirror that shape locally for user
+/// functions and constructors:
+/// - the declaration must be explicitly `@pure`/`@phpstan-pure`/`@psalm-pure`
+///   in reflection,
+/// - no by-ref params / assert tags / throw tags,
+/// - the body may contain no side-effecting expression except calls/new we can
+///   resolve into this same candidate set.
+///
+/// This is intentionally narrower than phpstan, but every diagnostic it emits is
+/// a case phpstan also reports.
+fn run_pure_function_statement_without_impure_points(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let candidates = collect_pure_candidates(fa);
+    let pure = pure_callable_closure(&candidates);
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            crate::rules::functions::stmt_level_calls(st, &mut |e| {
+                let ExprKind::Call { callee, args } = &e.kind else {
+                    return;
+                };
+                if args.iter().any(|a| a.placeholder) {
+                    return;
+                }
+                let Some(key) = function_call_key(scope, callee) else {
+                    return;
+                };
+                if !pure.contains(&key) {
+                    return;
+                }
+                let CallableKey::Function(fqn) = key else {
+                    return;
+                };
+                let display = fqn.trim_start_matches('\\');
+                out.push(
+                    Diagnostic::error(
+                        e.span,
+                        format!("Call to function {display}() on a separate line has no effect."),
+                    )
+                    .with_code("function.resultUnused"),
+                );
+            });
+        }
+    });
+    out
+}
+
+fn run_pure_constructor_statement_without_impure_points(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let candidates = collect_pure_candidates(fa);
+    let pure = pure_callable_closure(&candidates);
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            crate::rules::functions::stmt_level_calls(st, &mut |e| {
+                let ExprKind::New { class, .. } = &e.kind else {
+                    return;
+                };
+                let Some(class_fqn) = class_expr_fqn(scope, class) else {
+                    return;
+                };
+                let key = method_callable_key(&class_fqn, "__construct");
+                if !pure.contains(&key) {
+                    return;
+                }
+                let display = fa
+                    .reflection
+                    .class(&class_fqn)
+                    .map(|c| c.fqn.trim_start_matches('\\'))
+                    .unwrap_or_else(|| class_fqn.trim_start_matches('\\'));
+                out.push(
+                    Diagnostic::error(
+                        e.span,
+                        format!("Call to new {display}() on a separate line has no effect."),
+                    )
+                    .with_code("new.resultUnused"),
+                );
+            });
+        }
+    });
+    out
+}
+
+fn run_pure_method_statement_without_impure_points(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let candidates = collect_pure_candidates(fa);
+    let pure = pure_callable_closure(&candidates);
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |_scope, region| {
+        for st in region {
+            crate::rules::functions::stmt_level_calls(st, &mut |e| {
+                let ExprKind::MethodCall {
+                    recv,
+                    nullsafe,
+                    method,
+                    args,
+                } = &e.kind
+                else {
+                    return;
+                };
+                if *nullsafe || !args.is_empty() {
+                    return;
+                }
+                let Some(key) = exact_method_call_key(fa, recv, method) else {
+                    return;
+                };
+                if !pure.contains(&key) {
+                    return;
+                }
+                let Some(info) = candidates.get(&key).and_then(|c| c.method.as_ref()) else {
+                    return;
+                };
+                if info.declared_pure {
+                    return;
+                }
+                out.push(
+                    Diagnostic::error(
+                        e.span,
+                        format!(
+                            "Call to method {}() on a separate line has no effect.",
+                            info.display
+                        ),
+                    )
+                    .with_code("method.resultUnused"),
+                );
+            });
+        }
+    });
+    out
+}
+
+fn run_pure_static_method_statement_without_impure_points(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let candidates = collect_pure_candidates(fa);
+    let pure = pure_callable_closure(&candidates);
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            crate::rules::functions::stmt_level_calls(st, &mut |e| {
+                let ExprKind::StaticCall {
+                    class,
+                    method,
+                    args,
+                } = &e.kind
+                else {
+                    return;
+                };
+                if !args.is_empty() {
+                    return;
+                }
+                let Some(key) = exact_static_method_call_key(fa, scope, class, method) else {
+                    return;
+                };
+                if !pure.contains(&key) {
+                    return;
+                }
+                let Some(info) = candidates.get(&key).and_then(|c| c.method.as_ref()) else {
+                    return;
+                };
+                if info.declared_pure {
+                    return;
+                }
+                out.push(
+                    Diagnostic::error(
+                        e.span,
+                        format!(
+                            "Call to {}() on a separate line has no effect.",
+                            info.display
+                        ),
+                    )
+                    .with_code("staticMethod.resultUnused"),
+                );
+            });
+        }
+    });
+    out
+}
+
+fn pure_callable_closure(candidates: &HashMap<CallableKey, PureCandidate>) -> HashSet<CallableKey> {
+    let mut pure = HashSet::new();
+    loop {
+        let before = pure.len();
+        for (key, cand) in candidates {
+            if pure.contains(key) {
+                continue;
+            }
+            if cand.deps.iter().all(|dep| pure.contains(dep)) {
+                pure.insert(key.clone());
+            }
+        }
+        if pure.len() == before {
+            break;
+        }
+    }
+    pure
+}
+
+fn collect_pure_candidates(fa: &FileAnalysis) -> HashMap<CallableKey, PureCandidate> {
+    let mut out = HashMap::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            collect_pure_candidates_stmt(fa, scope, st, &mut out);
+        }
+    });
+    out
+}
+
+fn collect_pure_candidates_stmt(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    st: &Stmt,
+    out: &mut HashMap<CallableKey, PureCandidate>,
+) {
+    match &st.kind {
+        StmtKind::Function(f) => {
+            collect_function_candidate(fa, scope, f, out);
+            for s in &f.body {
+                collect_pure_candidates_stmt(fa, scope, s, out);
+            }
+        }
+        StmtKind::Class(c) => collect_class_candidates(fa, scope, c, out),
+        StmtKind::Block(b) | StmtKind::Namespace { body: Some(b), .. } => {
+            for s in b {
+                collect_pure_candidates_stmt(fa, scope, s, out);
+            }
+        }
+        StmtKind::If {
+            then, elseifs, els, ..
+        } => {
+            collect_pure_candidates_stmt(fa, scope, then, out);
+            for e in elseifs {
+                collect_pure_candidates_stmt(fa, scope, &e.body, out);
+            }
+            if let Some(e) = els {
+                collect_pure_candidates_stmt(fa, scope, e, out);
+            }
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::DoWhile { body, .. }
+        | StmtKind::For { body, .. }
+        | StmtKind::Foreach { body, .. } => collect_pure_candidates_stmt(fa, scope, body, out),
+        StmtKind::Switch { cases, .. } => {
+            for case in cases {
+                for s in &case.body {
+                    collect_pure_candidates_stmt(fa, scope, s, out);
+                }
+            }
+        }
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            for s in body {
+                collect_pure_candidates_stmt(fa, scope, s, out);
+            }
+            for c in catches {
+                for s in &c.body {
+                    collect_pure_candidates_stmt(fa, scope, s, out);
+                }
+            }
+            if let Some(fin) = finally {
+                for s in fin {
+                    collect_pure_candidates_stmt(fa, scope, s, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_function_candidate(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    f: &FunctionDecl,
+    out: &mut HashMap<CallableKey, PureCandidate>,
+) {
+    let refl = reflect_function(scope, fa.interner, f);
+    if !refl.pure || callable_signature_disqualifies(&refl.params, f.doc.as_deref()) {
+        return;
+    }
+    let Some(deps) = body_dependencies(fa, scope, &f.body, DependencyMode::FunctionConstructorOnly)
+    else {
+        return;
+    };
+    out.insert(
+        CallableKey::Function(refl.fqn),
+        PureCandidate { deps, method: None },
+    );
+}
+
+fn collect_class_candidates(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    c: &ClassDecl,
+    out: &mut HashMap<CallableKey, PureCandidate>,
+) {
+    let Some(name) = c.name else { return };
+    let class_fqn = scope.qualify(fa.interner.resolve(name));
+    let class = reflect_class(scope, fa.interner, &class_fqn, c);
+    for m in &c.members {
+        let Member::Method(md) = m else { continue };
+        if !matches!(c.kind, ClassKind::Class | ClassKind::Enum) {
+            continue;
+        }
+        if !fa
+            .interner
+            .resolve(md.name)
+            .eq_ignore_ascii_case("__construct")
+        {
+            collect_method_candidate(fa, scope, &class, md, out);
+            continue;
+        }
+        let Some(refl) = class
+            .methods
+            .iter()
+            .find(|r| r.name.eq_ignore_ascii_case("__construct") && !r.magic)
+        else {
+            continue;
+        };
+        if !refl.pure || callable_signature_disqualifies(&refl.params, md.doc.as_deref()) {
+            continue;
+        }
+        let Some(body) = &md.body else { continue };
+        let Some(deps) =
+            body_dependencies(fa, scope, body, DependencyMode::FunctionConstructorOnly)
+        else {
+            continue;
+        };
+        out.insert(
+            method_callable_key(&class.fqn, "__construct"),
+            PureCandidate { deps, method: None },
+        );
+    }
+}
+
+fn collect_method_candidate(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    class: &php_reflect::ClassReflection,
+    md: &MethodDecl,
+    out: &mut HashMap<CallableKey, PureCandidate>,
+) {
+    let Some(body) = &md.body else { return };
+    if md.by_ref || doc_is_explicit_impure(md.doc.as_deref()) {
+        return;
+    }
+    let method_name = fa.interner.resolve(md.name);
+    let Some(refl) = class
+        .methods
+        .iter()
+        .find(|r| r.name.eq_ignore_ascii_case(method_name) && !r.magic)
+    else {
+        return;
+    };
+    if refl.name.eq_ignore_ascii_case("__construct")
+        || matches!(refl.return_type, Type::Never)
+        || callable_signature_disqualifies(&refl.params, md.doc.as_deref())
+    {
+        return;
+    }
+    let Some(deps) = body_dependencies(fa, scope, body, DependencyMode::IncludeMethods) else {
+        return;
+    };
+    out.insert(
+        method_callable_key(&class.fqn, &refl.name),
+        PureCandidate {
+            deps,
+            method: Some(PureMethodCandidate {
+                display: format!("{}::{}", class.fqn.trim_start_matches('\\'), refl.name),
+                declared_pure: refl.pure,
+            }),
+        },
+    );
+}
+
+fn callable_signature_disqualifies(
+    params: &[php_reflect::ParamReflection],
+    doc: Option<&str>,
+) -> bool {
+    params.iter().any(|p| p.by_ref) || doc_has_throw_or_assert(doc)
+}
+
+fn doc_has_throw_or_assert(doc: Option<&str>) -> bool {
+    let Some(doc) = doc else { return false };
+    php_phpdoc::parse_block(doc).tags.iter().any(|tag| {
+        tag_name_is_throw_or_assert(&tag.name)
+            || tag
+                .value
+                .split('@')
+                .skip(1)
+                .any(tag_value_starts_throw_or_assert)
+    })
+}
+
+fn doc_is_explicit_impure(doc: Option<&str>) -> bool {
+    let Some(doc) = doc else { return false };
+    php_phpdoc::parse_block(doc).tags.iter().any(|tag| {
+        tag_is_base(&tag.name, "impure")
+            || tag
+                .value
+                .split('@')
+                .skip(1)
+                .any(|value| tag_value_starts_with_base(value, "impure"))
+    })
+}
+
+fn tag_is_base(tag: &str, expected: &str) -> bool {
+    tag.strip_prefix("phpstan-")
+        .or_else(|| tag.strip_prefix("psalm-"))
+        .unwrap_or(tag)
+        == expected
+}
+
+fn tag_value_starts_with_base(value: &str, expected: &str) -> bool {
+    let tag = value
+        .char_indices()
+        .find(|(_, ch)| !(ch.is_ascii_alphanumeric() || *ch == '-'))
+        .map(|(i, _)| &value[..i])
+        .unwrap_or(value);
+    !tag.is_empty() && tag_is_base(tag, expected)
+}
+
+fn tag_name_is_throw_or_assert(name: &str) -> bool {
+    matches!(
+        name.strip_prefix("phpstan-")
+            .or_else(|| name.strip_prefix("psalm-"))
+            .unwrap_or(name),
+        "throws" | "assert" | "assert-if-true" | "assert-if-false"
+    )
+}
+
+fn tag_value_starts_throw_or_assert(value: &str) -> bool {
+    let tag = value
+        .char_indices()
+        .find(|(_, ch)| !(ch.is_ascii_alphanumeric() || *ch == '-'))
+        .map(|(i, _)| &value[..i])
+        .unwrap_or(value);
+    !tag.is_empty() && tag_name_is_throw_or_assert(tag)
+}
+
+#[derive(Clone, Copy)]
+enum DependencyMode {
+    FunctionConstructorOnly,
+    IncludeMethods,
+}
+
+fn body_dependencies(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    body: &[Stmt],
+    mode: DependencyMode,
+) -> Option<HashSet<CallableKey>> {
+    let mut deps = HashSet::new();
+    for st in body {
+        if statement_kind_is_impure(&st.kind) {
+            return None;
+        }
+        let mut ok = true;
+        walk::for_each_expr_in_scope(st, &mut |e| {
+            if !ok {
+                return;
+            }
+            match expression_effect(fa, scope, e, mode) {
+                ExprEffect::Pure => {}
+                ExprEffect::Dependency(dep) => {
+                    deps.insert(dep);
+                }
+                ExprEffect::Impure => ok = false,
+            }
+        });
+        if !ok {
+            return None;
+        }
+    }
+    Some(deps)
+}
+
+fn statement_kind_is_impure(kind: &StmtKind) -> bool {
+    matches!(
+        kind,
+        StmtKind::Echo(_)
+            | StmtKind::Global(_)
+            | StmtKind::StaticVars(_)
+            | StmtKind::Unset(_)
+            | StmtKind::Goto(_)
+            | StmtKind::HaltCompiler(_)
+            | StmtKind::InlineHtml(_)
+            | StmtKind::Error
+    )
+}
+
+enum ExprEffect {
+    Pure,
+    Dependency(CallableKey),
+    Impure,
+}
+
+fn expression_effect(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    e: &Expr,
+    mode: DependencyMode,
+) -> ExprEffect {
+    match &e.kind {
+        ExprKind::Call { callee, args } => {
+            if args.iter().any(|a| a.placeholder) {
+                return ExprEffect::Impure;
+            }
+            function_call_key(scope, callee).map_or(ExprEffect::Impure, ExprEffect::Dependency)
+        }
+        ExprKind::New { class, .. } => {
+            let Some(class) = class_expr_fqn(scope, class) else {
+                return ExprEffect::Impure;
+            };
+            ExprEffect::Dependency(method_callable_key(&class, "__construct"))
+        }
+        ExprKind::MethodCall {
+            recv,
+            nullsafe,
+            method,
+            args,
+        } if matches!(mode, DependencyMode::IncludeMethods) => {
+            if *nullsafe || !args.is_empty() {
+                return ExprEffect::Impure;
+            }
+            exact_method_call_key(fa, recv, method)
+                .map_or(ExprEffect::Impure, ExprEffect::Dependency)
+        }
+        ExprKind::StaticCall {
+            class,
+            method,
+            args,
+        } if matches!(mode, DependencyMode::IncludeMethods) => {
+            if !args.is_empty() {
+                return ExprEffect::Impure;
+            }
+            exact_static_method_call_key(fa, scope, class, method)
+                .map_or(ExprEffect::Impure, ExprEffect::Dependency)
+        }
+        ExprKind::MethodCall { .. } | ExprKind::StaticCall { .. } => ExprEffect::Impure,
+        ExprKind::Index { .. } | ExprKind::Prop { .. } | ExprKind::StaticProp { .. }
+            if matches!(mode, DependencyMode::IncludeMethods) =>
+        {
+            ExprEffect::Impure
+        }
+        ExprKind::NewAnon { .. }
+        | ExprKind::Assign { .. }
+        | ExprKind::AssignOp { .. }
+        | ExprKind::AssignRef { .. }
+        | ExprKind::PreInc(_)
+        | ExprKind::PreDec(_)
+        | ExprKind::PostInc(_)
+        | ExprKind::PostDec(_)
+        | ExprKind::Yield { .. }
+        | ExprKind::YieldFrom(_)
+        | ExprKind::Throw(_)
+        | ExprKind::Exit(_)
+        | ExprKind::Print(_)
+        | ExprKind::Clone(_)
+        | ExprKind::Include { .. }
+        | ExprKind::Eval(_)
+        | ExprKind::Match { .. }
+        | ExprKind::ErrorSuppress(_)
+        | ExprKind::ShellExec(_)
+        | ExprKind::Closure(_)
+        | ExprKind::ArrowFn(_)
+        | ExprKind::VariableVariable(_)
+        | ExprKind::DollarBrace(_)
+        | ExprKind::Error => ExprEffect::Impure,
+        _ => ExprEffect::Pure,
+    }
+}
+
+fn exact_method_call_key(
+    fa: &FileAnalysis,
+    recv: &Expr,
+    method: &MemberName,
+) -> Option<CallableKey> {
+    let recv = peel_paren(recv);
+    if !matches!(recv.kind, ExprKind::Variable(_)) {
+        return None;
+    }
+    let MemberName::Ident(name) = method else {
+        return None;
+    };
+    let receiver_fqn = named_type_fqn(&fa.type_of(recv))?;
+    if !fa.class_fully_known(&receiver_fqn) {
+        return None;
+    }
+    let method_name = fa.interner.resolve(*name);
+    let found = fa.reflection.find_method(&receiver_fqn, method_name)?;
+    if found.member.magic || found.member.is_static {
+        return None;
+    }
+    if !same_fqn(&found.declaring_class, &receiver_fqn) {
+        return None;
+    }
+    if !instance_dispatch_is_exact(fa, &receiver_fqn, &found) {
+        return None;
+    }
+    Some(method_callable_key(
+        &found.declaring_class,
+        &found.member.name,
+    ))
+}
+
+fn exact_static_method_call_key(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    class: &Expr,
+    method: &MemberName,
+) -> Option<CallableKey> {
+    let MemberName::Ident(name) = method else {
+        return None;
+    };
+    let class_fqn = class_expr_fqn(scope, class)?;
+    if !fa.class_fully_known(&class_fqn) {
+        return None;
+    }
+    let method_name = fa.interner.resolve(*name);
+    let found = fa.reflection.find_method(&class_fqn, method_name)?;
+    if found.member.magic || !found.member.is_static {
+        return None;
+    }
+    if !same_fqn(&found.declaring_class, &class_fqn) {
+        return None;
+    }
+    Some(method_callable_key(
+        &found.declaring_class,
+        &found.member.name,
+    ))
+}
+
+fn instance_dispatch_is_exact(
+    fa: &FileAnalysis,
+    receiver_fqn: &str,
+    found: &Found<MethodReflection>,
+) -> bool {
+    if found.member.visibility == Visibility::Private || found.member.is_final {
+        return true;
+    }
+    fa.reflection
+        .class(receiver_fqn)
+        .is_some_and(|class| class.is_final)
+}
+
+fn method_callable_key(class: &str, method: &str) -> CallableKey {
+    CallableKey::Method {
+        class: class.trim_start_matches('\\').to_ascii_lowercase(),
+        method: method.to_ascii_lowercase(),
+    }
+}
+
+fn named_type_fqn(t: &Type) -> Option<String> {
+    match t {
+        Type::Named { fqn, .. } => Some(fqn.clone()),
+        Type::Nullable(inner) => named_type_fqn(inner),
+        _ => None,
+    }
+}
+
+fn same_fqn(a: &str, b: &str) -> bool {
+    a.trim_start_matches('\\')
+        .eq_ignore_ascii_case(b.trim_start_matches('\\'))
+}
+
+fn function_call_key(scope: &Scope, callee: &Expr) -> Option<CallableKey> {
+    let ExprKind::Name(name) = &peel_paren(callee).kind else {
+        return None;
+    };
+    let fqn = match scope.resolve_function(name) {
+        Resolution::Fqn(fqn) => fqn,
+        Resolution::Fallback { namespaced, .. } => namespaced,
+        Resolution::LateStatic(_) | Resolution::BuiltinType(_) => return None,
+    };
+    Some(CallableKey::Function(fqn))
+}
+
+fn class_expr_fqn(scope: &Scope, class: &Expr) -> Option<String> {
+    let ExprKind::Name(name) = &peel_paren(class).kind else {
+        return None;
+    };
+    match scope.resolve_class(name) {
+        Resolution::Fqn(fqn) => Some(fqn),
+        Resolution::LateStatic(_) | Resolution::BuiltinType(_) | Resolution::Fallback { .. } => {
+            None
+        }
+    }
+}
+
+fn peel_paren(mut e: &Expr) -> &Expr {
+    while let ExprKind::Paren(inner) = &e.kind {
+        e = inner;
+    }
+    e
 }
 
 // ---------------------------------------------------------------------------
@@ -439,15 +1244,24 @@ fn run_noop(fa: &FileAnalysis) -> Vec<Diagnostic> {
     walk::for_each_stmt(fa.program, &mut |s| {
         let StmtKind::Expr(e) = &s.kind else { return };
         match &e.kind {
-            ExprKind::Binary { op: BinOp::LogicalXor, .. } => out.push(
+            ExprKind::Binary {
+                op: BinOp::LogicalXor,
+                ..
+            } => out.push(
                 Diagnostic::error(e.span, "Unused result of \"xor\" operator.")
                     .with_code("logicalXor.resultUnused"),
             ),
-            ExprKind::Binary { op: BinOp::LogicalAnd, .. } => out.push(
+            ExprKind::Binary {
+                op: BinOp::LogicalAnd,
+                ..
+            } => out.push(
                 Diagnostic::error(e.span, "Unused result of \"and\" operator.")
                     .with_code("logicalAnd.resultUnused"),
             ),
-            ExprKind::Binary { op: BinOp::LogicalOr, .. } => out.push(
+            ExprKind::Binary {
+                op: BinOp::LogicalOr,
+                ..
+            } => out.push(
                 Diagnostic::error(e.span, "Unused result of \"or\" operator.")
                     .with_code("logicalOr.resultUnused"),
             ),
@@ -457,18 +1271,25 @@ fn run_noop(fa: &FileAnalysis) -> Vec<Diagnostic> {
             ),
             // `&&` / `||` whose result is discarded and which has no side effect
             // (the short-circuit idiom `$x && f()` has an effect → not flagged).
-            ExprKind::Binary { op: BinOp::BoolAnd, .. } if !has_side_effect(e) => out.push(
+            ExprKind::Binary {
+                op: BinOp::BoolAnd, ..
+            } if !has_side_effect(e) => out.push(
                 Diagnostic::error(e.span, "Unused result of \"&&\" operator.")
                     .with_code("booleanAnd.resultUnused"),
             ),
-            ExprKind::Binary { op: BinOp::BoolOr, .. } if !has_side_effect(e) => out.push(
+            ExprKind::Binary {
+                op: BinOp::BoolOr, ..
+            } if !has_side_effect(e) => out.push(
                 Diagnostic::error(e.span, "Unused result of \"||\" operator.")
                     .with_code("booleanOr.resultUnused"),
             ),
             // Any other pure value expression on its own line does nothing.
             _ if is_pure_value_noop(e) => out.push(
-                Diagnostic::error(e.span, "Expression on a separate line does not do anything.")
-                    .with_code("expr.resultUnused"),
+                Diagnostic::error(
+                    e.span,
+                    "Expression on a separate line does not do anything.",
+                )
+                .with_code("expr.resultUnused"),
             ),
             _ => {}
         }
@@ -515,7 +1336,12 @@ fn is_pure_value_noop(e: &Expr) -> bool {
 fn has_side_effect(e: &Expr) -> bool {
     let mut found = false;
     walk::for_each_expr(
-        &php_ast::Program { stmts: vec![Stmt::new(php_span::Span::new(0, 0), StmtKind::Expr(e.clone()))] },
+        &php_ast::Program {
+            stmts: vec![Stmt::new(
+                php_span::Span::new(0, 0),
+                StmtKind::Expr(e.clone()),
+            )],
+        },
         &mut |x| {
             if matches!(
                 x.kind,
@@ -555,23 +1381,71 @@ fn has_side_effect(e: &Expr) -> bool {
 /// no-op).
 fn contains_assign(e: &Expr) -> bool {
     let mut found = false;
-    walk::for_each_expr(&php_ast::Program { stmts: vec![Stmt::new(php_span::Span::new(0, 0), StmtKind::Expr(e.clone()))] }, &mut |x| {
-        if matches!(
-            x.kind,
-            ExprKind::Assign { .. } | ExprKind::AssignOp { .. } | ExprKind::AssignRef { .. }
-        ) {
-            found = true;
-        }
-    });
+    walk::for_each_expr(
+        &php_ast::Program {
+            stmts: vec![Stmt::new(
+                php_span::Span::new(0, 0),
+                StmtKind::Expr(e.clone()),
+            )],
+        },
+        &mut |x| {
+            if matches!(
+                x.kind,
+                ExprKind::Assign { .. } | ExprKind::AssignOp { .. } | ExprKind::AssignRef { .. }
+            ) {
+                found = true;
+            }
+        },
+    );
     found
 }
 
 pub(crate) static RULES: &[RuleEntry] = &[
-    RuleEntry { name: "deadCode.unreachable", level: 4, run: run_unreachable },
-    RuleEntry { name: "method.unused", level: 4, run: run_unused_private_method },
-    RuleEntry { name: "classConstant.unused", level: 4, run: run_unused_private_constant },
-    RuleEntry { name: "property.unused", level: 4, run: run_unused_private_property },
-    RuleEntry { name: "noop", level: 4, run: run_noop },
+    RuleEntry {
+        name: "deadCode.unreachable",
+        level: 4,
+        run: run_unreachable,
+    },
+    RuleEntry {
+        name: "method.unused",
+        level: 4,
+        run: run_unused_private_method,
+    },
+    RuleEntry {
+        name: "classConstant.unused",
+        level: 4,
+        run: run_unused_private_constant,
+    },
+    RuleEntry {
+        name: "property.unused",
+        level: 4,
+        run: run_unused_private_property,
+    },
+    RuleEntry {
+        name: "noop",
+        level: 4,
+        run: run_noop,
+    },
+    RuleEntry {
+        name: "deadCode.function.resultUnused",
+        level: 4,
+        run: run_pure_function_statement_without_impure_points,
+    },
+    RuleEntry {
+        name: "deadCode.new.resultUnused",
+        level: 4,
+        run: run_pure_constructor_statement_without_impure_points,
+    },
+    RuleEntry {
+        name: "deadCode.method.resultUnused",
+        level: 4,
+        run: run_pure_method_statement_without_impure_points,
+    },
+    RuleEntry {
+        name: "deadCode.staticMethod.resultUnused",
+        level: 4,
+        run: run_pure_static_method_statement_without_impure_points,
+    },
 ];
 
 #[cfg(test)]
@@ -634,7 +1508,8 @@ mod tests {
 
     #[test]
     fn used_private_method_is_clean() {
-        let src = "<?php class C { private function helper() {} function run() { $this->helper(); } }";
+        let src =
+            "<?php class C { private function helper() {} function run() { $this->helper(); } }";
         assert!(codes(src, run_unused_private_method).is_empty());
     }
 
@@ -659,7 +1534,8 @@ mod tests {
     #[test]
     fn dynamic_method_call_disables_rule() {
         // A computed method name means we can't prove `helper` unused.
-        let src = "<?php class C { private function helper() {} function run($m) { $this->$m(); } }";
+        let src =
+            "<?php class C { private function helper() {} function run($m) { $this->$m(); } }";
         assert!(codes(src, run_unused_private_method).is_empty());
     }
 
@@ -675,7 +1551,10 @@ mod tests {
     #[test]
     fn unused_private_constant_is_flagged() {
         let src = "<?php class C { private const FOO = 1; }";
-        assert_eq!(codes(src, run_unused_private_constant), ["classConstant.unused"]);
+        assert_eq!(
+            codes(src, run_unused_private_constant),
+            ["classConstant.unused"]
+        );
     }
 
     #[test]
@@ -714,6 +1593,211 @@ mod tests {
     fn dynamic_property_access_disables_rule() {
         let src = "<?php class C { private $data = 1; function f($k) { return $this->$k; } }";
         assert!(codes(src, run_unused_private_property).is_empty());
+    }
+
+    // --- CallTo*StatementWithoutImpurePointsRule ------------------------
+
+    #[test]
+    fn pure_user_function_statement_is_flagged() {
+        let src = "<?php /** @pure */ function value(): int { return 1; } value();";
+        assert_eq!(
+            codes(src, run_pure_function_statement_without_impure_points),
+            ["function.resultUnused"]
+        );
+    }
+
+    #[test]
+    fn pure_user_function_value_used_is_clean() {
+        let src = "<?php /** @pure */ function value(): int { return 1; } echo value();";
+        assert!(codes(src, run_pure_function_statement_without_impure_points).is_empty());
+    }
+
+    #[test]
+    fn impure_user_function_statement_is_clean() {
+        let src = "<?php function value(): int { return 1; } value();";
+        assert!(codes(src, run_pure_function_statement_without_impure_points).is_empty());
+    }
+
+    #[test]
+    fn pure_function_with_echo_is_clean() {
+        let src = "<?php /** @pure */ function value(): int { echo 1; return 1; } value();";
+        assert!(codes(src, run_pure_function_statement_without_impure_points).is_empty());
+    }
+
+    #[test]
+    fn pure_function_transitive_call_is_flagged() {
+        let src = "<?php
+            /** @pure */ function leaf(): int { return 1; }
+            /** @pure */ function wrap(): int { return leaf(); }
+            wrap();
+        ";
+        assert_eq!(
+            codes(src, run_pure_function_statement_without_impure_points),
+            ["function.resultUnused"]
+        );
+    }
+
+    #[test]
+    fn pure_function_with_unknown_call_is_clean() {
+        let src = "<?php /** @pure */ function value(): int { return unknown(); } value();";
+        assert!(codes(src, run_pure_function_statement_without_impure_points).is_empty());
+    }
+
+    #[test]
+    fn pure_constructor_new_statement_is_flagged() {
+        let src = "<?php class C { /** @pure */ public function __construct() {} } new C();";
+        assert_eq!(
+            codes(src, run_pure_constructor_statement_without_impure_points),
+            ["new.resultUnused"]
+        );
+    }
+
+    #[test]
+    fn pure_constructor_with_echo_is_clean() {
+        let src =
+            "<?php class C { /** @pure */ public function __construct() { echo 1; } } new C();";
+        assert!(codes(src, run_pure_constructor_statement_without_impure_points).is_empty());
+    }
+
+    #[test]
+    fn pure_constructor_value_used_is_clean() {
+        let src = "<?php class C { /** @pure */ public function __construct() {} } $c = new C();";
+        assert!(codes(src, run_pure_constructor_statement_without_impure_points).is_empty());
+    }
+
+    #[test]
+    fn pure_constructor_with_pure_function_dependency_is_flagged() {
+        let src = "<?php
+            /** @pure */ function leaf(): int { return 1; }
+            class C { /** @pure */ public function __construct() { leaf(); } }
+            new C();
+        ";
+        assert_eq!(
+            codes(src, run_pure_constructor_statement_without_impure_points),
+            ["new.resultUnused"]
+        );
+    }
+
+    #[test]
+    fn method_without_impure_points_statement_is_flagged() {
+        let src = r#"<?php
+            final class C {
+                public function value(): int { return 1; }
+            }
+            function f(C $c): void { $c->value(); }
+        "#;
+        assert_eq!(
+            codes(src, run_pure_method_statement_without_impure_points),
+            ["method.resultUnused"]
+        );
+    }
+
+    #[test]
+    fn method_without_impure_points_value_used_is_clean() {
+        let src = r#"<?php
+            final class C {
+                public function value(): int { return 1; }
+            }
+            function f(C $c): int { return $c->value(); }
+        "#;
+        assert!(codes(src, run_pure_method_statement_without_impure_points).is_empty());
+    }
+
+    #[test]
+    fn pure_annotated_method_is_left_to_methods_rule() {
+        let src = r#"<?php
+            final class C {
+                /** @pure */
+                public function value(): int { return 1; }
+            }
+            function f(C $c): void { $c->value(); }
+        "#;
+        assert!(codes(src, run_pure_method_statement_without_impure_points).is_empty());
+    }
+
+    #[test]
+    fn overridable_method_without_impure_points_is_clean() {
+        let src = r#"<?php
+            class C {
+                public function value(): int { return 1; }
+            }
+            function f(C $c): void { $c->value(); }
+        "#;
+        assert!(codes(src, run_pure_method_statement_without_impure_points).is_empty());
+    }
+
+    #[test]
+    fn method_with_argument_is_clean() {
+        let src = r#"<?php
+            final class C {
+                public function value(int $i): int { return $i; }
+            }
+            function f(C $c): void { $c->value(1); }
+        "#;
+        assert!(codes(src, run_pure_method_statement_without_impure_points).is_empty());
+    }
+
+    #[test]
+    fn method_with_impure_point_is_clean() {
+        let src = r#"<?php
+            final class C {
+                public function value(): int { echo 1; return 1; }
+            }
+            function f(C $c): void { $c->value(); }
+        "#;
+        assert!(codes(src, run_pure_method_statement_without_impure_points).is_empty());
+    }
+
+    #[test]
+    fn method_with_private_pure_dependency_is_flagged() {
+        let src = r#"<?php
+            final class C {
+                private function leaf(): int { return 1; }
+                public function value(): int { return $this->leaf(); }
+            }
+            function f(C $c): void { $c->value(); }
+        "#;
+        assert_eq!(
+            codes(src, run_pure_method_statement_without_impure_points),
+            ["method.resultUnused"]
+        );
+    }
+
+    #[test]
+    fn static_method_without_impure_points_statement_is_flagged() {
+        let src = r#"<?php
+            class C {
+                public static function value(): int { return 1; }
+            }
+            C::value();
+        "#;
+        assert_eq!(
+            codes(src, run_pure_static_method_statement_without_impure_points),
+            ["staticMethod.resultUnused"]
+        );
+    }
+
+    #[test]
+    fn pure_annotated_static_method_is_left_to_methods_rule() {
+        let src = r#"<?php
+            class C {
+                /** @pure */
+                public static function value(): int { return 1; }
+            }
+            C::value();
+        "#;
+        assert!(codes(src, run_pure_static_method_statement_without_impure_points).is_empty());
+    }
+
+    #[test]
+    fn self_static_method_call_is_clean() {
+        let src = r#"<?php
+            class C {
+                public static function value(): int { return 1; }
+                public function f(): void { self::value(); }
+            }
+        "#;
+        assert!(codes(src, run_pure_static_method_statement_without_impure_points).is_empty());
     }
 
     // --- noop ------------------------------------------------------------
@@ -768,7 +1852,10 @@ mod tests {
 
     #[test]
     fn boolean_and_pure_statement_is_flagged() {
-        assert_eq!(codes("<?php $a && $b;", run_noop), ["booleanAnd.resultUnused"]);
+        assert_eq!(
+            codes("<?php $a && $b;", run_noop),
+            ["booleanAnd.resultUnused"]
+        );
     }
 
     #[test]

@@ -45,19 +45,27 @@
 //! - `match.void` (`UsageOfVoidMatchExpressionRule`) — a `match` expression whose
 //!   inferred type is `void` used in a value position (not a bare statement).
 //!
-//! Deferred (need machinery we don't have):
-//! - `ImpossibleCheckTypeFunctionCall/MethodCall/StaticMethodCallRule`
-//!   (`function.impossibleType`, …) — needs evaluating a type-predicate against
-//!   the (now narrowable) type map; a follow-up rule, not a capability gap.
+//! Partials / deferred:
+//! - `function.impossibleType` (`ImpossibleCheckTypeFunctionCallRule`) — scalar
+//!   `is_*` false-only subset.
+//! - `method.impossibleType` / `staticMethod.impossibleType`
+//!   (`ImpossibleCheckTypeMethodCallRule` / `ImpossibleCheckTypeStaticMethodCallRule`) —
+//!   false-only subset for local methods with simple `@phpstan-assert` /
+//!   `@phpstan-assert-if-true` parameter assertions.
 //! - `MatchExpressionRule`'s `match.unhandled` — needs enum-case exhaustiveness,
 //!   and enum cases are not yet reflected (`php-reflect` skips `EnumCase`).
+//! - Always-true method/static type checks (`*.alreadyNarrowedType`) — needs
+//!   phpstan's last-condition marker to avoid reports it suppresses.
 //! - `ConstantConditionInTraitRule` — trait-instantiation aware; out of scope.
 
 use crate::{walk, FileAnalysis, RuleEntry};
-use php_ast::{BinOp, ElseIf, Expr, ExprKind, StmtKind, UnOp};
+use php_ast::{
+    BinOp, ClassDecl, ElseIf, Expr, ExprKind, Member, MemberName, MethodDecl, Stmt, StmtKind, UnOp,
+};
 use php_diagnostics::Diagnostic;
 use php_infer::{eval_const, ConstVal};
-use php_resolve::{RefKind, Resolution, ResolvedRef};
+use php_reflect::resolve_doc_type;
+use php_resolve::{for_each_region, RefKind, Resolution, ResolvedRef, Scope};
 use php_span::Span;
 use php_types::Type;
 use std::collections::HashMap;
@@ -69,7 +77,10 @@ use std::collections::HashMap;
 /// The last `\`-separated segment of a name, lowercased (for matching the magic
 /// constants `true`/`false`/`null`, which may appear bare or fully-qualified).
 fn name_keyword(text: &str) -> String {
-    text.rsplit('\\').next().unwrap_or(text).to_ascii_lowercase()
+    text.rsplit('\\')
+        .next()
+        .unwrap_or(text)
+        .to_ascii_lowercase()
 }
 
 /// The statically-known truthiness of `e`, or `None` when it can't be proven.
@@ -163,7 +174,11 @@ fn push_elseif(fa: &FileAnalysis, ei: &ElseIf, out: &mut Vec<Diagnostic>) {
         out.push(diag(
             ei.cond.span,
             format!("Elseif condition is always {v}."),
-            if v { "elseif.alwaysTrue" } else { "elseif.alwaysFalse" },
+            if v {
+                "elseif.alwaysTrue"
+            } else {
+                "elseif.alwaysFalse"
+            },
         ));
     }
 }
@@ -180,7 +195,11 @@ fn run_ternary_condition(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 out.push(diag(
                     cond.span,
                     format!("Ternary operator condition is always {v}."),
-                    if v { "ternary.alwaysTrue" } else { "ternary.alwaysFalse" },
+                    if v {
+                        "ternary.alwaysTrue"
+                    } else {
+                        "ternary.alwaysFalse"
+                    },
                 ));
             }
         }
@@ -199,12 +218,16 @@ fn run_while_condition(fa: &FileAnalysis) -> Vec<Diagnostic> {
     walk::for_each_stmt(fa.program, &mut |s| {
         if let StmtKind::While { cond, .. } = &s.kind {
             match const_bool(fa, cond) {
-                Some(false) => {
-                    out.push(diag(cond.span, "While loop condition is always false.", "while.alwaysFalse"))
-                }
-                Some(true) if is_literal_true(cond) => {
-                    out.push(diag(cond.span, "While loop condition is always true.", "while.alwaysTrue"))
-                }
+                Some(false) => out.push(diag(
+                    cond.span,
+                    "While loop condition is always false.",
+                    "while.alwaysFalse",
+                )),
+                Some(true) if is_literal_true(cond) => out.push(diag(
+                    cond.span,
+                    "While loop condition is always true.",
+                    "while.alwaysTrue",
+                )),
                 _ => {}
             }
         }
@@ -242,14 +265,22 @@ fn run_do_while_condition(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_boolean_not(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     walk::for_each_expr(fa.program, &mut |e| {
-        if let ExprKind::Unary { op: UnOp::Not, expr } = &e.kind {
+        if let ExprKind::Unary {
+            op: UnOp::Not,
+            expr,
+        } = &e.kind
+        {
             if let Some(v) = const_bool(fa, expr) {
                 // `!` flips: a constantly-true operand makes the negation false.
                 let result = !v;
                 out.push(diag(
                     expr.span,
                     format!("Negated boolean expression is always {result}."),
-                    if result { "booleanNot.alwaysTrue" } else { "booleanNot.alwaysFalse" },
+                    if result {
+                        "booleanNot.alwaysTrue"
+                    } else {
+                        "booleanNot.alwaysFalse"
+                    },
                 ));
             }
         }
@@ -271,7 +302,9 @@ fn binary_sides(
     out: &mut Vec<Diagnostic>,
 ) {
     walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Binary { op, lhs, rhs } = &e.kind else { return };
+        let ExprKind::Binary { op, lhs, rhs } = &e.kind else {
+            return;
+        };
         if !matches_op(*op) {
             return;
         }
@@ -313,21 +346,51 @@ fn side_code(prefix: &str, left: bool, v: bool) -> &'static str {
 
 fn run_boolean_and(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    binary_sides(fa, |op| matches!(op, BinOp::BoolAnd), "booleanAnd", "&&", &mut out);
-    binary_sides(fa, |op| matches!(op, BinOp::LogicalAnd), "booleanAnd", "and", &mut out);
+    binary_sides(
+        fa,
+        |op| matches!(op, BinOp::BoolAnd),
+        "booleanAnd",
+        "&&",
+        &mut out,
+    );
+    binary_sides(
+        fa,
+        |op| matches!(op, BinOp::LogicalAnd),
+        "booleanAnd",
+        "and",
+        &mut out,
+    );
     out
 }
 
 fn run_boolean_or(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    binary_sides(fa, |op| matches!(op, BinOp::BoolOr), "booleanOr", "||", &mut out);
-    binary_sides(fa, |op| matches!(op, BinOp::LogicalOr), "booleanOr", "or", &mut out);
+    binary_sides(
+        fa,
+        |op| matches!(op, BinOp::BoolOr),
+        "booleanOr",
+        "||",
+        &mut out,
+    );
+    binary_sides(
+        fa,
+        |op| matches!(op, BinOp::LogicalOr),
+        "booleanOr",
+        "or",
+        &mut out,
+    );
     out
 }
 
 fn run_logical_xor(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    binary_sides(fa, |op| matches!(op, BinOp::LogicalXor), "logicalXor", "xor", &mut out);
+    binary_sides(
+        fa,
+        |op| matches!(op, BinOp::LogicalXor),
+        "logicalXor",
+        "xor",
+        &mut out,
+    );
     out
 }
 
@@ -394,11 +457,19 @@ fn run_impossible_instanceof(fa: &FileAnalysis) -> Vec<Diagnostic> {
         .collect();
     let mut out = Vec::new();
     walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Instanceof { expr, class } = &e.kind else { return };
-        let ExprKind::Name(n) = &class.kind else { return };
-        let Some(r) = cmap.get(&(n.span.start, n.span.end)) else { return };
+        let ExprKind::Instanceof { expr, class } = &e.kind else {
+            return;
+        };
+        let ExprKind::Name(n) = &class.kind else {
+            return;
+        };
+        let Some(r) = cmap.get(&(n.span.start, n.span.end)) else {
+            return;
+        };
         // Only an explicitly-named, fully-known class (skip self/static/parent/builtin).
-        let Resolution::Fqn(class_fqn) = &r.resolution else { return };
+        let Resolution::Fqn(class_fqn) = &r.resolution else {
+            return;
+        };
         if !fa.class_fully_known(class_fqn) {
             return;
         }
@@ -422,7 +493,9 @@ fn run_impossible_instanceof(fa: &FileAnalysis) -> Vec<Diagnostic> {
 }
 
 fn instanceof_result(fa: &FileAnalysis, value: &Type, target: &str) -> Option<bool> {
-    let Type::Named { fqn, .. } = value else { return None };
+    let Type::Named { fqn, .. } = value else {
+        return None;
+    };
     if !fa.class_fully_known(fqn) {
         return None;
     }
@@ -430,7 +503,11 @@ fn instanceof_result(fa: &FileAnalysis, value: &Type, target: &str) -> Option<bo
         return Some(true);
     }
     // Not a subtype: provably false only if the value class is final.
-    let is_final = fa.reflection.class(fqn).map(|c| c.is_final).unwrap_or(false);
+    let is_final = fa
+        .reflection
+        .class(fqn)
+        .map(|c| c.is_final)
+        .unwrap_or(false);
     is_final.then_some(false)
 }
 
@@ -455,20 +532,32 @@ fn run_impossible_check_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
         .collect();
     let mut out = Vec::new();
     walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Call { callee, args } = &e.kind else { return };
-        let ExprKind::Name(n) = &callee.kind else { return };
-        let Some(r) = fmap.get(&(n.span.start, n.span.end)) else { return };
+        let ExprKind::Call { callee, args } = &e.kind else {
+            return;
+        };
+        let ExprKind::Name(n) = &callee.kind else {
+            return;
+        };
+        let Some(r) = fmap.get(&(n.span.start, n.span.end)) else {
+            return;
+        };
         let fname = match &r.resolution {
             Resolution::Fqn(f) => f.trim_start_matches('\\').to_ascii_lowercase(),
-            Resolution::Fallback { global, .. } => global.trim_start_matches('\\').to_ascii_lowercase(),
+            Resolution::Fallback { global, .. } => {
+                global.trim_start_matches('\\').to_ascii_lowercase()
+            }
             _ => return,
         };
-        let Some(pred) = predicate_cat(&fname) else { return };
+        let Some(pred) = predicate_cat(&fname) else {
+            return;
+        };
         let Some(arg0) = args.first() else { return };
         if arg0.spread || arg0.placeholder || arg0.name.is_some() {
             return;
         }
-        let Some(vcat) = category(&fa.type_of(&arg0.value)) else { return };
+        let Some(vcat) = category(&fa.type_of(&arg0.value)) else {
+            return;
+        };
         // Always-*true* type-check (`is_int($int)`) is OFF by default in phpstan
         // (`checkAlwaysTrueCheckTypeFunctionCall`) — it reports the resulting dead
         // code instead. Only report the impossible (always-false) case.
@@ -498,10 +587,344 @@ fn predicate_cat(fname: &str) -> Option<Cat> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// ImpossibleCheckTypeMethodCallRule / StaticMethodCallRule
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct AssertMethod {
+    param_index: usize,
+    target: Type,
+}
+
+/// Local `@phpstan-assert` / `@phpstan-assert-if-true` methods keyed by
+/// `(declaring-class-lower, method-lower, is-static)`.
+fn assertion_methods(fa: &FileAnalysis) -> HashMap<(String, String, bool), AssertMethod> {
+    let mut out = HashMap::new();
+    for_each_class(fa, |scope, class_fqn, c| {
+        for m in methods(c) {
+            let Some(assertion) = method_assertion(fa, scope, m) else {
+                continue;
+            };
+            out.insert(
+                (
+                    fqn_key(class_fqn),
+                    fa.interner.resolve(m.name).to_ascii_lowercase(),
+                    m.modifiers.is_static,
+                ),
+                assertion,
+            );
+        }
+    });
+    out
+}
+
+fn method_assertion(fa: &FileAnalysis, scope: &Scope, m: &MethodDecl) -> Option<AssertMethod> {
+    let doc = m.doc.as_deref()?;
+    for tag in php_phpdoc::parse_block(doc).tags {
+        let name = tag.name.as_str();
+        if !matches!(
+            name,
+            "phpstan-assert" | "phpstan-assert-if-true" | "psalm-assert" | "psalm-assert-if-true"
+        ) {
+            continue;
+        }
+        let (ty, rest) = parse_assert_type(&tag.value)?;
+        let param_name = assert_param_name(rest)?;
+        let param_index = m
+            .params
+            .iter()
+            .position(|p| fa.interner.resolve(p.name) == param_name)?;
+        let target = resolve_doc_type(scope, &[], &ty);
+        // Keep only the categories this module can compare without ambiguity.
+        category(&target)?;
+        return Some(AssertMethod {
+            param_index,
+            target,
+        });
+    }
+    None
+}
+
+fn parse_assert_type(value: &str) -> Option<(php_phpdoc::DocType, &str)> {
+    let value = value.trim_start();
+    // Exact-type assertions (`=int`) are safe for our coarse category checks.
+    let value = value.strip_prefix('=').unwrap_or(value).trim_start();
+    // Negated assertions (`!int`) invert the method result; defer until we model
+    // the full assertion algebra.
+    if value.starts_with('!') {
+        return None;
+    }
+    let (ty, consumed) = php_phpdoc::parse_type_prefix(value)?;
+    Some((ty, &value[consumed..]))
+}
+
+fn assert_param_name(rest: &str) -> Option<&str> {
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix('$')?;
+    let end = rest
+        .char_indices()
+        .find_map(|(idx, ch)| (!(ch == '_' || ch.is_ascii_alphanumeric())).then_some(idx))
+        .unwrap_or(rest.len());
+    (end > 0).then_some(&rest[..end])
+}
+
+fn run_impossible_check_type_method_call(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    if !fa.treat_phpdoc_types_as_certain {
+        return Vec::new();
+    }
+    let assertions = assertion_methods(fa);
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::MethodCall {
+            recv,
+            nullsafe,
+            method,
+            args,
+        } = &e.kind
+        else {
+            return;
+        };
+        if *nullsafe {
+            return;
+        }
+        let Some(method_name) = member_ident(fa, method) else {
+            return;
+        };
+        let Some(receiver_fqn) = receiver_class(fa, recv) else {
+            return;
+        };
+        if !fa.class_fully_known(&receiver_fqn) {
+            return;
+        }
+        let Some(found) = fa.reflection.find_method(&receiver_fqn, &method_name) else {
+            return;
+        };
+        if found.member.magic || found.member.is_static {
+            return;
+        }
+        let Some(assertion) = assertions.get(&(
+            fqn_key(&found.declaring_class),
+            found.member.name.to_ascii_lowercase(),
+            false,
+        )) else {
+            return;
+        };
+        if assertion_call_is_false(fa, &assertion.target, assertion.param_index, args) {
+            out.push(diag(
+                e.span,
+                format!(
+                    "Call to method {}::{}() will always evaluate to false.",
+                    found.declaring_class.trim_start_matches('\\'),
+                    found.member.name
+                ),
+                "method.impossibleType",
+            ));
+        }
+    });
+    out
+}
+
+fn run_impossible_check_type_static_method_call(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    if !fa.treat_phpdoc_types_as_certain {
+        return Vec::new();
+    }
+    let assertions = assertion_methods(fa);
+    let cmap: HashMap<(u32, u32), &ResolvedRef> = fa
+        .resolved_refs
+        .iter()
+        .filter(|r| r.kind == RefKind::Class)
+        .map(|r| ((r.span.start, r.span.end), r))
+        .collect();
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::StaticCall {
+            class,
+            method,
+            args,
+        } = &e.kind
+        else {
+            return;
+        };
+        let Some(method_name) = member_ident(fa, method) else {
+            return;
+        };
+        let Some(target_fqn) = static_call_class(fa, &cmap, class) else {
+            return;
+        };
+        if !fa.class_fully_known(&target_fqn) {
+            return;
+        }
+        let Some(found) = fa.reflection.find_method(&target_fqn, &method_name) else {
+            return;
+        };
+        if found.member.magic || !found.member.is_static {
+            return;
+        }
+        let Some(assertion) = assertions.get(&(
+            fqn_key(&found.declaring_class),
+            found.member.name.to_ascii_lowercase(),
+            true,
+        )) else {
+            return;
+        };
+        if assertion_call_is_false(fa, &assertion.target, assertion.param_index, args) {
+            out.push(diag(
+                e.span,
+                format!(
+                    "Call to static method {}::{}() will always evaluate to false.",
+                    found.declaring_class.trim_start_matches('\\'),
+                    found.member.name
+                ),
+                "staticMethod.impossibleType",
+            ));
+        }
+    });
+    out
+}
+
+fn assertion_call_is_false(
+    fa: &FileAnalysis,
+    target: &Type,
+    param_index: usize,
+    args: &[php_ast::Arg],
+) -> bool {
+    let Some(arg) = args.get(param_index) else {
+        return false;
+    };
+    if arg.spread || arg.placeholder || arg.name.is_some() {
+        return false;
+    }
+    let Some(actual) = category(&fa.type_of(&arg.value)) else {
+        return false;
+    };
+    let Some(expected) = category(target) else {
+        return false;
+    };
+    actual != expected
+}
+
+fn member_ident(fa: &FileAnalysis, m: &MemberName) -> Option<String> {
+    match m {
+        MemberName::Ident(sym) => Some(fa.interner.resolve(*sym).to_string()),
+        MemberName::Var(_) | MemberName::Expr(_) => None,
+    }
+}
+
+fn receiver_class(fa: &FileAnalysis, recv: &Expr) -> Option<String> {
+    match fa.type_of(recv) {
+        Type::Named { fqn, .. } => Some(fqn),
+        _ => None,
+    }
+}
+
+fn static_call_class(
+    _fa: &FileAnalysis,
+    cmap: &HashMap<(u32, u32), &ResolvedRef>,
+    class: &Expr,
+) -> Option<String> {
+    let ExprKind::Name(n) = &class.kind else {
+        return None;
+    };
+    let r = cmap.get(&(n.span.start, n.span.end))?;
+    match &r.resolution {
+        Resolution::Fqn(fqn) => Some(fqn.clone()),
+        Resolution::Fallback { .. } | Resolution::LateStatic(_) | Resolution::BuiltinType(_) => {
+            None
+        }
+    }
+}
+
+fn fqn_key(fqn: &str) -> String {
+    fqn.trim_start_matches('\\').to_ascii_lowercase()
+}
+
+fn for_each_class(fa: &FileAnalysis, mut f: impl FnMut(&Scope, &str, &ClassDecl)) {
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            walk_class_stmt(st, scope, fa.interner, &mut f);
+        }
+    });
+}
+
+fn walk_class_stmt(
+    st: &Stmt,
+    scope: &Scope,
+    interner: &php_intern::Interner,
+    f: &mut impl FnMut(&Scope, &str, &ClassDecl),
+) {
+    match &st.kind {
+        StmtKind::Class(c) => {
+            if let Some(name) = c.name {
+                let fqn = scope.qualify(interner.resolve(name));
+                f(scope, &fqn, c);
+            }
+        }
+        StmtKind::Block(b) => b
+            .iter()
+            .for_each(|s| walk_class_stmt(s, scope, interner, f)),
+        StmtKind::Function(fd) => fd
+            .body
+            .iter()
+            .for_each(|s| walk_class_stmt(s, scope, interner, f)),
+        StmtKind::If {
+            then, elseifs, els, ..
+        } => {
+            walk_class_stmt(then, scope, interner, f);
+            for e in elseifs {
+                walk_class_stmt(&e.body, scope, interner, f);
+            }
+            if let Some(e) = els {
+                walk_class_stmt(e, scope, interner, f);
+            }
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::DoWhile { body, .. }
+        | StmtKind::For { body, .. }
+        | StmtKind::Foreach { body, .. } => walk_class_stmt(body, scope, interner, f),
+        StmtKind::Switch { cases, .. } => {
+            for c in cases {
+                for s in &c.body {
+                    walk_class_stmt(s, scope, interner, f);
+                }
+            }
+        }
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            for s in body {
+                walk_class_stmt(s, scope, interner, f);
+            }
+            for c in catches {
+                for s in &c.body {
+                    walk_class_stmt(s, scope, interner, f);
+                }
+            }
+            if let Some(fin) = finally {
+                for s in fin {
+                    walk_class_stmt(s, scope, interner, f);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn methods(c: &ClassDecl) -> impl Iterator<Item = &MethodDecl> {
+    c.members.iter().filter_map(|m| match m {
+        Member::Method(md) => Some(md),
+        _ => None,
+    })
+}
+
 fn run_strict_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Binary { op, lhs, rhs } = &e.kind else { return };
+        let ExprKind::Binary { op, lhs, rhs } = &e.kind else {
+            return;
+        };
         let (sigil, always_false) = match op {
             BinOp::Identical => ("===", true),
             BinOp::NotIdentical => ("!==", false),
@@ -559,7 +982,9 @@ fn run_strict_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_constant_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Binary { op, lhs, rhs } = &e.kind else { return };
+        let ExprKind::Binary { op, lhs, rhs } = &e.kind else {
+            return;
+        };
         // (sigil, node-type for `<` family, loose flag)
         let (sigil, ntype, loose) = match op {
             BinOp::Eq => ("==", "equal", true),
@@ -623,8 +1048,12 @@ fn run_constant_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_match_arms(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Match { subject, arms } = &e.kind else { return };
-        let Some(subj) = eval_const(subject) else { return };
+        let ExprKind::Match { subject, arms } = &e.kind else {
+            return;
+        };
+        let Some(subj) = eval_const(subject) else {
+            return;
+        };
 
         // Every condition must fold to a constant; otherwise we can't reason about
         // any arm safely (a non-constant arm could match the subject).
@@ -726,20 +1155,86 @@ fn run_void_match(fa: &FileAnalysis) -> Vec<Diagnostic> {
 // ---------------------------------------------------------------------------
 
 pub(crate) static RULES: &[RuleEntry] = &[
-    RuleEntry { name: "comparison.if", level: 4, run: run_if_condition },
-    RuleEntry { name: "comparison.ternary", level: 4, run: run_ternary_condition },
-    RuleEntry { name: "comparison.while", level: 4, run: run_while_condition },
-    RuleEntry { name: "comparison.doWhile", level: 4, run: run_do_while_condition },
-    RuleEntry { name: "comparison.booleanNot", level: 4, run: run_boolean_not },
-    RuleEntry { name: "comparison.booleanAnd", level: 4, run: run_boolean_and },
-    RuleEntry { name: "comparison.booleanOr", level: 4, run: run_boolean_or },
-    RuleEntry { name: "comparison.logicalXor", level: 4, run: run_logical_xor },
-    RuleEntry { name: "comparison.strict", level: 4, run: run_strict_comparison },
-    RuleEntry { name: "comparison.constant", level: 4, run: run_constant_comparison },
-    RuleEntry { name: "comparison.impossibleInstanceof", level: 4, run: run_impossible_instanceof },
-    RuleEntry { name: "comparison.impossibleCheckType", level: 4, run: run_impossible_check_type },
-    RuleEntry { name: "comparison.matchArms", level: 4, run: run_match_arms },
-    RuleEntry { name: "comparison.voidMatch", level: 2, run: run_void_match },
+    RuleEntry {
+        name: "comparison.if",
+        level: 4,
+        run: run_if_condition,
+    },
+    RuleEntry {
+        name: "comparison.ternary",
+        level: 4,
+        run: run_ternary_condition,
+    },
+    RuleEntry {
+        name: "comparison.while",
+        level: 4,
+        run: run_while_condition,
+    },
+    RuleEntry {
+        name: "comparison.doWhile",
+        level: 4,
+        run: run_do_while_condition,
+    },
+    RuleEntry {
+        name: "comparison.booleanNot",
+        level: 4,
+        run: run_boolean_not,
+    },
+    RuleEntry {
+        name: "comparison.booleanAnd",
+        level: 4,
+        run: run_boolean_and,
+    },
+    RuleEntry {
+        name: "comparison.booleanOr",
+        level: 4,
+        run: run_boolean_or,
+    },
+    RuleEntry {
+        name: "comparison.logicalXor",
+        level: 4,
+        run: run_logical_xor,
+    },
+    RuleEntry {
+        name: "comparison.strict",
+        level: 4,
+        run: run_strict_comparison,
+    },
+    RuleEntry {
+        name: "comparison.constant",
+        level: 4,
+        run: run_constant_comparison,
+    },
+    RuleEntry {
+        name: "comparison.impossibleInstanceof",
+        level: 4,
+        run: run_impossible_instanceof,
+    },
+    RuleEntry {
+        name: "comparison.impossibleCheckType",
+        level: 4,
+        run: run_impossible_check_type,
+    },
+    RuleEntry {
+        name: "comparison.impossibleCheckTypeMethodCall",
+        level: 4,
+        run: run_impossible_check_type_method_call,
+    },
+    RuleEntry {
+        name: "comparison.impossibleCheckTypeStaticMethodCall",
+        level: 4,
+        run: run_impossible_check_type_static_method_call,
+    },
+    RuleEntry {
+        name: "comparison.matchArms",
+        level: 4,
+        run: run_match_arms,
+    },
+    RuleEntry {
+        name: "comparison.voidMatch",
+        level: 2,
+        run: run_void_match,
+    },
 ];
 
 #[cfg(test)]
@@ -752,7 +1247,8 @@ mod tests {
     #[test]
     fn instanceof_subclass_always_true_is_off_by_default() {
         // phpstan defaults always-true instanceof reporting OFF; we match that.
-        let src = "<?php class A {} class B extends A {} function f(B $b) { return $b instanceof A; }";
+        let src =
+            "<?php class A {} class B extends A {} function f(B $b) { return $b instanceof A; }";
         assert!(codes(src, run_impossible_instanceof).is_empty());
     }
 
@@ -765,7 +1261,10 @@ mod tests {
     #[test]
     fn instanceof_final_unrelated_always_false() {
         let src = "<?php final class C {} class D {} function f(C $c) { return $c instanceof D; }";
-        assert_eq!(codes(src, run_impossible_instanceof), ["instanceof.alwaysFalse"]);
+        assert_eq!(
+            codes(src, run_impossible_instanceof),
+            ["instanceof.alwaysFalse"]
+        );
     }
 
     #[test]
@@ -793,7 +1292,10 @@ mod tests {
     #[test]
     fn is_int_on_string_always_false() {
         let src = "<?php function f(string $s) { return is_int($s); }";
-        assert_eq!(codes(src, run_impossible_check_type), ["function.impossibleType"]);
+        assert_eq!(
+            codes(src, run_impossible_check_type),
+            ["function.impossibleType"]
+        );
     }
 
     #[test]
@@ -802,21 +1304,113 @@ mod tests {
         assert!(codes(src, run_impossible_check_type).is_empty());
     }
 
+    #[test]
+    fn assertion_method_impossible_scalar_type() {
+        let src = "<?php
+            class TypeChecker {
+                /** @phpstan-assert-if-true string $value */
+                public function isString($value): bool { return is_string($value); }
+            }
+            function f(TypeChecker $c, int $i) { return $c->isString($i); }";
+        assert_eq!(
+            codes(src, run_impossible_check_type_method_call),
+            ["method.impossibleType"]
+        );
+    }
+
+    #[test]
+    fn assertion_method_already_narrowed_is_deferred() {
+        let src = "<?php
+            class TypeChecker {
+                /** @phpstan-assert-if-true string $value */
+                public function isString($value): bool { return is_string($value); }
+            }
+            function f(TypeChecker $c, string $s) { return $c->isString($s); }";
+        assert!(codes(src, run_impossible_check_type_method_call).is_empty());
+    }
+
+    #[test]
+    fn assertion_method_on_mixed_is_clean() {
+        let src = "<?php
+            class TypeChecker {
+                /** @phpstan-assert-if-true string $value */
+                public function isString($value): bool { return is_string($value); }
+            }
+            function f(TypeChecker $c, $x) { return $c->isString($x); }";
+        assert!(codes(src, run_impossible_check_type_method_call).is_empty());
+    }
+
+    #[test]
+    fn method_without_assertion_doc_is_clean() {
+        let src = "<?php
+            class TypeChecker {
+                public function isString($value): bool { return is_string($value); }
+            }
+            function f(TypeChecker $c, int $i) { return $c->isString($i); }";
+        assert!(codes(src, run_impossible_check_type_method_call).is_empty());
+    }
+
+    #[test]
+    fn assertion_static_method_impossible_scalar_type() {
+        let src = "<?php
+            class TypeChecker {
+                /** @phpstan-assert-if-true string $value */
+                public static function isString($value): bool { return is_string($value); }
+            }
+            function f(int $i) { return TypeChecker::isString($i); }";
+        assert_eq!(
+            codes(src, run_impossible_check_type_static_method_call),
+            ["staticMethod.impossibleType"]
+        );
+    }
+
+    #[test]
+    fn assertion_static_method_already_narrowed_is_deferred() {
+        let src = "<?php
+            class TypeChecker {
+                /** @phpstan-assert-if-true string $value */
+                public static function isString($value): bool { return is_string($value); }
+            }
+            function f(string $s) { return TypeChecker::isString($s); }";
+        assert!(codes(src, run_impossible_check_type_static_method_call).is_empty());
+    }
+
     // --- if / elseif ---
 
     #[test]
     fn if_always_true_and_false() {
-        assert_eq!(codes("<?php if (true) { echo 1; }", run_if_condition), ["if.alwaysTrue"]);
-        assert_eq!(codes("<?php if (false) { echo 1; }", run_if_condition), ["if.alwaysFalse"]);
+        assert_eq!(
+            codes("<?php if (true) { echo 1; }", run_if_condition),
+            ["if.alwaysTrue"]
+        );
+        assert_eq!(
+            codes("<?php if (false) { echo 1; }", run_if_condition),
+            ["if.alwaysFalse"]
+        );
     }
 
     #[test]
     fn if_on_literal_int_and_string() {
-        assert_eq!(codes("<?php if (1) { echo 1; }", run_if_condition), ["if.alwaysTrue"]);
-        assert_eq!(codes("<?php if (0) { echo 1; }", run_if_condition), ["if.alwaysFalse"]);
-        assert_eq!(codes("<?php if ('') { echo 1; }", run_if_condition), ["if.alwaysFalse"]);
-        assert_eq!(codes("<?php if ('x') { echo 1; }", run_if_condition), ["if.alwaysTrue"]);
-        assert_eq!(codes("<?php if ('0') { echo 1; }", run_if_condition), ["if.alwaysFalse"]);
+        assert_eq!(
+            codes("<?php if (1) { echo 1; }", run_if_condition),
+            ["if.alwaysTrue"]
+        );
+        assert_eq!(
+            codes("<?php if (0) { echo 1; }", run_if_condition),
+            ["if.alwaysFalse"]
+        );
+        assert_eq!(
+            codes("<?php if ('') { echo 1; }", run_if_condition),
+            ["if.alwaysFalse"]
+        );
+        assert_eq!(
+            codes("<?php if ('x') { echo 1; }", run_if_condition),
+            ["if.alwaysTrue"]
+        );
+        assert_eq!(
+            codes("<?php if ('0') { echo 1; }", run_if_condition),
+            ["if.alwaysFalse"]
+        );
     }
 
     #[test]
@@ -829,7 +1423,11 @@ mod tests {
     #[test]
     fn if_on_variable_is_clean() {
         // An unknown variable's truthiness is not provable — no false positive.
-        assert!(codes("<?php function f($x) { if ($x) { echo 1; } }", run_if_condition).is_empty());
+        assert!(codes(
+            "<?php function f($x) { if ($x) { echo 1; } }",
+            run_if_condition
+        )
+        .is_empty());
         assert!(codes("<?php if (foo()) { echo 1; }", run_if_condition).is_empty());
     }
 
@@ -852,8 +1450,14 @@ mod tests {
 
     #[test]
     fn ternary_constant() {
-        assert_eq!(codes("<?php $x = true ? 1 : 2;", run_ternary_condition), ["ternary.alwaysTrue"]);
-        assert_eq!(codes("<?php $x = false ? 1 : 2;", run_ternary_condition), ["ternary.alwaysFalse"]);
+        assert_eq!(
+            codes("<?php $x = true ? 1 : 2;", run_ternary_condition),
+            ["ternary.alwaysTrue"]
+        );
+        assert_eq!(
+            codes("<?php $x = false ? 1 : 2;", run_ternary_condition),
+            ["ternary.alwaysFalse"]
+        );
     }
 
     #[test]
@@ -865,12 +1469,18 @@ mod tests {
 
     #[test]
     fn while_always_false() {
-        assert_eq!(codes("<?php while (false) { echo 1; }", run_while_condition), ["while.alwaysFalse"]);
+        assert_eq!(
+            codes("<?php while (false) { echo 1; }", run_while_condition),
+            ["while.alwaysFalse"]
+        );
     }
 
     #[test]
     fn while_true_is_flagged() {
-        assert_eq!(codes("<?php while (true) { echo 1; }", run_while_condition), ["while.alwaysTrue"]);
+        assert_eq!(
+            codes("<?php while (true) { echo 1; }", run_while_condition),
+            ["while.alwaysTrue"]
+        );
     }
 
     #[test]
@@ -881,7 +1491,10 @@ mod tests {
     #[test]
     fn do_while_constant() {
         assert_eq!(
-            codes("<?php do { echo 1; } while (false);", run_do_while_condition),
+            codes(
+                "<?php do { echo 1; } while (false);",
+                run_do_while_condition
+            ),
             ["doWhile.alwaysFalse"]
         );
         assert_eq!(
@@ -895,8 +1508,14 @@ mod tests {
     #[test]
     fn boolean_not_constant() {
         // !true -> always false ; !false -> always true.
-        assert_eq!(codes("<?php $x = !true;", run_boolean_not), ["booleanNot.alwaysFalse"]);
-        assert_eq!(codes("<?php $x = !false;", run_boolean_not), ["booleanNot.alwaysTrue"]);
+        assert_eq!(
+            codes("<?php $x = !true;", run_boolean_not),
+            ["booleanNot.alwaysFalse"]
+        );
+        assert_eq!(
+            codes("<?php $x = !false;", run_boolean_not),
+            ["booleanNot.alwaysTrue"]
+        );
     }
 
     #[test]
@@ -909,25 +1528,46 @@ mod tests {
     #[test]
     fn boolean_and_sides() {
         // Left literal-true, right a call (unknown): only the left fires.
-        assert_eq!(codes("<?php $x = true && foo();", run_boolean_and), ["booleanAnd.leftAlwaysTrue"]);
-        assert_eq!(codes("<?php $x = foo() && false;", run_boolean_and), ["booleanAnd.rightAlwaysFalse"]);
+        assert_eq!(
+            codes("<?php $x = true && foo();", run_boolean_and),
+            ["booleanAnd.leftAlwaysTrue"]
+        );
+        assert_eq!(
+            codes("<?php $x = foo() && false;", run_boolean_and),
+            ["booleanAnd.rightAlwaysFalse"]
+        );
     }
 
     #[test]
     fn boolean_or_sides() {
-        assert_eq!(codes("<?php $x = false || foo();", run_boolean_or), ["booleanOr.leftAlwaysFalse"]);
-        assert_eq!(codes("<?php $x = foo() || true;", run_boolean_or), ["booleanOr.rightAlwaysTrue"]);
+        assert_eq!(
+            codes("<?php $x = false || foo();", run_boolean_or),
+            ["booleanOr.leftAlwaysFalse"]
+        );
+        assert_eq!(
+            codes("<?php $x = foo() || true;", run_boolean_or),
+            ["booleanOr.rightAlwaysTrue"]
+        );
     }
 
     #[test]
     fn logical_and_keyword() {
-        assert_eq!(codes("<?php $x = true and foo();", run_boolean_and), ["booleanAnd.leftAlwaysTrue"]);
+        assert_eq!(
+            codes("<?php $x = true and foo();", run_boolean_and),
+            ["booleanAnd.leftAlwaysTrue"]
+        );
     }
 
     #[test]
     fn logical_xor_sides() {
-        assert_eq!(codes("<?php $x = true xor foo();", run_logical_xor), ["logicalXor.leftAlwaysTrue"]);
-        assert_eq!(codes("<?php $x = foo() xor false;", run_logical_xor), ["logicalXor.rightAlwaysFalse"]);
+        assert_eq!(
+            codes("<?php $x = true xor foo();", run_logical_xor),
+            ["logicalXor.leftAlwaysTrue"]
+        );
+        assert_eq!(
+            codes("<?php $x = foo() xor false;", run_logical_xor),
+            ["logicalXor.rightAlwaysFalse"]
+        );
     }
 
     #[test]
@@ -940,7 +1580,10 @@ mod tests {
     #[test]
     fn strict_identical_disjoint_scalars() {
         // int literal === string literal: provably different categories.
-        assert_eq!(codes("<?php $x = (1 === 'a');", run_strict_comparison), ["identical.alwaysFalse"]);
+        assert_eq!(
+            codes("<?php $x = (1 === 'a');", run_strict_comparison),
+            ["identical.alwaysFalse"]
+        );
     }
 
     #[test]
@@ -965,23 +1608,44 @@ mod tests {
     #[test]
     fn strict_constant_equal_values_fold() {
         // Constant operands fold to a definite result (phpstan reports these).
-        assert_eq!(codes("<?php $x = (1 === 1);", run_strict_comparison), ["identical.alwaysTrue"]);
-        assert_eq!(codes("<?php $x = (1 === 2);", run_strict_comparison), ["identical.alwaysFalse"]);
-        assert_eq!(codes("<?php $x = (2 !== 2);", run_strict_comparison), ["notIdentical.alwaysFalse"]);
+        assert_eq!(
+            codes("<?php $x = (1 === 1);", run_strict_comparison),
+            ["identical.alwaysTrue"]
+        );
+        assert_eq!(
+            codes("<?php $x = (1 === 2);", run_strict_comparison),
+            ["identical.alwaysFalse"]
+        );
+        assert_eq!(
+            codes("<?php $x = (2 !== 2);", run_strict_comparison),
+            ["notIdentical.alwaysFalse"]
+        );
     }
 
     // --- constant loose / number comparison ---
 
     #[test]
     fn constant_loose_comparison_folds() {
-        assert_eq!(codes("<?php $x = (1 == 1);", run_constant_comparison), ["equal.alwaysTrue"]);
-        assert_eq!(codes("<?php $x = (1 != 1);", run_constant_comparison), ["notEqual.alwaysFalse"]);
+        assert_eq!(
+            codes("<?php $x = (1 == 1);", run_constant_comparison),
+            ["equal.alwaysTrue"]
+        );
+        assert_eq!(
+            codes("<?php $x = (1 != 1);", run_constant_comparison),
+            ["notEqual.alwaysFalse"]
+        );
     }
 
     #[test]
     fn constant_number_comparison_folds() {
-        assert_eq!(codes("<?php $x = (5 > 3);", run_constant_comparison), ["greater.alwaysTrue"]);
-        assert_eq!(codes("<?php $x = (2 <= 1);", run_constant_comparison), ["smallerOrEqual.alwaysFalse"]);
+        assert_eq!(
+            codes("<?php $x = (5 > 3);", run_constant_comparison),
+            ["greater.alwaysTrue"]
+        );
+        assert_eq!(
+            codes("<?php $x = (2 <= 1);", run_constant_comparison),
+            ["smallerOrEqual.alwaysFalse"]
+        );
     }
 
     #[test]

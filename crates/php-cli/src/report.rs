@@ -37,17 +37,26 @@ pub fn render_table(report: &Report) -> String {
                 Severity::Warning => "warning",
             };
             let id = f.identifier.map(|i| format!("  ({i})")).unwrap_or_default();
-            out.push_str(&format!("  {}:{} {}  {}{}\n", f.line, f.column, marker, f.message, id));
+            out.push_str(&format!(
+                "  {}:{} {}  {}{}\n",
+                f.line, f.column, marker, f.message, id
+            ));
         }
         out.push('\n');
     }
 
     let errors = report.error_count();
     if errors == 0 {
-        out.push_str(&format!("[OK] No errors ({} files analyzed)\n", report.files_analyzed));
+        out.push_str(&format!(
+            "[OK] No errors ({} files analyzed)\n",
+            report.files_analyzed
+        ));
     } else {
         let noun = if errors == 1 { "error" } else { "errors" };
-        out.push_str(&format!("[ERROR] Found {errors} {noun} ({} files analyzed)\n", report.files_analyzed));
+        out.push_str(&format!(
+            "[ERROR] Found {errors} {noun} ({} files analyzed)\n",
+            report.files_analyzed
+        ));
     }
     out
 }
@@ -80,7 +89,10 @@ pub fn render_json(report: &Report) -> String {
 
     let mut files: BTreeMap<String, FileBlock> = BTreeMap::new();
     for f in &report.findings {
-        let block = files.entry(f.path.clone()).or_insert(FileBlock { errors: 0, messages: Vec::new() });
+        let block = files.entry(f.path.clone()).or_insert(FileBlock {
+            errors: 0,
+            messages: Vec::new(),
+        });
         block.errors += 1;
         block.messages.push(Message {
             message: f.message.clone(),
@@ -90,7 +102,10 @@ pub fn render_json(report: &Report) -> String {
         });
     }
     let out = Out {
-        totals: Totals { errors: 0, file_errors: report.error_count() },
+        totals: Totals {
+            errors: 0,
+            file_errors: report.error_count(),
+        },
         files,
         errors: Vec::new(),
     };
@@ -107,7 +122,11 @@ pub fn render_github(report: &Report) -> String {
         };
         let id = f.identifier.map(|i| format!(" ({i})")).unwrap_or_default();
         // Escape per GitHub's workflow-command rules.
-        let msg = f.message.replace('%', "%25").replace('\r', "%0D").replace('\n', "%0A");
+        let msg = f
+            .message
+            .replace('%', "%25")
+            .replace('\r', "%0D")
+            .replace('\n', "%0A");
         out.push_str(&format!(
             "::{level} file={},line={},col={}::{msg}{id}\n",
             f.path, f.line, f.column
@@ -172,7 +191,12 @@ mod tests {
     fn table_groups_by_file_and_summarizes() {
         let report = Report {
             findings: vec![
-                finding("src/A.php", 3, "should return int but returns string", "return.type"),
+                finding(
+                    "src/A.php",
+                    3,
+                    "should return int but returns string",
+                    "return.type",
+                ),
                 finding("src/A.php", 7, "unknown class `Foo`", "class.notFound"),
             ],
             files_analyzed: 2,
@@ -185,7 +209,10 @@ mod tests {
 
     #[test]
     fn table_ok_when_clean() {
-        let report = Report { findings: vec![], files_analyzed: 5 };
+        let report = Report {
+            findings: vec![],
+            files_analyzed: 5,
+        };
         assert!(render_table(&report).contains("[OK] No errors (5 files analyzed)"));
     }
 
@@ -198,9 +225,15 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&render_json(&report)).unwrap();
         assert_eq!(v["totals"]["file_errors"], 1);
         assert_eq!(v["files"]["src/A.php"]["errors"], 1);
-        assert_eq!(v["files"]["src/A.php"]["messages"][0]["message"], "bad return");
+        assert_eq!(
+            v["files"]["src/A.php"]["messages"][0]["message"],
+            "bad return"
+        );
         assert_eq!(v["files"]["src/A.php"]["messages"][0]["line"], 4);
-        assert_eq!(v["files"]["src/A.php"]["messages"][0]["identifier"], "return.type");
+        assert_eq!(
+            v["files"]["src/A.php"]["messages"][0]["identifier"],
+            "return.type"
+        );
     }
 
     #[test]
@@ -220,7 +253,10 @@ mod tests {
 
     #[test]
     fn render_dispatch_unknown_format() {
-        let report = Report { findings: vec![], files_analyzed: 0 };
+        let report = Report {
+            findings: vec![],
+            files_analyzed: 0,
+        };
         assert!(render(&report, "table").is_some());
         assert!(render(&report, "json").is_some());
         assert!(render(&report, "nope").is_none());

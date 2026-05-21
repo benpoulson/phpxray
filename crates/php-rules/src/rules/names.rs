@@ -35,9 +35,20 @@ fn run_used_names(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 StmtKind::Use(items) => {
                     check_uses(items, "", false, fa.interner, bucket, &mut out);
                 }
-                StmtKind::GroupUse { prefix, kind, items } => {
+                StmtKind::GroupUse {
+                    prefix,
+                    kind,
+                    items,
+                } => {
                     let ignore_all = matches!(kind, Some(UseKind::Function | UseKind::Const));
-                    check_uses(items, &prefix.text, ignore_all, fa.interner, bucket, &mut out);
+                    check_uses(
+                        items,
+                        &prefix.text,
+                        ignore_all,
+                        fa.interner,
+                        bucket,
+                        &mut out,
+                    );
                 }
                 StmtKind::Class(decl) => {
                     check_class(decl, st.span, ns, fa.interner, bucket, &mut out);
@@ -72,7 +83,11 @@ fn check_class(
     let name_lc = name.to_ascii_lowercase();
     let (word, code) = kind_words(decl.kind);
     if bucket.contains(&name_lc) {
-        let qualified = if ns.is_empty() { name.to_string() } else { format!("{ns}\\{name}") };
+        let qualified = if ns.is_empty() {
+            name.to_string()
+        } else {
+            format!("{ns}\\{name}")
+        };
         out.push(
             Diagnostic::error(
                 span,
@@ -124,11 +139,18 @@ fn check_uses(
 
 /// The last `\`-separated segment of a name (its default import alias).
 fn last_segment(text: &str) -> String {
-    text.trim_start_matches('\\').rsplit('\\').next().unwrap_or(text).to_string()
+    text.trim_start_matches('\\')
+        .rsplit('\\')
+        .next()
+        .unwrap_or(text)
+        .to_string()
 }
 
-pub(crate) static RULES: &[RuleEntry] =
-    &[RuleEntry { name: "use.nameInUse", level: 0, run: run_used_names }];
+pub(crate) static RULES: &[RuleEntry] = &[RuleEntry {
+    name: "use.nameInUse",
+    level: 0,
+    run: run_used_names,
+}];
 
 #[cfg(test)]
 mod tests {
@@ -143,9 +165,18 @@ mod tests {
 
     #[test]
     fn duplicate_interface_and_trait() {
-        assert_eq!(codes(r#"<?php interface I {} interface I {}"#, run_used_names), ["interface.nameInUse"]);
-        assert_eq!(codes(r#"<?php trait T {} trait T {}"#, run_used_names), ["trait.nameInUse"]);
-        assert_eq!(codes(r#"<?php enum E {} enum E {}"#, run_used_names), ["enum.nameInUse"]);
+        assert_eq!(
+            codes(r#"<?php interface I {} interface I {}"#, run_used_names),
+            ["interface.nameInUse"]
+        );
+        assert_eq!(
+            codes(r#"<?php trait T {} trait T {}"#, run_used_names),
+            ["trait.nameInUse"]
+        );
+        assert_eq!(
+            codes(r#"<?php enum E {} enum E {}"#, run_used_names),
+            ["enum.nameInUse"]
+        );
     }
 
     #[test]
@@ -155,7 +186,10 @@ mod tests {
 
     #[test]
     fn case_insensitive() {
-        assert_eq!(codes(r#"<?php class Foo {} class foo {}"#, run_used_names), ["class.nameInUse"]);
+        assert_eq!(
+            codes(r#"<?php class Foo {} class foo {}"#, run_used_names),
+            ["class.nameInUse"]
+        );
     }
 
     #[test]

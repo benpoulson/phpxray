@@ -49,7 +49,14 @@ pub fn return_type_errors(
     treat_phpdoc_certain: bool,
     check_nullables: bool,
 ) -> Vec<Diagnostic> {
-    let cx = Cx { index, interner, types, native_types, treat_phpdoc_certain, check_nullables };
+    let cx = Cx {
+        index,
+        interner,
+        types,
+        native_types,
+        treat_phpdoc_certain,
+        check_nullables,
+    };
     let mut out = Vec::new();
     for_each_region(&program.stmts, interner, |scope, region| {
         cx.collect(scope, region, &mut out);
@@ -81,7 +88,9 @@ impl Cx<'_> {
                 StmtKind::Function(f) => self.check_function(scope, f, out),
                 StmtKind::Class(c) => self.check_class(scope, c, out),
                 StmtKind::Block(b) => self.collect(scope, b, out),
-                StmtKind::If { then, elseifs, els, .. } => {
+                StmtKind::If {
+                    then, elseifs, els, ..
+                } => {
                     self.collect(scope, std::slice::from_ref(then), out);
                     for e in elseifs {
                         self.collect(scope, std::slice::from_ref(&e.body), out);
@@ -93,8 +102,14 @@ impl Cx<'_> {
                 StmtKind::While { body, .. }
                 | StmtKind::DoWhile { body, .. }
                 | StmtKind::For { body, .. }
-                | StmtKind::Foreach { body, .. } => self.collect(scope, std::slice::from_ref(body), out),
-                StmtKind::Try { body, catches, finally } => {
+                | StmtKind::Foreach { body, .. } => {
+                    self.collect(scope, std::slice::from_ref(body), out)
+                }
+                StmtKind::Try {
+                    body,
+                    catches,
+                    finally,
+                } => {
                     self.collect(scope, body, out);
                     for c in catches {
                         self.collect(scope, &c.body, out);
@@ -108,7 +123,9 @@ impl Cx<'_> {
                         self.collect(scope, &case.body, out);
                     }
                 }
-                StmtKind::Declare { body: Some(b), .. } => self.collect(scope, std::slice::from_ref(b), out),
+                StmtKind::Declare { body: Some(b), .. } => {
+                    self.collect(scope, std::slice::from_ref(b), out)
+                }
                 _ => {}
             }
         }
@@ -117,7 +134,11 @@ impl Cx<'_> {
     fn check_function(&self, scope: &Scope, f: &FunctionDecl, out: &mut Vec<Diagnostic>) {
         let refl = reflect_function(scope, self.interner, f);
         if !skip_return(&refl.return_type) {
-            let ret = Ret { declared: refl.return_type.clone(), native_declared: refl.native_return.clone(), label: format!("function {}()", refl.fqn) };
+            let ret = Ret {
+                declared: refl.return_type.clone(),
+                native_declared: refl.native_return.clone(),
+                label: format!("function {}()", refl.fqn),
+            };
             self.check_returns_in(&f.body, &ret, out);
         }
         // Nested declarations inside the body.
@@ -132,11 +153,19 @@ impl Cx<'_> {
             let Member::Method(md) = m else { continue };
             let Some(body) = &md.body else { continue };
             let mname = self.interner.resolve(md.name);
-            let Some(mr) = refl.methods.iter().find(|x| !x.magic && x.name.eq_ignore_ascii_case(mname)) else {
+            let Some(mr) = refl
+                .methods
+                .iter()
+                .find(|x| !x.magic && x.name.eq_ignore_ascii_case(mname))
+            else {
                 continue;
             };
             if !skip_return(&mr.return_type) {
-                let ret = Ret { declared: mr.return_type.clone(), native_declared: mr.native_return.clone(), label: format!("{}::{}()", fqn, mr.name) };
+                let ret = Ret {
+                    declared: mr.return_type.clone(),
+                    native_declared: mr.native_return.clone(),
+                    label: format!("{}::{}()", fqn, mr.name),
+                };
                 self.check_returns_in(body, &ret, out);
             }
             self.collect(scope, body, out);
@@ -152,7 +181,9 @@ impl Cx<'_> {
                 StmtKind::Return(Some(e)) => self.check_return_expr(e, ret, out),
                 StmtKind::Return(None) => {} // bare `return;` — needs generator awareness.
                 StmtKind::Block(b) => self.check_returns_in(b, ret, out),
-                StmtKind::If { then, elseifs, els, .. } => {
+                StmtKind::If {
+                    then, elseifs, els, ..
+                } => {
                     self.check_returns_in(std::slice::from_ref(then), ret, out);
                     for ei in elseifs {
                         self.check_returns_in(std::slice::from_ref(&ei.body), ret, out);
@@ -164,13 +195,19 @@ impl Cx<'_> {
                 StmtKind::While { body, .. }
                 | StmtKind::DoWhile { body, .. }
                 | StmtKind::For { body, .. }
-                | StmtKind::Foreach { body, .. } => self.check_returns_in(std::slice::from_ref(body), ret, out),
+                | StmtKind::Foreach { body, .. } => {
+                    self.check_returns_in(std::slice::from_ref(body), ret, out)
+                }
                 StmtKind::Switch { cases, .. } => {
                     for c in cases {
                         self.check_returns_in(&c.body, ret, out);
                     }
                 }
-                StmtKind::Try { body, catches, finally } => {
+                StmtKind::Try {
+                    body,
+                    catches,
+                    finally,
+                } => {
                     self.check_returns_in(body, ret, out);
                     for c in catches {
                         self.check_returns_in(&c.body, ret, out);
@@ -179,7 +216,9 @@ impl Cx<'_> {
                         self.check_returns_in(f, ret, out);
                     }
                 }
-                StmtKind::Declare { body: Some(b), .. } => self.check_returns_in(std::slice::from_ref(b), ret, out),
+                StmtKind::Declare { body: Some(b), .. } => {
+                    self.check_returns_in(std::slice::from_ref(b), ret, out)
+                }
                 // Nested function/class declarations have their own return types and
                 // are checked separately (by `collect`); don't descend here.
                 _ => {}
@@ -191,15 +230,26 @@ impl Cx<'_> {
         // Unmapped (e.g. inside a closure the map leaves opaque) → `mixed` → lenient.
         let actual = self.types.get(&key(e)).cloned().unwrap_or(Type::Mixed);
         // checkNullables gate (level < 8): strip `null` from the returned value.
-        let checked = if self.check_nullables { actual.clone() } else { php_infer::strip_null_lenient(&actual) };
+        let checked = if self.check_nullables {
+            actual.clone()
+        } else {
+            php_infer::strip_null_lenient(&actual)
+        };
         if is_assignable(self.index, &checked, &ret.declared) {
             return;
         }
         // treatPhpDocTypesAsCertain=false: suppress if the *native* types agree.
         if !self.treat_phpdoc_certain {
-            let native = self.native_types.get(&key(e)).cloned().unwrap_or(Type::Mixed);
-            let native =
-                if self.check_nullables { native } else { php_infer::strip_null_lenient(&native) };
+            let native = self
+                .native_types
+                .get(&key(e))
+                .cloned()
+                .unwrap_or(Type::Mixed);
+            let native = if self.check_nullables {
+                native
+            } else {
+                php_infer::strip_null_lenient(&native)
+            };
             if is_assignable(self.index, &native, &ret.native_declared) {
                 return;
             }
@@ -207,18 +257,20 @@ impl Cx<'_> {
         out.push(
             Diagnostic::error(
                 e.span,
-                format!("{} should return {} but returns {}", ret.label, ret.declared, actual),
+                format!(
+                    "{} should return {} but returns {}",
+                    ret.label, ret.declared, actual
+                ),
             )
             .with_code("return.type"),
         );
     }
 }
 
-
 /// Declared return types not worth checking: `mixed` (everything fits), `void`
 /// and `never` (no value is returned to check against).
 fn skip_return(t: &Type) -> bool {
-    matches!(t, Type::Mixed | Type::Void | Type::Never)
+    matches!(t, Type::Mixed | Type::ExplicitMixed | Type::Void | Type::Never)
 }
 
 #[cfg(test)]
@@ -321,7 +373,10 @@ mod tests {
             class Widget {}
             function make(): Animal { return new Widget(); }"#,
         );
-        assert_eq!(d, ["function make() should return Animal but returns Widget"]);
+        assert_eq!(
+            d,
+            ["function make() should return Animal but returns Widget"]
+        );
     }
 
     #[test]

@@ -236,7 +236,9 @@ impl Collector {
 
             ExprKind::Binary { lhs, rhs, .. }
             | ExprKind::Assign { target: lhs, rhs }
-            | ExprKind::AssignOp { target: lhs, rhs, .. }
+            | ExprKind::AssignOp {
+                target: lhs, rhs, ..
+            }
             | ExprKind::AssignRef { target: lhs, rhs }
             | ExprKind::Coalesce { lhs, rhs } => {
                 self.expr(scope, lhs);
@@ -372,7 +374,12 @@ impl Collector {
                 }
             }
             StmtKind::Block(b) => self.stmts(scope, b),
-            StmtKind::If { cond, then, elseifs, els } => {
+            StmtKind::If {
+                cond,
+                then,
+                elseifs,
+                els,
+            } => {
                 self.expr(scope, cond);
                 self.stmt(scope, then);
                 for e in elseifs {
@@ -387,13 +394,24 @@ impl Collector {
                 self.expr(scope, cond);
                 self.stmt(scope, body);
             }
-            StmtKind::For { init, cond, update, body } => {
+            StmtKind::For {
+                init,
+                cond,
+                update,
+                body,
+            } => {
                 for v in init.iter().chain(cond).chain(update) {
                     self.expr(scope, v);
                 }
                 self.stmt(scope, body);
             }
-            StmtKind::Foreach { subject, key, value, body, .. } => {
+            StmtKind::Foreach {
+                subject,
+                key,
+                value,
+                body,
+                ..
+            } => {
                 self.expr(scope, subject);
                 if let Some(k) = key {
                     self.expr(scope, k);
@@ -410,7 +428,11 @@ impl Collector {
                     self.stmts(scope, &case.body);
                 }
             }
-            StmtKind::Try { body, catches, finally } => {
+            StmtKind::Try {
+                body,
+                catches,
+                finally,
+            } => {
                 self.stmts(scope, body);
                 for c in catches {
                     // `catch (A | B $e)` — the caught types are class references.
@@ -421,7 +443,9 @@ impl Collector {
                     self.stmts(scope, f);
                 }
             }
-            StmtKind::Global(es) | StmtKind::Unset(es) => es.iter().for_each(|e| self.expr(scope, e)),
+            StmtKind::Global(es) | StmtKind::Unset(es) => {
+                es.iter().for_each(|e| self.expr(scope, e))
+            }
             StmtKind::StaticVars(vs) => {
                 for v in vs {
                     if let Some(d) = &v.default {
@@ -456,8 +480,10 @@ impl Collector {
 /// `true`/`false`/`null` and the magic `__LINE__`-style constants are language
 /// constants, never namespaced.
 fn is_reserved_const(text: &str) -> bool {
-    matches!(text.to_ascii_lowercase().as_str(), "true" | "false" | "null")
-        || (text.starts_with("__") && text.ends_with("__"))
+    matches!(
+        text.to_ascii_lowercase().as_str(),
+        "true" | "false" | "null"
+    ) || (text.starts_with("__") && text.ends_with("__"))
 }
 
 #[cfg(test)]
@@ -469,7 +495,12 @@ mod tests {
         assert!(!r.has_errors(), "parse errors in test source");
         resolve_references(&r.program, &r.interner)
             .into_iter()
-            .map(|rf| (rf.kind, rf.resolution.fqn().unwrap_or("<late/builtin>").to_string()))
+            .map(|rf| {
+                (
+                    rf.kind,
+                    rf.resolution.fqn().unwrap_or("<late/builtin>").to_string(),
+                )
+            })
             .collect()
     }
 
@@ -501,7 +532,10 @@ mod tests {
         let got = refs(r#"<?php namespace App; \strlen("x"); \Other\go();"#);
         assert_eq!(
             got,
-            [(RefKind::Function, "strlen".into()), (RefKind::Function, "Other\\go".into())]
+            [
+                (RefKind::Function, "strlen".into()),
+                (RefKind::Function, "Other\\go".into())
+            ]
         );
     }
 
@@ -523,16 +557,15 @@ mod tests {
 
     #[test]
     fn catch_types_are_class_refs() {
-        let got = refs(
-            r#"<?php namespace App; try {} catch (\RuntimeException | Bad $e) {}"#,
-        );
+        let got = refs(r#"<?php namespace App; try {} catch (\RuntimeException | Bad $e) {}"#);
         assert!(got.contains(&(RefKind::Class, "RuntimeException".into())));
         assert!(got.contains(&(RefKind::Class, "App\\Bad".into())));
     }
 
     #[test]
     fn bare_name_is_a_const_ref_but_reserved_are_skipped() {
-        let got = refs(r#"<?php namespace App; echo MY_CONST; echo true; echo null; echo __LINE__;"#);
+        let got =
+            refs(r#"<?php namespace App; echo MY_CONST; echo true; echo null; echo __LINE__;"#);
         assert_eq!(got, [(RefKind::Const, "App\\MY_CONST".into())]);
     }
 
@@ -573,12 +606,15 @@ mod tests {
     #[test]
     fn self_parent_static_resolve_as_late_static() {
         let got: Vec<_> = {
-            let r = php_parser::parse(r#"<?php namespace App; class C extends B { function m() { return new static(); } }"#);
+            let r = php_parser::parse(
+                r#"<?php namespace App; class C extends B { function m() { return new static(); } }"#,
+            );
             resolve_references(&r.program, &r.interner)
                 .into_iter()
                 .map(|rf| (rf.kind, rf.resolution))
                 .collect()
         };
-        assert!(got.iter().any(|(k, r)| *k == RefKind::Class && matches!(r, Resolution::LateStatic(s) if s == "static")));
+        assert!(got.iter().any(|(k, r)| *k == RefKind::Class
+            && matches!(r, Resolution::LateStatic(s) if s == "static")));
     }
 }

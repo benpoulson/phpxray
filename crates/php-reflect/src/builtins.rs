@@ -8,16 +8,145 @@
 //! the manifest stays human-readable and we reuse one type parser. Parsing is
 //! lenient — an unrecognised type string falls back to `mixed`.
 
-use crate::{resolve_doc_type, FunctionReflection, ParamReflection};
+use crate::{
+    resolve_doc_type, AttributeSpec, ClassReflection, ConstReflection, FunctionReflection,
+    MethodReflection, ParamReflection, PropertyReflection,
+};
+use php_ast::{ClassKind, Visibility};
 use php_resolve::Scope;
 use php_types::Type;
 
 const BUILTIN_FUNCTIONS: &str = include_str!("../stubs/builtin-functions.txt");
+const BUILTIN_CLASSES: &str = include_str!("../stubs/builtin-classes.txt");
 
 /// Parse the committed manifest into function reflections.
 pub(crate) fn builtin_functions() -> Vec<FunctionReflection> {
     let scope = Scope::global();
-    BUILTIN_FUNCTIONS.lines().filter_map(|line| parse_line(line, &scope)).collect()
+    BUILTIN_FUNCTIONS
+        .lines()
+        .filter_map(|line| parse_line(line, &scope))
+        .collect()
+}
+
+/// Parse the committed built-in class-member manifest.
+pub(crate) fn builtin_classes() -> Vec<ClassReflection> {
+    let scope = Scope::global();
+    let mut classes = Vec::<ClassReflection>::new();
+    for line in BUILTIN_CLASSES.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split('\t');
+        match fields.next() {
+            Some("class") => {
+                let kind = parse_kind(fields.next().unwrap_or("class"));
+                let fqn = fields.next().unwrap_or("").to_string();
+                if fqn.is_empty() {
+                    continue;
+                }
+                let parents = parse_named_list(fields.next().unwrap_or(""));
+                let interfaces = parse_named_list(fields.next().unwrap_or(""));
+                let traits = parse_named_list(fields.next().unwrap_or(""));
+                let flags = fields.next().unwrap_or("");
+                classes.push(ClassReflection {
+                    fqn,
+                    kind,
+                    is_abstract: flags.contains('a'),
+                    is_final: flags.contains('f'),
+                    is_readonly: flags.contains('r'),
+                    parents,
+                    interfaces,
+                    traits,
+                    templates: Vec::new(),
+                    methods: Vec::new(),
+                    properties: Vec::new(),
+                    constants: Vec::new(),
+                    mixins: Vec::new(),
+                    deprecated: false,
+                    attribute: builtin_attribute(flags),
+                    consistent_constructor: false,
+                    builtin: true,
+                });
+            }
+            Some("method") => {
+                let class = fields.next().unwrap_or("");
+                let name = fields.next().unwrap_or("");
+                let visibility = parse_visibility(fields.next().unwrap_or("public"));
+                let flags = fields.next().unwrap_or("");
+                let return_type = deser_type(fields.next().unwrap_or(""), &scope);
+                let native_return = deser_type(fields.next().unwrap_or(""), &scope);
+                let params = parse_params_field(fields.next().unwrap_or(""), &scope);
+                let Some(cr) = ensure_class(&mut classes, class) else {
+                    continue;
+                };
+                cr.methods.push(MethodReflection {
+                    name: name.to_string(),
+                    visibility,
+                    is_static: flags.contains('s'),
+                    is_abstract: flags.contains('a'),
+                    is_final: flags.contains('f'),
+                    params,
+                    return_type,
+                    explicit_return: true,
+                    native_return,
+                    templates: Vec::new(),
+                    deprecated: false,
+                    pure: flags.contains('p'),
+                    must_use_return_value: flags.contains('u'),
+                    magic: false,
+                });
+            }
+            Some("property") => {
+                let class = fields.next().unwrap_or("");
+                let name = fields.next().unwrap_or("");
+                let visibility = parse_visibility(fields.next().unwrap_or("public"));
+                let flags = fields.next().unwrap_or("");
+                let ty = deser_type(fields.next().unwrap_or(""), &scope);
+                let native_ty = deser_type(fields.next().unwrap_or(""), &scope);
+                let Some(cr) = ensure_class(&mut classes, class) else {
+                    continue;
+                };
+                cr.properties.push(PropertyReflection {
+                    name: name.to_string(),
+                    visibility,
+                    is_static: flags.contains('s'),
+                    is_readonly: flags.contains('r'),
+                    ty,
+                    native_ty,
+                    has_default: false,
+                    access: php_phpdoc::PropertyAccess::ReadWrite,
+                    magic: false,
+                });
+            }
+            Some("constant") => {
+                let class = fields.next().unwrap_or("");
+                let name = fields.next().unwrap_or("");
+                let visibility = parse_visibility(fields.next().unwrap_or("public"));
+                let flags = fields.next().unwrap_or("");
+                let ty = deser_type(fields.next().unwrap_or(""), &scope);
+                let int_value = fields.next().and_then(|s| {
+                    if s.is_empty() {
+                        None
+                    } else {
+                        s.parse::<i64>().ok()
+                    }
+                });
+                let Some(cr) = ensure_class(&mut classes, class) else {
+                    continue;
+                };
+                cr.constants.push(ConstReflection {
+                    name: name.to_string(),
+                    visibility,
+                    ty,
+                    is_final: flags.contains('f'),
+                    int_value,
+                });
+            }
+            _ => {}
+        }
+    }
+    classes
 }
 
 fn parse_line(line: &str, scope: &Scope) -> Option<FunctionReflection> {
@@ -31,7 +160,10 @@ fn parse_line(line: &str, scope: &Scope) -> Option<FunctionReflection> {
     let params = if params_field.is_empty() {
         Vec::new()
     } else {
-        params_field.split(';').filter_map(|p| parse_param(p, scope)).collect()
+        params_field
+            .split(';')
+            .filter_map(|p| parse_param(p, scope))
+            .collect()
     };
     Some(FunctionReflection {
         fqn,
@@ -44,6 +176,7 @@ fn parse_line(line: &str, scope: &Scope) -> Option<FunctionReflection> {
         // Built-in purity is curated separately (rules' PURE_BUILTINS); the stub
         // manifest carries no purity info.
         pure: false,
+        must_use_return_value: false,
         builtin: true,
     })
 }
@@ -65,6 +198,14 @@ fn parse_param(s: &str, scope: &Scope) -> Option<ParamReflection> {
     })
 }
 
+fn parse_params_field(s: &str, scope: &Scope) -> Vec<ParamReflection> {
+    if s.is_empty() {
+        Vec::new()
+    } else {
+        s.split(';').filter_map(|p| parse_param(p, scope)).collect()
+    }
+}
+
 fn deser_type(s: &str, scope: &Scope) -> Type {
     if s.is_empty() {
         return Type::Mixed;
@@ -75,6 +216,76 @@ fn deser_type(s: &str, scope: &Scope) -> Type {
     }
 }
 
+fn parse_kind(s: &str) -> ClassKind {
+    match s {
+        "interface" => ClassKind::Interface,
+        "trait" => ClassKind::Trait,
+        "enum" => ClassKind::Enum,
+        _ => ClassKind::Class,
+    }
+}
+
+fn parse_visibility(s: &str) -> Visibility {
+    match s {
+        "private" => Visibility::Private,
+        "protected" => Visibility::Protected,
+        _ => Visibility::Public,
+    }
+}
+
+fn parse_named_list(s: &str) -> Vec<Type> {
+    s.split(',')
+        .filter(|p| !p.is_empty())
+        .map(|fqn| Type::Named {
+            fqn: fqn.to_string(),
+            args: Vec::new(),
+        })
+        .collect()
+}
+
+fn ensure_class<'a>(
+    classes: &'a mut Vec<ClassReflection>,
+    fqn: &str,
+) -> Option<&'a mut ClassReflection> {
+    if fqn.is_empty() {
+        return None;
+    }
+    if let Some(idx) = classes.iter().position(|c| c.fqn.eq_ignore_ascii_case(fqn)) {
+        return classes.get_mut(idx);
+    }
+    classes.push(ClassReflection {
+        fqn: fqn.to_string(),
+        kind: ClassKind::Class,
+        is_abstract: false,
+        is_final: false,
+        is_readonly: false,
+        parents: Vec::new(),
+        interfaces: Vec::new(),
+        traits: Vec::new(),
+        templates: Vec::new(),
+        methods: Vec::new(),
+        properties: Vec::new(),
+        constants: Vec::<ConstReflection>::new(),
+        mixins: Vec::new(),
+        deprecated: false,
+        attribute: None,
+        consistent_constructor: false,
+        builtin: true,
+    });
+    classes.last_mut()
+}
+
+fn builtin_attribute(flags: &str) -> Option<AttributeSpec> {
+    if flags.contains('A') {
+        Some(AttributeSpec {
+            targets: crate::attr_target::ALL,
+            repeatable: false,
+        })
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,16 +293,51 @@ mod tests {
     #[test]
     fn loads_and_resolves_common_signatures() {
         let fns = builtin_functions();
-        assert!(fns.len() > 4000, "expected thousands of builtins, got {}", fns.len());
+        assert!(
+            fns.len() > 4000,
+            "expected thousands of builtins, got {}",
+            fns.len()
+        );
 
-        let strlen = fns.iter().find(|f| f.fqn.eq_ignore_ascii_case("strlen")).unwrap();
+        let strlen = fns
+            .iter()
+            .find(|f| f.fqn.eq_ignore_ascii_case("strlen"))
+            .unwrap();
         assert_eq!(strlen.return_type, Type::Int);
         assert_eq!(strlen.params.len(), 1);
         assert_eq!(strlen.params[0].ty, Type::String);
 
-        let count = fns.iter().find(|f| f.fqn.eq_ignore_ascii_case("count")).unwrap();
+        let count = fns
+            .iter()
+            .find(|f| f.fqn.eq_ignore_ascii_case("count"))
+            .unwrap();
         assert_eq!(count.return_type, Type::Int);
         // mode param is optional.
         assert!(count.params.last().unwrap().optional);
+    }
+
+    #[test]
+    fn loads_common_builtin_class_members() {
+        let classes = builtin_classes();
+        let date = classes
+            .iter()
+            .find(|c| c.fqn.eq_ignore_ascii_case("DateTimeImmutable"))
+            .unwrap();
+        assert!(date.interfaces.iter().any(|t| {
+            matches!(t, Type::Named { fqn, .. } if fqn.eq_ignore_ascii_case("DateTimeInterface"))
+        }));
+        assert!(date
+            .methods
+            .iter()
+            .any(|m| m.name.eq_ignore_ascii_case("format") && m.return_type == Type::String));
+
+        let zone = classes
+            .iter()
+            .find(|c| c.fqn.eq_ignore_ascii_case("DateTimeZone"))
+            .unwrap();
+        assert!(zone
+            .methods
+            .iter()
+            .any(|m| m.name.eq_ignore_ascii_case("getName") && m.return_type == Type::String));
     }
 }

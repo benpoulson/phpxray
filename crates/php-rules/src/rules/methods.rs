@@ -55,29 +55,39 @@
 //!   2) — `static::m()` calling a private method (unsafe on non-final classes).
 //! - `consistentConstructor.private` (`ConsistentConstructorDeclarationRule`, level
 //!   0) — a private `__construct` in a class marked `@phpstan-consistent-constructor`.
+//! - `method.resultDiscarded` / `method.inVoidCast` and
+//!   `staticMethod.resultDiscarded` / `staticMethod.inVoidCast`
+//!   (`Call*MethodStatementWithNoDiscardRule`) — PHP 8.5 `#[NoDiscard]` calls
+//!   and unnecessary `(void)` casts.
+//! - `MissingMethodSelfOutTypeRule` (level 6) — missing iterable value type,
+//!   generic args, or callable signature inside `@phpstan-self-out`.
 //!
 //! DEFERRED (need expression-type inference, not just the AST + reflection):
 //! - `CallMethodsRule` argument *type* matching beyond positional, named-argument
 //!   resolution, `MethodCallableRule`/`StaticMethodCallableRule` (`callable.notSupported`
 //!   never fires on PHP 8.1+ — the only condition our target version triggers),
 //!   `IncompatibleDefaultParameterTypeRule`, `MethodSignatureRule` param/return
-//!   covariance, `Call*MethodStatementWithNoDiscardRule` (needs `#[NoDiscard]`/void-cast
-//!   reflection), `ExistingClassesInTypehintsRule` (overlaps class-existence rules),
-//!   `MissingMethodSelfOutTypeRule`, `MethodCallWithPossiblyRenamedNamedArgumentRule`,
+//!   covariance, closure/arrow callable NoDiscard metadata propagation,
+//!   `ExistingClassesInTypehintsRule` (overlaps class-existence rules),
+//!   `MethodCallWithPossiblyRenamedNamedArgumentRule`,
 //!   `ConsistentConstructorRule` (param/visibility comparison vs parent constructor —
 //!   the `consistentConstructor` *attribute* requires a custom PHPDoc tag we don't model).
 
 use crate::{FileAnalysis, RuleEntry};
 use php_ast::{
-    ClassDecl, ClassKind, Expr, ExprKind, Member, MemberName, MethodDecl, Stmt, StmtKind, Visibility,
+    BinOp, CastKind, ClassDecl, ClassKind, Expr, ExprKind, Member, MemberName, MethodDecl, Name,
+    NameFq, Stmt, StmtKind, Visibility,
 };
 use php_diagnostics::Diagnostic;
 use php_intern::Interner;
-use php_reflect::{reflect_class, ClassReflection, Found, MethodReflection, ReflectionIndex};
+use php_phpdoc::DocType;
+use php_reflect::{
+    reflect_class, ClassReflection, Found, MethodReflection, ParamReflection, ReflectionIndex,
+};
 use php_resolve::{for_each_region, Resolution, Scope};
 use php_span::Span;
 use php_types::Type;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
 // shared traversal: every class-like with its FQN + declaring scope
@@ -107,8 +117,12 @@ fn walk_class_stmt(
                 f(scope, &fqn, c);
             }
         }
-        StmtKind::Block(b) => b.iter().for_each(|s| walk_class_stmt(s, scope, interner, f)),
-        StmtKind::If { then, elseifs, els, .. } => {
+        StmtKind::Block(b) => b
+            .iter()
+            .for_each(|s| walk_class_stmt(s, scope, interner, f)),
+        StmtKind::If {
+            then, elseifs, els, ..
+        } => {
             walk_class_stmt(then, scope, interner, f);
             for e in elseifs {
                 walk_class_stmt(&e.body, scope, interner, f);
@@ -121,18 +135,28 @@ fn walk_class_stmt(
         | StmtKind::DoWhile { body, .. }
         | StmtKind::For { body, .. }
         | StmtKind::Foreach { body, .. } => walk_class_stmt(body, scope, interner, f),
-        StmtKind::Try { body, catches, finally } => {
-            body.iter().for_each(|s| walk_class_stmt(s, scope, interner, f));
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            body.iter()
+                .for_each(|s| walk_class_stmt(s, scope, interner, f));
             for c in catches {
-                c.body.iter().for_each(|s| walk_class_stmt(s, scope, interner, f));
+                c.body
+                    .iter()
+                    .for_each(|s| walk_class_stmt(s, scope, interner, f));
             }
             if let Some(fin) = finally {
-                fin.iter().for_each(|s| walk_class_stmt(s, scope, interner, f));
+                fin.iter()
+                    .for_each(|s| walk_class_stmt(s, scope, interner, f));
             }
         }
         StmtKind::Switch { cases, .. } => {
             for case in cases {
-                case.body.iter().for_each(|s| walk_class_stmt(s, scope, interner, f));
+                case.body
+                    .iter()
+                    .for_each(|s| walk_class_stmt(s, scope, interner, f));
             }
         }
         StmtKind::Declare { body: Some(b), .. } => walk_class_stmt(b, scope, interner, f),
@@ -153,7 +177,9 @@ fn vis(m: &MethodDecl) -> Visibility {
 }
 
 fn is_ctor(fa: &FileAnalysis, m: &MethodDecl) -> bool {
-    fa.interner.resolve(m.name).eq_ignore_ascii_case("__construct")
+    fa.interner
+        .resolve(m.name)
+        .eq_ignore_ascii_case("__construct")
 }
 
 /// The display name of a class (its name as written, leading `\` stripped).
@@ -165,16 +191,11 @@ fn display(fa: &FileAnalysis, c: &ClassDecl) -> String {
 
 /// A best-effort span for a method-level diagnostic. Our AST does not record a
 /// span on [`MethodDecl`] itself, so we point at the first available child span:
-/// a parameter type, a parameter default, the return type, the first body
-/// statement, an attribute argument — else a zero span.
+/// a parameter, the return type, the first body statement, an attribute argument
+/// — else a zero span.
 fn method_span(m: &MethodDecl) -> Span {
-    for p in &m.params {
-        if let Some(t) = &p.ty {
-            return t.span;
-        }
-        if let Some(d) = &p.default {
-            return d.span;
-        }
+    if let Some(p) = m.params.first() {
+        return p.span;
     }
     if let Some(t) = &m.return_type {
         return t.span;
@@ -226,15 +247,25 @@ fn run_abstract_in_non_abstract(fa: &FileAnalysis) -> Vec<Diagnostic> {
             let mname = fa.interner.resolve(m.name);
             // Enums get implicit `cases`/`from`/`tryFrom`.
             if c.kind == ClassKind::Enum
-                && matches!(mname.to_ascii_lowercase().as_str(), "cases" | "from" | "tryfrom")
+                && matches!(
+                    mname.to_ascii_lowercase().as_str(),
+                    "cases" | "from" | "tryfrom"
+                )
             {
                 continue;
             }
-            let lead = if c.kind == ClassKind::Enum { "Enum" } else { "Non-abstract class" };
+            let lead = if c.kind == ClassKind::Enum {
+                "Enum"
+            } else {
+                "Non-abstract class"
+            };
             out.push(
                 Diagnostic::error(
                     method_span(m),
-                    format!("{lead} {} contains abstract method {mname}().", display(fa, c)),
+                    format!(
+                        "{lead} {} contains abstract method {mname}().",
+                        display(fa, c)
+                    ),
                 )
                 .with_code("method.abstract"),
             );
@@ -285,15 +316,24 @@ fn run_abstract_body(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 out.push(
                     Diagnostic::error(
                         method_span(m),
-                        format!("Abstract method {}::{}() cannot contain body.", display(fa, c), name),
+                        format!(
+                            "Abstract method {}::{}() cannot contain body.",
+                            display(fa, c),
+                            name
+                        ),
                     )
                     .with_code("method.nonAbstract"),
                 );
-            } else if !m.modifiers.is_abstract && m.body.is_none() && c.kind != ClassKind::Interface {
+            } else if !m.modifiers.is_abstract && m.body.is_none() && c.kind != ClassKind::Interface
+            {
                 out.push(
                     Diagnostic::error(
                         method_span(m),
-                        format!("Non-abstract method {}::{}() must contain body.", display(fa, c), name),
+                        format!(
+                            "Non-abstract method {}::{}() must contain body.",
+                            display(fa, c),
+                            name
+                        ),
                     )
                     .with_code("method.nonAbstract"),
                 );
@@ -386,7 +426,10 @@ fn run_constructor_modifiers(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 out.push(
                     Diagnostic::error(
                         method_span(m),
-                        format!("Constructor {}::__construct() cannot be static.", display(fa, c)),
+                        format!(
+                            "Constructor {}::__construct() cannot be static.",
+                            display(fa, c)
+                        ),
                     )
                     .with_code("method.staticConstructor"),
                 );
@@ -432,7 +475,11 @@ fn run_missing_implementation(fa: &FileAnalysis) -> Vec<Diagnostic> {
             return;
         }
         for (mname, declaring) in collect_unimplemented_abstracts(fa.reflection, fqn) {
-            let lead = if c.kind == ClassKind::Enum { "Enum" } else { "Non-abstract class" };
+            let lead = if c.kind == ClassKind::Enum {
+                "Enum"
+            } else {
+                "Non-abstract class"
+            };
             out.push(
                 Diagnostic::error(
                     class_span(c),
@@ -476,7 +523,12 @@ fn collect_unimplemented_abstracts(refl: &ReflectionIndex, fqn: &str) -> Vec<(St
 }
 
 /// Gather every method name declared anywhere in `fqn`'s hierarchy.
-fn collect_method_names(refl: &ReflectionIndex, fqn: &str, visited: &mut Vec<String>, out: &mut Vec<String>) {
+fn collect_method_names(
+    refl: &ReflectionIndex,
+    fqn: &str,
+    visited: &mut Vec<String>,
+    out: &mut Vec<String>,
+) {
     let key = fqn.trim_start_matches('\\').to_ascii_lowercase();
     if visited.contains(&key) {
         return;
@@ -488,7 +540,12 @@ fn collect_method_names(refl: &ReflectionIndex, fqn: &str, visited: &mut Vec<Str
             out.push(m.name.clone());
         }
     }
-    for parent in class.parents.iter().chain(&class.interfaces).chain(&class.traits) {
+    for parent in class
+        .parents
+        .iter()
+        .chain(&class.interfaces)
+        .chain(&class.traits)
+    {
         if let Type::Named { fqn: pf, .. } = parent {
             collect_method_names(refl, pf, visited, out);
         }
@@ -515,7 +572,10 @@ fn run_serializable_methods(fa: &FileAnalysis) -> Vec<Diagnostic> {
             scope
                 .resolve_class(n)
                 .fqn()
-                .map(|f| f.trim_start_matches('\\').eq_ignore_ascii_case("Serializable"))
+                .map(|f| {
+                    f.trim_start_matches('\\')
+                        .eq_ignore_ascii_case("Serializable")
+                })
                 .unwrap_or(false)
         }) || fa.reflection.is_subclass_of(fqn, "Serializable");
         if !implements_serializable {
@@ -554,7 +614,8 @@ fn run_method_attribute_target(fa: &FileAnalysis) -> Vec<Diagnostic> {
         for m in methods(c) {
             for group in &m.attrs {
                 for attr in &group.attrs {
-                    let Some(fqn) = scope.resolve_class(&attr.name).fqn().map(str::to_string) else {
+                    let Some(fqn) = scope.resolve_class(&attr.name).fqn().map(str::to_string)
+                    else {
                         continue;
                     };
                     let short = fqn.trim_start_matches('\\');
@@ -580,12 +641,16 @@ fn run_method_attribute_target(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_overriding_method(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for_each_class(fa, |_, fqn, c| {
-        let Some(class) = fa.reflection.class(fqn) else { return };
+        let Some(class) = fa.reflection.class(fqn) else {
+            return;
+        };
         for m in &class.methods {
             if m.magic {
                 continue;
             }
-            let Some(parent) = find_parent_method(fa.reflection, class, &m.name) else { continue };
+            let Some(parent) = find_parent_method(fa.reflection, class, &m.name) else {
+                continue;
+            };
             let pm = &parent.member;
             let here = display(fa, c);
             let there = parent.declaring_class.trim_start_matches('\\');
@@ -595,7 +660,9 @@ fn run_overriding_method(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 out.push(
                     Diagnostic::error(
                         class_span(c),
-                        format!("Method {here}::{mname}() overrides final method {there}::{mname}()."),
+                        format!(
+                            "Method {here}::{mname}() overrides final method {there}::{mname}()."
+                        ),
                     )
                     .with_code("method.parentMethodFinal"),
                 );
@@ -619,7 +686,9 @@ fn run_overriding_method(fa: &FileAnalysis) -> Vec<Diagnostic> {
             }
             // Visibility must not be narrowed (private parent methods aren't
             // really overridden, so skip them).
-            if pm.visibility != Visibility::Private && vis_rank(pm.visibility) > vis_rank(m.visibility) {
+            if pm.visibility != Visibility::Private
+                && vis_rank(pm.visibility) > vis_rank(m.visibility)
+            {
                 let (lead, want) = match (pm.visibility, m.visibility) {
                     (Visibility::Public, Visibility::Private) => ("Private", "be public"),
                     (Visibility::Public, _) => ("Protected", "also be public"),
@@ -660,7 +729,11 @@ fn vis_word(v: Visibility) -> &'static str {
 
 /// Find the nearest non-magic method named `name` strictly above `class` in the
 /// hierarchy (parents, then interfaces).
-fn find_parent_method(refl: &ReflectionIndex, class: &ClassReflection, name: &str) -> Option<Found<MethodReflection>> {
+fn find_parent_method(
+    refl: &ReflectionIndex,
+    class: &ClassReflection,
+    name: &str,
+) -> Option<Found<MethodReflection>> {
     for parent in class.parents.iter().chain(&class.interfaces) {
         if let Type::Named { fqn: pf, .. } = parent {
             if let Some(found) = refl.find_method(pf, name) {
@@ -681,7 +754,9 @@ fn find_parent_method(refl: &ReflectionIndex, class: &ClassReflection, name: &st
 fn run_missing_return_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for_each_class(fa, |_, fqn, c| {
-        let Some(class) = fa.reflection.class(fqn) else { return };
+        let Some(class) = fa.reflection.class(fqn) else {
+            return;
+        };
         for (md, _mr) in zip_methods(fa.interner, c, class) {
             // "Specified" = a native return type OR a `@return` tag in the method's
             // docblock. We key off the tag's *presence* (like phpstan), not the
@@ -701,7 +776,10 @@ fn run_missing_return_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
             out.push(
                 Diagnostic::error(
                     method_span(md),
-                    format!("Method {}::{name}() has no return type specified.", display(fa, c)),
+                    format!(
+                        "Method {}::{name}() has no return type specified.",
+                        display(fa, c)
+                    ),
                 )
                 .with_code("missingType.return"),
             );
@@ -720,7 +798,12 @@ fn doc_has_return(doc: Option<&str>) -> bool {
 /// method `name`. Returns true as soon as `check` does. phpstan considers a method
 /// "typed" if *any* prototype anywhere up the hierarchy supplies the type — e.g. an
 /// interface's `@return` flows down through an abstract base to a concrete override.
-fn hierarchy_method<F>(fa: &FileAnalysis, class: &php_reflect::ClassReflection, name: &str, mut check: F) -> bool
+fn hierarchy_method<F>(
+    fa: &FileAnalysis,
+    class: &php_reflect::ClassReflection,
+    name: &str,
+    mut check: F,
+) -> bool
 where
     F: FnMut(&MethodReflection) -> bool,
 {
@@ -736,20 +819,36 @@ where
         if !seen.insert(fqn.clone()) {
             continue;
         }
-        let Some(anc) = fa.reflection.class(&fqn) else { continue };
-        if let Some(m) = anc.methods.iter().find(|m| !m.magic && m.name.eq_ignore_ascii_case(name)) {
+        let Some(anc) = fa.reflection.class(&fqn) else {
+            continue;
+        };
+        if let Some(m) = anc
+            .methods
+            .iter()
+            .find(|m| !m.magic && m.name.eq_ignore_ascii_case(name))
+        {
             if check(m) {
                 return true;
             }
         }
-        stack.extend(anc.parents.iter().chain(&anc.interfaces).chain(&anc.traits).filter_map(named_fqn));
+        stack.extend(
+            anc.parents
+                .iter()
+                .chain(&anc.interfaces)
+                .chain(&anc.traits)
+                .filter_map(named_fqn),
+        );
     }
     false
 }
 
 /// Whether an overridden prototype anywhere up the hierarchy declares a non-`mixed`
 /// return type (native or `@return`). phpstan inherits it, so the override needn't repeat.
-fn inherited_return_typed(fa: &FileAnalysis, class: &php_reflect::ClassReflection, name: &str) -> bool {
+fn inherited_return_typed(
+    fa: &FileAnalysis,
+    class: &php_reflect::ClassReflection,
+    name: &str,
+) -> bool {
     hierarchy_method(fa, class, name, |m| m.explicit_return)
 }
 
@@ -760,7 +859,9 @@ fn inherited_param_typed(
     name: &str,
     idx: usize,
 ) -> bool {
-    hierarchy_method(fa, class, name, |m| m.params.get(idx).is_some_and(|p| p.explicit))
+    hierarchy_method(fa, class, name, |m| {
+        m.params.get(idx).is_some_and(|p| p.explicit)
+    })
 }
 
 /// Whether a docblock declares a `@param … $name` (any `@param*` prefix), with
@@ -788,7 +889,9 @@ fn doc_has_param(doc: Option<&str>, name: &str) -> bool {
 fn run_missing_param_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for_each_class(fa, |_, fqn, c| {
-        let Some(class) = fa.reflection.class(fqn) else { return };
+        let Some(class) = fa.reflection.class(fqn) else {
+            return;
+        };
         for (md, _mr) in zip_methods(fa.interner, c, class) {
             let mname = fa.interner.resolve(md.name);
             for (idx, p) in md.params.iter().enumerate() {
@@ -847,6 +950,9 @@ fn zip_methods<'a>(
 fn run_call_existence(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for_each_class(fa, |scope, fqn, c| {
+        if c.kind == ClassKind::Trait {
+            return;
+        }
         for m in methods(c) {
             let Some(body) = &m.body else { continue };
             let mut exprs: Vec<&Expr> = Vec::new();
@@ -861,24 +967,60 @@ fn run_call_existence(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
-fn check_call_expr(e: &Expr, fa: &FileAnalysis, scope: &Scope, self_fqn: &str, out: &mut Vec<Diagnostic>) {
+fn check_call_expr(
+    e: &Expr,
+    fa: &FileAnalysis,
+    scope: &Scope,
+    self_fqn: &str,
+    out: &mut Vec<Diagnostic>,
+) {
     match &e.kind {
-        ExprKind::MethodCall { recv, method, args, .. } => {
+        ExprKind::MethodCall {
+            recv, method, args, ..
+        } => {
             // Only `$this->m(...)` — other receivers need type inference.
             if !is_this(recv, fa) {
                 return;
             }
             if let MemberName::Ident(name) = method {
                 // Spread/named args make arity opaque — skip arity but still check existence.
-                let opaque = args.iter().any(|a| a.spread || a.name.is_some() || a.placeholder);
-                check_member_call(e, fa, self_fqn, fa.interner.resolve(*name), args.len(), opaque, false, out);
+                let opaque = args
+                    .iter()
+                    .any(|a| a.spread || a.name.is_some() || a.placeholder);
+                check_member_call(
+                    e,
+                    fa,
+                    self_fqn,
+                    fa.interner.resolve(*name),
+                    args.len(),
+                    opaque,
+                    false,
+                    out,
+                );
             }
         }
-        ExprKind::StaticCall { class, method, args } => {
-            let Some(target) = static_target_fqn(class, scope, self_fqn) else { return };
+        ExprKind::StaticCall {
+            class,
+            method,
+            args,
+        } => {
+            let Some(target) = static_target_fqn(class, scope, self_fqn) else {
+                return;
+            };
             if let MemberName::Ident(name) = method {
-                let opaque = args.iter().any(|a| a.spread || a.name.is_some() || a.placeholder);
-                check_member_call(e, fa, &target, fa.interner.resolve(*name), args.len(), opaque, true, out);
+                let opaque = args
+                    .iter()
+                    .any(|a| a.spread || a.name.is_some() || a.placeholder);
+                check_member_call(
+                    e,
+                    fa,
+                    &target,
+                    fa.interner.resolve(*name),
+                    args.len(),
+                    opaque,
+                    true,
+                    out,
+                );
             }
         }
         _ => {}
@@ -894,7 +1036,9 @@ fn is_this(e: &Expr, fa: &FileAnalysis) -> bool {
 /// (resolved against the enclosing class). `parent` is skipped (we don't have the
 /// parent FQN directly here); fully-qualified names resolve normally.
 fn static_target_fqn(class: &Expr, scope: &Scope, self_fqn: &str) -> Option<String> {
-    let ExprKind::Name(n) = &class.kind else { return None };
+    let ExprKind::Name(n) = &class.kind else {
+        return None;
+    };
     match scope.resolve_class(n) {
         Resolution::LateStatic(which) => match which.as_str() {
             "self" | "static" => Some(self_fqn.to_string()),
@@ -925,11 +1069,25 @@ fn check_member_call(
         if fa.reflection.find_method(class_fqn, magic).is_some() {
             return;
         }
+        if !is_static
+            && fa
+                .reflection
+                .final_concrete_descendants_have_method(class_fqn, method)
+        {
+            return;
+        }
         let short = class_fqn.trim_start_matches('\\');
-        let code = if is_static { "staticMethod.notFound" } else { "method.notFound" };
+        let code = if is_static {
+            "staticMethod.notFound"
+        } else {
+            "method.notFound"
+        };
         out.push(
-            Diagnostic::error(call.span, format!("Call to an undefined method {short}::{method}()."))
-                .with_code(code),
+            Diagnostic::error(
+                call.span,
+                format!("Call to an undefined method {short}::{method}()."),
+            )
+            .with_code(code),
         );
         return;
     };
@@ -937,7 +1095,11 @@ fn check_member_call(
     if mr.magic || arity_opaque {
         return;
     }
-    let required = mr.params.iter().filter(|p| !p.optional && !p.variadic).count();
+    let required = mr
+        .params
+        .iter()
+        .filter(|p| !p.optional && !p.variadic)
+        .count();
     let variadic = mr.params.iter().any(|p| p.variadic);
     let max = mr.params.len();
     let here = found.declaring_class.trim_start_matches('\\');
@@ -992,7 +1154,12 @@ fn collect_exprs_in_stmt<'a>(st: &'a Stmt, out: &mut Vec<&'a Expr>) {
             es.iter().for_each(|e| collect_expr(e, out))
         }
         StmtKind::Block(b) => b.iter().for_each(|s| collect_exprs_in_stmt(s, out)),
-        StmtKind::If { cond, then, elseifs, els } => {
+        StmtKind::If {
+            cond,
+            then,
+            elseifs,
+            els,
+        } => {
             collect_expr(cond, out);
             collect_exprs_in_stmt(then, out);
             for ei in elseifs {
@@ -1011,13 +1178,24 @@ fn collect_exprs_in_stmt<'a>(st: &'a Stmt, out: &mut Vec<&'a Expr>) {
             collect_exprs_in_stmt(body, out);
             collect_expr(cond, out);
         }
-        StmtKind::For { init, cond, update, body } => {
+        StmtKind::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
             for e in init.iter().chain(cond).chain(update) {
                 collect_expr(e, out);
             }
             collect_exprs_in_stmt(body, out);
         }
-        StmtKind::Foreach { subject, key, value, body, .. } => {
+        StmtKind::Foreach {
+            subject,
+            key,
+            value,
+            body,
+            ..
+        } => {
             collect_expr(subject, out);
             if let Some(k) = key {
                 collect_expr(k, out);
@@ -1034,7 +1212,11 @@ fn collect_exprs_in_stmt<'a>(st: &'a Stmt, out: &mut Vec<&'a Expr>) {
                 cs.body.iter().for_each(|s| collect_exprs_in_stmt(s, out));
             }
         }
-        StmtKind::Try { body, catches, finally } => {
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
             body.iter().for_each(|s| collect_exprs_in_stmt(s, out));
             for cc in catches {
                 cc.body.iter().for_each(|s| collect_exprs_in_stmt(s, out));
@@ -1102,7 +1284,9 @@ fn collect_expr<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
         Unary { expr, .. } | Cast { expr, .. } => collect_expr(expr, out),
         Binary { lhs, rhs, .. }
         | Assign { target: lhs, rhs }
-        | AssignOp { target: lhs, rhs, .. }
+        | AssignOp {
+            target: lhs, rhs, ..
+        }
         | AssignRef { target: lhs, rhs }
         | Coalesce { lhs, rhs } => {
             collect_expr(lhs, out);
@@ -1156,14 +1340,28 @@ fn collect_expr<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
 fn run_method_argument_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::MethodCall { recv, method, args, .. } = &e.kind else { return };
-        let MemberName::Ident(name) = method else { return };
-        if args.iter().any(|a| a.spread || a.name.is_some() || a.placeholder) {
+        let ExprKind::MethodCall {
+            recv, method, args, ..
+        } = &e.kind
+        else {
+            return;
+        };
+        let MemberName::Ident(name) = method else {
+            return;
+        };
+        if args
+            .iter()
+            .any(|a| a.spread || a.name.is_some() || a.placeholder)
+        {
             return;
         }
-        let Some(fqn) = named_fqn(&fa.type_of(recv)) else { return };
+        let Some(fqn) = named_fqn(&fa.type_of(recv)) else {
+            return;
+        };
         let mname = fa.interner.resolve(*name);
-        let Some(found) = fa.reflection.find_method(&fqn, mname) else { return };
+        let Some(found) = fa.reflection.find_method(&fqn, mname) else {
+            return;
+        };
         let mr = &found.member;
         if mr.magic {
             return;
@@ -1207,6 +1405,123 @@ fn named_fqn(t: &Type) -> Option<String> {
 // CallMethodsRule — existence + visibility on a typed receiver (`$expr->m()`)
 // ---------------------------------------------------------------------------
 
+/// Level-8 `checkNullables` strictness for method calls: at lower levels
+/// phpstan strips `null` from a nullable receiver before judging the call, while
+/// level 8+ reports `method.nonObject` for `$maybeC->m()`. This branch is
+/// intentionally separate from method-existence so `?C->missing()` is reported
+/// as a nullable receiver problem, not as an undefined method.
+fn run_nullable_method_access(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    crate::walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::MethodCall {
+            recv,
+            nullsafe,
+            method,
+            ..
+        } = &e.kind
+        else {
+            return;
+        };
+        if *nullsafe {
+            return;
+        }
+        let MemberName::Ident(name) = method else {
+            return;
+        };
+        let recv_ty = fa.type_of(recv);
+        let Some(non_null) = super::non_null_part(&recv_ty) else {
+            return;
+        };
+        if !super::known_objectish_type(fa, &non_null) {
+            return;
+        }
+        let mname = fa.interner.resolve(*name);
+        out.push(
+            Diagnostic::error(
+                e.span,
+                format!(
+                    "Cannot call method {mname}() on {}.",
+                    super::nullable_type_display(&recv_ty)
+                ),
+            )
+            .with_code("method.nonObject"),
+        );
+    });
+    out
+}
+
+/// Level-7 `checkUnionTypes`: when a method call is valid for only some arms of
+/// a concrete object union, phpstan reports the call on the whole union. We
+/// implement the FP-safe slice: every union arm must be a fully-known class-ish
+/// type, and at least one arm has the method while at least one definitely does
+/// not.
+fn run_union_method_access(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    crate::walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::MethodCall {
+            recv,
+            method,
+            nullsafe,
+            ..
+        } = &e.kind
+        else {
+            return;
+        };
+        if *nullsafe {
+            return;
+        }
+        let MemberName::Ident(name) = method else {
+            return;
+        };
+        let recv_ty = fa.type_of(recv);
+        let Some((has_method, lacks_method)) = union_method_status(fa, &recv_ty, fa.interner.resolve(*name)) else {
+            return;
+        };
+        if !(has_method && lacks_method) {
+            return;
+        }
+        let mname = fa.interner.resolve(*name);
+        out.push(
+            Diagnostic::error(
+                e.span,
+                format!("Call to an undefined method {recv_ty}::{mname}()."),
+            )
+            .with_code("method.notFound"),
+        );
+    });
+    out
+}
+
+fn union_method_status(fa: &FileAnalysis, ty: &Type, method: &str) -> Option<(bool, bool)> {
+    let Type::Union(parts) = ty else {
+        return None;
+    };
+    if parts.len() < 2 || super::type_contains_null(ty) {
+        return None;
+    }
+    let mut has_method = false;
+    let mut lacks_method = false;
+    for part in parts {
+        let Type::Named { fqn, .. } = part else {
+            return None;
+        };
+        if !fa.class_fully_known(fqn) {
+            return None;
+        }
+        if fa.reflection.find_method(fqn, method).is_some()
+            || fa.reflection.find_method(fqn, "__call").is_some()
+            || fa
+                .reflection
+                .final_concrete_descendants_have_method(fqn, method)
+        {
+            has_method = true;
+        } else {
+            lacks_method = true;
+        }
+    }
+    Some((has_method, lacks_method))
+}
+
 /// `CallMethodsRule` (the existence part expressible from the type map) — an
 /// instance method call `$expr->m(...)` on a non-`$this` receiver whose inferred
 /// type resolves to a *known* class with no method `m` and no `__call`
@@ -1216,13 +1531,23 @@ fn named_fqn(t: &Type) -> Option<String> {
 fn run_call_methods_typed(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::MethodCall { recv, method, .. } = &e.kind else { return };
-        let MemberName::Ident(name) = method else { return };
+        let ExprKind::MethodCall { recv, method, .. } = &e.kind else {
+            return;
+        };
+        let MemberName::Ident(name) = method else {
+            return;
+        };
         // `$this->m()` is handled by run_call_existence (with self-class context).
         if is_this(recv, fa) {
             return;
         }
-        let Some(fqn) = named_fqn(&fa.type_of(recv)) else { return };
+        let recv_ty = fa.type_of(recv);
+        if fa.check_nullables && super::type_contains_null(&recv_ty) {
+            return;
+        }
+        let Some(fqn) = named_fqn(&recv_ty) else {
+            return;
+        };
         // The class must be known so absence/visibility is reliable.
         if !fa.class_fully_known(&fqn) {
             return;
@@ -1233,6 +1558,12 @@ fn run_call_methods_typed(fa: &FileAnalysis) -> Vec<Diagnostic> {
             None => {
                 // __call accepts any method name.
                 if fa.reflection.find_method(&fqn, "__call").is_some() {
+                    return;
+                }
+                if fa
+                    .reflection
+                    .final_concrete_descendants_have_method(&fqn, mname)
+                {
                     return;
                 }
                 out.push(
@@ -1262,6 +1593,9 @@ fn run_call_methods_typed(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_static_call_named(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for_each_class(fa, |scope, _, c| {
+        if c.kind == ClassKind::Trait {
+            return;
+        }
         for m in methods(c) {
             let Some(body) = &m.body else { continue };
             let mut exprs: Vec<&Expr> = Vec::new();
@@ -1269,9 +1603,15 @@ fn run_static_call_named(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 collect_exprs_in_stmt(st, &mut exprs);
             }
             for e in exprs {
-                let ExprKind::StaticCall { class, method, .. } = &e.kind else { continue };
-                let MemberName::Ident(name) = method else { continue };
-                let ExprKind::Name(n) = &class.kind else { continue };
+                let ExprKind::StaticCall { class, method, .. } = &e.kind else {
+                    continue;
+                };
+                let MemberName::Ident(name) = method else {
+                    continue;
+                };
+                let ExprKind::Name(n) = &class.kind else {
+                    continue;
+                };
                 // Only explicitly-named classes (skip self/static/parent/builtins).
                 let fqn = match scope.resolve_class(n) {
                     Resolution::LateStatic(_) | Resolution::BuiltinType(_) => continue,
@@ -1303,6 +1643,274 @@ fn run_static_call_named(fa: &FileAnalysis) -> Vec<Diagnostic> {
 }
 
 // ---------------------------------------------------------------------------
+// MethodCallWithPossiblyRenamedNamedArgumentRule (level 0)
+// ---------------------------------------------------------------------------
+
+/// `MethodCallWithPossiblyRenamedNamedArgumentRule` — a call to
+/// `Base::m(paramName: ...)` through a parameter typed as `Base`, where a known
+/// subtype overrides `m()` and renames that parameter. Conservative: only
+/// parameter receivers are considered, and both the receiver class hierarchy and
+/// the subtype hierarchy must be fully indexed.
+fn run_renamed_named_argument_call(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let renames = collect_overriding_parameter_renames(fa);
+    if renames.is_empty() {
+        return Vec::new();
+    }
+
+    let mut calls: HashMap<(String, String, String), Vec<NamedArgMethodCall>> = HashMap::new();
+    for call in collect_parameter_receiver_named_arg_calls(fa) {
+        calls
+            .entry((
+                call.prototype_class.to_ascii_lowercase(),
+                call.method.to_ascii_lowercase(),
+                call.parameter.clone(),
+            ))
+            .or_default()
+            .push(call);
+    }
+
+    let mut out = Vec::new();
+    for rename in renames {
+        let key = (
+            rename.prototype_class.to_ascii_lowercase(),
+            rename.method.to_ascii_lowercase(),
+            rename.prototype_parameter.clone(),
+        );
+        let Some(matching_calls) = calls.get(&key) else {
+            continue;
+        };
+        for call in matching_calls {
+            out.push(
+                Diagnostic::error(
+                    call.span,
+                    format!(
+                        "Call to {}::{}() uses named argument for parameter ${}, but {} renames it to ${}.",
+                        rename.prototype_class.trim_start_matches('\\'),
+                        rename.method,
+                        rename.prototype_parameter,
+                        rename.subtype_class.trim_start_matches('\\'),
+                        rename.subtype_parameter
+                    ),
+                )
+                .with_code("argument.parameterRenamedInSubtype"),
+            );
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone)]
+struct ParameterRename {
+    prototype_class: String,
+    method: String,
+    subtype_class: String,
+    prototype_parameter: String,
+    subtype_parameter: String,
+}
+
+#[derive(Debug, Clone)]
+struct NamedArgMethodCall {
+    prototype_class: String,
+    method: String,
+    parameter: String,
+    span: Span,
+}
+
+fn collect_overriding_parameter_renames(fa: &FileAnalysis) -> Vec<ParameterRename> {
+    let mut out = Vec::new();
+    for_each_class(fa, |_, fqn, _| {
+        if !fa.class_fully_known(fqn) {
+            return;
+        }
+        let Some(class) = fa.reflection.class(fqn) else {
+            return;
+        };
+        for method in &class.methods {
+            if method.magic || method.visibility == Visibility::Private {
+                continue;
+            }
+            let Some(parent) = find_parent_method(fa.reflection, class, &method.name) else {
+                continue;
+            };
+            if parent.member.visibility == Visibility::Private || parent.member.magic {
+                continue;
+            }
+            if !method_accepts_named_arguments(fa, &parent.declaring_class, &parent.member.name) {
+                continue;
+            }
+            for (prototype_param, method_param) in parent.member.params.iter().zip(&method.params) {
+                if prototype_param.name == method_param.name {
+                    continue;
+                }
+                out.push(ParameterRename {
+                    prototype_class: parent.declaring_class.clone(),
+                    method: parent.member.name.clone(),
+                    subtype_class: class.fqn.clone(),
+                    prototype_parameter: prototype_param.name.clone(),
+                    subtype_parameter: method_param.name.clone(),
+                });
+            }
+        }
+    });
+    out
+}
+
+fn collect_parameter_receiver_named_arg_calls(fa: &FileAnalysis) -> Vec<NamedArgMethodCall> {
+    let mut out = Vec::new();
+    crate::walk::for_each_stmt(fa.program, &mut |st| match &st.kind {
+        StmtKind::Function(f) => {
+            let params = param_name_set(fa, &f.params);
+            collect_named_arg_calls_in_body(fa, &params, &f.body, &mut out);
+        }
+        StmtKind::Class(c) => {
+            for member in &c.members {
+                let Member::Method(m) = member else { continue };
+                let Some(body) = &m.body else { continue };
+                let params = param_name_set(fa, &m.params);
+                collect_named_arg_calls_in_body(fa, &params, body, &mut out);
+            }
+        }
+        _ => {}
+    });
+    out
+}
+
+fn param_name_set(fa: &FileAnalysis, params: &[php_ast::Param]) -> HashSet<String> {
+    params
+        .iter()
+        .map(|p| fa.interner.resolve(p.name).to_string())
+        .collect()
+}
+
+fn collect_named_arg_calls_in_body(
+    fa: &FileAnalysis,
+    parameter_names: &HashSet<String>,
+    body: &[Stmt],
+    out: &mut Vec<NamedArgMethodCall>,
+) {
+    for st in body {
+        crate::walk::for_each_expr_in_scope(st, &mut |e| {
+            let ExprKind::MethodCall {
+                recv, method, args, ..
+            } = &e.kind
+            else {
+                return;
+            };
+            if !receiver_is_parameter(recv, fa, parameter_names) {
+                return;
+            }
+            let MemberName::Ident(name) = method else {
+                return;
+            };
+            let Some(receiver_fqn) = named_fqn(&fa.type_of(recv)) else {
+                return;
+            };
+            if !fa.class_fully_known(&receiver_fqn) {
+                return;
+            }
+            let method_name = fa.interner.resolve(*name);
+            let Some(found) = fa.reflection.find_method(&receiver_fqn, method_name) else {
+                return;
+            };
+            if found.member.magic || found.member.visibility == Visibility::Private {
+                return;
+            }
+            let Some(declaring_class) = fa.reflection.class(&found.declaring_class) else {
+                return;
+            };
+            if declaring_class.is_final {
+                return;
+            }
+            if !method_accepts_named_arguments(fa, &found.declaring_class, &found.member.name) {
+                return;
+            }
+            for arg in args {
+                let Some(arg_name) = arg.name.map(|s| fa.interner.resolve(s)) else {
+                    continue;
+                };
+                if !found.member.params.iter().any(|p| p.name == arg_name) {
+                    continue;
+                }
+                out.push(NamedArgMethodCall {
+                    prototype_class: found.declaring_class.clone(),
+                    method: found.member.name.clone(),
+                    parameter: arg_name.to_string(),
+                    span: arg.span,
+                });
+            }
+        });
+    }
+}
+
+fn receiver_is_parameter(e: &Expr, fa: &FileAnalysis, parameter_names: &HashSet<String>) -> bool {
+    let ExprKind::Variable(sym) = &e.kind else {
+        return false;
+    };
+    let name = fa.interner.resolve(*sym);
+    name != "this" && parameter_names.contains(name)
+}
+
+fn method_accepts_named_arguments(fa: &FileAnalysis, class_fqn: &str, method: &str) -> bool {
+    if !class_accepts_named_arguments(fa, class_fqn, &mut Vec::new()) {
+        return false;
+    }
+    let mut found = false;
+    let mut accepts = true;
+    for_each_class(fa, |_, fqn, c| {
+        if found || !same_fqn(fqn, class_fqn) {
+            return;
+        }
+        for m in methods(c) {
+            if !fa.interner.resolve(m.name).eq_ignore_ascii_case(method) {
+                continue;
+            }
+            found = true;
+            accepts = !doc_has_no_named_arguments(m.doc.as_deref());
+            break;
+        }
+    });
+    found && accepts
+}
+
+fn class_accepts_named_arguments(
+    fa: &FileAnalysis,
+    class_fqn: &str,
+    seen: &mut Vec<String>,
+) -> bool {
+    let key = class_fqn.trim_start_matches('\\').to_ascii_lowercase();
+    if seen.contains(&key) {
+        return true;
+    }
+    seen.push(key);
+    let mut accepts = None;
+    for_each_class(fa, |_, fqn, c| {
+        if same_fqn(fqn, class_fqn) {
+            accepts = Some(!doc_has_no_named_arguments(c.doc.as_deref()));
+        }
+    });
+    if accepts != Some(true) {
+        return false;
+    }
+    let Some(class) = fa.reflection.class(class_fqn) else {
+        return false;
+    };
+    class
+        .parents
+        .iter()
+        .filter_map(named_fqn)
+        .all(|parent| class_accepts_named_arguments(fa, &parent, seen))
+}
+
+fn doc_has_no_named_arguments(doc: Option<&str>) -> bool {
+    doc.is_some_and(|d| d.contains("@no-named-arguments"))
+}
+
+fn same_fqn(a: &str, b: &str) -> bool {
+    a.trim_start_matches('\\')
+        .eq_ignore_ascii_case(b.trim_start_matches('\\'))
+}
+
+// ---------------------------------------------------------------------------
 // NullsafeMethodCallRule (level 4)
 // ---------------------------------------------------------------------------
 
@@ -1312,7 +1920,14 @@ fn run_static_call_named(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_nullsafe_never_null(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::MethodCall { recv, nullsafe: true, .. } = &e.kind else { return };
+        let ExprKind::MethodCall {
+            recv,
+            nullsafe: true,
+            ..
+        } = &e.kind
+        else {
+            return;
+        };
         let ty = fa.type_of(recv);
         if !type_is_definitely_non_null(&ty) {
             return;
@@ -1320,9 +1935,7 @@ fn run_nullsafe_never_null(fa: &FileAnalysis) -> Vec<Diagnostic> {
         out.push(
             Diagnostic::error(
                 e.span,
-                format!(
-                    "Using nullsafe method call on non-nullable type {ty}. Use -> instead."
-                ),
+                format!("Using nullsafe method call on non-nullable type {ty}. Use -> instead."),
             )
             .with_code("nullsafe.neverNull"),
         );
@@ -1380,10 +1993,18 @@ fn run_new_result_unused(fa: &FileAnalysis) -> Vec<Diagnostic> {
     crate::walk::for_each_stmt(fa.program, &mut |st| {
         let StmtKind::Expr(e) = &st.kind else { return };
         // Only the immediate `new C()` as a statement (not `$x = new C()`).
-        let ExprKind::New { class, .. } = &e.kind else { return };
-        let ExprKind::Name(_) = &class.kind else { return };
-        let Some(fqn) = named_fqn(&fa.type_of(e)) else { return };
-        let Some(cr) = fa.reflection.class(&fqn) else { return };
+        let ExprKind::New { class, .. } = &e.kind else {
+            return;
+        };
+        let ExprKind::Name(_) = &class.kind else {
+            return;
+        };
+        let Some(fqn) = named_fqn(&fa.type_of(e)) else {
+            return;
+        };
+        let Some(cr) = fa.reflection.class(&fqn) else {
+            return;
+        };
         // Skip anything we can't be sure about; only flag when the class has no
         // constructor at all (definitively side-effect-free instantiation).
         if fa.reflection.find_method(&fqn, "__construct").is_some() {
@@ -1423,16 +2044,24 @@ fn run_private_through_static(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 collect_exprs_in_stmt(st, &mut exprs);
             }
             for e in exprs {
-                let ExprKind::StaticCall { class, method, .. } = &e.kind else { continue };
-                let MemberName::Ident(name) = method else { continue };
+                let ExprKind::StaticCall { class, method, .. } = &e.kind else {
+                    continue;
+                };
+                let MemberName::Ident(name) = method else {
+                    continue;
+                };
                 // Only `static::` (late static binding), spelled as a bare name.
-                let ExprKind::Name(n) = &class.kind else { continue };
+                let ExprKind::Name(n) = &class.kind else {
+                    continue;
+                };
                 if !matches!(scope.resolve_class(n), Resolution::LateStatic(ref w) if w == "static")
                 {
                     continue;
                 }
                 let mname = fa.interner.resolve(*name);
-                let Some(found) = fa.reflection.find_method(fqn, mname) else { continue };
+                let Some(found) = fa.reflection.find_method(fqn, mname) else {
+                    continue;
+                };
                 if found.member.magic || found.member.visibility != Visibility::Private {
                     continue;
                 }
@@ -1440,7 +2069,9 @@ fn run_private_through_static(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 out.push(
                     Diagnostic::error(
                         e.span,
-                        format!("Unsafe call to private method {here}::{mname}() through static::."),
+                        format!(
+                            "Unsafe call to private method {here}::{mname}() through static::."
+                        ),
                     )
                     .with_code("staticClassAccess.privateMethod"),
                 );
@@ -1483,6 +2114,386 @@ fn run_consistent_constructor_private(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
+/// `ConsistentConstructorRule` — when a parent (or ancestor) class declares
+/// `@consistent-constructor`, a child constructor must stay compatible with the
+/// constructor contract found there. Conservative: requires a fully-indexed
+/// hierarchy and skips type comparisons whose answer depends on unresolved
+/// classes/templates/self/static.
+fn run_consistent_constructor(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_class(fa, |_, fqn, c| {
+        if c.kind != ClassKind::Class || !fa.class_fully_known(fqn) {
+            return;
+        }
+        let Some(class) = fa.reflection.class(fqn) else {
+            return;
+        };
+        let Some(parent_fqn) = class.parents.iter().find_map(named_fqn) else {
+            return;
+        };
+        let Some(proto) = find_consistent_constructor_prototype(fa, &parent_fqn, &mut Vec::new())
+        else {
+            return;
+        };
+        for (md, mr) in zip_methods(fa.interner, c, class) {
+            if !mr.name.eq_ignore_ascii_case("__construct") {
+                continue;
+            }
+            compare_constructor_signature(fa, &proto, fqn, mr, method_span(md), &mut out);
+        }
+    });
+    out
+}
+
+#[derive(Clone)]
+struct ConstructorPrototype {
+    declaring_class: String,
+    params: Vec<ParamReflection>,
+    visibility: Visibility,
+}
+
+fn find_consistent_constructor_prototype(
+    fa: &FileAnalysis,
+    fqn: &str,
+    seen: &mut Vec<String>,
+) -> Option<ConstructorPrototype> {
+    let key = fqn.trim_start_matches('\\').to_ascii_lowercase();
+    if seen.contains(&key) {
+        return None;
+    }
+    seen.push(key);
+    let class = fa.reflection.class(fqn)?;
+    if class.consistent_constructor {
+        if let Some(found) = fa.reflection.find_method(&class.fqn, "__construct") {
+            if !found.member.magic {
+                return Some(ConstructorPrototype {
+                    declaring_class: found.declaring_class,
+                    params: found.member.params,
+                    visibility: found.member.visibility,
+                });
+            }
+        }
+        // PHPStan uses DummyConstructorReflection for a consistent class without
+        // a constructor: public, no parameters.
+        return Some(ConstructorPrototype {
+            declaring_class: class.fqn.clone(),
+            params: Vec::new(),
+            visibility: Visibility::Public,
+        });
+    }
+    for parent in &class.parents {
+        if let Some(parent_fqn) = named_fqn(parent) {
+            if let Some(proto) = find_consistent_constructor_prototype(fa, &parent_fqn, seen) {
+                return Some(proto);
+            }
+        }
+    }
+    None
+}
+
+fn compare_constructor_signature(
+    fa: &FileAnalysis,
+    proto: &ConstructorPrototype,
+    child_fqn: &str,
+    method: &MethodReflection,
+    span: Span,
+    out: &mut Vec<Diagnostic>,
+) {
+    compare_constructor_params(fa, proto, child_fqn, method, span, out);
+    compare_constructor_visibility(proto, child_fqn, method, span, out);
+}
+
+fn compare_constructor_params(
+    fa: &FileAnalysis,
+    proto: &ConstructorPrototype,
+    child_fqn: &str,
+    method: &MethodReflection,
+    span: Span,
+    out: &mut Vec<Diagnostic>,
+) {
+    let child = child_fqn.trim_start_matches('\\');
+    let parent = proto.declaring_class.trim_start_matches('\\');
+    let mname = &method.name;
+    let pname = "__construct";
+    let mut last_proto_idx: Option<usize> = None;
+    let mut prototype_after_variadic = false;
+
+    for (i, prototype_param) in proto.params.iter().enumerate() {
+        last_proto_idx = Some(i);
+        let Some(method_param) = method.params.get(i) else {
+            out.push(
+                Diagnostic::error(
+                    span,
+                    format!(
+                        "Method {child}::{mname}() overrides method {parent}::{pname}() but misses parameter #{} ${}.",
+                        i + 1,
+                        prototype_param.name
+                    ),
+                )
+                .with_code("parameter.missing"),
+            );
+            continue;
+        };
+
+        if !prototype_param.by_ref && method_param.by_ref {
+            out.push(
+                Diagnostic::error(
+                    span,
+                    format!(
+                        "Parameter #{} ${} of method {child}::{mname}() is passed by reference but parameter #{} ${} of method {parent}::{pname}() is not passed by reference.",
+                        i + 1,
+                        method_param.name,
+                        i + 1,
+                        prototype_param.name
+                    ),
+                )
+                .with_code("parameter.byRef"),
+            );
+        } else if prototype_param.by_ref && !method_param.by_ref {
+            out.push(
+                Diagnostic::error(
+                    span,
+                    format!(
+                        "Parameter #{} ${} of method {child}::{mname}() is not passed by reference but parameter #{} ${} of method {parent}::{pname}() is passed by reference.",
+                        i + 1,
+                        method_param.name,
+                        i + 1,
+                        prototype_param.name
+                    ),
+                )
+                .with_code("parameter.notByRef"),
+            );
+        }
+
+        if prototype_param.variadic {
+            prototype_after_variadic = true;
+            if !method_param.variadic {
+                if !method_param.optional {
+                    if method.params.len() != i + 1 {
+                        out.push(
+                            Diagnostic::error(
+                                span,
+                                format!(
+                                    "Parameter #{} ${} of method {child}::{mname}() is not optional.",
+                                    i + 1,
+                                    method_param.name
+                                ),
+                            )
+                            .with_code("parameter.notOptional"),
+                        );
+                    } else {
+                        out.push(
+                            Diagnostic::error(
+                                span,
+                                format!(
+                                    "Parameter #{} ${} of method {child}::{mname}() is not variadic but parameter #{} ${} of method {parent}::{pname}() is variadic.",
+                                    i + 1,
+                                    method_param.name,
+                                    i + 1,
+                                    prototype_param.name
+                                ),
+                            )
+                            .with_code("parameter.notVariadic"),
+                        );
+                    }
+                    continue;
+                } else if method.params.len() == i + 1 {
+                    out.push(
+                        Diagnostic::error(
+                            span,
+                            format!(
+                                "Parameter #{} ${} of method {child}::{mname}() is not variadic.",
+                                i + 1,
+                                method_param.name
+                            ),
+                        )
+                        .with_code("parameter.notVariadic"),
+                    );
+                }
+            }
+        } else if method_param.variadic {
+            for (j, remaining) in proto.params.iter().enumerate().skip(i) {
+                if constructor_param_type_compatible(
+                    fa,
+                    &method_param.native_ty,
+                    &remaining.native_ty,
+                ) {
+                    continue;
+                }
+                out.push(
+                    Diagnostic::error(
+                        span,
+                        format!(
+                            "Parameter #{} ...${} ({}) of method {child}::{mname}() is not contravariant with parameter #{} ${} ({}) of method {parent}::{pname}().",
+                            i + 1,
+                            method_param.name,
+                            method_param.native_ty,
+                            j + 1,
+                            remaining.name,
+                            remaining.native_ty
+                        ),
+                    )
+                    .with_code("method.childParameterType"),
+                );
+            }
+            break;
+        }
+
+        if prototype_param.optional && !method_param.optional {
+            out.push(
+                Diagnostic::error(
+                    span,
+                    format!(
+                        "Parameter #{} ${} of method {child}::{mname}() is required but parameter #{} ${} of method {parent}::{pname}() is optional.",
+                        i + 1,
+                        method_param.name,
+                        i + 1,
+                        prototype_param.name
+                    ),
+                )
+                .with_code("parameter.notOptional"),
+            );
+        }
+
+        if !constructor_param_type_compatible(
+            fa,
+            &method_param.native_ty,
+            &prototype_param.native_ty,
+        ) {
+            out.push(
+                Diagnostic::error(
+                    span,
+                    format!(
+                        "Parameter #{} ${} ({}) of method {child}::{mname}() is not contravariant with parameter #{} ${} ({}) of method {parent}::{pname}().",
+                        i + 1,
+                        method_param.name,
+                        method_param.native_ty,
+                        i + 1,
+                        prototype_param.name,
+                        prototype_param.native_ty
+                    ),
+                )
+                .with_code("method.childParameterType"),
+            );
+        }
+    }
+
+    let last_checked = last_proto_idx.map_or(0, |i| i + 1);
+    for (j, method_param) in method.params.iter().enumerate().skip(last_checked) {
+        if j == method.params.len() - 1 && prototype_after_variadic && !method_param.variadic {
+            out.push(
+                Diagnostic::error(
+                    span,
+                    format!(
+                        "Parameter #{} ${} of method {child}::{mname}() is not variadic.",
+                        j + 1,
+                        method_param.name
+                    ),
+                )
+                .with_code("parameter.notVariadic"),
+            );
+            continue;
+        }
+        if method_param.optional {
+            continue;
+        }
+        out.push(
+            Diagnostic::error(
+                span,
+                format!(
+                    "Parameter #{} ${} of method {child}::{mname}() is not optional.",
+                    j + 1,
+                    method_param.name
+                ),
+            )
+            .with_code("parameter.notOptional"),
+        );
+    }
+}
+
+fn compare_constructor_visibility(
+    proto: &ConstructorPrototype,
+    child_fqn: &str,
+    method: &MethodReflection,
+    span: Span,
+    out: &mut Vec<Diagnostic>,
+) {
+    if proto.visibility == Visibility::Private {
+        return;
+    }
+    let child = child_fqn.trim_start_matches('\\');
+    let parent = proto.declaring_class.trim_start_matches('\\');
+    let mname = &method.name;
+    if proto.visibility == Visibility::Public && method.visibility != Visibility::Public {
+        let lead = if method.visibility == Visibility::Private {
+            "Private"
+        } else {
+            "Protected"
+        };
+        out.push(
+            Diagnostic::error(
+                span,
+                format!(
+                    "{lead} method {child}::{mname}() overriding public method {parent}::__construct() should also be public."
+                ),
+            )
+            .with_code("method.visibility"),
+        );
+    } else if method.visibility == Visibility::Private {
+        out.push(
+            Diagnostic::error(
+                span,
+                format!(
+                    "Private method {child}::{mname}() overriding protected method {parent}::__construct() should be protected or public."
+                ),
+            )
+            .with_code("method.visibility"),
+        );
+    }
+}
+
+fn constructor_param_type_compatible(
+    fa: &FileAnalysis,
+    method_type: &Type,
+    prototype_type: &Type,
+) -> bool {
+    if !constructor_type_decidable(fa, method_type)
+        || !constructor_type_decidable(fa, prototype_type)
+    {
+        return true;
+    }
+    php_infer::is_assignable(fa.reflection, prototype_type, method_type)
+}
+
+fn constructor_type_decidable(fa: &FileAnalysis, ty: &Type) -> bool {
+    match ty {
+        Type::Mixed
+        | Type::Unknown(_)
+        | Type::SelfType
+        | Type::StaticType
+        | Type::Parent
+        | Type::TemplateVar(_)
+        | Type::Conditional { .. } => false,
+        Type::Named { fqn, args } => {
+            fa.class_fully_known(fqn) && args.iter().all(|a| constructor_type_decidable(fa, a))
+        }
+        Type::Nullable(inner) | Type::List(inner) | Type::ClassString(Some(inner)) => {
+            constructor_type_decidable(fa, inner)
+        }
+        Type::Union(parts) | Type::Intersection(parts) => {
+            parts.iter().all(|p| constructor_type_decidable(fa, p))
+        }
+        Type::Array(Some(kv)) | Type::Iterable(Some(kv)) => {
+            constructor_type_decidable(fa, &kv.0) && constructor_type_decidable(fa, &kv.1)
+        }
+        Type::Callable(Some(sig)) => {
+            sig.params.iter().all(|p| constructor_type_decidable(fa, p))
+                && constructor_type_decidable(fa, &sig.ret)
+        }
+        _ => true,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // IncompatibleDefaultParameterTypeRule (level 2)
 // ---------------------------------------------------------------------------
@@ -1523,7 +2534,9 @@ fn const_default_type(e: &php_ast::Expr) -> Type {
 fn run_incompatible_default_param(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for_each_class(fa, |_, fqn, c| {
-        let Some(class) = fa.reflection.class(fqn) else { return };
+        let Some(class) = fa.reflection.class(fqn) else {
+            return;
+        };
         let short = class.fqn.trim_start_matches('\\');
         for (md, mr) in zip_methods(fa.interner, c, class) {
             for (i, (p, pr)) in md.params.iter().zip(&mr.params).enumerate() {
@@ -1534,7 +2547,7 @@ fn run_incompatible_default_param(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     continue;
                 }
                 // No declared type → nothing to check.
-                if pr.ty == Type::Mixed {
+                if pr.ty.is_mixed() {
                     continue;
                 }
                 // Param defaults aren't in the body type-map; fold the literal.
@@ -1590,11 +2603,19 @@ fn run_method_result_unused(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for s in &fa.program.stmts {
         crate::rules::functions::stmt_level_calls(s, &mut |e| {
-            let ExprKind::MethodCall { recv, method, .. } = &e.kind else { return };
-            let MemberName::Ident(name) = method else { return };
-            let Some(fqn) = named_fqn(&fa.type_of(recv)) else { return };
+            let ExprKind::MethodCall { recv, method, .. } = &e.kind else {
+                return;
+            };
+            let MemberName::Ident(name) = method else {
+                return;
+            };
+            let Some(fqn) = named_fqn(&fa.type_of(recv)) else {
+                return;
+            };
             let mname = fa.interner.resolve(*name);
-            let Some(found) = fa.reflection.find_method(&fqn, mname) else { return };
+            let Some(found) = fa.reflection.find_method(&fqn, mname) else {
+                return;
+            };
             if let Some(d) = pure_call_diag(&found.member, &fqn, "method.resultUnused", e.span) {
                 out.push(d);
             }
@@ -1611,9 +2632,15 @@ fn run_static_method_result_unused(fa: &FileAnalysis) -> Vec<Diagnostic> {
     for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
         for s in region {
             crate::rules::functions::stmt_level_calls(s, &mut |e| {
-                let ExprKind::StaticCall { class, method, .. } = &e.kind else { return };
-                let MemberName::Ident(name) = method else { return };
-                let ExprKind::Name(n) = &class.kind else { return };
+                let ExprKind::StaticCall { class, method, .. } = &e.kind else {
+                    return;
+                };
+                let MemberName::Ident(name) = method else {
+                    return;
+                };
+                let ExprKind::Name(n) = &class.kind else {
+                    return;
+                };
                 let fqn = match scope.resolve_class(n) {
                     Resolution::LateStatic(_) | Resolution::BuiltinType(_) => return,
                     r => match r.fqn() {
@@ -1622,8 +2649,11 @@ fn run_static_method_result_unused(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     },
                 };
                 let mname = fa.interner.resolve(*name);
-                let Some(found) = fa.reflection.find_method(&fqn, mname) else { return };
-                if let Some(d) = pure_call_diag(&found.member, &fqn, "staticMethod.resultUnused", e.span)
+                let Some(found) = fa.reflection.find_method(&fqn, mname) else {
+                    return;
+                };
+                if let Some(d) =
+                    pure_call_diag(&found.member, &fqn, "staticMethod.resultUnused", e.span)
                 {
                     out.push(d);
                 }
@@ -1635,16 +2665,282 @@ fn run_static_method_result_unused(fa: &FileAnalysis) -> Vec<Diagnostic> {
 
 /// Build the `*.resultUnused` diagnostic for a discarded call to `m`, if `m` is a
 /// non-magic pure method that doesn't return `never`.
-fn pure_call_diag(m: &MethodReflection, fqn: &str, code: &'static str, span: Span) -> Option<Diagnostic> {
+fn pure_call_diag(
+    m: &MethodReflection,
+    fqn: &str,
+    code: &'static str,
+    span: Span,
+) -> Option<Diagnostic> {
     if m.magic || !m.pure || matches!(m.return_type, Type::Never) {
         return None;
     }
     let short = fqn.trim_start_matches('\\');
-    let kind = if m.is_static { "static method" } else { "method" };
+    let kind = if m.is_static {
+        "static method"
+    } else {
+        "method"
+    };
     Some(
         Diagnostic::error(
             span,
-            format!("Call to {kind} {short}::{}() on a separate line has no effect.", m.name),
+            format!(
+                "Call to {kind} {short}::{}() on a separate line has no effect.",
+                m.name
+            ),
+        )
+        .with_code(code),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// CallTo*MethodStatementWithNoDiscardRule
+// ---------------------------------------------------------------------------
+
+/// `$obj->m();` / `(void) $obj->m();` for methods declared with `#[NoDiscard]`.
+///
+/// Pipe-right first-class callables are treated as calls to the referenced
+/// method, matching PHPStan. Standalone first-class callables remain clean.
+fn run_method_no_discard(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    if !fa.php_version.at_least(80500) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for s in &fa.program.stmts {
+        crate::rules::functions::stmt_level_calls(s, &mut |e| {
+            let Some((call, in_void_cast, from_pipe)) = method_call_for_no_discard(e) else {
+                return;
+            };
+            let ExprKind::MethodCall {
+                recv, method, args, ..
+            } = &call.kind
+            else {
+                return;
+            };
+            if !from_pipe && args.iter().any(|a| a.placeholder) {
+                return;
+            }
+            let MemberName::Ident(name) = method else {
+                return;
+            };
+            let Some(fqn) = named_fqn(&fa.type_of(recv)) else {
+                return;
+            };
+            let mname = fa.interner.resolve(*name);
+            let Some(found) = fa.reflection.find_method(&fqn, mname) else {
+                return;
+            };
+            if let Some(d) = no_discard_method_diag(
+                &found.member,
+                &found.declaring_class,
+                "method",
+                in_void_cast,
+                e.span,
+            ) {
+                out.push(d);
+            }
+        });
+    }
+    out
+}
+
+/// `C::m();` / `(void) C::m();` for static methods declared with `#[NoDiscard]`.
+fn run_static_method_no_discard(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    if !fa.php_version.at_least(80500) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for s in region {
+            crate::rules::functions::stmt_level_calls(s, &mut |e| {
+                let Some((call, in_void_cast, from_pipe)) = static_method_call_for_no_discard(e)
+                else {
+                    return;
+                };
+                let ExprKind::StaticCall {
+                    class,
+                    method,
+                    args,
+                } = &call.kind
+                else {
+                    return;
+                };
+                if !from_pipe && args.iter().any(|a| a.placeholder) {
+                    return;
+                }
+                let MemberName::Ident(name) = method else {
+                    return;
+                };
+                let Some(fqn) = static_call_class_fqn_for_no_discard(fa, scope, class) else {
+                    return;
+                };
+                let mname = fa.interner.resolve(*name);
+                let Some(found) = fa.reflection.find_method(&fqn, mname) else {
+                    return;
+                };
+                if let Some(d) = no_discard_method_diag(
+                    &found.member,
+                    &found.declaring_class,
+                    "staticMethod",
+                    in_void_cast,
+                    e.span,
+                ) {
+                    out.push(d);
+                }
+            });
+        }
+    });
+    out
+}
+
+fn method_call_for_no_discard(e: &Expr) -> Option<(&Expr, bool, bool)> {
+    let (e, in_void_cast) = match &e.kind {
+        ExprKind::Cast {
+            kind: CastKind::Void,
+            expr,
+        } => (peel_paren(expr), true),
+        _ => (e, false),
+    };
+    let e = peel_paren(e);
+    match &e.kind {
+        ExprKind::MethodCall { .. } => Some((e, in_void_cast, false)),
+        ExprKind::Binary {
+            op: BinOp::Pipe,
+            rhs,
+            ..
+        } => pipe_method_call_for_no_discard(rhs)
+            .map(|(call, from_pipe)| (call, in_void_cast, from_pipe)),
+        _ => None,
+    }
+}
+
+fn static_method_call_for_no_discard(e: &Expr) -> Option<(&Expr, bool, bool)> {
+    let (e, in_void_cast) = match &e.kind {
+        ExprKind::Cast {
+            kind: CastKind::Void,
+            expr,
+        } => (peel_paren(expr), true),
+        _ => (e, false),
+    };
+    let e = peel_paren(e);
+    match &e.kind {
+        ExprKind::StaticCall { .. } => Some((e, in_void_cast, false)),
+        ExprKind::Binary {
+            op: BinOp::Pipe,
+            rhs,
+            ..
+        } => pipe_static_method_call_for_no_discard(rhs)
+            .map(|(call, from_pipe)| (call, in_void_cast, from_pipe)),
+        _ => None,
+    }
+}
+
+fn pipe_method_call_for_no_discard(rhs: &Expr) -> Option<(&Expr, bool)> {
+    let rhs = peel_paren(rhs);
+    match &rhs.kind {
+        ExprKind::MethodCall { args, .. } if args.iter().any(|a| a.placeholder) => {
+            Some((rhs, true))
+        }
+        ExprKind::ArrowFn(a)
+            if matches!(&peel_paren(&a.body).kind, ExprKind::MethodCall { .. }) =>
+        {
+            Some((peel_paren(&a.body), false))
+        }
+        _ => None,
+    }
+}
+
+fn pipe_static_method_call_for_no_discard(rhs: &Expr) -> Option<(&Expr, bool)> {
+    let rhs = peel_paren(rhs);
+    match &rhs.kind {
+        ExprKind::StaticCall { args, .. } if args.iter().any(|a| a.placeholder) => {
+            Some((rhs, true))
+        }
+        ExprKind::ArrowFn(a)
+            if matches!(&peel_paren(&a.body).kind, ExprKind::StaticCall { .. }) =>
+        {
+            Some((peel_paren(&a.body), false))
+        }
+        _ => None,
+    }
+}
+
+fn peel_paren(mut e: &Expr) -> &Expr {
+    while let ExprKind::Paren(inner) = &e.kind {
+        e = inner;
+    }
+    e
+}
+
+fn static_call_class_fqn_for_no_discard(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    class: &Expr,
+) -> Option<String> {
+    if let ExprKind::Name(n) = &class.kind {
+        return match scope.resolve_class(n) {
+            Resolution::LateStatic(_) | Resolution::BuiltinType(_) => None,
+            r => r.fqn().map(|f| f.trim_start_matches('\\').to_string()),
+        };
+    }
+    static_class_fqn_from_type(fa, &fa.type_of(class))
+}
+
+fn static_class_fqn_from_type(fa: &FileAnalysis, t: &Type) -> Option<String> {
+    match t {
+        Type::Named { fqn, .. } => Some(fqn.clone()),
+        Type::ClassString(Some(inner)) => static_class_fqn_from_type(fa, inner),
+        Type::LiteralString(s) => fa.reflection.class(s).map(|c| c.fqn.clone()),
+        Type::Nullable(inner) => static_class_fqn_from_type(fa, inner),
+        _ => None,
+    }
+}
+
+fn no_discard_method_diag(
+    m: &MethodReflection,
+    declaring_class: &str,
+    code_base: &'static str,
+    in_void_cast: bool,
+    span: Span,
+) -> Option<Diagnostic> {
+    let short = declaring_class.trim_start_matches('\\');
+    let kind = if m.is_static {
+        "static method"
+    } else {
+        "method"
+    };
+    if in_void_cast {
+        if m.must_use_return_value {
+            return None;
+        }
+        let code = match code_base {
+            "staticMethod" => "staticMethod.inVoidCast",
+            _ => "method.inVoidCast",
+        };
+        return Some(
+            Diagnostic::error(
+                span,
+                format!(
+                    "Call to {kind} {short}::{}() in (void) cast but method allows discarding return value.",
+                    m.name
+                ),
+            )
+            .with_code(code),
+        );
+    }
+    if !m.must_use_return_value {
+        return None;
+    }
+    let code = match code_base {
+        "staticMethod" => "staticMethod.resultDiscarded",
+        _ => "method.resultDiscarded",
+    };
+    Some(
+        Diagnostic::error(
+            span,
+            format!(
+                "Call to {kind} {short}::{}() on a separate line discards return value.",
+                m.name
+            ),
         )
         .with_code(code),
     )
@@ -1657,7 +2953,9 @@ fn run_missing_method_iterable_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
         for st in region {
-            let StmtKind::Class(c) = &st.kind else { continue };
+            let StmtKind::Class(c) = &st.kind else {
+                continue;
+            };
             let Some(nm) = c.name else { continue };
             let fqn = scope.qualify(fa.interner.resolve(nm));
             let refl = reflect_class(scope, fa.interner, &fqn, c);
@@ -1680,13 +2978,18 @@ fn run_missing_method_iterable_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
             for m in &c.members {
                 let Member::Method(md) = m else { continue };
                 let mname = fa.interner.resolve(md.name);
-                let Some(mr) =
-                    refl.methods.iter().find(|x| !x.magic && x.name.eq_ignore_ascii_case(mname))
+                let Some(mr) = refl
+                    .methods
+                    .iter()
+                    .find(|x| !x.magic && x.name.eq_ignore_ascii_case(mname))
                 else {
                     continue;
                 };
                 // Overrides an ancestor method → its @param/@return may be inherited.
-                if ancestors.iter().any(|a| fa.reflection.find_method(a, mname).is_some()) {
+                if ancestors
+                    .iter()
+                    .any(|a| fa.reflection.find_method(a, mname).is_some())
+                {
                     continue;
                 }
                 for (p, pr) in md.params.iter().zip(mr.params.iter()) {
@@ -1705,7 +3008,8 @@ fn run_missing_method_iterable_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     }
                 }
                 if let Some(rt) = &md.return_type {
-                    if let Some(word) = crate::rules::functions::bare_iterable_word(&mr.return_type) {
+                    if let Some(word) = crate::rules::functions::bare_iterable_word(&mr.return_type)
+                    {
                         out.push(
                             Diagnostic::error(
                                 rt.span,
@@ -1724,62 +3028,563 @@ fn run_missing_method_iterable_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
+fn run_missing_method_self_out_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_class(fa, |scope, class_fqn, c| {
+        let class_short = class_fqn.trim_start_matches('\\');
+        let class_templates = fa
+            .reflection
+            .class(class_fqn)
+            .map(|r| r.templates.clone())
+            .unwrap_or_default();
+        for member in &c.members {
+            let Member::Method(md) = member else { continue };
+            let Some(doc) = md.doc.as_deref() else {
+                continue;
+            };
+            let method_name = fa.interner.resolve(md.name);
+            let span = method_span(md);
+            for ty in self_out_doc_types(doc) {
+                SelfOutDocCheck {
+                    fa,
+                    scope,
+                    class_fqn,
+                    class_short,
+                    method_name,
+                    class_templates: &class_templates,
+                    span,
+                    out: &mut out,
+                }
+                .check(&ty);
+            }
+        }
+    });
+    out
+}
+
+fn self_out_doc_types(doc_raw: &str) -> Vec<DocType> {
+    php_phpdoc::parse_block(doc_raw)
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            let base = tag
+                .name
+                .strip_prefix("phpstan-")
+                .or_else(|| tag.name.strip_prefix("psalm-"))
+                .unwrap_or(&tag.name);
+            if base != "self-out" {
+                return None;
+            }
+            php_phpdoc::parse_type_prefix(&tag.value).map(|(ty, _)| ty)
+        })
+        .collect()
+}
+
+struct SelfOutDocCheck<'a, 'b> {
+    fa: &'a FileAnalysis<'a>,
+    scope: &'a Scope,
+    class_fqn: &'a str,
+    class_short: &'a str,
+    method_name: &'a str,
+    class_templates: &'a [String],
+    span: Span,
+    out: &'b mut Vec<Diagnostic>,
+}
+
+impl SelfOutDocCheck<'_, '_> {
+    fn check(&mut self, ty: &DocType) {
+        if let Some(word) = missing_iterable_word_doc(ty) {
+            self.out.push(
+                Diagnostic::error(
+                    self.span,
+                    format!(
+                        "Method {}::{}() has PHPDoc tag @phpstan-self-out with no value type specified in iterable type {word}.",
+                        self.class_short, self.method_name
+                    ),
+                )
+                .with_code("missingType.iterableValue"),
+            );
+        }
+
+        for (name, generics) in missing_generic_doc(
+            self.fa,
+            self.scope,
+            self.class_fqn,
+            self.class_templates,
+            ty,
+        ) {
+            self.out.push(
+                Diagnostic::error(
+                    self.span,
+                    format!(
+                        "Method {}::{}() has PHPDoc tag @phpstan-self-out with generic class {name} but does not specify its types: {generics}",
+                        self.class_short, self.method_name
+                    ),
+                )
+                .with_code("missingType.generics"),
+            );
+        }
+
+        if missing_callable_signature_doc(ty) {
+            self.out.push(
+                Diagnostic::error(
+                    self.span,
+                    format!(
+                        "Method {}::{}() has PHPDoc tag @phpstan-self-out with no signature specified for callable.",
+                        self.class_short, self.method_name
+                    ),
+                )
+                .with_code("missingType.callable"),
+            );
+        }
+    }
+}
+
+fn missing_iterable_word_doc(t: &DocType) -> Option<&'static str> {
+    match t {
+        DocType::Named(n) if n.eq_ignore_ascii_case("array") => Some("array"),
+        DocType::Named(n) if n.eq_ignore_ascii_case("iterable") => Some("iterable"),
+        DocType::Nullable(inner) | DocType::Array(inner) => missing_iterable_word_doc(inner),
+        DocType::Union(parts) | DocType::Intersection(parts) => {
+            parts.iter().find_map(missing_iterable_word_doc)
+        }
+        DocType::Generic { args, .. } => args.iter().find_map(missing_iterable_word_doc),
+        DocType::Shape { fields, .. } => {
+            fields.iter().find_map(|f| missing_iterable_word_doc(&f.ty))
+        }
+        DocType::Callable { params, ret, .. } => params
+            .iter()
+            .find_map(missing_iterable_word_doc)
+            .or_else(|| ret.as_deref().and_then(missing_iterable_word_doc)),
+        DocType::Conditional {
+            target, then, els, ..
+        } => missing_iterable_word_doc(target)
+            .or_else(|| missing_iterable_word_doc(then))
+            .or_else(|| missing_iterable_word_doc(els)),
+        _ => None,
+    }
+}
+
+fn missing_generic_doc(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    class_fqn: &str,
+    class_templates: &[String],
+    t: &DocType,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    collect_missing_generic_doc(fa, scope, class_fqn, class_templates, t, &mut out);
+    out
+}
+
+fn collect_missing_generic_doc(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    class_fqn: &str,
+    class_templates: &[String],
+    t: &DocType,
+    out: &mut Vec<(String, String)>,
+) {
+    match t {
+        DocType::Named(n) => {
+            if let Some((name, templates)) =
+                generic_class_without_args(fa, scope, class_fqn, class_templates, n)
+            {
+                out.push((name, templates));
+            }
+        }
+        DocType::Generic { args, .. } => {
+            for arg in args {
+                collect_missing_generic_doc(fa, scope, class_fqn, class_templates, arg, out);
+            }
+        }
+        DocType::Nullable(inner) | DocType::Array(inner) => {
+            collect_missing_generic_doc(fa, scope, class_fqn, class_templates, inner, out)
+        }
+        DocType::Union(parts) | DocType::Intersection(parts) => {
+            for p in parts {
+                collect_missing_generic_doc(fa, scope, class_fqn, class_templates, p, out);
+            }
+        }
+        DocType::Shape { fields, .. } => {
+            for f in fields {
+                collect_missing_generic_doc(fa, scope, class_fqn, class_templates, &f.ty, out);
+            }
+        }
+        DocType::Callable { params, ret, .. } => {
+            for p in params {
+                collect_missing_generic_doc(fa, scope, class_fqn, class_templates, p, out);
+            }
+            if let Some(ret) = ret {
+                collect_missing_generic_doc(fa, scope, class_fqn, class_templates, ret, out);
+            }
+        }
+        DocType::Conditional {
+            target, then, els, ..
+        } => {
+            for p in [target.as_ref(), then.as_ref(), els.as_ref()] {
+                collect_missing_generic_doc(fa, scope, class_fqn, class_templates, p, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn generic_class_without_args(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    class_fqn: &str,
+    class_templates: &[String],
+    name: &str,
+) -> Option<(String, String)> {
+    if is_doc_keyword(name) {
+        return None;
+    }
+    let fqn = match name.to_ascii_lowercase().as_str() {
+        "self" | "static" | "$this" => class_fqn.to_string(),
+        _ => match scope.resolve_class(&name_from_doc(name)) {
+            Resolution::Fqn(fqn) => fqn,
+            Resolution::Fallback { namespaced, .. } => namespaced,
+            _ => return None,
+        },
+    };
+    let templates = if fqn
+        .trim_start_matches('\\')
+        .eq_ignore_ascii_case(class_fqn.trim_start_matches('\\'))
+    {
+        class_templates.to_vec()
+    } else {
+        fa.reflection.class(&fqn)?.templates.clone()
+    };
+    if templates.is_empty() {
+        return None;
+    }
+    let name = fa
+        .reflection
+        .class(&fqn)
+        .map(|r| r.fqn.trim_start_matches('\\').to_string())
+        .unwrap_or_else(|| fqn.trim_start_matches('\\').to_string());
+    Some((name, templates.join(", ")))
+}
+
+fn name_from_doc(text: &str) -> Name {
+    let fq = if text.starts_with("namespace\\") {
+        NameFq::Relative
+    } else if text.starts_with('\\') {
+        NameFq::Fq
+    } else {
+        NameFq::NotFq
+    };
+    Name {
+        span: Span::new(0, 0),
+        fq,
+        text: text.to_string(),
+    }
+}
+
+fn is_doc_keyword(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "array"
+            | "iterable"
+            | "callable"
+            | "int"
+            | "integer"
+            | "float"
+            | "double"
+            | "string"
+            | "bool"
+            | "boolean"
+            | "void"
+            | "never"
+            | "mixed"
+            | "object"
+            | "resource"
+            | "null"
+            | "true"
+            | "false"
+            | "scalar"
+            | "list"
+            | "non-empty-array"
+            | "non-empty-list"
+            | "class-string"
+    )
+}
+
+fn missing_callable_signature_doc(t: &DocType) -> bool {
+    match t {
+        DocType::Named(n) => n.eq_ignore_ascii_case("callable"),
+        DocType::Nullable(inner) | DocType::Array(inner) => missing_callable_signature_doc(inner),
+        DocType::Union(parts) | DocType::Intersection(parts) => {
+            parts.iter().any(missing_callable_signature_doc)
+        }
+        DocType::Generic { args, .. } => args.iter().any(missing_callable_signature_doc),
+        DocType::Shape { fields, .. } => {
+            fields.iter().any(|f| missing_callable_signature_doc(&f.ty))
+        }
+        DocType::Callable { params, ret, .. } => {
+            params.iter().any(missing_callable_signature_doc)
+                || ret.as_deref().is_some_and(missing_callable_signature_doc)
+        }
+        DocType::Conditional {
+            target, then, els, ..
+        } => {
+            missing_callable_signature_doc(target)
+                || missing_callable_signature_doc(then)
+                || missing_callable_signature_doc(els)
+        }
+        _ => false,
+    }
+}
+
 pub(crate) static RULES: &[RuleEntry] = &[
-    RuleEntry { name: "method.resultUnused", level: 4, run: run_method_result_unused },
+    RuleEntry {
+        name: "method.resultUnused",
+        level: 4,
+        run: run_method_result_unused,
+    },
+    RuleEntry {
+        name: "method.noDiscard",
+        level: 0,
+        run: run_method_no_discard,
+    },
     RuleEntry {
         name: "missingType.iterableValue",
         level: 6,
         run: run_missing_method_iterable_value,
     },
-    RuleEntry { name: "staticMethod.resultUnused", level: 4, run: run_static_method_result_unused },
-    RuleEntry { name: "method.abstract", level: 0, run: run_abstract_in_non_abstract },
-    RuleEntry { name: "method.abstractPrivate", level: 0, run: run_abstract_private },
-    RuleEntry { name: "method.nonAbstract", level: 0, run: run_abstract_body },
-    RuleEntry { name: "method.finalPrivate", level: 0, run: run_final_private },
-    RuleEntry { name: "method.visibilityInInterface", level: 0, run: run_visibility_in_interface },
-    RuleEntry { name: "constructor.returnType", level: 0, run: run_constructor_return_type },
-    RuleEntry { name: "method.staticConstructor", level: 0, run: run_constructor_modifiers },
-    RuleEntry { name: "method.duplicateParameter", level: 0, run: run_duplicate_parameter },
-    RuleEntry { name: "method.missingImplementation", level: 0, run: run_missing_implementation },
-    RuleEntry { name: "class.serializable", level: 0, run: run_serializable_methods },
-    RuleEntry { name: "method.attributeTarget", level: 0, run: run_method_attribute_target },
-    RuleEntry { name: "method.overriding", level: 0, run: run_overriding_method },
-    RuleEntry { name: "method.callExistence", level: 0, run: run_call_existence },
-    RuleEntry { name: "method.callTyped", level: 0, run: run_call_methods_typed },
-    RuleEntry { name: "staticMethod.callNamed", level: 0, run: run_static_call_named },
-    RuleEntry { name: "consistentConstructor.private", level: 0, run: run_consistent_constructor_private },
-    RuleEntry { name: "staticClassAccess.privateMethod", level: 2, run: run_private_through_static },
-    RuleEntry { name: "parameter.defaultValue", level: 2, run: run_incompatible_default_param },
-    RuleEntry { name: "nullsafe.neverNull", level: 4, run: run_nullsafe_never_null },
-    RuleEntry { name: "new.resultUnused", level: 4, run: run_new_result_unused },
-    RuleEntry { name: "argument.type", level: 5, run: run_method_argument_types },
-    RuleEntry { name: "missingType.return", level: 6, run: run_missing_return_type },
-    RuleEntry { name: "missingType.parameter", level: 6, run: run_missing_param_type },
+    RuleEntry {
+        name: "missingType.selfOut",
+        level: 6,
+        run: run_missing_method_self_out_type,
+    },
+    RuleEntry {
+        name: "staticMethod.resultUnused",
+        level: 4,
+        run: run_static_method_result_unused,
+    },
+    RuleEntry {
+        name: "staticMethod.noDiscard",
+        level: 0,
+        run: run_static_method_no_discard,
+    },
+    RuleEntry {
+        name: "method.abstract",
+        level: 0,
+        run: run_abstract_in_non_abstract,
+    },
+    RuleEntry {
+        name: "method.abstractPrivate",
+        level: 0,
+        run: run_abstract_private,
+    },
+    RuleEntry {
+        name: "method.nonAbstract",
+        level: 0,
+        run: run_abstract_body,
+    },
+    RuleEntry {
+        name: "method.finalPrivate",
+        level: 0,
+        run: run_final_private,
+    },
+    RuleEntry {
+        name: "method.visibilityInInterface",
+        level: 0,
+        run: run_visibility_in_interface,
+    },
+    RuleEntry {
+        name: "constructor.returnType",
+        level: 0,
+        run: run_constructor_return_type,
+    },
+    RuleEntry {
+        name: "method.staticConstructor",
+        level: 0,
+        run: run_constructor_modifiers,
+    },
+    RuleEntry {
+        name: "method.duplicateParameter",
+        level: 0,
+        run: run_duplicate_parameter,
+    },
+    RuleEntry {
+        name: "method.missingImplementation",
+        level: 0,
+        run: run_missing_implementation,
+    },
+    RuleEntry {
+        name: "class.serializable",
+        level: 0,
+        run: run_serializable_methods,
+    },
+    RuleEntry {
+        name: "method.attributeTarget",
+        level: 0,
+        run: run_method_attribute_target,
+    },
+    RuleEntry {
+        name: "method.overriding",
+        level: 0,
+        run: run_overriding_method,
+    },
+    RuleEntry {
+        name: "method.callExistence",
+        level: 0,
+        run: run_call_existence,
+    },
+    RuleEntry {
+        name: "method.callTyped",
+        level: 0,
+        run: run_call_methods_typed,
+    },
+    RuleEntry {
+        name: "method.nullableAccess",
+        level: 8,
+        run: run_nullable_method_access,
+    },
+    RuleEntry {
+        name: "method.unionAccess",
+        level: 7,
+        run: run_union_method_access,
+    },
+    RuleEntry {
+        name: "staticMethod.callNamed",
+        level: 0,
+        run: run_static_call_named,
+    },
+    RuleEntry {
+        name: "argument.parameterRenamedInSubtype",
+        level: 0,
+        run: run_renamed_named_argument_call,
+    },
+    RuleEntry {
+        name: "consistentConstructor.private",
+        level: 0,
+        run: run_consistent_constructor_private,
+    },
+    RuleEntry {
+        name: "consistentConstructor",
+        level: 0,
+        run: run_consistent_constructor,
+    },
+    RuleEntry {
+        name: "staticClassAccess.privateMethod",
+        level: 2,
+        run: run_private_through_static,
+    },
+    RuleEntry {
+        name: "parameter.defaultValue",
+        level: 2,
+        run: run_incompatible_default_param,
+    },
+    RuleEntry {
+        name: "nullsafe.neverNull",
+        level: 4,
+        run: run_nullsafe_never_null,
+    },
+    RuleEntry {
+        name: "new.resultUnused",
+        level: 4,
+        run: run_new_result_unused,
+    },
+    RuleEntry {
+        name: "argument.type",
+        level: 5,
+        run: run_method_argument_types,
+    },
+    RuleEntry {
+        name: "missingType.return",
+        level: 6,
+        run: run_missing_return_type,
+    },
+    RuleEntry {
+        name: "missingType.parameter",
+        level: 6,
+        run: run_missing_param_type,
+    },
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::codes;
+    use crate::testutil::{codes, codes_version};
+    use crate::PhpVersion;
 
     // --- missingType.iterableValue ---
 
     #[test]
     fn bare_array_param_flagged() {
         let src = r#"<?php class C { public function m(array $a): void {} }"#;
-        assert_eq!(codes(src, run_missing_method_iterable_value), ["missingType.iterableValue"]);
+        assert_eq!(
+            codes(src, run_missing_method_iterable_value),
+            ["missingType.iterableValue"]
+        );
     }
 
     #[test]
     fn typed_array_param_via_phpdoc_clean() {
         let src = r#"<?php class C { /** @param array<string, mixed> $a */ public function m(array $a): void {} }"#;
-        assert!(codes(src, run_missing_method_iterable_value).is_empty(), "{:?}", codes(src, run_missing_method_iterable_value));
+        assert!(
+            codes(src, run_missing_method_iterable_value).is_empty(),
+            "{:?}",
+            codes(src, run_missing_method_iterable_value)
+        );
     }
 
     #[test]
     fn typed_array_param_multiline_with_description_clean() {
         let src = "<?php class C {\n    /**\n     * @param array<string, mixed> $attributes Additional attributes\n     */\n    public function m(array $attributes = []): void {}\n}";
-        assert!(codes(src, run_missing_method_iterable_value).is_empty(), "{:?}", codes(src, run_missing_method_iterable_value));
+        assert!(
+            codes(src, run_missing_method_iterable_value).is_empty(),
+            "{:?}",
+            codes(src, run_missing_method_iterable_value)
+        );
+    }
+
+    #[test]
+    fn self_out_bare_array_arg_is_flagged() {
+        let src = r#"<?php
+            /** @template T */
+            class Foo {
+                /** @phpstan-self-out self<array> */
+                public function doFoo(): void {}
+            }
+        "#;
+        assert_eq!(
+            codes(src, run_missing_method_self_out_type),
+            ["missingType.iterableValue"]
+        );
+    }
+
+    #[test]
+    fn self_out_generic_class_without_args_is_flagged() {
+        let src = r#"<?php
+            /** @template T */
+            class Foo {
+                /** @phpstan-self-out self */
+                public function doFoo(): void {}
+            }
+        "#;
+        assert_eq!(
+            codes(src, run_missing_method_self_out_type),
+            ["missingType.generics"]
+        );
+    }
+
+    #[test]
+    fn self_out_callable_without_signature_is_flagged() {
+        let src = r#"<?php
+            /** @template T */
+            class Foo {
+                /** @phpstan-self-out Foo<int>&callable */
+                public function doFoo(): void {}
+            }
+        "#;
+        assert_eq!(
+            codes(src, run_missing_method_self_out_type),
+            ["missingType.callable"]
+        );
     }
 
     // --- method/staticMethod.resultUnused (pure call discarded) ---------
@@ -1792,7 +3597,10 @@ mod tests {
                 public function val(): int { return 1; }
             }
             function f(C $c) { $c->val(); }"#;
-        assert_eq!(codes(src, run_method_result_unused), ["method.resultUnused"]);
+        assert_eq!(
+            codes(src, run_method_result_unused),
+            ["method.resultUnused"]
+        );
     }
 
     #[test]
@@ -1825,7 +3633,10 @@ mod tests {
                 public static function val(): int { return 1; }
             }
             function f() { C::val(); }"#;
-        assert_eq!(codes(src, run_static_method_result_unused), ["staticMethod.resultUnused"]);
+        assert_eq!(
+            codes(src, run_static_method_result_unused),
+            ["staticMethod.resultUnused"]
+        );
     }
 
     #[test]
@@ -1843,9 +3654,158 @@ mod tests {
     }
 
     #[test]
+    fn nodiscard_method_statement_is_flagged_on_php85() {
+        let v85 = PhpVersion::parse("8.5").unwrap();
+        let src = r#"<?php
+            class C { #[NoDiscard] public function val(): int { return 1; } }
+            function f(C $c): void { $c->val(); }"#;
+        assert_eq!(
+            codes_version(src, run_method_no_discard, v85),
+            ["method.resultDiscarded"]
+        );
+    }
+
+    #[test]
+    fn nodiscard_method_statement_is_version_gated() {
+        let src = r#"<?php
+            class C { #[NoDiscard] public function val(): int { return 1; } }
+            function f(C $c): void { $c->val(); }"#;
+        assert!(codes(src, run_method_no_discard).is_empty());
+    }
+
+    #[test]
+    fn void_cast_plain_method_is_flagged_on_php85() {
+        let v85 = PhpVersion::parse("8.5").unwrap();
+        let src = r#"<?php
+            class C { public function val(): int { return 1; } }
+            function f(C $c): void { (void) $c->val(); }"#;
+        assert_eq!(
+            codes_version(src, run_method_no_discard, v85),
+            ["method.inVoidCast"]
+        );
+    }
+
+    #[test]
+    fn standalone_first_class_callable_nodiscard_method_is_clean_on_php85() {
+        let v85 = PhpVersion::parse("8.5").unwrap();
+        let src = r#"<?php
+            class C { #[NoDiscard] public function val(): int { return 1; } }
+            function f(C $c): void { $c->val(...); }"#;
+        assert!(codes_version(src, run_method_no_discard, v85).is_empty());
+    }
+
+    #[test]
+    fn pipe_into_nodiscard_method_is_flagged_on_php85() {
+        let v85 = PhpVersion::parse("8.5").unwrap();
+        let src = r#"<?php
+            class C { #[NoDiscard] public function val(int $i): int { return $i; } }
+            function f(C $c): void { 5 |> $c->val(...); }"#;
+        assert_eq!(
+            codes_version(src, run_method_no_discard, v85),
+            ["method.resultDiscarded"]
+        );
+    }
+
+    #[test]
+    fn void_cast_pipe_into_plain_method_is_flagged_on_php85() {
+        let v85 = PhpVersion::parse("8.5").unwrap();
+        let src = r#"<?php
+            class C { public function val(int $i): int { return $i; } }
+            function f(C $c): void { (void) (5 |> $c->val(...)); }"#;
+        assert_eq!(
+            codes_version(src, run_method_no_discard, v85),
+            ["method.inVoidCast"]
+        );
+    }
+
+    #[test]
+    fn nodiscard_static_method_statement_is_flagged_on_php85() {
+        let v85 = PhpVersion::parse("8.5").unwrap();
+        let src = r#"<?php
+            class C { #[NoDiscard] public static function val(): int { return 1; } }
+            function f(): void { C::val(); }"#;
+        assert_eq!(
+            codes_version(src, run_static_method_no_discard, v85),
+            ["staticMethod.resultDiscarded"]
+        );
+    }
+
+    #[test]
+    fn void_cast_plain_static_method_is_flagged_on_php85() {
+        let v85 = PhpVersion::parse("8.5").unwrap();
+        let src = r#"<?php
+            class C { public static function val(): int { return 1; } }
+            function f(): void { (void) C::val(); }"#;
+        assert_eq!(
+            codes_version(src, run_static_method_no_discard, v85),
+            ["staticMethod.inVoidCast"]
+        );
+    }
+
+    #[test]
+    fn standalone_first_class_callable_nodiscard_static_method_is_clean_on_php85() {
+        let v85 = PhpVersion::parse("8.5").unwrap();
+        let src = r#"<?php
+            class C { #[NoDiscard] public static function val(): int { return 1; } }
+            function f(): void { C::val(...); }"#;
+        assert!(codes_version(src, run_static_method_no_discard, v85).is_empty());
+    }
+
+    #[test]
+    fn pipe_into_nodiscard_static_method_is_flagged_on_php85() {
+        let v85 = PhpVersion::parse("8.5").unwrap();
+        let src = r#"<?php
+            class C { #[NoDiscard] public static function val(int $i): int { return $i; } }
+            function f(): void { 5 |> C::val(...); }"#;
+        assert_eq!(
+            codes_version(src, run_static_method_no_discard, v85),
+            ["staticMethod.resultDiscarded"]
+        );
+    }
+
+    #[test]
+    fn void_cast_pipe_into_plain_static_method_is_flagged_on_php85() {
+        let v85 = PhpVersion::parse("8.5").unwrap();
+        let src = r#"<?php
+            class C { public static function val(int $i): int { return $i; } }
+            function f(): void { (void) (5 |> C::val(...)); }"#;
+        assert_eq!(
+            codes_version(src, run_static_method_no_discard, v85),
+            ["staticMethod.inVoidCast"]
+        );
+    }
+
+    #[test]
+    fn pipe_arrow_into_nodiscard_static_method_is_flagged_on_php85() {
+        let v85 = PhpVersion::parse("8.5").unwrap();
+        let src = r#"<?php
+            class C { #[NoDiscard] public static function val(int $i): int { return $i; } }
+            function f(): void { 5 |> (fn($x) => C::val($x)); }"#;
+        assert_eq!(
+            codes_version(src, run_static_method_no_discard, v85),
+            ["staticMethod.resultDiscarded"]
+        );
+    }
+
+    #[test]
+    fn dynamic_class_static_method_is_flagged_when_class_string_is_exact_on_php85() {
+        let v85 = PhpVersion::parse("8.5").unwrap();
+        let src = r#"<?php
+            class C { #[NoDiscard] public static function val(): int { return 1; } }
+            function f(): void { $class = C::class; $class::val(); }"#;
+        assert_eq!(
+            codes_version(src, run_static_method_no_discard, v85),
+            ["staticMethod.resultDiscarded"]
+        );
+    }
+
+    #[test]
     fn abstract_method_in_non_abstract_class() {
         let src = "<?php class C { abstract function f(); }";
-        assert_eq!(codes(src, run_abstract_in_non_abstract), ["method.abstract"]);
+        assert_eq!(
+            codes(src, run_abstract_in_non_abstract),
+            ["method.abstract"]
+        );
     }
 
     #[test]
@@ -1906,7 +3866,10 @@ mod tests {
     #[test]
     fn non_public_interface_method_flagged() {
         let src = "<?php interface I { protected function f(); }";
-        assert_eq!(codes(src, run_visibility_in_interface), ["method.visibility"]);
+        assert_eq!(
+            codes(src, run_visibility_in_interface),
+            ["method.visibility"]
+        );
     }
 
     #[test]
@@ -1918,7 +3881,10 @@ mod tests {
     #[test]
     fn constructor_with_return_type_flagged() {
         let src = "<?php class C { public function __construct(): void {} }";
-        assert_eq!(codes(src, run_constructor_return_type), ["constructor.returnType"]);
+        assert_eq!(
+            codes(src, run_constructor_return_type),
+            ["constructor.returnType"]
+        );
     }
 
     #[test]
@@ -1930,13 +3896,19 @@ mod tests {
     #[test]
     fn static_constructor_flagged() {
         let src = "<?php class C { public static function __construct() {} }";
-        assert_eq!(codes(src, run_constructor_modifiers), ["method.staticConstructor"]);
+        assert_eq!(
+            codes(src, run_constructor_modifiers),
+            ["method.staticConstructor"]
+        );
     }
 
     #[test]
     fn duplicate_parameter_flagged() {
         let src = "<?php class C { public function f($a, $a) {} }";
-        assert_eq!(codes(src, run_duplicate_parameter), ["method.duplicateParameter"]);
+        assert_eq!(
+            codes(src, run_duplicate_parameter),
+            ["method.duplicateParameter"]
+        );
     }
 
     #[test]
@@ -1950,7 +3922,10 @@ mod tests {
         let src = "<?php
             abstract class Base { abstract public function f(): void; }
             class C extends Base {}";
-        assert_eq!(codes(src, run_missing_implementation), ["method.missingImplementation"]);
+        assert_eq!(
+            codes(src, run_missing_implementation),
+            ["method.missingImplementation"]
+        );
     }
 
     #[test]
@@ -1995,7 +3970,8 @@ mod tests {
 
     #[test]
     fn call_to_undefined_this_method_flagged() {
-        let src = "<?php class C { public function a() { $this->missing(); } public function b() {} }";
+        let src =
+            "<?php class C { public function a() { $this->missing(); } public function b() {} }";
         assert!(codes(src, run_call_existence).contains(&"method.notFound"));
     }
 
@@ -2068,7 +4044,8 @@ mod tests {
     fn phpdoc_return_this_clean() {
         // `@return $this` resolves to a type our reflection may render as exotic,
         // but the *tag* is present — so it's documented, not "missing".
-        let src = "<?php class C { /** @return $this */ public function chain() { return $this; } }";
+        let src =
+            "<?php class C { /** @return $this */ public function chain() { return $this; } }";
         assert!(codes(src, run_missing_return_type).is_empty());
     }
 
@@ -2145,7 +4122,10 @@ mod tests {
     #[test]
     fn missing_param_type_flagged() {
         let src = "<?php class C { public function f($a): void {} }";
-        assert_eq!(codes(src, run_missing_param_type), ["missingType.parameter"]);
+        assert_eq!(
+            codes(src, run_missing_param_type),
+            ["missingType.parameter"]
+        );
     }
 
     #[test]
@@ -2202,6 +4182,21 @@ mod tests {
     }
 
     #[test]
+    fn abstract_receiver_with_final_leaf_methods_is_clean() {
+        let src = r#"<?php
+            abstract class Number {}
+            final class IntegerNumber extends Number { public function plus(Number $n): Number { return $this; } }
+            final class DecimalNumber extends Number { public function plus(Number $n): Number { return $this; } }
+            function add(Number $a, Number $b): Number {
+                if ($a instanceof IntegerNumber) { return $a->plus($b); }
+                if ($a instanceof DecimalNumber) { return $a->plus($b); }
+                return $a->plus($b);
+            }
+        "#;
+        assert!(codes(src, run_call_methods_typed).is_empty());
+    }
+
+    #[test]
     fn this_receiver_skipped_by_typed_rule() {
         // $this is handled by run_call_existence; this rule must stay silent.
         let src = "<?php class C { public function a(): void { $this->missing(); } }";
@@ -2212,6 +4207,52 @@ mod tests {
     fn magic_call_receiver_is_lenient() {
         let src = "<?php class C { public function __call($n, $a) {} } function f(): void { $c = new C(); $c->whatever(); }";
         assert!(codes(src, run_call_methods_typed).is_empty());
+    }
+
+    #[test]
+    fn nullable_method_call_is_flagged_at_strict_level() {
+        let src =
+            "<?php class C { public function ok(): void {} } function f(?C $c): void { $c->ok(); }";
+        assert_eq!(codes(src, run_nullable_method_access), ["method.nonObject"]);
+    }
+
+    #[test]
+    fn nullsafe_method_call_on_nullable_is_clean() {
+        let src = "<?php class C { public function ok(): void {} } function f(?C $c): void { $c?->ok(); }";
+        assert!(codes(src, run_nullable_method_access).is_empty());
+    }
+
+    #[test]
+    fn narrowed_nullable_method_call_is_clean() {
+        let src = "<?php class C { public function ok(): void {} } function f(?C $c): void { if ($c === null) { return; } $c->ok(); }";
+        assert!(codes(src, run_nullable_method_access).is_empty());
+    }
+
+    #[test]
+    fn nullable_method_call_suppresses_not_found_branch() {
+        let src = "<?php class C {} function f(?C $c): void { $c->missing(); }";
+        assert!(codes(src, run_call_methods_typed).is_empty());
+    }
+
+    #[test]
+    fn union_method_call_missing_on_one_arm_is_flagged() {
+        let src = "<?php class A { public function ok(): void {} } class B {} \
+            /** @param A|B $x */ function f($x): void { $x->ok(); }";
+        assert_eq!(codes(src, run_union_method_access), ["method.notFound"]);
+    }
+
+    #[test]
+    fn union_method_call_present_on_all_arms_is_clean() {
+        let src = "<?php class A { public function ok(): void {} } class B { public function ok(): void {} } \
+            /** @param A|B $x */ function f($x): void { $x->ok(); }";
+        assert!(codes(src, run_union_method_access).is_empty());
+    }
+
+    #[test]
+    fn nullable_union_method_call_is_left_to_nullable_rule() {
+        let src = "<?php class A { public function ok(): void {} } \
+            /** @param A|null $x */ function f($x): void { $x->ok(); }";
+        assert!(codes(src, run_union_method_access).is_empty());
     }
 
     // --- CallStaticMethodsRule (named class) -----------------------------
@@ -2256,7 +4297,8 @@ mod tests {
 
     #[test]
     fn nullsafe_on_nullable_clean() {
-        let src = "<?php class C { public function a(): void {} } function f(?C $c): void { $c?->a(); }";
+        let src =
+            "<?php class C { public function a(): void {} } function f(?C $c): void { $c?->a(); }";
         assert!(codes(src, run_nullsafe_never_null).is_empty());
     }
 
@@ -2282,7 +4324,8 @@ mod tests {
 
     #[test]
     fn new_with_constructor_as_statement_clean() {
-        let src = "<?php class C { public function __construct() {} } function f(): void { new C(); }";
+        let src =
+            "<?php class C { public function __construct() {} } function f(): void { new C(); }";
         assert!(codes(src, run_new_result_unused).is_empty());
     }
 
@@ -2332,14 +4375,16 @@ mod tests {
 
     #[test]
     fn private_constructor_with_consistent_tag_flagged() {
-        let src = "<?php /** @consistent-constructor */ class C { private function __construct() {} }";
+        let src =
+            "<?php /** @consistent-constructor */ class C { private function __construct() {} }";
         assert!(codes(src, run_consistent_constructor_private)
             .contains(&"consistentConstructor.private"));
     }
 
     #[test]
     fn public_constructor_with_consistent_tag_clean() {
-        let src = "<?php /** @consistent-constructor */ class C { public function __construct() {} }";
+        let src =
+            "<?php /** @consistent-constructor */ class C { public function __construct() {} }";
         assert!(codes(src, run_consistent_constructor_private).is_empty());
     }
 
@@ -2353,6 +4398,106 @@ mod tests {
     fn private_constructor_in_final_with_tag_clean() {
         let src = "<?php /** @consistent-constructor */ final class C { private function __construct() {} }";
         assert!(codes(src, run_consistent_constructor_private).is_empty());
+    }
+
+    // --- ConsistentConstructorRule ---------------------------------------
+
+    #[test]
+    fn consistent_constructor_missing_param_is_flagged() {
+        let src = r#"<?php
+            /** @phpstan-consistent-constructor */
+            class Base { public function __construct(int $id) {} }
+            class Child extends Base { public function __construct() {} }"#;
+        assert_eq!(
+            codes(src, run_consistent_constructor),
+            ["parameter.missing"]
+        );
+    }
+
+    #[test]
+    fn consistent_constructor_extra_required_param_is_flagged_for_dummy_parent() {
+        let src = r#"<?php
+            /** @phpstan-consistent-constructor */
+            class Base {}
+            class Child extends Base { public function __construct(int $id) {} }"#;
+        assert_eq!(
+            codes(src, run_consistent_constructor),
+            ["parameter.notOptional"]
+        );
+    }
+
+    #[test]
+    fn consistent_constructor_type_mismatch_is_flagged() {
+        let src = r#"<?php
+            /** @phpstan-consistent-constructor */
+            class Base { public function __construct(int $id) {} }
+            class Child extends Base { public function __construct(string $id) {} }"#;
+        assert_eq!(
+            codes(src, run_consistent_constructor),
+            ["method.childParameterType"]
+        );
+    }
+
+    #[test]
+    fn consistent_constructor_visibility_narrowing_is_flagged() {
+        let src = r#"<?php
+            /** @consistent-constructor */
+            class Base { public function __construct() {} }
+            class Child extends Base { protected function __construct() {} }"#;
+        assert_eq!(
+            codes(src, run_consistent_constructor),
+            ["method.visibility"]
+        );
+    }
+
+    #[test]
+    fn unmarked_parent_constructor_is_clean_for_consistency_rule() {
+        let src = r#"<?php
+            class Base { public function __construct(int $id) {} }
+            class Child extends Base { public function __construct() {} }"#;
+        assert!(codes(src, run_consistent_constructor).is_empty());
+    }
+
+    // --- MethodCallWithPossiblyRenamedNamedArgumentRule ------------------
+
+    #[test]
+    fn named_argument_renamed_in_subtype_is_flagged_on_parameter_receiver() {
+        let src = r#"<?php
+            class Base { public function send($payload): void {} }
+            class Child extends Base { public function send($data): void {} }
+            function f(Base $b): void { $b->send(payload: 1); }"#;
+        assert_eq!(
+            codes(src, run_renamed_named_argument_call),
+            ["argument.parameterRenamedInSubtype"]
+        );
+    }
+
+    #[test]
+    fn renamed_named_argument_rule_skips_direct_new_receiver() {
+        let src = r#"<?php
+            class Base { public function send($payload): void {} }
+            class Child extends Base { public function send($data): void {} }
+            function f(): void { (new Base())->send(payload: 1); }"#;
+        assert!(codes(src, run_renamed_named_argument_call).is_empty());
+    }
+
+    #[test]
+    fn renamed_named_argument_rule_skips_no_named_arguments_doc() {
+        let src = r#"<?php
+            /** @no-named-arguments */
+            class Base { public function send($payload): void {} }
+            class Child extends Base { public function send($data): void {} }
+            function f(Base $b): void { $b->send(payload: 1); }"#;
+        assert!(codes(src, run_renamed_named_argument_call).is_empty());
+    }
+
+    #[test]
+    fn same_parameter_name_in_subtype_is_clean_for_named_argument_rule() {
+        let src = r#"<?php
+            class Base { public function send($payload): void {} }
+            class Child extends Base { public function send($payload): void {} }
+            function f(Base $b): void { $b->send(payload: 1); }"#;
+        assert!(codes(src, run_renamed_named_argument_call).is_empty());
     }
 
     // --- IncompatibleDefaultParameterTypeRule ----------------------------

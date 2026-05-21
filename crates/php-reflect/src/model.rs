@@ -76,6 +76,9 @@ pub struct FunctionReflection {
     /// Declared side-effect-free via `@pure`/`@phpstan-pure`/`@psalm-pure` (and not
     /// `@phpstan-impure`). Used by the `*.resultUnused` rules.
     pub pure: bool,
+    /// Declared with PHP 8.5's `#[NoDiscard]`; call-as-statement should report
+    /// that the return value is discarded.
+    pub must_use_return_value: bool,
     /// Loaded from the built-in stub manifest (Cap #4) rather than reflected from
     /// project source. The stub *arity* is unreliable (phpstorm-stubs omits
     /// defaults on some optional params and over-/under-counts variadics), so the
@@ -104,6 +107,9 @@ pub struct MethodReflection {
     /// Declared side-effect-free via `@pure`/`@phpstan-pure`/`@psalm-pure` (and not
     /// `@phpstan-impure`). Used by the `*.resultUnused` rules.
     pub pure: bool,
+    /// Declared with PHP 8.5's `#[NoDiscard]`; call-as-statement should report
+    /// that the return value is discarded.
+    pub must_use_return_value: bool,
     /// Declared only via a class-level `@method` tag (no real implementation).
     pub magic: bool,
 }
@@ -171,6 +177,8 @@ pub struct ClassReflection {
     /// The class (or a parent) declares `@phpstan-consistent-constructor`, which
     /// makes `new static()` safe (subclasses can't change the constructor).
     pub consistent_constructor: bool,
+    /// Loaded from the built-in stub manifest rather than project source.
+    pub builtin: bool,
 }
 
 /// `#[Attribute(...)]` metadata on an attribute class: which targets it may be
@@ -190,21 +198,29 @@ pub mod attr_target {
     pub const PROPERTY: u32 = 8;
     pub const CLASS_CONSTANT: u32 = 16;
     pub const PARAMETER: u32 = 32;
-    pub const ALL: u32 = 63;
-    pub const IS_REPEATABLE: u32 = 64;
+    pub const CONSTANT: u32 = 64;
+    pub const ALL: u32 = 127;
+    pub const IS_REPEATABLE: u32 = 128;
 }
 
 /// Parse the `#[Attribute]` / `#[Attribute(flags)]` group on a declaration, if
 /// present, into an [`AttributeSpec`]. The attribute name must resolve to the
 /// global `\Attribute`.
-fn attribute_spec(scope: &Scope, interner: &Interner, attrs: &[AttributeGroup]) -> Option<AttributeSpec> {
+fn attribute_spec(
+    scope: &Scope,
+    interner: &Interner,
+    attrs: &[AttributeGroup],
+) -> Option<AttributeSpec> {
     for g in attrs {
         for a in &g.attrs {
             if !is_php_attribute(scope, &a.name) {
                 continue;
             }
             return Some(match &a.args {
-                None => AttributeSpec { targets: attr_target::ALL, repeatable: false },
+                None => AttributeSpec {
+                    targets: attr_target::ALL,
+                    repeatable: false,
+                },
                 Some(args) => {
                     let flags = args
                         .first()
@@ -212,7 +228,11 @@ fn attribute_spec(scope: &Scope, interner: &Interner, attrs: &[AttributeGroup]) 
                         .unwrap_or(attr_target::ALL);
                     let targets = flags & attr_target::ALL;
                     AttributeSpec {
-                        targets: if targets != 0 { targets } else { attr_target::ALL },
+                        targets: if targets != 0 {
+                            targets
+                        } else {
+                            attr_target::ALL
+                        },
                         repeatable: flags & attr_target::IS_REPEATABLE != 0,
                     }
                 }
@@ -230,10 +250,15 @@ fn is_php_attribute(scope: &Scope, name: &Name) -> bool {
 fn eval_attr_flags(interner: &Interner, e: &Expr) -> Option<u32> {
     match &e.kind {
         ExprKind::Paren(inner) => eval_attr_flags(interner, inner),
-        ExprKind::Binary { op: BinOp::BitOr, lhs, rhs } => {
-            Some(eval_attr_flags(interner, lhs)? | eval_attr_flags(interner, rhs)?)
-        }
-        ExprKind::ClassConst { name: MemberName::Ident(sym), .. } => attr_const(interner.resolve(*sym)),
+        ExprKind::Binary {
+            op: BinOp::BitOr,
+            lhs,
+            rhs,
+        } => Some(eval_attr_flags(interner, lhs)? | eval_attr_flags(interner, rhs)?),
+        ExprKind::ClassConst {
+            name: MemberName::Ident(sym),
+            ..
+        } => attr_const(interner.resolve(*sym)),
         ExprKind::Int(n) => u32::try_from(*n).ok(),
         _ => None,
     }
@@ -247,6 +272,7 @@ fn attr_const(name: &str) -> Option<u32> {
         "TARGET_PROPERTY" => attr_target::PROPERTY,
         "TARGET_CLASS_CONSTANT" => attr_target::CLASS_CONSTANT,
         "TARGET_PARAMETER" => attr_target::PARAMETER,
+        "TARGET_CONSTANT" => attr_target::CONSTANT,
         "TARGET_ALL" => attr_target::ALL,
         "IS_REPEATABLE" => attr_target::IS_REPEATABLE,
         _ => return None,
@@ -254,25 +280,40 @@ fn attr_const(name: &str) -> Option<u32> {
 }
 
 /// Reflect a free function declaration.
-pub fn reflect_function(scope: &Scope, interner: &Interner, f: &FunctionDecl) -> FunctionReflection {
+pub fn reflect_function(
+    scope: &Scope,
+    interner: &Interner,
+    f: &FunctionDecl,
+) -> FunctionReflection {
     let doc = parse_doc(f.doc.as_deref());
     let templates: Vec<String> = doc.templates.iter().map(|t| t.name.clone()).collect();
     FunctionReflection {
         fqn: scope.qualify(interner.resolve(f.name)),
         params: reflect_params(scope, interner, &templates, &f.params, &doc),
-        return_type: merge_type(scope, &templates, f.return_type.as_ref(), doc.returns.as_ref()),
+        return_type: merge_type(
+            scope,
+            &templates,
+            f.return_type.as_ref(),
+            doc.returns.as_ref(),
+        ),
         native_return: native_type(scope, f.return_type.as_ref()),
         by_ref: f.by_ref,
         templates,
         deprecated: doc.deprecated,
         pure: doc_is_pure(f.doc.as_deref()),
+        must_use_return_value: has_nodiscard_attr(&f.attrs),
         builtin: false,
     }
 }
 
 /// Reflect a class/interface/trait/enum declaration. `fqn` is its already-resolved
 /// fully-qualified name (the caller knows the declaring scope).
-pub fn reflect_class(scope: &Scope, interner: &Interner, fqn: &str, c: &ClassDecl) -> ClassReflection {
+pub fn reflect_class(
+    scope: &Scope,
+    interner: &Interner,
+    fqn: &str,
+    c: &ClassDecl,
+) -> ClassReflection {
     let doc = parse_doc(c.doc.as_deref());
     let class_templates: Vec<String> = doc.templates.iter().map(|t| t.name.clone()).collect();
 
@@ -285,7 +326,10 @@ pub fn reflect_class(scope: &Scope, interner: &Interner, fqn: &str, c: &ClassDec
                 methods.push(reflect_method(scope, interner, &class_templates, md));
                 // Constructor property promotion: a `__construct` parameter with a
                 // visibility modifier is *also* a property of the class.
-                if interner.resolve(md.name).eq_ignore_ascii_case("__construct") {
+                if interner
+                    .resolve(md.name)
+                    .eq_ignore_ascii_case("__construct")
+                {
                     promoted_properties(
                         scope,
                         interner,
@@ -306,7 +350,10 @@ pub fn reflect_class(scope: &Scope, interner: &Interner, fqn: &str, c: &ClassDec
             Member::EnumCase(ec) => constants.push(ConstReflection {
                 name: interner.resolve(ec.name).to_string(),
                 visibility: Visibility::Public,
-                ty: Type::Named { fqn: fqn.to_string(), args: Vec::new() },
+                ty: Type::Named {
+                    fqn: fqn.to_string(),
+                    args: Vec::new(),
+                },
                 is_final: true,
                 int_value: None,
             }),
@@ -317,8 +364,19 @@ pub fn reflect_class(scope: &Scope, interner: &Interner, fqn: &str, c: &ClassDec
     }
 
     // Magic members from the class docblock.
-    methods.extend(doc.methods.iter().map(|m| magic_method(scope, &class_templates, m)));
-    properties.extend(doc.properties.iter().filter_map(|p| magic_property(scope, &class_templates, p)));
+    methods.extend(
+        doc.methods
+            .iter()
+            .map(|m| magic_method(scope, &class_templates, m)),
+    );
+    properties.extend(
+        doc.properties
+            .iter()
+            .filter_map(|p| magic_property(scope, &class_templates, p)),
+    );
+    if c.kind == ClassKind::Enum {
+        synthesize_enum_members(scope, c, &mut methods, &mut properties);
+    }
 
     let traits: Vec<Name> = c
         .members
@@ -339,7 +397,11 @@ pub fn reflect_class(scope: &Scope, interner: &Interner, fqn: &str, c: &ClassDec
         parents: parents_with_generics(scope, &class_templates, &c.extends, &doc.extends),
         interfaces: parents_with_generics(scope, &class_templates, &c.implements, &doc.implements),
         traits: parents_with_generics(scope, &class_templates, &traits, &doc.uses),
-        mixins: doc.mixins.iter().map(|m| resolve_doc_type(scope, &class_templates, m)).collect(),
+        mixins: doc
+            .mixins
+            .iter()
+            .map(|m| resolve_doc_type(scope, &class_templates, m))
+            .collect(),
         templates: class_templates,
         methods,
         properties,
@@ -350,6 +412,93 @@ pub fn reflect_class(scope: &Scope, interner: &Interner, fqn: &str, c: &ClassDec
             .doc
             .as_deref()
             .is_some_and(|d| d.contains("consistent-constructor")),
+        builtin: false,
+    }
+}
+
+fn synthesize_enum_members(
+    scope: &Scope,
+    c: &ClassDecl,
+    methods: &mut Vec<MethodReflection>,
+    properties: &mut Vec<PropertyReflection>,
+) {
+    properties.push(PropertyReflection {
+        name: "name".to_string(),
+        visibility: Visibility::Public,
+        is_static: false,
+        is_readonly: true,
+        ty: Type::String,
+        native_ty: Type::String,
+        has_default: false,
+        access: PropertyAccess::ReadOnly,
+        magic: false,
+    });
+
+    let static_enum = Type::StaticType;
+    methods.push(synthetic_method(
+        "cases",
+        Vec::new(),
+        Type::List(Box::new(static_enum.clone())),
+    ));
+
+    let Some(backing) = &c.backing else { return };
+    let backing_ty = resolve_ast_type(scope, backing);
+    properties.push(PropertyReflection {
+        name: "value".to_string(),
+        visibility: Visibility::Public,
+        is_static: false,
+        is_readonly: true,
+        ty: backing_ty.clone(),
+        native_ty: backing_ty.clone(),
+        has_default: false,
+        access: PropertyAccess::ReadOnly,
+        magic: false,
+    });
+    methods.push(synthetic_method(
+        "from",
+        vec![synthetic_param("value", backing_ty.clone())],
+        static_enum.clone(),
+    ));
+    methods.push(synthetic_method(
+        "tryFrom",
+        vec![synthetic_param("value", backing_ty)],
+        static_enum.nullable(),
+    ));
+}
+
+fn synthetic_method(
+    name: &str,
+    params: Vec<ParamReflection>,
+    return_type: Type,
+) -> MethodReflection {
+    MethodReflection {
+        name: name.to_string(),
+        visibility: Visibility::Public,
+        is_static: true,
+        is_abstract: false,
+        is_final: true,
+        params,
+        return_type: return_type.clone(),
+        explicit_return: true,
+        native_return: return_type,
+        templates: Vec::new(),
+        deprecated: false,
+        pure: true,
+        must_use_return_value: false,
+        magic: false,
+    }
+}
+
+fn synthetic_param(name: &str, ty: Type) -> ParamReflection {
+    ParamReflection {
+        name: name.to_string(),
+        ty: ty.clone(),
+        by_ref: false,
+        variadic: false,
+        optional: false,
+        promoted: false,
+        explicit: true,
+        native_ty: ty,
     }
 }
 
@@ -367,7 +516,9 @@ fn promoted_properties(
     let doc = parse_doc(ctor.doc.as_deref());
     let templates = combine_templates(class_templates, &doc);
     for p in &ctor.params {
-        let Some(visibility) = p.modifiers.visibility else { continue };
+        let Some(visibility) = p.modifiers.visibility else {
+            continue;
+        };
         let pname = interner.resolve(p.name);
         let doc_ty = doc
             .params
@@ -388,7 +539,12 @@ fn promoted_properties(
     }
 }
 
-fn reflect_method(scope: &Scope, interner: &Interner, class_templates: &[String], m: &MethodDecl) -> MethodReflection {
+fn reflect_method(
+    scope: &Scope,
+    interner: &Interner,
+    class_templates: &[String],
+    m: &MethodDecl,
+) -> MethodReflection {
     let doc = parse_doc(m.doc.as_deref());
     let templates = combine_templates(class_templates, &doc);
     MethodReflection {
@@ -398,12 +554,18 @@ fn reflect_method(scope: &Scope, interner: &Interner, class_templates: &[String]
         is_abstract: m.modifiers.is_abstract || m.body.is_none(),
         is_final: m.modifiers.is_final,
         params: reflect_params(scope, interner, &templates, &m.params, &doc),
-        return_type: merge_type(scope, &templates, m.return_type.as_ref(), doc.returns.as_ref()),
+        return_type: merge_type(
+            scope,
+            &templates,
+            m.return_type.as_ref(),
+            doc.returns.as_ref(),
+        ),
         native_return: native_type(scope, m.return_type.as_ref()),
         explicit_return: m.return_type.is_some() || doc.returns.is_some(),
         templates,
         deprecated: doc.deprecated,
         pure: doc_is_pure(m.doc.as_deref()),
+        must_use_return_value: has_nodiscard_attr(&m.attrs),
         magic: false,
     }
 }
@@ -436,8 +598,17 @@ fn reflect_properties(
     }
 }
 
-fn reflect_consts(scope: &Scope, cd: &php_ast::ClassConstDecl, interner: &Interner, out: &mut Vec<ConstReflection>) {
-    let ty = cd.ty.as_ref().map(|t| resolve_ast_type(scope, t)).unwrap_or(Type::Mixed);
+fn reflect_consts(
+    scope: &Scope,
+    cd: &php_ast::ClassConstDecl,
+    interner: &Interner,
+    out: &mut Vec<ConstReflection>,
+) {
+    let ty = cd
+        .ty
+        .as_ref()
+        .map(|t| resolve_ast_type(scope, t))
+        .unwrap_or(Type::Mixed);
     for c in &cd.consts {
         out.push(ConstReflection {
             name: interner.resolve(c.name).to_string(),
@@ -456,14 +627,24 @@ fn const_int_value(e: &php_ast::Expr) -> Option<i64> {
     match &e.kind {
         E::Int(n) => Some(*n),
         E::Paren(inner) => const_int_value(inner),
-        E::Unary { op: php_ast::UnOp::Minus, expr } => const_int_value(expr).map(|n| n.wrapping_neg()),
-        E::Unary { op: php_ast::UnOp::Plus, expr } => const_int_value(expr),
+        E::Unary {
+            op: php_ast::UnOp::Minus,
+            expr,
+        } => const_int_value(expr).map(|n| n.wrapping_neg()),
+        E::Unary {
+            op: php_ast::UnOp::Plus,
+            expr,
+        } => const_int_value(expr),
         _ => None,
     }
 }
 
 /// Reflect a `@method` magic-method declaration.
-fn magic_method(scope: &Scope, class_templates: &[String], m: &php_phpdoc::MethodTag) -> MethodReflection {
+fn magic_method(
+    scope: &Scope,
+    class_templates: &[String],
+    m: &php_phpdoc::MethodTag,
+) -> MethodReflection {
     let templates = class_templates.to_vec();
     MethodReflection {
         name: m.name.clone(),
@@ -471,7 +652,11 @@ fn magic_method(scope: &Scope, class_templates: &[String], m: &php_phpdoc::Metho
         is_static: m.is_static,
         is_abstract: false,
         is_final: false,
-        params: m.params.iter().map(|p| magic_param(scope, &templates, p)).collect(),
+        params: m
+            .params
+            .iter()
+            .map(|p| magic_param(scope, &templates, p))
+            .collect(),
         return_type: m
             .return_type
             .as_ref()
@@ -482,6 +667,7 @@ fn magic_method(scope: &Scope, class_templates: &[String], m: &php_phpdoc::Metho
         templates,
         deprecated: false,
         pure: false,
+        must_use_return_value: false,
         magic: true,
     }
 }
@@ -489,7 +675,11 @@ fn magic_method(scope: &Scope, class_templates: &[String], m: &php_phpdoc::Metho
 fn magic_param(scope: &Scope, templates: &[String], p: &MethodParam) -> ParamReflection {
     ParamReflection {
         name: p.name.clone().unwrap_or_default(),
-        ty: p.ty.as_ref().map(|t| resolve_doc_type(scope, templates, t)).unwrap_or(Type::Mixed),
+        ty: p
+            .ty
+            .as_ref()
+            .map(|t| resolve_doc_type(scope, templates, t))
+            .unwrap_or(Type::Mixed),
         by_ref: p.by_ref,
         variadic: p.variadic,
         optional: p.default.is_some() || p.variadic,
@@ -500,14 +690,22 @@ fn magic_param(scope: &Scope, templates: &[String], p: &MethodParam) -> ParamRef
 }
 
 /// Reflect a `@property*` magic property. Skips tags without a name.
-fn magic_property(scope: &Scope, templates: &[String], p: &php_phpdoc::PropertyTag) -> Option<PropertyReflection> {
+fn magic_property(
+    scope: &Scope,
+    templates: &[String],
+    p: &php_phpdoc::PropertyTag,
+) -> Option<PropertyReflection> {
     let name = p.name.clone()?;
     Some(PropertyReflection {
         name,
         visibility: Visibility::Public,
         is_static: false,
         is_readonly: p.access == PropertyAccess::ReadOnly,
-        ty: p.ty.as_ref().map(|t| resolve_doc_type(scope, templates, t)).unwrap_or(Type::Mixed),
+        ty: p
+            .ty
+            .as_ref()
+            .map(|t| resolve_doc_type(scope, templates, t))
+            .unwrap_or(Type::Mixed),
         native_ty: Type::Mixed,
         has_default: false,
         access: p.access,
@@ -548,7 +746,12 @@ fn reflect_params(
 
 /// Resolve native parents to types, attaching generic args from matching
 /// `@extends`/`@implements`/`@use` doc generics (matched by resolved FQN).
-fn parents_with_generics(scope: &Scope, templates: &[String], native: &[Name], doc_generics: &[DocType]) -> Vec<Type> {
+fn parents_with_generics(
+    scope: &Scope,
+    templates: &[String],
+    native: &[Name],
+    doc_generics: &[DocType],
+) -> Vec<Type> {
     let doc_args: Vec<(String, Vec<Type>)> = doc_generics
         .iter()
         .filter_map(|d| match resolve_doc_type(scope, templates, d) {
@@ -560,7 +763,11 @@ fn parents_with_generics(scope: &Scope, templates: &[String], native: &[Name], d
         .iter()
         .filter_map(|n| {
             let fqn = scope.resolve_class(n).fqn()?.to_string();
-            let args = doc_args.iter().find(|(f, _)| *f == fqn).map(|(_, a)| a.clone()).unwrap_or_default();
+            let args = doc_args
+                .iter()
+                .find(|(f, _)| *f == fqn)
+                .map(|(_, a)| a.clone())
+                .unwrap_or_default();
             Some(Type::Named { fqn, args })
         })
         .collect()
@@ -568,7 +775,12 @@ fn parents_with_generics(scope: &Scope, templates: &[String], native: &[Name], d
 
 /// Merge a native type hint and a PHPDoc type: the doc type wins when present,
 /// then the native hint, else `mixed`.
-fn merge_type(scope: &Scope, templates: &[String], native: Option<&AstType>, doc: Option<&DocType>) -> Type {
+fn merge_type(
+    scope: &Scope,
+    templates: &[String],
+    native: Option<&AstType>,
+    doc: Option<&DocType>,
+) -> Type {
     if let Some(d) = doc {
         return resolve_doc_type(scope, templates, d);
     }
@@ -582,7 +794,9 @@ fn merge_type(scope: &Scope, templates: &[String], native: Option<&AstType>, doc
 /// `mixed` when there is no native type. Used for `treatPhpDocTypesAsCertain:
 /// false` native-level checking.
 fn native_type(scope: &Scope, native: Option<&AstType>) -> Type {
-    native.map(|n| resolve_ast_type(scope, n)).unwrap_or(Type::Mixed)
+    native
+        .map(|n| resolve_ast_type(scope, n))
+        .unwrap_or(Type::Mixed)
 }
 
 /// Class templates plus a method's own `@template` names.
@@ -615,6 +829,17 @@ fn doc_is_pure(raw: Option<&str>) -> bool {
         }
     }
     pure && !impure
+}
+
+fn has_nodiscard_attr(attrs: &[AttributeGroup]) -> bool {
+    attrs.iter().any(|g| {
+        g.attrs.iter().any(|a| {
+            a.name
+                .text
+                .trim_start_matches('\\')
+                .eq_ignore_ascii_case("nodiscard")
+        })
+    })
 }
 
 #[cfg(test)]
@@ -660,10 +885,18 @@ mod tests {
                 public function __construct(private \Foo\Bar $output, public int $count = 0) {}
             }"#,
         );
-        let out = c.properties.iter().find(|p| p.name == "output").expect("$output property");
+        let out = c
+            .properties
+            .iter()
+            .find(|p| p.name == "output")
+            .expect("$output property");
         assert_eq!(out.visibility, Visibility::Private);
         assert_eq!(out.ty.to_string(), "Foo\\Bar");
-        let count = c.properties.iter().find(|p| p.name == "count").expect("$count property");
+        let count = c
+            .properties
+            .iter()
+            .find(|p| p.name == "count")
+            .expect("$count property");
         assert_eq!(count.visibility, Visibility::Public);
         assert_eq!(count.ty, Type::Int);
         assert!(count.has_default);
@@ -671,15 +904,15 @@ mod tests {
 
     #[test]
     fn non_promoted_constructor_param_is_not_a_property() {
-        let (c, _) = reflect_first_class(
-            r#"<?php class C { public function __construct(int $x) {} }"#,
-        );
+        let (c, _) =
+            reflect_first_class(r#"<?php class C { public function __construct(int $x) {} }"#);
         assert!(c.properties.iter().all(|p| p.name != "x"));
     }
 
     #[test]
     fn function_params_and_return_native() {
-        let (f, _) = first_function(r#"<?php function add(int $a, int $b = 0): int { return $a + $b; }"#);
+        let (f, _) =
+            first_function(r#"<?php function add(int $a, int $b = 0): int { return $a + $b; }"#);
         assert_eq!(f.fqn, "add");
         assert_eq!(f.params.len(), 2);
         assert_eq!(f.params[0].name, "a");
@@ -797,7 +1030,10 @@ mod tests {
             class Bag extends \ArrayObject implements \IteratorAggregate {}"#,
         );
         assert_eq!(c.parents[0].to_string(), "ArrayObject<int, string>");
-        assert_eq!(c.interfaces[0].to_string(), "IteratorAggregate<int, string>");
+        assert_eq!(
+            c.interfaces[0].to_string(),
+            "IteratorAggregate<int, string>"
+        );
     }
 
     #[test]

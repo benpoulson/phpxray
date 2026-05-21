@@ -72,13 +72,19 @@ pub fn parse_block(raw: &str) -> DocBlock {
         }
     }
 
-    DocBlock { description: description.join("\n").trim().to_string(), tags }
+    DocBlock {
+        description: description.join("\n").trim().to_string(),
+        tags,
+    }
 }
 
 /// Strip the `/** … */` (or `/* … */`) framing.
 fn strip_frame(s: &str) -> &str {
     let s = s.trim();
-    let s = s.strip_prefix("/**").or_else(|| s.strip_prefix("/*")).unwrap_or(s);
+    let s = s
+        .strip_prefix("/**")
+        .or_else(|| s.strip_prefix("/*"))
+        .unwrap_or(s);
     s.strip_suffix("*/").unwrap_or(s)
 }
 
@@ -110,7 +116,10 @@ mod tests {
     use super::*;
 
     fn tag(name: &str, value: &str) -> DocTag {
-        DocTag { name: name.to_string(), value: value.to_string() }
+        DocTag {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
     }
 
     #[test]
@@ -126,7 +135,10 @@ mod tests {
             "/**\n * Builds a thing.\n *\n * @param int $count how many\n * @return Thing\n */",
         );
         assert_eq!(b.description, "Builds a thing.");
-        assert_eq!(b.tags, [tag("param", "int $count how many"), tag("return", "Thing")]);
+        assert_eq!(
+            b.tags,
+            [tag("param", "int $count how many"), tag("return", "Thing")]
+        );
     }
 
     #[test]
@@ -134,7 +146,13 @@ mod tests {
         let b = parse_block(
             "/**\n * @param string $name a very\n *   long description that\n *   wraps\n */",
         );
-        assert_eq!(b.tags, [tag("param", "string $name a very long description that wraps")]);
+        assert_eq!(
+            b.tags,
+            [tag(
+                "param",
+                "string $name a very long description that wraps"
+            )]
+        );
     }
 
     #[test]
@@ -149,7 +167,13 @@ mod tests {
         // Both are on one line, so the first tag absorbs the rest as body; the
         // realistic multi-line form is covered below.
         let b2 = parse_block("/**\n * @phpstan-return list<int>\n * @psalm-param T $x\n */");
-        assert_eq!(b2.tags, [tag("phpstan-return", "list<int>"), tag("psalm-param", "T $x")]);
+        assert_eq!(
+            b2.tags,
+            [
+                tag("phpstan-return", "list<int>"),
+                tag("psalm-param", "T $x")
+            ]
+        );
         assert_eq!(b.tags[0].name, "phpstan-return");
     }
 
