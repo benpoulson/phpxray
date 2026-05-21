@@ -2,4 +2,5 @@
 //! the `.phpt` section extractor (TDD Tier C corpus plumbing) and corpus
 //! traversal helpers.
 
+pub mod corpus;
 pub mod phpt;

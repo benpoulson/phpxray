@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 php-ast.workspace = true
 php-resolve.workspace = true
+php-types.workspace = true
 
 [dev-dependencies]
 # Tests build per-file indexes from source via the parser + resolver.

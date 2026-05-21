@@ -2971,95 +2971,102 @@ const BP_REF_RHS: u8 = 50; // `=&` RHS: a variable, above all binary operators
 const BP_TERNARY_RHS: u8 = 14; // `?:`/`?:` is left-associative (matches `%left '?' ':'`)
 
 fn infix_power(k: T) -> Option<(u8, u8)> {
-    Some(match k {
-        T::Keyword(Kw::LogicalOr) => (4, 5),
-        T::Keyword(Kw::LogicalXor) => (6, 7),
-        T::Keyword(Kw::LogicalAnd) => (8, 9),
-        T::Eq
-        | T::PlusEq
-        | T::MinusEq
-        | T::MulEq
-        | T::DivEq
-        | T::ModEq
-        | T::PowEq
-        | T::ConcatEq
-        | T::AndEq
-        | T::OrEq
-        | T::XorEq
-        | T::SlEq
-        | T::SrEq
-        | T::CoalesceEq => (51, 11), // right-assoc; high left-bp so `=` binds to
-        // the immediate lvalue (PHP shifts `=` over reducing the LHS: e.g.
-        // `a && $y = b` parses as `a && ($y = b)`, and `clone $b = c` as
-        // `clone($b = c)`), low right-bp so the RHS still captures binary ops.
-        T::Question => (14, 13),
-        T::Coalesce => (16, 15), // right-assoc
-        T::BoolOr => (18, 19),
-        T::BoolAnd => (20, 21),
-        T::Pipe => (22, 23),
-        T::Caret => (24, 25),
-        T::AmpFollowedByVar | T::AmpNotFollowedByVar => (26, 27),
-        T::IsEqual | T::IsNotEqual | T::IsIdentical | T::IsNotIdentical | T::Spaceship => (28, 29),
-        T::Lt | T::LtEq | T::Gt | T::GtEq => (30, 31),
-        T::PipeOp => (32, 33),
-        T::Dot => (34, 35),
-        T::Sl | T::Sr => (36, 37),
-        T::Plus | T::Minus => (38, 39),
-        T::Star | T::Slash | T::Percent => (40, 41),
-        T::Keyword(Kw::Instanceof) => (44, 45),
-        T::Pow => (48, 47), // right-assoc
-        _ => return None,
-    })
+    operator_info(k).map(|op| (op.lbp, op.rbp))
 }
 
 fn binop_of(k: T) -> Option<BinOp> {
-    Some(match k {
-        T::Keyword(Kw::LogicalOr) => BinOp::LogicalOr,
-        T::Keyword(Kw::LogicalXor) => BinOp::LogicalXor,
-        T::Keyword(Kw::LogicalAnd) => BinOp::LogicalAnd,
-        T::BoolOr => BinOp::BoolOr,
-        T::BoolAnd => BinOp::BoolAnd,
-        T::Pipe => BinOp::BitOr,
-        T::Caret => BinOp::BitXor,
-        T::AmpFollowedByVar | T::AmpNotFollowedByVar => BinOp::BitAnd,
-        T::IsEqual => BinOp::Eq,
-        T::IsNotEqual => BinOp::NotEq,
-        T::IsIdentical => BinOp::Identical,
-        T::IsNotIdentical => BinOp::NotIdentical,
-        T::Spaceship => BinOp::Spaceship,
-        T::Lt => BinOp::Lt,
-        T::LtEq => BinOp::LtEq,
-        T::Gt => BinOp::Gt,
-        T::GtEq => BinOp::GtEq,
-        T::PipeOp => BinOp::Pipe,
-        T::Dot => BinOp::Concat,
-        T::Sl => BinOp::Shl,
-        T::Sr => BinOp::Shr,
-        T::Plus => BinOp::Add,
-        T::Minus => BinOp::Sub,
-        T::Star => BinOp::Mul,
-        T::Slash => BinOp::Div,
-        T::Percent => BinOp::Mod,
-        T::Pow => BinOp::Pow,
-        _ => return None,
-    })
+    operator_info(k).and_then(|op| op.binop)
 }
 
 fn compound_assign_op(k: T) -> Option<BinOp> {
+    operator_info(k).and_then(|op| op.compound_assign)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OperatorInfo {
+    lbp: u8,
+    rbp: u8,
+    binop: Option<BinOp>,
+    compound_assign: Option<BinOp>,
+}
+
+impl OperatorInfo {
+    const fn special(lbp: u8, rbp: u8) -> Self {
+        Self {
+            lbp,
+            rbp,
+            binop: None,
+            compound_assign: None,
+        }
+    }
+
+    const fn binary(lbp: u8, rbp: u8, binop: BinOp) -> Self {
+        Self {
+            lbp,
+            rbp,
+            binop: Some(binop),
+            compound_assign: None,
+        }
+    }
+
+    const fn compound(binop: BinOp) -> Self {
+        // Right-assoc; high left-bp so assignment binds to the immediate lvalue,
+        // low right-bp so the RHS still captures binary operators.
+        Self {
+            lbp: 51,
+            rbp: 11,
+            binop: None,
+            compound_assign: Some(binop),
+        }
+    }
+}
+
+fn operator_info(k: T) -> Option<OperatorInfo> {
     Some(match k {
-        T::PlusEq => BinOp::Add,
-        T::MinusEq => BinOp::Sub,
-        T::MulEq => BinOp::Mul,
-        T::DivEq => BinOp::Div,
-        T::ModEq => BinOp::Mod,
-        T::PowEq => BinOp::Pow,
-        T::ConcatEq => BinOp::Concat,
-        T::AndEq => BinOp::BitAnd,
-        T::OrEq => BinOp::BitOr,
-        T::XorEq => BinOp::BitXor,
-        T::SlEq => BinOp::Shl,
-        T::SrEq => BinOp::Shr,
-        T::CoalesceEq => BinOp::Coalesce,
+        T::Keyword(Kw::LogicalOr) => OperatorInfo::binary(4, 5, BinOp::LogicalOr),
+        T::Keyword(Kw::LogicalXor) => OperatorInfo::binary(6, 7, BinOp::LogicalXor),
+        T::Keyword(Kw::LogicalAnd) => OperatorInfo::binary(8, 9, BinOp::LogicalAnd),
+        T::Eq => OperatorInfo::special(51, 11),
+        T::PlusEq => OperatorInfo::compound(BinOp::Add),
+        T::MinusEq => OperatorInfo::compound(BinOp::Sub),
+        T::MulEq => OperatorInfo::compound(BinOp::Mul),
+        T::DivEq => OperatorInfo::compound(BinOp::Div),
+        T::ModEq => OperatorInfo::compound(BinOp::Mod),
+        T::PowEq => OperatorInfo::compound(BinOp::Pow),
+        T::ConcatEq => OperatorInfo::compound(BinOp::Concat),
+        T::AndEq => OperatorInfo::compound(BinOp::BitAnd),
+        T::OrEq => OperatorInfo::compound(BinOp::BitOr),
+        T::XorEq => OperatorInfo::compound(BinOp::BitXor),
+        T::SlEq => OperatorInfo::compound(BinOp::Shl),
+        T::SrEq => OperatorInfo::compound(BinOp::Shr),
+        T::CoalesceEq => OperatorInfo::compound(BinOp::Coalesce),
+        T::Question => OperatorInfo::special(14, 13),
+        T::Coalesce => OperatorInfo::special(16, 15),
+        T::BoolOr => OperatorInfo::binary(18, 19, BinOp::BoolOr),
+        T::BoolAnd => OperatorInfo::binary(20, 21, BinOp::BoolAnd),
+        T::Pipe => OperatorInfo::binary(22, 23, BinOp::BitOr),
+        T::Caret => OperatorInfo::binary(24, 25, BinOp::BitXor),
+        T::AmpFollowedByVar | T::AmpNotFollowedByVar => OperatorInfo::binary(26, 27, BinOp::BitAnd),
+        T::IsEqual => OperatorInfo::binary(28, 29, BinOp::Eq),
+        T::IsNotEqual => OperatorInfo::binary(28, 29, BinOp::NotEq),
+        T::IsIdentical => OperatorInfo::binary(28, 29, BinOp::Identical),
+        T::IsNotIdentical => OperatorInfo::binary(28, 29, BinOp::NotIdentical),
+        T::Spaceship => OperatorInfo::binary(28, 29, BinOp::Spaceship),
+        T::Lt => OperatorInfo::binary(30, 31, BinOp::Lt),
+        T::LtEq => OperatorInfo::binary(30, 31, BinOp::LtEq),
+        T::Gt => OperatorInfo::binary(30, 31, BinOp::Gt),
+        T::GtEq => OperatorInfo::binary(30, 31, BinOp::GtEq),
+        T::PipeOp => OperatorInfo::binary(32, 33, BinOp::Pipe),
+        T::Dot => OperatorInfo::binary(34, 35, BinOp::Concat),
+        T::Sl => OperatorInfo::binary(36, 37, BinOp::Shl),
+        T::Sr => OperatorInfo::binary(36, 37, BinOp::Shr),
+        T::Plus => OperatorInfo::binary(38, 39, BinOp::Add),
+        T::Minus => OperatorInfo::binary(38, 39, BinOp::Sub),
+        T::Star => OperatorInfo::binary(40, 41, BinOp::Mul),
+        T::Slash => OperatorInfo::binary(40, 41, BinOp::Div),
+        T::Percent => OperatorInfo::binary(40, 41, BinOp::Mod),
+        T::Keyword(Kw::Instanceof) => OperatorInfo::special(44, 45),
+        T::Pow => OperatorInfo::binary(48, 47, BinOp::Pow),
         _ => return None,
     })
 }
@@ -3088,60 +3095,11 @@ fn canonical_int_key(s: &str) -> Option<i64> {
 }
 
 fn parse_int(text: &str) -> i64 {
-    let cleaned: String = text.chars().filter(|&c| c != '_').collect();
-    let lower = cleaned.to_ascii_lowercase();
-    let parsed: Result<i128, _> = if let Some(h) = lower.strip_prefix("0x") {
-        i128::from_str_radix(h, 16)
-    } else if let Some(b) = lower.strip_prefix("0b") {
-        i128::from_str_radix(b, 2)
-    } else if let Some(o) = lower.strip_prefix("0o") {
-        i128::from_str_radix(o, 8)
-    } else if cleaned.len() > 1
-        && cleaned.starts_with('0')
-        && cleaned.bytes().all(|b| (b'0'..=b'7').contains(&b))
-    {
-        i128::from_str_radix(&cleaned[1..], 8) // legacy octal
-    } else {
-        cleaned.parse::<i128>()
-    };
-    parsed.map(|v| v as i64).unwrap_or(0)
+    php_lexer::number::parse_int_literal(text)
 }
 
 fn parse_float(text: &str) -> f64 {
-    let cleaned: String = text.chars().filter(|&c| c != '_').collect();
-    let lower = cleaned.to_ascii_lowercase();
-    // Radix-prefixed integer literals that overflow `i64` arrive here as floats.
-    // PHP's `zend_{hex,oct,bin}_strtod` accumulate digit-by-digit in `double`
-    // (`v = v*base + digit`), which rounds differently from converting the exact
-    // integer once — replicate that so the value matches byte-for-byte.
-    if let Some(h) = lower.strip_prefix("0x") {
-        // hex: `value = value*16 + digit` (digit already 0-15).
-        let mut v = 0f64;
-        for c in h.bytes() {
-            if let Some(d) = (c as char).to_digit(16) {
-                v = v * 16.0 + d as f64;
-            }
-        }
-        return v;
-    }
-    if let Some(b) = lower.strip_prefix("0b") {
-        return radix_strtod_sub(b, 2.0);
-    }
-    if let Some(o) = lower.strip_prefix("0o") {
-        return radix_strtod_sub(o, 8.0);
-    }
-    cleaned.parse::<f64>().unwrap_or(0.0)
-}
-
-/// Accumulate base-2/base-8 `digits` exactly as PHP's `zend_{bin,oct}_strtod`:
-/// `value = value*base + c - '0'`. The floating-point operation order (add the
-/// raw char, then subtract `'0'`) matters for overflowing literals.
-fn radix_strtod_sub(digits: &str, base: f64) -> f64 {
-    let mut v = 0f64;
-    for c in digits.bytes() {
-        v = v * base + c as f64 - 48.0;
-    }
-    v
+    php_lexer::number::parse_float_literal(text)
 }
 
 /// Post-process a heredoc/nowdoc body: remove the single trailing newline that

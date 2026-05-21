@@ -10,6 +10,51 @@
 
 use std::fmt;
 
+/// The target PHP version of an analyzed project, encoded as phpstan-style
+/// version id (`8.4` -> `80400`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PhpVersion(u32);
+
+impl PhpVersion {
+    /// Build from a raw phpstan-style version id.
+    pub fn from_id(id: u32) -> Option<Self> {
+        (id >= 10_000).then_some(Self(id))
+    }
+
+    /// Build from a `major.minor[.patch]` string (e.g. `"8.4"`, `"8.4.1"`) or a
+    /// raw version id (`"80400"`). Returns `None` if it can't be parsed.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if let Ok(id) = s.parse::<u32>() {
+            return Self::from_id(id);
+        }
+        let mut parts = s.split('.');
+        let major: u32 = parts.next()?.trim().parse().ok()?;
+        let minor: u32 = parts.next().map_or(Ok(0), |p| p.trim().parse()).ok()?;
+        let patch: u32 = parts.next().map_or(Ok(0), |p| p.trim().parse()).ok()?;
+        Some(Self(major * 10_000 + minor * 100 + patch))
+    }
+
+    /// The phpstan-style numeric version id.
+    pub fn id(self) -> u32 {
+        self.0
+    }
+
+    /// Whether this version is at least `id` (a raw version id, e.g. `80500`).
+    pub fn at_least(self, id: u32) -> bool {
+        self.0 >= id
+    }
+}
+
+impl Default for PhpVersion {
+    /// When the project doesn't pin a `phpVersion`, assume current-stable PHP
+    /// 8.4. Newer-version rules stay opt-in until the project config asks for
+    /// them.
+    fn default() -> Self {
+        Self(80400)
+    }
+}
+
 /// A resolved PHP type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
@@ -213,6 +258,66 @@ impl Type {
             1 => flat.pop().unwrap(),
             _ => Type::Intersection(flat),
         }
+    }
+
+    /// Recursively transform this type in post-order.
+    ///
+    /// Every child type is transformed before the rebuilt parent is passed to
+    /// `mapper`. This is the common primitive for template substitution,
+    /// late-static binding, and recursive predicates that need to stay complete
+    /// as [`Type`] grows.
+    pub fn map(self, mapper: &mut impl FnMut(Type) -> Type) -> Type {
+        let rebuilt = match self {
+            Type::Nullable(inner) => Type::Nullable(Box::new(inner.map(mapper))),
+            Type::Union(parts) => Type::Union(parts.into_iter().map(|p| p.map(mapper)).collect()),
+            Type::Intersection(parts) => {
+                Type::Intersection(parts.into_iter().map(|p| p.map(mapper)).collect())
+            }
+            Type::Array(Some(kv)) => {
+                let (k, v) = *kv;
+                Type::Array(Some(Box::new((k.map(mapper), v.map(mapper)))))
+            }
+            Type::Iterable(Some(kv)) => {
+                let (k, v) = *kv;
+                Type::Iterable(Some(Box::new((k.map(mapper), v.map(mapper)))))
+            }
+            Type::List(inner) => Type::List(Box::new(inner.map(mapper))),
+            Type::Callable(Some(sig)) => Type::Callable(Some(Box::new(CallableSig {
+                params: sig.params.into_iter().map(|p| p.map(mapper)).collect(),
+                ret: sig.ret.map(mapper),
+            }))),
+            Type::ClassString(Some(inner)) => Type::ClassString(Some(Box::new(inner.map(mapper)))),
+            Type::Named { fqn, args } => Type::Named {
+                fqn,
+                args: args.into_iter().map(|a| a.map(mapper)).collect(),
+            },
+            Type::Shape { fields, sealed } => Type::Shape {
+                fields: fields
+                    .into_iter()
+                    .map(|field| ShapeField {
+                        key: field.key,
+                        optional: field.optional,
+                        ty: field.ty.map(mapper),
+                    })
+                    .collect(),
+                sealed,
+            },
+            Type::Conditional {
+                subject,
+                negated,
+                target,
+                then,
+                els,
+            } => Type::Conditional {
+                subject,
+                negated,
+                target: Box::new(target.map(mapper)),
+                then: Box::new(then.map(mapper)),
+                els: Box::new(els.map(mapper)),
+            },
+            other => other,
+        };
+        mapper(rebuilt)
     }
 }
 
@@ -418,5 +523,58 @@ mod tests {
             Type::Nullable(Box::new(Type::Int))
         );
         assert_eq!(Type::Null.nullable(), Type::Null);
+    }
+
+    #[test]
+    fn map_rebuilds_every_recursive_shape_post_order() {
+        let ty = Type::Named {
+            fqn: "Box".into(),
+            args: vec![
+                Type::Iterable(Some(Box::new((Type::String, Type::SelfType)))),
+                Type::ClassString(Some(Box::new(Type::StaticType))),
+                Type::Callable(Some(Box::new(CallableSig {
+                    params: vec![Type::Parent],
+                    ret: Type::SelfType,
+                }))),
+                Type::Shape {
+                    fields: vec![ShapeField {
+                        key: Some("item".into()),
+                        optional: false,
+                        ty: Type::Nullable(Box::new(Type::StaticType)),
+                    }],
+                    sealed: false,
+                },
+                Type::Conditional {
+                    subject: "$x".into(),
+                    negated: false,
+                    target: Box::new(Type::Parent),
+                    then: Box::new(Type::SelfType),
+                    els: Box::new(Type::StaticType),
+                },
+            ],
+        };
+
+        let mapped = ty.map(&mut |part| match part {
+            Type::SelfType => Type::Named {
+                fqn: "Current".into(),
+                args: vec![],
+            },
+            Type::StaticType => Type::Named {
+                fqn: "Late".into(),
+                args: vec![],
+            },
+            Type::Parent => Type::Named {
+                fqn: "Base".into(),
+                args: vec![],
+            },
+            other => other,
+        });
+
+        let rendered = mapped.to_string();
+        assert!(rendered.contains("iterable<string, Current>"));
+        assert!(rendered.contains("class-string<Late>"));
+        assert!(rendered.contains("callable(Base): Current"));
+        assert!(rendered.contains("array{item: ?Late, ...}"));
+        assert!(rendered.contains("($x is Base ? Current : Late)"));
     }
 }

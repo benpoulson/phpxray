@@ -22,7 +22,9 @@
 
 use php_intern::Symbol;
 use php_span::Span;
+use std::fmt;
 
+pub mod queries;
 pub mod walk;
 
 /// A whole parsed source unit.
@@ -57,7 +59,6 @@ impl Stmt {
 }
 
 #[derive(Clone, PartialEq, Debug)]
-#[non_exhaustive]
 pub enum StmtKind {
     /// An expression used as a statement (`foo();`).
     Expr(Expr),
@@ -465,7 +466,6 @@ impl Expr {
 }
 
 #[derive(Clone, PartialEq, Debug)]
-#[non_exhaustive]
 pub enum ExprKind {
     // --- literals ---
     Int(i64),
@@ -739,6 +739,52 @@ pub enum BinOp {
     Pipe,
     /// Only used by `??=` (the `??` operator itself is [`ExprKind::Coalesce`]).
     Coalesce,
+}
+
+impl fmt::Display for UnOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            UnOp::Plus => "+",
+            UnOp::Minus => "-",
+            UnOp::Not => "!",
+            UnOp::BitNot => "~",
+        })
+    }
+}
+
+impl fmt::Display for BinOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            BinOp::Add => "+",
+            BinOp::Sub => "-",
+            BinOp::Mul => "*",
+            BinOp::Div => "/",
+            BinOp::Mod => "%",
+            BinOp::Pow => "**",
+            BinOp::Concat => ".",
+            BinOp::BitOr => "|",
+            BinOp::BitAnd => "&",
+            BinOp::BitXor => "^",
+            BinOp::Shl => "<<",
+            BinOp::Shr => ">>",
+            BinOp::Eq => "==",
+            BinOp::NotEq => "!=",
+            BinOp::Identical => "===",
+            BinOp::NotIdentical => "!==",
+            BinOp::Lt => "<",
+            BinOp::LtEq => "<=",
+            BinOp::Gt => ">",
+            BinOp::GtEq => ">=",
+            BinOp::Spaceship => "<=>",
+            BinOp::BoolAnd => "&&",
+            BinOp::BoolOr => "||",
+            BinOp::LogicalAnd => "and",
+            BinOp::LogicalOr => "or",
+            BinOp::LogicalXor => "xor",
+            BinOp::Pipe => "|>",
+            BinOp::Coalesce => "??",
+        })
+    }
 }
 
 /// How an array literal / destructuring target was written.

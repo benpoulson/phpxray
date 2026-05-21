@@ -1,10 +1,16 @@
-import os, re, collections
-SRC = "/Users/ben/Projects/php-ast/phpstan-src"
+import collections
+import os
+import re
+import subprocess
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SRC = os.environ.get("PHPSTAN_SRC", os.path.join(ROOT, "phpstan-src"))
 RULES_DIR = os.path.join(SRC, "src")
 
-attr_re = re.compile(r'#\[RegisteredRule\(level:\s*(\d+)\)\]')
-class_re = re.compile(r'(?:final |abstract )?class (\w+)')
+attr_re = re.compile(r"#\[RegisteredRule\(level:\s*(\d+)\)\]")
+class_re = re.compile(r"(?:final |abstract )?class (\w+)")
 ident_re = re.compile(r"->identifier\(\s*'([^']+)'")
+
 EXTRA_IDENTS = {
     "DateTimeInstantiationRule": ["new.dateTime", "new.dateTimeImmutable"],
     # Emitted by the helper class NonexistentOffsetInArrayDimFetchCheck.
@@ -13,393 +19,199 @@ EXTRA_IDENTS = {
 
 NON_USER_CODE = {
     # PHPStan extension-development API policy rules. `php-analyzer` targets
-    # user PHP projects, and the runtime registry intentionally skips the Api
-    # category (see crates/php-rules/src/rules/mod.rs).
-    "ApiClassConstFetchRule", "ApiClassExtendsRule", "ApiClassImplementsRule",
-    "ApiInstanceofRule", "ApiInstanceofTypeRule", "ApiInstantiationRule",
-    "ApiInterfaceExtendsRule", "ApiMethodCallRule", "ApiStaticCallRule",
-    "ApiTraitUseRule", "GetTemplateTypeRule",
-    "NodeConnectingVisitorAttributesRule", "OldPhpParser4ClassRule",
-    "PhpStanNamespaceIn3rdPartyPackageRule", "RuntimeReflectionFunctionRule",
+    # user PHP projects, and the runtime registry intentionally skips this
+    # category.
+    "ApiClassConstFetchRule",
+    "ApiClassExtendsRule",
+    "ApiClassImplementsRule",
+    "ApiInstanceofRule",
+    "ApiInstanceofTypeRule",
+    "ApiInstantiationRule",
+    "ApiInterfaceExtendsRule",
+    "ApiMethodCallRule",
+    "ApiStaticCallRule",
+    "ApiTraitUseRule",
+    "GetTemplateTypeRule",
+    "NodeConnectingVisitorAttributesRule",
+    "OldPhpParser4ClassRule",
+    "PhpStanNamespaceIn3rdPartyPackageRule",
+    "RuntimeReflectionFunctionRule",
     "RuntimeReflectionInstantiationRule",
 }
 
-# level -> category -> list of (class, src_path, [identifiers])
-data = collections.defaultdict(lambda: collections.defaultdict(list))
-total = 0
-for root, _, files in os.walk(RULES_DIR):
-    for fn in files:
-        if not fn.endswith(".php"):
+LEVEL_THEME = {
+    0: "Basic existence + obvious mistakes (unknown classes/functions/methods on $this, wrong #args, always-undefined vars)",
+    1: "Possibly-undefined variables; magic methods/properties via __call/__get",
+    2: "Unknown methods on all expressions; PHPDoc validation",
+    3: "Return types; property type assignments",
+    4: "Basic dead code (always-false instanceof, dead else, unreachable, too-wide throws)",
+    5: "Argument types passed to functions/methods; by-ref args",
+    6: "Missing typehints (params/returns/properties/@var)",
+    7: "Partial union types (members not supporting a call); reportMaybes",
+    8: "Calling methods / accessing properties on nullable types",
+    9: "Strict mixed (explicit mixed only assignable to mixed)",
+    10: "Implicit mixed reported too (PHPStan 2.0)",
+}
+
+LEVEL_PARAMS = {
+    0: [],
+    1: ["checkMaybeUndefinedVariables", "checkExtraArguments", "reportMagicMethods", "reportMagicProperties"],
+    2: ["checkClassCaseSensitivity", "checkPhpDocMissingReturn"],
+    3: ["checkPhpDocMethodSignatures"],
+    4: ["checkAdvancedIsset"],
+    5: ["checkFunctionArgumentTypes", "checkArgumentsPassedByReference"],
+    6: ["checkMissingVarTagTypehint", "checkMissingTypehints"],
+    7: ["checkUnionTypes", "reportMaybes"],
+    8: ["checkNullables"],
+    9: ["checkExplicitMixed"],
+    10: ["checkImplicitMixed"],
+}
+
+STRICTNESS_ITEMS = {
+    7: [
+        (
+            "checkUnionTypes",
+            "Union-type member access",
+            "A method call / property access / array offset on a union must be valid for all members.",
+        ),
+        (
+            "reportMaybes",
+            'Report "maybe" mismatches',
+            "Report argument/return/offset mismatches that only might be wrong.",
+        ),
+    ],
+    8: [
+        (
+            "checkNullables",
+            "Nullable member access",
+            "Calling a method / accessing a property / offset on a nullable value is an error.",
+        ),
+    ],
+    9: [
+        (
+            "checkExplicitMixed",
+            "Strict explicit mixed",
+            "A value declared mixed is only assignable to mixed.",
+        ),
+    ],
+    10: [
+        (
+            "checkImplicitMixed",
+            "Strict implicit mixed",
+            "Same as level 9, but for values whose type was inferred as implicit mixed.",
+        ),
+    ],
+}
+
+
+def load_analyzer_manifest():
+    proc = subprocess.run(
+        ["cargo", "run", "-q", "-p", "xtask", "--", "rule-manifest"],
+        cwd=ROOT,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    )
+    rules = []
+    options = set()
+    for line in proc.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3:
             continue
-        path = os.path.join(root, fn)
-        with open(path, encoding="utf-8", errors="replace") as f:
-            text = f.read()
-        m = attr_re.search(text)
-        if not m:
+        kind, level, name = parts
+        if kind == "rule":
+            rules.append((int(level), name))
+        elif kind == "option":
+            options.add(name)
+    return sorted(rules), options
+
+
+def scan_phpstan_rules():
+    data = collections.defaultdict(lambda: collections.defaultdict(list))
+    total = 0
+    for root, _, files in os.walk(RULES_DIR):
+        for fn in files:
+            if not fn.endswith(".php"):
+                continue
+            path = os.path.join(root, fn)
+            with open(path, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            m = attr_re.search(text)
+            if not m:
+                continue
+            level = int(m.group(1))
+            after = text[m.end() :]
+            cm = class_re.search(after)
+            cls = cm.group(1) if cm else fn[:-4]
+            rel = os.path.relpath(path, RULES_DIR)
+            parts = rel.split(os.sep)
+            if parts[0] == "Rules" and len(parts) >= 3:
+                cat = parts[1]
+            elif parts[0] == "Rules":
+                cat = "(misc)"
+            else:
+                cat = parts[0]
+            idents = sorted(set(ident_re.findall(text)).union(EXTRA_IDENTS.get(cls, [])))
+            src_path = "phpstan-src/" + os.path.relpath(path, SRC).replace(os.sep, "/")
+            data[level][cat].append((cls, src_path, idents))
+            total += 1
+    return data, total
+
+
+def scan_toggle_rules():
+    toggle = collections.defaultdict(list)
+    confdir = os.path.join(SRC, "conf")
+    for n in range(0, 11):
+        p = os.path.join(confdir, f"config.level{n}.neon")
+        if not os.path.exists(p):
             continue
-        level = int(m.group(1))
-        after = text[m.end():]
-        cm = class_re.search(after)
-        cls = cm.group(1) if cm else fn[:-4]
-        rel = os.path.relpath(path, RULES_DIR)
-        parts = rel.split(os.sep)
-        # category = dir under src/Rules, else the top dir
-        if parts[0] == "Rules" and len(parts) >= 3:
-            cat = parts[1]
-        elif parts[0] == "Rules":
-            cat = "(misc)"
-        else:
-            cat = parts[0]
-        idents = sorted(set(ident_re.findall(text)).union(EXTRA_IDENTS.get(cls, [])))
-        src_path = "phpstan-src/" + os.path.relpath(path, SRC).replace(os.sep, "/")
-        data[level][cat].append((cls, src_path, idents))
-        total += 1
+        with open(p, encoding="utf-8", errors="replace") as f:
+            txt = f.read()
+        for c in re.findall(r"class:\s*PHPStan\\Rules\\([A-Za-z\\]+)", txt):
+            toggle[n].append(c.split("\\")[-1])
+    return toggle
 
-# feature-toggle-gated rules from conf level files
-toggle = collections.defaultdict(list)  # level -> [class]
-confdir = os.path.join(SRC, "conf")
-for n in range(0, 11):
-    p = os.path.join(confdir, f"config.level{n}.neon")
-    if not os.path.exists(p): continue
-    txt = open(p).read()
-    for c in re.findall(r'class:\s*PHPStan\\Rules\\([A-Za-z\\]+)', txt):
-        short = c.split("\\")[-1]
-        toggle[n].append(short)
 
-level_theme = {
-0:"Basic existence + obvious mistakes (unknown classes/functions/methods on $this, wrong #args, always-undefined vars)",
-1:"Possibly-undefined variables; magic methods/properties via __call/__get",
-2:"Unknown methods on all expressions; PHPDoc validation",
-3:"Return types; property type assignments",
-4:"Basic dead code (always-false instanceof, dead else, unreachable, too-wide throws)",
-5:"Argument types passed to functions/methods; by-ref args",
-6:"Missing typehints (params/returns/properties/@var)",
-7:"Partial union types (members not supporting a call); reportMaybes",
-8:"Calling methods / accessing properties on nullable types",
-9:"Strict mixed (explicit mixed only assignable to mixed)",
-10:"Implicit mixed reported too (PHPStan 2.0)",
-}
-# Implemented phpstan rule classes (tick the checklist box on regeneration).
-DONE = {
-    # Cast
-    "UnsetCastRule", "VoidCastRule",
-    # Keywords
-    "ContinueBreakInLoopRule", "DeclareStrictTypesRule", "GotoUndefinedLabelRule", "UnusedLabelRule",
-    "RequireFileExistsRule",
-    # Arrays
-    "DuplicateKeysInLiteralArraysRule", "OffsetAccessWithoutDimForReadingRule",
-    # Operators
-    "InvalidAssignVarRule", "InvalidIncDecOperationRule", "BacktickRule",
-    # Functions
-    "RedefinedParametersRule", "InvalidParameterNameRule", "VariadicParametersDeclarationRule",
-    "InnerFunctionRule", "InvalidLexicalVariablesInClosureUseRule", "UnusedClosureUsesRule",
-    "CallToNonExistentFunctionRule", "PrintfParametersRule", "DefineParametersRule", "FunctionCallableRule",
-    # Classes
-    "InstantiationRule", "InstantiationCallableRule", "NewStaticRule", "ExistingClassInClassExtendsRule",
-    "ExistingClassesInClassImplementsRule", "ExistingClassesInInterfaceExtendsRule",
-    "ExistingClassInTraitUseRule", "ExistingClassInInstanceOfRule", "EnumSanityRule",
-    "DuplicateDeclarationRule", "DuplicateClassDeclarationRule", "NonClassAttributeClassRule",
-    "InvalidPromotedPropertiesRule", "AllowedSubTypesRule",
-    # Properties
-    "ReadOnlyPropertyRule", "PropertyInClassRule", "PropertiesInInterfaceRule", "PropertyHookAttributesRule",
-    "OverridingPropertyRule", "AccessPropertiesRule", "ReadOnlyPropertyAssignRule",
-    # Methods
-    "AbstractMethodInNonAbstractClassRule", "AbstractPrivateMethodRule", "FinalPrivateMethodRule",
-    "MethodVisibilityInInterfaceRule", "ConstructorReturnTypeRule", "MissingMethodImplementationRule",
-    "MissingMagicSerializationMethodsRule", "MethodAttributesRule", "OverridingMethodRule",
-    "CallMethodsRule", "CallStaticMethodsRule", "MissingMethodReturnTypehintRule",
-    "MissingMethodParameterTypehintRule", "MissingMethodSelfOutTypeRule",
-    "CallToMethodStatementWithNoDiscardRule",
-    "CallToStaticMethodStatementWithNoDiscardRule",
-    # Comparison (constant-condition + strict-comparison; type-map driven, level 4)
-    "IfConstantConditionRule", "ElseIfConstantConditionRule", "TernaryOperatorConstantConditionRule",
-    "WhileLoopAlwaysFalseConditionRule", "WhileLoopAlwaysTrueConditionRule", "DoWhileLoopConstantConditionRule",
-    "BooleanNotConstantConditionRule", "BooleanAndConstantConditionRule", "BooleanOrConstantConditionRule",
-    "LogicalXorConstantConditionRule", "StrictComparisonOfDifferentTypesRule",
-    # Comparison constant folding (Cap #2: php_infer::eval_const)
-    "ConstantLooseComparisonRule", "NumberComparisonOperatorsConstantConditionRule",
-    # Operators (invalid binary/unary/comparison; type-map driven, level 2)
-    "InvalidBinaryOperationRule", "InvalidUnaryOperationRule", "InvalidComparisonOperationRule",
-    # Cast (invalid cast + echo/print/encapsed non-string; type-map driven, level 2)
-    "InvalidCastRule", "EchoRule", "PrintRule", "InvalidPartOfEncapsedStringRule",
-    # PhpDoc (structural, via our own php_phpdoc parser, level 2)
-    "WrongVariableNameInVarTagRule", "InvalidPHPStanDocTagRule",
-    # PhpDoc validation tags (safe parser/type-relation subsets; no speculative class coverage)
-    "InvalidPhpDocTagValueRule", "FunctionAssertRule", "MethodAssertRule",
-    "FunctionConditionalReturnTypeRule", "MethodConditionalReturnTypeRule",
-    "IncompatibleSelfOutTypeRule",
-    # PhpDoc type-subtyping (Cap #3: resolve_doc_type + resolve_ast_type + is_assignable)
-    "IncompatiblePhpDocTypeRule",
-    # Functions (structural + missing-typehint)
-    "PrintfArrayParametersRule", "DuplicateFunctionDeclarationRule", "ReturnNullsafeByRefRule",
-    "ArrowFunctionReturnNullsafeByRefRule", "CallToFunctionStatementWithoutSideEffectsRule",
-    "UselessFunctionReturnValueRule", "CallToFunctionStatementWithNoDiscardRule",
-    "MissingFunctionReturnTypehintRule", "MissingFunctionParameterTypehintRule",
-    # Variables
-    "ThisInGlobalStatementRule", "ThisInStaticStatementRule", "InvalidVariableAssignRule", "VariableCloningRule",
-    "EmptyRule", "IssetRule", "NullCoalesceRule",
-    "UnsetRule",
-    # DeadCode
-    "UnreachableStatementRule", "UnusedPrivateMethodRule", "UnusedPrivateConstantRule",
-    "UnusedPrivatePropertyRule", "NoopRule",
-    # Attribute-usage family (Cap #7: attribute-target reflection -> attribute.usage rule)
-    "ClassAttributesRule", "ClassConstantAttributesRule", "EnumCaseAttributesRule",
-    "FunctionAttributesRule", "MethodAttributesRule", "ParamAttributesRule",
-    "PropertyAttributesRule", "TraitAttributesRule",
-    # Cap #4: typed builtin stubs + castable-to-string predicate
-    "ImplodeParameterCastableToStringRule",
-    "ParameterCastableToStringRule", "SortParameterCastableToStringRule",
-    "ParameterCastableToNumberRule", "ArrayValuesRule",
-    "IncompatibleDefaultParameterTypeRule", "FilterVarRule", "CallUserFuncRule",
-    "RandomIntParametersRule", "ArrayFilterRule",
-    # Cap #5: definedness lattice
-    "DefinedVariableRule",
-    # Cap #8: callable-type resolution
-    "PipeOperatorRule", "CallCallablesRule",
-    # Cap #6: by-ref / @param-out flow (parameter.notByRef is part of the
-    # already-ticked IncompatiblePhpDocTypeRule; the foreach rule is toggle-gated)
-    "AssignToByRefExprFromForeachRule",
-    # --- Parallel rule batch (member-existence + phpdoc-type + structural) ---
-    # Properties
-    "AccessPropertiesInAssignRule", "AccessStaticPropertiesRule", "NullsafePropertyFetchRule",
-    "ReadingWriteOnlyPropertiesRule", "WritingToReadOnlyPropertiesRule",
-    "AccessPrivatePropertyThroughStaticRule",
-    # Classes
-    "ClassConstantRule", "DuplicateTraitDeclarationRule", "ExistingClassesInEnumImplementsRule",
-    "TraitAttributeClassRule", "AccessPrivateConstantThroughStaticRule", "MixinRule",
-    "NewStaticInAbstractClassStaticMethodRule",
-    # PhpDoc
-    "IncompatiblePropertyPhpDocTypeRule", "IncompatibleClassConstantPhpDocTypeRule",
-    "InvalidThrowsPhpDocValueRule", "RequireExtendsDefinitionClassRule",
-    "RequireExtendsDefinitionTraitRule", "RequireImplementsDefinitionClassRule",
-    "RequireImplementsDefinitionTraitRule", "SealedDefinitionClassRule",
-    # Methods
-    "CallToConstructorStatementWithoutSideEffectsRule", "NullsafeMethodCallRule",
-    "CallPrivateMethodThroughStaticRule", "ConsistentConstructorDeclarationRule",
-    "ConsistentConstructorRule", "MethodCallWithPossiblyRenamedNamedArgumentRule",
-    # --- Second parallel batch (Constants/Arrays/Exceptions/Traits/Comparison/
-    #     DeadCode/Generators/TooWideTypehints/Variables) ---
-    # Constants
-    "ClassAsClassConstantRule", "FinalPrivateConstantRule", "MagicConstantContextRule",
-    "OverridingConstantRule", "DynamicClassConstantFetchRule", "ValueAssignedToClassConstantRule",
-    # Arrays
-    "IterableInForeachRule", "UnpackIterableInArrayRule", "ArrayDestructuringRule",
-    "InvalidKeyInArrayItemRule", "InvalidKeyInArrayDimFetchRule",
-    "ArrayUnpackingRule", "NonexistentOffsetInArrayDimFetchRule",
-    # Exceptions / Traits
-    "ThrowExprTypeRule", "CaughtExceptionExistenceRule", "OverwrittenExitPointByFinallyRule",
-    "ConflictingTraitConstantsRule", "NotAnalysedTraitRule",
-    # catch.alreadyCaught — structural dead-catch (earlier catch covers this one);
-    # the rule's other half (catch.neverThrown) needs throw-set analysis (deferred).
-    "CatchWithUnthrownExceptionRule",
-    # Version-gated (fire only when the project pins PHP < the feature version);
-    # silent at the default 8.4 target. NoncapturingCatch/ThrowExpression < 8.0.
-    "NoncapturingCatchRule", "ThrowExpressionRule",
-    # Names: UsedNamesRule — in-file duplicate class-like declarations + use aliases.
-    "UsedNamesRule",
-    # Methods: first-class-callable version gate (callable.notSupported, < 8.1); the
-    # existence half is the shared method.notFound/staticMethod.notFound rules.
-    "MethodCallableRule", "StaticMethodCallableRule",
-    # PhpDoc: @phpstan-sealed on a trait (sealed.onTrait) — placement check.
-    "SealedDefinitionTraitRule",
-    # Properties: @readonly (PHPDoc) property may not have a default value.
-    "ReadOnlyByPhpDocPropertyRule",
-    # Methods: discarded call to a @pure method (method/staticMethod.resultUnused),
-    # via the new `pure` flag on MethodReflection.
-    "CallToMethodStatementWithoutSideEffectsRule",
-    "CallToStaticMethodStatementWithoutSideEffectsRule",
-    # Constants: missingType.iterableValue for a native-typed bare-array class const.
-    "MissingClassConstantTypehintRule",
-    # Functions/Methods ReturnTypeRule (`return.type`) — return statements checked
-    # against the declared return via return_type.rs (functions + methods).
-    "ReturnTypeRule",
-    # Root-level DateTimeInstantiationRule: literal invalid DateTime strings.
-    "DateTimeInstantiationRule",
-    # Comparison / Generators
-    "MatchExpressionRule", "UsageOfVoidMatchExpressionRule", "YieldInGeneratorRule",
-    "YieldFromTypeRule", "YieldTypeRule",
-    # TooWideTypehints
-    "TooWideFunctionReturnTypehintRule", "TooWideMethodReturnTypehintRule",
-    "TooWideArrowFunctionReturnTypehintRule", "TooWideClosureReturnTypehintRule",
-    "TooWidePropertyTypeRule",
-    # Variables
-    "CompactVariablesRule", "ParameterOutAssignedTypeRule",
-    # --- "Easy/structural" batch ---
-    # Namespaces / Types / Missing / EnumCases / Whitespace / Regexp / Properties
-    "ExistingNamesInUseRule", "ExistingNamesInGroupUseRule",
-    "InvalidTypesInUnionRule", "MissingReturnRule",
-    "InvalidCallablePropertyTypeRule", "MissingPropertyTypehintRule",
-    "AccessStaticPropertiesInAssignRule",
-    "EnumCaseOutsideEnumRule", "FileWhitespaceRule", "RegularExpressionPatternRule",
-    "RegularExpressionQuotingRule", "IgnoreParseErrorRule",
-    # Covered with zero code by our consolidated unknown-symbol resolution, which
-    # already resolves class names in ALL typehint positions (params/returns/
-    # properties/closure/arrow) -> class.notFound. Verified.
-    "ExistingClassesInTypehintsRule", "ExistingClassesInPropertiesRule",
-    "ExistingClassesInClosureTypehintsRule", "ExistingClassesInArrowFunctionTypehintsRule",
-    "ExistingClassesInPropertyHookTypehintsRule", "ConstantRule", "CallToFunctionParametersRule",
-    # D1: impossible-check rules (narrowing + is_subclass_of; no new engine)
-    "ImpossibleInstanceOfRule", "ImpossibleCheckTypeFunctionCallRule",
-    # D7: small one-off deferrals (type-rules the earlier batch wrongly punted)
-    "TypesAssignedToPropertiesRule",
-    "DefaultValueTypesAssignedToPropertiesRule",
-    "GetNonVirtualPropertyHookReadRule", "SetNonVirtualPropertyHookAssignRule",
-    "ReadOnlyPropertyAssignRefRule", "PropertyAssignRefRule",
-    "ReadOnlyByPhpDocPropertyAssignRule", "ReadOnlyByPhpDocPropertyAssignRefRule",
-    "IncompatibleClosureDefaultParameterTypeRule", "IncompatibleArrowFunctionDefaultParameterTypeRule",
-    "ClosureAttributesRule", "ArrowFunctionAttributesRule",
-    # D8: version-gated rules, now implemented properly (gate on fa.php_version;
-    # fire only when the configured target is below the PHP feature version).
-    "FinalConstantRule", "NativeTypedClassConstantRule", "ConstantsInTraitsRule",
-    "ReadOnlyClassRule", "ConstantAttributesRule",
-    # D2: magic-tag validation (@mixin) — phpdoc.rs run_mixin
-    "MixinRule", "MixinTraitRule",
-    # Classes: local @phpstan-require-* enforcement for tags visible in the
-    # current file (full cross-file tag reflection remains a reflection deepening).
-    "RequireExtendsRule", "RequireImplementsRule",
-    # Pure: deterministic reflection checks for @pure declarations (by-ref
-    # params and pure-void signatures); body impure-point collection remains a
-    # future deepening but these branches match phpstan's FunctionPurityCheck.
-    "PureFunctionRule", "PureMethodRule",
-    # Exceptions: explicit @throws void contradicted by a direct throw point in
-    # the function/method body.
-    "ThrowsVoidFunctionWithExplicitThrowPointRule",
-    "ThrowsVoidMethodWithExplicitThrowPointRule",
-    # DeadCode: conservative same-file transitive purity for @pure function calls
-    # and @pure constructors discarded as statements.
-    "CallToFunctionStatementWithoutImpurePointsRule",
-    "CallToConstructorStatementWithoutImpurePointsRule",
-    # Generics: FP-safe structural template checks (existing class names,
-    # optional-template ordering, enum generic ban, method/@method shadowing).
-    # Bound/default subtype, type-alias, generic-arity, and variance branches
-    # need deeper PHPDoc/reflection metadata and remain deferred.
-    "ClassTemplateTypeRule", "InterfaceTemplateTypeRule", "TraitTemplateTypeRule",
-    "EnumTemplateTypeRule", "FunctionTemplateTypeRule", "MethodTemplateTypeRule",
-    "MethodTagTemplateTypeRule", "MethodTagTemplateTypeTraitRule",
-    # Class PHPDoc tags: safe missing-type / trait-target checks, class.notFound
-    # remains intentionally silent where stub coverage would risk FPs.
-    "MethodTagRule", "MethodTagTraitRule", "PropertyTagRule", "PropertyTagTraitRule",
-    "InvalidPhpDocVarTagTypeRule", "SetPropertyHookParameterRule",
-    # Parallel rule batch: conservative PHPStan-identical branches only.
-    "ClassAncestorsRule", "InterfaceAncestorsRule", "EnumAncestorsRule",
-    "ImpossibleCheckTypeMethodCallRule", "ImpossibleCheckTypeStaticMethodCallRule",
-    "IncompatibleParamImmediatelyInvokedCallableRule", "VarTagChangedExpressionTypeRule",
-    "UnusedConstructorParametersRule", "LocalTypeAliasesRule", "LocalTypeTraitAliasesRule",
-    "OffsetAccessAssignmentRule", "OffsetAccessValueAssignmentRule", "DeadForeachRule",
-    "MissingReadOnlyPropertyAssignRule", "MissingReadOnlyByPhpDocPropertyAssignRule",
-    # Batch 10: final stretch, safe subsets only.
-    "DeprecatedCastRule", "OffsetAccessAssignOpRule",
-    "LocalTypeTraitUseAliasesRule", "MethodTagTraitUseRule",
-    "PropertyTagTraitUseRule", "MixinTraitUseRule",
-    "FunctionSignatureVarianceRule", "MethodSignatureVarianceRule",
-    "PropertyVarianceRule", "UsedTraitsRule",
-    "ClosureReturnTypeRule", "ArrowFunctionReturnTypeRule",
-    "ParameterOutExecutionEndTypeRule",
-    "CallToMethodStatementWithoutImpurePointsRule",
-    "CallToStaticMethodStatementWithoutImpurePointsRule",
-    "TooWideFunctionParameterOutTypeRule", "TooWideMethodParameterOutTypeRule",
-}
-# Rules we can't implement yet, with the reason.
-_TYPES = "needs the type system (operand/value types)"
-_VGATE = "PHP-version gate: feature requires PHP < our 8.6 target, so the rule can never fire"
-DEFERRED = {
-    # This batch's deferrals (not capability gaps unless noted):
-    "EnumCaseAttributesRule": "thin wrapper over the shared attribute-target AttributesCheck; belongs with attribute rules",
-    # --- Capability: array shape / offset tracking + non-emptiness ---
-    # --- Capability: literal/value types ---
-    # --- Capability: type inference inside closures/arrow-fns ---
-    "ThrowsVoidPropertyHookWithExplicitThrowPointRule": "property hooks do not carry their own docblocks in our AST yet, so hook-level @throws void cannot be distinguished from property PHPDoc",
-}
-
-level_params = {
-0:[], 1:["checkMaybeUndefinedVariables","checkExtraArguments","reportMagicMethods","reportMagicProperties"],
-2:["checkClassCaseSensitivity","checkPhpDocMissingReturn"],
-3:["checkPhpDocMethodSignatures"],
-4:["checkAdvancedIsset"],
-5:["checkFunctionArgumentTypes","checkArgumentsPassedByReference"],
-6:["checkMissingVarTagTypehint","checkMissingTypehints"],
-7:["checkUnionTypes","reportMaybes"],
-8:["checkNullables"],
-9:["checkExplicitMixed"],
-10:["checkImplicitMixed"],
-}
-
-# Levels 7-10 are not rule classes but modes of RuleLevelHelper. These are the
-# concrete work items (checkbox title, description).
-strictness_items = {
-7:[
- ("Union-type member access (`checkUnionTypes`)",
-  "A method call / property access / array offset on a union must be valid for **all** members; report "
-  "when only some support it (partial union). Today `php_infer::is_assignable` accepts a union if any arm fits."),
- ("Report \"maybe\" mismatches (`reportMaybes`)",
-  "Report argument/return/offset mismatches that only *might* be wrong — consumed by ~10 existing rules "
-  "(e.g. `Functions/CallCallablesRule`, `Methods/MethodSignatureRule`, `Arrays/NonexistentOffsetInArrayDimFetchRule`)."),
-],
-8:[
- ("Nullable member access (`checkNullables`)",
-  "Calling a method / accessing a property / offset on a `T|null` is an error — don't silently strip null "
-  "first. (The classic \"Cannot call method X() on T|null\".)"),
-],
-9:[
- ("Strict explicit mixed (`checkExplicitMixed`)",
-  "A value declared `mixed` is only assignable to `mixed`; using it where a concrete type is required "
-  "(call/access/argument/return) is an error. Tightens `is_assignable(mixed, T)` from its lenient `true`."),
-],
-10:[
- ("Strict implicit mixed (`checkImplicitMixed`)",
-  "Same as level 9 but also for **implicit** mixed — values whose type we couldn't infer, not just those "
-  "declared `mixed`. (PHPStan 2.0; `max` = level 10.)"),
-],
-}
-
-STRICTNESS_DONE = {
-    "Union-type member access (`checkUnionTypes`)",
-    "Nullable member access (`checkNullables`)",
-}
+manifest_rules, manifest_options = load_analyzer_manifest()
+data, total = scan_phpstan_rules()
+toggle = scan_toggle_rules()
 
 out = []
 w = out.append
-w("# PHPStan rule catalog — Phase 1 backlog\n")
-w(f"> Generated from a checkout of **phpstan/phpstan-src @ 2.2.x** (`./phpstan-src`, gitignored).")
-w(f"> Source of truth: the `#[RegisteredRule(level: N)]` attribute on each rule class, plus the")
-w(f"> feature-toggle rules and parameters in `conf/config.level*.neon`. **{total} attribute-registered")
-w(f"> rules** across levels 0–9, plus per-level strictness toggles.\n")
-w("**How levels work:** cumulative — level N runs every rule at levels ≤ N. Levels 0–6 introduce")
-w("discrete rules; **levels 7–10 add almost no new rule classes** — they flip parameters")
-w("(`checkUnionTypes`, `checkNullables`, `checkExplicitMixed`, implicit-mixed) that make the existing")
-w("argument/method/property/return rules stricter. Replicating 7–10 means honoring those modes in our")
-w("assignability/inference layer, not writing new rules.\n")
-w("Each entry is a checkbox so this doubles as the implementation tracker. `id:` lists the phpstan")
-w("error identifier(s) the rule emits (literal ones; some are built dynamically).\n")
-w("### Already implemented in `php-analyzer`")
-w("- [x] **unknown-symbol** — `id:` `class.notFound`, `function.notFound`, `constant.notFound` (level 0; our single rule covers what phpstan spreads across many existence rules)")
-w("- [x] **return-type** — `id:` `return.type` (level ~3; flow-tracked return vs declared type)")
-w("- [x] **Cast/UnsetCastRule** — `id:` `cast.unset` (level 0)")
-w("- [x] **Cast/VoidCastRule** — `id:` `cast.void` (level 0)")
-w("- [x] **Keywords/ContinueBreakInLoopRule** — `id:` `continue.outOfLoop`, `break.outOfLoop` (level 0)")
-w("- [x] **Keywords/DeclareStrictTypesRule** — `id:` `declareStrictTypes.value`, `declareStrictTypes.notFirst` (level 0)")
-w("- [x] **Keywords/GotoUndefinedLabelRule** — `id:` `goto.labelUndefined` (level 0)")
-w("- [x] **Keywords/UnusedLabelRule** — `id:` `label.unused` (level 0)")
-w("- [x] **Arrays/DuplicateKeysInLiteralArraysRule** — `id:` `array.duplicateKey` (level 0)")
-w("- [x] **Arrays/OffsetAccessWithoutDimForReadingRule** — `id:` `offsetAccess.noDim` (level 0)")
-w("- [x] **Operators/InvalidAssignVarRule** — `id:` `assign.invalidExpr`, `nullsafe.assign`, `nullsafe.byRef` (level 0)")
-w("- [x] **Operators/InvalidIncDecOperationRule** — `id:` `pre/postInc/Dec.expr` (level 0; syntactic half — type half deferred)")
-w("- [x] **Operators/BacktickRule** — `id:` `backtick.deprecated` (level 0)")
-w("- [x] **Functions** — 10 rules: parameter.duplicate/name/variadicNotLast, function.inner/nameCase, closure.invalidUse/unusedUse, argument.printf/define, arguments.count (existence via unknown-symbol)")
-w("- [x] **Classes** — 13 rules: new.* (interface/trait/enum/abstract/static), class/interface extends + implements + traitUse kind checks, instanceof.trait, enum.* sanity, duplicate declaration/member, attribute.* target, property.invalidPromoted")
-w("- [x] **Properties** — 7 rules: readonly misuse, property-in-class/interface modifiers, hook attributes, override compatibility, $this->prop existence, readonly-assign-outside-ctor")
-w("- [x] **Methods** — 13 rules: abstract/final/visibility modifiers, constructor return/static, missing-impl, magic-serialization, attributes, override compatibility, method existence + arg-count, missing param/return typehints")
-w("- [x] **argument.type** (M-T8) — type-aware argument checks at call sites (functions + instance methods) via the per-file type map (`fa.type_of` + `is_assignable`); level 5")
+w("# PHPStan Rule Catalog\n")
+w(
+    "> Generated from `./phpstan-src` plus `cargo run -q -p xtask -- rule-manifest`. "
+    "The PHPStan catalog is scanned from source; analyzer coverage is owned by the Rust rule registry."
+)
 w("")
-w("### Prioritization note")
-w("Not every level-0 rule matters for a general analyzer. The **`Api`** category and a few")
-w("phpstan-internal rules (`NodeConnectingVisitorAttributesRule`, `OldPhpParser4ClassRule`,")
-w("`PhpStanNamespaceIn3rdPartyPackageRule`, `RuntimeReflection*`, `GetTemplateTypeRule`) police")
-w("**phpstan extension/plugin development**, not user PHP code — skip these. The")
-w("`InternalTag` restricted-usage extensions are niche. Focus first on the high-value categories:")
-w("`Functions`, `Methods`, `Classes`, `Variables`, `Properties`, `Comparison`, `DeadCode`.")
-w("")
+w("## Analyzer Manifest\n")
+w("These are the runtime rules currently registered by `php-analyzer`, grouped by activation level.\n")
+manifest_by_level = collections.defaultdict(list)
+for level, name in manifest_rules:
+    manifest_by_level[level].append(name)
+for level in sorted(manifest_by_level):
+    w(f"### Level {level}")
+    for name in manifest_by_level[level]:
+        w(f"- [x] `{name}`")
+    w("")
+
+w("## Analyzer Strictness Options\n")
+for level in range(7, 11):
+    w(f"### Level {level} — {LEVEL_THEME[level]}")
+    w(f"*PHPStan parameters:* `{'`, `'.join(LEVEL_PARAMS[level])}`\n")
+    for option, title, desc in STRICTNESS_ITEMS[level]:
+        box = "x" if option in manifest_options else " "
+        w(f"- [{box}] **{title}** (`{option}`) — {desc}")
+    w("")
+
 w("---\n")
+w("## PHPStan Catalog\n")
+w(
+    "The rows below are PHPStan's registered rule classes. They are not marked as analyzer-complete here; "
+    "that truth lives in the analyzer manifest above. PHPStan extension-development API rules are marked "
+    "as not applicable to user-code analysis."
+)
+w("")
 
 grand = 0
 for level in range(0, 10):
@@ -408,43 +220,38 @@ for level in range(0, 10):
     grand += n_rules
     if n_rules == 0 and not toggle.get(level):
         continue
-    w(f"## Level {level} — {level_theme[level]}")
-    if level_params.get(level):
-        w(f"*Enables parameters:* `{'`, `'.join(level_params[level])}`  ")
+    w(f"## Level {level} — {LEVEL_THEME[level]}")
+    if LEVEL_PARAMS.get(level):
+        w(f"*Enables parameters:* `{'`, `'.join(LEVEL_PARAMS[level])}`  ")
     w(f"*{n_rules} discrete rules.*\n")
     for cat in sorted(cats):
         w(f"### {cat}")
         for cls, src_path, idents in sorted(cats[cat]):
-            idtxt = f" — `id:` {', '.join('`'+i+'`' for i in idents)}" if idents else ""
-            box = "x" if cls in DONE or cls in NON_USER_CODE else " "
-            note = f" — _covered: phpstan extension-development API rule; not applicable to user-code analysis_" if cls in NON_USER_CODE else ""
-            if cls in DEFERRED:
-                note = f" — _deferred: {DEFERRED[cls]}_"
+            idtxt = f" — `id:` {', '.join('`' + i + '`' for i in idents)}" if idents else ""
+            box = "x" if cls in NON_USER_CODE else " "
+            note = (
+                " — _covered: phpstan extension-development API rule; not applicable to user-code analysis_"
+                if cls in NON_USER_CODE
+                else ""
+            )
             w(f"- [{box}] **{cls}** — `{src_path}`{idtxt}{note}")
         w("")
     if toggle.get(level):
-        w(f"*Feature-toggle-gated rules at this level (often bleeding-edge):* " +
-          ", ".join(sorted(set(toggle[level]))) + "\n")
+        w(
+            "*Feature-toggle-gated rules at this level:* "
+            + ", ".join(sorted(set(toggle[level])))
+            + "\n"
+        )
 
-w("## Levels 7–10 — strictness modes (RuleLevelHelper)\n")
-w("These add **no new rule classes**. They are flags on phpstan's central type-acceptance helper")
-w("`phpstan-src/src/Rules/RuleLevelHelper.php` (`findTypeToCheck`/`accepts`), which nearly every")
-w("type-aware rule calls. In our architecture they are **modes of `php_infer::is_assignable` plus the")
-w("member-access / argument rules** — `is_assignable` is currently lenient on nullables / unions / mixed,")
-w("and each level tightens one of those. Implement them as the corresponding lower-level rules land.\n")
-for level in range(7, 11):
-    w(f"### Level {level} — {level_theme[level]}")
-    w(f"*Enables parameters:* `{'`, `'.join(level_params[level])}` · *location:* `phpstan-src/src/Rules/RuleLevelHelper.php`\n")
-    for title, desc in strictness_items[level]:
-        box = "x" if title in STRICTNESS_DONE else " "
-        w(f"- [{box}] **{title}** — {desc}")
-    w("")
-strict_count = sum(len(v) for v in strictness_items.values())
+strict_count = sum(len(v) for v in STRICTNESS_ITEMS.values())
 w("---\n")
-w(f"**Totals:** {grand} discrete rules across levels 0–9, plus {strict_count} strictness-mode work "
-  f"items for levels 7–10 = **{grand + strict_count} checklist items**. "
-  f"Level breakdown: " + ", ".join(f"L{l}={sum(len(v) for v in data.get(l,{}).values())}" for l in range(0,10)) + ".")
+w(
+    f"**Totals:** {grand} discrete PHPStan rules across levels 0-9, plus {strict_count} "
+    f"strictness-mode work items for levels 7-10. Analyzer manifest entries: {len(manifest_rules)} "
+    f"rules and {len(manifest_options)} enabled strictness options."
+)
 
-open("/Users/ben/Projects/php-ast/docs/phpstan-rules.md","w").write("\n".join(out)+"\n")
-print(f"wrote docs/phpstan-rules.md — {total} rules")
-print("level counts:", {l: sum(len(v) for v in data.get(l,{}).values()) for l in range(0,10)})
+target = os.path.join(ROOT, "docs", "phpstan-rules.md")
+with open(target, "w", encoding="utf-8") as f:
+    f.write("\n".join(out) + "\n")
+print(f"wrote docs/phpstan-rules.md — {total} phpstan rules, {len(manifest_rules)} analyzer rules")

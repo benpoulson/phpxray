@@ -91,6 +91,41 @@ fn definitely_not_iterable(t: &Type) -> bool {
     }
 }
 
+fn definitely_iterable(t: &Type) -> bool {
+    match t {
+        Type::Array(_) | Type::List(_) | Type::Iterable(_) | Type::Shape { .. } => true,
+        Type::Named { fqn, .. } => {
+            fqn.eq_ignore_ascii_case("Generator")
+                || fqn.eq_ignore_ascii_case("Iterator")
+                || fqn.eq_ignore_ascii_case("Traversable")
+        }
+        Type::Union(parts) => !parts.is_empty() && parts.iter().all(definitely_iterable),
+        Type::Nullable(inner) => definitely_iterable(inner),
+        _ => false,
+    }
+}
+
+fn maybe_iterable(t: &Type) -> bool {
+    let Type::Union(parts) = t else {
+        return false;
+    };
+    if parts.is_empty() {
+        return false;
+    }
+    let mut yes = false;
+    let mut no = false;
+    for part in parts {
+        if definitely_iterable(part) {
+            yes = true;
+        } else if definitely_not_iterable(part) {
+            no = true;
+        } else {
+            return false;
+        }
+    }
+    yes && no
+}
+
 // ---------------------------------------------------------------------------
 // Finding the yields that belong to a given scope
 // ---------------------------------------------------------------------------
@@ -289,7 +324,7 @@ fn function_decl_return_type(fd: &FunctionDecl, fa: &FileAnalysis, scope: &Scope
 }
 
 fn doc_has_return(doc: Option<&str>) -> bool {
-    doc.is_some_and(|d| d.contains("@return") || d.contains("-return"))
+    php_phpdoc::query::has_return_conservative(doc)
 }
 
 // ---------------------------------------------------------------------------
@@ -365,6 +400,28 @@ fn run_yield_from_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
         };
         let t = fa.type_of(inner);
         if definitely_not_iterable(&t) {
+            out.push(
+                Diagnostic::error(
+                    inner.span,
+                    format!(
+                        "Argument of an invalid type {t} passed to yield from, only iterables are supported."
+                    ),
+                )
+                .with_code("generator.nonIterable"),
+            );
+        }
+    });
+    out
+}
+
+fn run_yield_from_maybe_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::YieldFrom(inner) = &e.kind else {
+            return;
+        };
+        let t = fa.type_of(inner);
+        if maybe_iterable(&t) {
             out.push(
                 Diagnostic::error(
                     inner.span,
@@ -682,7 +739,6 @@ fn collect_void_yield_uses_stmt(st: &Stmt, out: &mut Vec<Diagnostic>) {
         | StmtKind::InlineHtml(_)
         | StmtKind::Nop
         | StmtKind::Error => {}
-        _ => {}
     }
 }
 
@@ -817,7 +873,6 @@ fn collect_void_yield_uses_expr(e: &Expr, consumed: bool, out: &mut Vec<Diagnost
         ExprKind::Isset(es) => es
             .iter()
             .for_each(|e| collect_void_yield_uses_expr(e, true, out)),
-        _ => {}
     }
 }
 
@@ -855,6 +910,11 @@ pub(crate) static RULES: &[RuleEntry] = &[
         name: "generators.yieldFromType",
         level: 3,
         run: run_yield_from_type,
+    },
+    RuleEntry {
+        name: "generators.yieldFromMaybeType",
+        level: 7,
+        run: run_yield_from_maybe_type,
     },
     RuleEntry {
         name: "generators.yieldType",
@@ -988,6 +1048,26 @@ mod tests {
     fn yield_from_typed_int_param_is_flagged() {
         let src = "<?php function g(int $n): Generator { yield from $n; }";
         assert_eq!(codes(src, run_yield_from_type), ["generator.nonIterable"]);
+    }
+
+    #[test]
+    fn yield_from_array_or_int_param_is_maybe_non_iterable() {
+        let src = r#"<?php
+            /** @param array<int>|int $x */
+            function g($x): Generator { yield from $x; }"#;
+        assert!(codes(src, run_yield_from_type).is_empty());
+        assert_eq!(
+            codes(src, run_yield_from_maybe_type),
+            ["generator.nonIterable"]
+        );
+    }
+
+    #[test]
+    fn yield_from_array_or_unknown_object_is_not_reported_as_safe_maybe() {
+        let src = r#"<?php
+            /** @param array<int>|\ArrayObject $x */
+            function g($x): Generator { yield from $x; }"#;
+        assert!(codes(src, run_yield_from_maybe_type).is_empty());
     }
 
     #[test]

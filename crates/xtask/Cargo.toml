@@ -25,4 +25,7 @@ php-reflect.workspace = true
 php-types.workspace = true
 php-infer.workspace = true
 php-rules.workspace = true
+php-cli.workspace = true
+php-config.workspace = true
+rayon.workspace = true
 walkdir.workspace = true

@@ -48,7 +48,7 @@
 //!   cross-file purity cases for the `CallTo*StatementWithoutImpurePointsRule`
 //!   family.
 
-use crate::{walk, FileAnalysis, RuleEntry};
+use crate::{symbols, walk, FileAnalysis, RuleEntry};
 use php_ast::{
     BinOp, ClassDecl, ClassKind, Expr, ExprKind, FunctionDecl, Member, MemberName, MethodDecl,
     Stmt, StmtKind, Visibility,
@@ -915,61 +915,14 @@ fn callable_signature_disqualifies(
 }
 
 fn doc_has_throw_or_assert(doc: Option<&str>) -> bool {
-    let Some(doc) = doc else { return false };
-    php_phpdoc::parse_block(doc).tags.iter().any(|tag| {
-        tag_name_is_throw_or_assert(&tag.name)
-            || tag
-                .value
-                .split('@')
-                .skip(1)
-                .any(tag_value_starts_throw_or_assert)
-    })
-}
-
-fn doc_is_explicit_impure(doc: Option<&str>) -> bool {
-    let Some(doc) = doc else { return false };
-    php_phpdoc::parse_block(doc).tags.iter().any(|tag| {
-        tag_is_base(&tag.name, "impure")
-            || tag
-                .value
-                .split('@')
-                .skip(1)
-                .any(|value| tag_value_starts_with_base(value, "impure"))
-    })
-}
-
-fn tag_is_base(tag: &str, expected: &str) -> bool {
-    tag.strip_prefix("phpstan-")
-        .or_else(|| tag.strip_prefix("psalm-"))
-        .unwrap_or(tag)
-        == expected
-}
-
-fn tag_value_starts_with_base(value: &str, expected: &str) -> bool {
-    let tag = value
-        .char_indices()
-        .find(|(_, ch)| !(ch.is_ascii_alphanumeric() || *ch == '-'))
-        .map(|(i, _)| &value[..i])
-        .unwrap_or(value);
-    !tag.is_empty() && tag_is_base(tag, expected)
-}
-
-fn tag_name_is_throw_or_assert(name: &str) -> bool {
-    matches!(
-        name.strip_prefix("phpstan-")
-            .or_else(|| name.strip_prefix("psalm-"))
-            .unwrap_or(name),
-        "throws" | "assert" | "assert-if-true" | "assert-if-false"
+    php_phpdoc::query::has_base_tag(
+        doc,
+        &["throws", "assert", "assert-if-true", "assert-if-false"],
     )
 }
 
-fn tag_value_starts_throw_or_assert(value: &str) -> bool {
-    let tag = value
-        .char_indices()
-        .find(|(_, ch)| !(ch.is_ascii_alphanumeric() || *ch == '-'))
-        .map(|(i, _)| &value[..i])
-        .unwrap_or(value);
-    !tag.is_empty() && tag_name_is_throw_or_assert(tag)
+fn doc_is_explicit_impure(doc: Option<&str>) -> bool {
+    php_phpdoc::query::has_base_tag(doc, &["impure"])
 }
 
 #[derive(Clone, Copy)]
@@ -1126,7 +1079,7 @@ fn exact_method_call_key(
     if found.member.magic || found.member.is_static {
         return None;
     }
-    if !same_fqn(&found.declaring_class, &receiver_fqn) {
+    if !symbols::same_fqn(&found.declaring_class, &receiver_fqn) {
         return None;
     }
     if !instance_dispatch_is_exact(fa, &receiver_fqn, &found) {
@@ -1156,7 +1109,7 @@ fn exact_static_method_call_key(
     if found.member.magic || !found.member.is_static {
         return None;
     }
-    if !same_fqn(&found.declaring_class, &class_fqn) {
+    if !symbols::same_fqn(&found.declaring_class, &class_fqn) {
         return None;
     }
     Some(method_callable_key(
@@ -1191,11 +1144,6 @@ fn named_type_fqn(t: &Type) -> Option<String> {
         Type::Nullable(inner) => named_type_fqn(inner),
         _ => None,
     }
-}
-
-fn same_fqn(a: &str, b: &str) -> bool {
-    a.trim_start_matches('\\')
-        .eq_ignore_ascii_case(b.trim_start_matches('\\'))
 }
 
 fn function_call_key(scope: &Scope, callee: &Expr) -> Option<CallableKey> {

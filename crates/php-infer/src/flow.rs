@@ -11,7 +11,10 @@
 //! value. This is the approximation phpstan-style linters use; it is sound enough
 //! to drive diagnostics and never panics.
 
-use crate::TypeCtx;
+use crate::{
+    refine::{strip_false, strip_falsy, strip_null_strict},
+    TypeCtx,
+};
 use php_ast::{BinOp, Expr, ExprKind, FunctionDecl, Stmt, StmtKind, UnOp};
 use php_types::Type;
 use std::collections::HashMap;
@@ -176,7 +179,7 @@ impl TypeCtx<'_> {
                                 }
                             } else if fname == "is_null" {
                                 // `!is_null($x)` ⇒ null stripped from $x's type.
-                                out.push((place, strip_null(&self.infer(&arg0.value))));
+                                out.push((place, strip_null_strict(&self.infer(&arg0.value))));
                             } else if let Some(t) = predicate_type(&fname) {
                                 // `!is_string($x)` etc. ⇒ drop the union members of
                                 // that kind (`string|array` → `array`). Only narrows a
@@ -251,7 +254,7 @@ impl TypeCtx<'_> {
         };
         let t = match (lit, eq) {
             (Type::Null, true) => Type::Null,
-            (Type::Null, false) => strip_null(&self.infer(operand)),
+            (Type::Null, false) => strip_null_strict(&self.infer(operand)),
             (Type::False, true) => Type::False,
             (Type::False, false) => strip_false(&self.infer(operand)),
             _ => return,
@@ -602,7 +605,7 @@ impl TypeCtx<'_> {
                 // condition expression; check it before `update` advances the loop var.
                 let definite = cond
                     .last()
-                    .is_some_and(|c| self.static_truth(c) == Some(true));
+                    .is_some_and(|c| crate::returns::static_truth(self, c) == Some(true));
                 for e in cond.iter().chain(update) {
                     self.rec_here(e, map);
                     self.apply_expr(e);
@@ -784,7 +787,7 @@ impl TypeCtx<'_> {
     ) {
         self.rec_here(subject, map);
         let subj_ty = self.apply_expr(subject);
-        let (k, v) = iter_kv(&subj_ty);
+        let (k, v) = crate::arrays::iter_key_value(&subj_ty);
         self.widen_loop_assignments(body);
         let base = self.vars.clone();
         if let Some(key) = key {
@@ -826,64 +829,6 @@ fn narrow_to(cur: &Type, t: &Type, index: &php_reflect::ReflectionIndex) -> Type
         _ if crate::is_assignable(index, t, cur) => t.clone(),
         _ if crate::is_assignable(index, cur, t) => cur.clone(),
         _ => t.clone(),
-    }
-}
-
-/// Remove `null` from a type. `?T` → `T`; a union drops its `null` arm; a bare
-/// `null` becomes `never` (the branch is unreachable).
-fn strip_null(t: &Type) -> Type {
-    match t {
-        Type::Nullable(inner) => (**inner).clone(),
-        Type::Null => Type::Never,
-        Type::Union(parts) => {
-            let kept: Vec<Type> = parts
-                .iter()
-                .filter(|p| !matches!(p, Type::Null))
-                .cloned()
-                .collect();
-            Type::union(kept)
-        }
-        other => other.clone(),
-    }
-}
-
-/// Remove the always-falsy members (`null`, `false`) from a type — the refinement
-/// a truthy `if ($x)` guarantees. `string|false` → `string`, `?T` → `T`,
-/// `bool` → `true`. Conservative: other types keep their value (a truthy `int`
-/// is still `int`; we don't introduce non-zero-int types).
-fn strip_falsy(t: &Type) -> Type {
-    match t {
-        Type::Nullable(inner) => strip_falsy(inner),
-        Type::Null | Type::False => Type::Never,
-        Type::Bool => Type::True,
-        Type::Union(parts) => {
-            let kept: Vec<Type> = parts
-                .iter()
-                .filter(|p| !matches!(p, Type::Null | Type::False))
-                .cloned()
-                .collect();
-            Type::union(kept)
-        }
-        other => other.clone(),
-    }
-}
-
-/// Remove `false` from a type (a `$x !== false` guard). `bool` → `true`; a union
-/// drops its `false` arm; bare `false` → `never`. `null` is preserved.
-fn strip_false(t: &Type) -> Type {
-    match t {
-        Type::False => Type::Never,
-        Type::Bool => Type::True,
-        Type::Union(parts) => {
-            let kept: Vec<Type> = parts
-                .iter()
-                .filter(|p| !matches!(p, Type::False))
-                .cloned()
-                .collect();
-            Type::union(kept)
-        }
-        Type::Nullable(inner) => Type::Nullable(Box::new(strip_false(inner))),
-        other => other.clone(),
     }
 }
 
@@ -1026,15 +971,6 @@ fn always_terminates(s: &Stmt) -> bool {
                 && always_terminates(els)
         }
         _ => false,
-    }
-}
-
-/// The (key, value) element types yielded when iterating a type.
-fn iter_kv(t: &Type) -> (Type, Type) {
-    match t {
-        Type::Array(Some(kv)) | Type::Iterable(Some(kv)) => (kv.0.clone(), kv.1.clone()),
-        Type::List(v) => (Type::Int, (**v).clone()),
-        _ => (Type::Mixed, Type::Mixed),
     }
 }
 

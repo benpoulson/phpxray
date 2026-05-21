@@ -15,52 +15,7 @@ use php_infer::TypeMap;
 use php_intern::Interner;
 use php_reflect::ReflectionIndex;
 use php_resolve::ResolvedRef;
-use php_types::Type;
-
-/// The target PHP version of the analyzed project, as a phpstan-style version id
-/// (`8.4` → `80400`). Rules whose applicability depends on a language version
-/// gate on this (the analogue of phpstan's `PhpVersion` dependency), e.g.
-/// `#[\Override]` on properties exists only in PHP ≥ 8.5.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PhpVersion(u32);
-
-impl PhpVersion {
-    /// Build from a `major.minor[.patch]` string (e.g. `"8.4"`, `"8.4.1"`) or a
-    /// raw version id (`"80400"`). Returns `None` if it can't be parsed.
-    pub fn parse(s: &str) -> Option<PhpVersion> {
-        let s = s.trim();
-        // Raw version id form (e.g. "80400").
-        if let Ok(id) = s.parse::<u32>() {
-            if id >= 10_000 {
-                return Some(PhpVersion(id));
-            }
-        }
-        let mut parts = s.split('.');
-        let major: u32 = parts.next()?.trim().parse().ok()?;
-        let minor: u32 = parts.next().map_or(Ok(0), |p| p.trim().parse()).ok()?;
-        let patch: u32 = parts.next().map_or(Ok(0), |p| p.trim().parse()).ok()?;
-        Some(PhpVersion(major * 10_000 + minor * 100 + patch))
-    }
-
-    /// The phpstan-style numeric version id.
-    pub fn id(self) -> u32 {
-        self.0
-    }
-
-    /// Whether this version is at least `id` (a raw version id, e.g. `80500`).
-    pub fn at_least(self, id: u32) -> bool {
-        self.0 >= id
-    }
-}
-
-impl Default for PhpVersion {
-    /// When the project doesn't pin a `phpVersion`, assume a current-stable PHP
-    /// (8.4). This keeps 8.5-only checks (e.g. property `#[\Override]`) off unless
-    /// the project opts in — matching how most real projects are analyzed.
-    fn default() -> Self {
-        PhpVersion(80400)
-    }
-}
+use php_types::{PhpVersion, Type};
 
 /// The read-only inputs a rule reads about one file. The shared project/reflection
 /// indexes are borrowed (built once for the whole run).
@@ -152,7 +107,7 @@ impl FileAnalysis<'_> {
     /// inherit the member, so reporting it absent would be a false positive.
     pub fn class_fully_known(&self, fqn: &str) -> bool {
         fn known(fa: &FileAnalysis, fqn: &str, seen: &mut Vec<String>) -> bool {
-            let key = fqn.trim_start_matches('\\').to_ascii_lowercase();
+            let key = php_resolve::SymbolKey::class_like(fqn).into_string();
             if seen.contains(&key) {
                 return true;
             }
@@ -182,6 +137,30 @@ pub struct RuleEntry {
     pub level: u8,
     /// The check — pure over [`FileAnalysis`].
     pub run: fn(&FileAnalysis) -> Vec<Diagnostic>,
+}
+
+/// Machine-readable rule metadata exported for docs/tooling. Keep this as a
+/// pure projection of the runtime registry so generated catalogs don't grow a
+/// second source of truth for analyzer coverage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuleManifestEntry {
+    pub name: &'static str,
+    pub level: u8,
+}
+
+/// Return the analyzer's registered rule manifest, sorted for stable generated
+/// output.
+pub fn rule_manifest() -> Vec<RuleManifestEntry> {
+    let mut out: Vec<_> = crate::rules::CATEGORY_RULES
+        .iter()
+        .flat_map(|cat| cat.iter())
+        .map(|r| RuleManifestEntry {
+            name: r.name,
+            level: r.level,
+        })
+        .collect();
+    out.sort_by(|a, b| a.level.cmp(&b.level).then(a.name.cmp(b.name)));
+    out
 }
 
 /// The rules active at `level` (cumulative: every rule with `rule.level <= level`),
@@ -227,6 +206,25 @@ mod tests {
         // Cumulative: higher levels include everything from lower ones.
         assert!(names_at(9).len() >= names_at(3).len());
         assert!(names_at(3).len() > l0.len());
+    }
+
+    #[test]
+    fn manifest_is_sorted_projection_of_registry() {
+        let manifest = rule_manifest();
+        assert!(!manifest.is_empty());
+        assert!(manifest
+            .windows(2)
+            .all(|w| (w[0].level, w[0].name) <= (w[1].level, w[1].name)));
+        let manifest_names: Vec<_> = manifest.iter().map(|r| r.name).collect();
+        let mut registry_names: Vec<_> = crate::rules::CATEGORY_RULES
+            .iter()
+            .flat_map(|cat| cat.iter())
+            .map(|r| r.name)
+            .collect();
+        registry_names.sort();
+        let mut sorted_manifest_names = manifest_names;
+        sorted_manifest_names.sort();
+        assert_eq!(sorted_manifest_names, registry_names);
     }
 
     #[test]

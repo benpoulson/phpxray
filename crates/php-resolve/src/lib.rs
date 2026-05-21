@@ -18,9 +18,11 @@ use php_ast::{Name, NameFq};
 mod diagnostics;
 mod index;
 mod references;
+pub mod symbols;
 pub use diagnostics::diagnostics;
 pub use index::{for_each_region, index_file, ClassSymbol, ConstSymbol, FileIndex, FunctionSymbol};
 pub use references::{resolve_references, RefKind, ResolvedRef};
+pub use symbols::{display_fqn, strip_leading_slash, SymbolKey, SymbolKind, SymbolOrigin};
 
 /// What a name resolves to in a given [`Scope`].
 #[derive(Debug, Clone, PartialEq, Eq)]

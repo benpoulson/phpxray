@@ -65,14 +65,12 @@
 
 use crate::{walk, FileAnalysis, RuleEntry};
 use php_ast::{
-    ClassDecl, ClassKind, Expr, ExprKind, Member, Name, NameFq, Param, PropertyDecl, PropertyHook,
-    Stmt, StmtKind,
+    ClassDecl, ClassKind, Expr, ExprKind, Member, Param, PropertyDecl, PropertyHook, Stmt, StmtKind,
 };
 use php_diagnostics::Diagnostic;
 use php_intern::Interner;
-use php_phpdoc::DocType;
 use php_reflect::{resolve_ast_type, resolve_doc_type};
-use php_resolve::{for_each_region, Resolution, Scope};
+use php_resolve::{for_each_region, Scope};
 use php_span::Span;
 use php_types::Type;
 use std::collections::HashMap;
@@ -1163,26 +1161,14 @@ fn definite_supertype_relation(fa: &FileAnalysis, value: &Type, target: &Type) -
     use Type::*;
     match (value, target) {
         (
-            Mixed
-                | ExplicitMixed
-                | Unknown(_)
-                | TemplateVar(_)
-                | Object
-                | Resource
-                | Callable(_)
-                | ClassString(_),
+            Mixed | ExplicitMixed | Unknown(_) | TemplateVar(_) | Object | Resource | Callable(_)
+            | ClassString(_),
             _,
         )
         | (
             _,
-            Mixed
-                | ExplicitMixed
-                | Unknown(_)
-                | TemplateVar(_)
-                | Object
-                | Resource
-                | Callable(_)
-                | ClassString(_),
+            Mixed | ExplicitMixed | Unknown(_) | TemplateVar(_) | Object | Resource | Callable(_)
+            | ClassString(_),
         ) => None,
         (SelfType | StaticType | Parent, _) | (_, SelfType | StaticType | Parent) => None,
         (Never, _) => Some(true),
@@ -1574,7 +1560,8 @@ fn check_hook_incompat(
         let (Some(pname), Some(doc_ty)) = (&p.name, &p.ty) else {
             continue;
         };
-        let Some(native_t) = hook_param_native_type(fa, scope, hook, hook_name, pname, property_native)
+        let Some(native_t) =
+            hook_param_native_type(fa, scope, hook, hook_name, pname, property_native)
         else {
             out.push(
                 Diagnostic::error(
@@ -2034,238 +2021,45 @@ fn check_var_tag_missing_types(
             None => "PHPDoc tag @var".to_string(),
         };
 
-        if let Some(word) = missing_iterable_word_doc(&ty) {
-            out.push(
-                Diagnostic::error(
-                    span,
-                    format!("{ident} has no value type specified in iterable type {word}."),
-                )
-                .with_code("missingType.iterableValue"),
-            );
-        }
-
-        for (name, generics) in missing_generic_doc(fa, scope, env, &ty) {
-            out.push(
-                Diagnostic::error(
-                    span,
-                    format!("{ident} contains generic {name} but does not specify its types: {generics}"),
-                )
-                .with_code("missingType.generics"),
-            );
-        }
-
-        if missing_callable_signature_doc(&ty) {
-            out.push(
-                Diagnostic::error(
-                    span,
-                    format!("{ident} has no signature specified for callable."),
-                )
-                .with_code("missingType.callable"),
-            );
-        }
-    }
-}
-
-fn missing_iterable_word_doc(t: &DocType) -> Option<&'static str> {
-    match t {
-        DocType::Named(n) if n.eq_ignore_ascii_case("array") => Some("array"),
-        DocType::Named(n) if n.eq_ignore_ascii_case("iterable") => Some("iterable"),
-        DocType::Nullable(inner) | DocType::Array(inner) => missing_iterable_word_doc(inner),
-        DocType::Union(parts) | DocType::Intersection(parts) => {
-            parts.iter().find_map(missing_iterable_word_doc)
-        }
-        DocType::Generic { args, .. } => args.iter().find_map(missing_iterable_word_doc),
-        DocType::Shape { fields, .. } => {
-            fields.iter().find_map(|f| missing_iterable_word_doc(&f.ty))
-        }
-        DocType::Callable { params, ret, .. } => params
-            .iter()
-            .find_map(missing_iterable_word_doc)
-            .or_else(|| ret.as_deref().and_then(missing_iterable_word_doc)),
-        DocType::Conditional {
-            target, then, els, ..
-        } => missing_iterable_word_doc(target)
-            .or_else(|| missing_iterable_word_doc(then))
-            .or_else(|| missing_iterable_word_doc(els)),
-        _ => None,
-    }
-}
-
-fn missing_generic_doc(
-    fa: &FileAnalysis,
-    scope: &Scope,
-    env: &TemplateEnv,
-    t: &DocType,
-) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    collect_missing_generic_doc(fa, scope, env, t, &mut out);
-    out
-}
-
-fn collect_missing_generic_doc(
-    fa: &FileAnalysis,
-    scope: &Scope,
-    env: &TemplateEnv,
-    t: &DocType,
-    out: &mut Vec<(String, String)>,
-) {
-    match t {
-        DocType::Named(n) => {
-            if let Some((name, templates)) = generic_class_without_args(fa, scope, env, n) {
-                out.push((name, templates));
+        let ctx = crate::missing_type::DocGenericContext {
+            reflection: fa.reflection,
+            scope,
+            class_fqn: env.class_fqn.as_deref(),
+            current_class_templates: &env.class_templates,
+            excluded_templates: &env.all,
+            skip_traits: true,
+        };
+        for issue in crate::missing_type::check_doc_type(ctx, &ty) {
+            match issue {
+                crate::missing_type::MissingTypeIssue::IterableValue { word } => {
+                    out.push(
+                        Diagnostic::error(
+                            span,
+                            format!("{ident} has no value type specified in iterable type {word}."),
+                        )
+                        .with_code("missingType.iterableValue"),
+                    );
+                }
+                crate::missing_type::MissingTypeIssue::GenericArgs { name, templates } => {
+                    out.push(
+                        Diagnostic::error(
+                            span,
+                            format!("{ident} contains generic {name} but does not specify its types: {templates}"),
+                        )
+                        .with_code("missingType.generics"),
+                    );
+                }
+                crate::missing_type::MissingTypeIssue::CallableSignature => {
+                    out.push(
+                        Diagnostic::error(
+                            span,
+                            format!("{ident} has no signature specified for callable."),
+                        )
+                        .with_code("missingType.callable"),
+                    );
+                }
             }
         }
-        DocType::Generic { args, .. } => {
-            for arg in args {
-                collect_missing_generic_doc(fa, scope, env, arg, out);
-            }
-        }
-        DocType::Nullable(inner) | DocType::Array(inner) => {
-            collect_missing_generic_doc(fa, scope, env, inner, out);
-        }
-        DocType::Union(parts) | DocType::Intersection(parts) => {
-            for p in parts {
-                collect_missing_generic_doc(fa, scope, env, p, out);
-            }
-        }
-        DocType::Shape { fields, .. } => {
-            for f in fields {
-                collect_missing_generic_doc(fa, scope, env, &f.ty, out);
-            }
-        }
-        DocType::Callable { params, ret, .. } => {
-            for p in params {
-                collect_missing_generic_doc(fa, scope, env, p, out);
-            }
-            if let Some(ret) = ret {
-                collect_missing_generic_doc(fa, scope, env, ret, out);
-            }
-        }
-        DocType::Conditional {
-            target, then, els, ..
-        } => {
-            for p in [target.as_ref(), then.as_ref(), els.as_ref()] {
-                collect_missing_generic_doc(fa, scope, env, p, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn generic_class_without_args(
-    fa: &FileAnalysis,
-    scope: &Scope,
-    env: &TemplateEnv,
-    name: &str,
-) -> Option<(String, String)> {
-    if is_doc_keyword(name) || env.all.iter().any(|t| t == name) {
-        return None;
-    }
-
-    let fqn = match name.to_ascii_lowercase().as_str() {
-        "self" | "static" | "$this" => env.class_fqn.clone()?,
-        _ => match scope.resolve_class(&name_from_doc(name)) {
-            Resolution::Fqn(fqn) => fqn,
-            Resolution::Fallback { namespaced, .. } => namespaced,
-            _ => return None,
-        },
-    };
-
-    let class_ref = fa.reflection.class(&fqn)?;
-    if class_ref.kind == ClassKind::Trait {
-        return None;
-    }
-
-    let templates = if env
-        .class_fqn
-        .as_deref()
-        .is_some_and(|current| fqn.trim_start_matches('\\').eq_ignore_ascii_case(current))
-    {
-        env.class_templates.clone()
-    } else {
-        class_ref.templates.clone()
-    };
-    if templates.is_empty() {
-        return None;
-    }
-
-    Some((
-        class_ref.fqn.trim_start_matches('\\').to_string(),
-        templates.join(", "),
-    ))
-}
-
-fn name_from_doc(text: &str) -> Name {
-    let fq = if text.starts_with("namespace\\") {
-        NameFq::Relative
-    } else if text.starts_with('\\') {
-        NameFq::Fq
-    } else {
-        NameFq::NotFq
-    };
-    Name {
-        span: Span::new(0, 0),
-        fq,
-        text: text.to_string(),
-    }
-}
-
-fn is_doc_keyword(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "array"
-            | "iterable"
-            | "callable"
-            | "int"
-            | "integer"
-            | "float"
-            | "double"
-            | "string"
-            | "bool"
-            | "boolean"
-            | "void"
-            | "never"
-            | "mixed"
-            | "object"
-            | "resource"
-            | "null"
-            | "true"
-            | "false"
-            | "scalar"
-            | "array-key"
-            | "list"
-            | "non-empty-array"
-            | "non-empty-list"
-            | "class-string"
-            | "interface-string"
-            | "trait-string"
-            | "enum-string"
-    )
-}
-
-fn missing_callable_signature_doc(t: &DocType) -> bool {
-    match t {
-        DocType::Named(n) => n.eq_ignore_ascii_case("callable"),
-        DocType::Nullable(inner) | DocType::Array(inner) => missing_callable_signature_doc(inner),
-        DocType::Union(parts) | DocType::Intersection(parts) => {
-            parts.iter().any(missing_callable_signature_doc)
-        }
-        DocType::Generic { args, .. } => args.iter().any(missing_callable_signature_doc),
-        DocType::Shape { fields, .. } => {
-            fields.iter().any(|f| missing_callable_signature_doc(&f.ty))
-        }
-        DocType::Callable { params, ret, .. } => {
-            params.iter().any(missing_callable_signature_doc)
-                || ret.as_deref().is_some_and(missing_callable_signature_doc)
-        }
-        DocType::Conditional {
-            target, then, els, ..
-        } => {
-            missing_callable_signature_doc(target)
-                || missing_callable_signature_doc(then)
-                || missing_callable_signature_doc(els)
-        }
-        _ => false,
     }
 }
 
@@ -2996,13 +2790,13 @@ fn collect_object_class_names(t: &Type, out: &mut Vec<String>) {
 /// Split a doc tag name into its base and an optional `phpstan`/`psalm` prefix.
 /// `"phpstan-param"` -> `("param", Some("phpstan"))`; `"param"` -> `("param", None)`.
 fn strip_doc_prefix(name: &str) -> (&str, Option<&str>) {
-    if let Some(rest) = name.strip_prefix("phpstan-") {
-        (rest, Some("phpstan"))
-    } else if let Some(rest) = name.strip_prefix("psalm-") {
-        (rest, Some("psalm"))
-    } else {
-        (name, None)
-    }
+    let (base, prefix) = php_phpdoc::query::split_prefix(name);
+    let prefix = match prefix {
+        Some(php_phpdoc::query::TagPrefix::PhpStan) => Some("phpstan"),
+        Some(php_phpdoc::query::TagPrefix::Psalm) => Some("psalm"),
+        None => None,
+    };
+    (base, prefix)
 }
 
 // --- @mixin validation (MixinRule / MixinTraitRule / MixinTraitUseRule) -----

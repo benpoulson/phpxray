@@ -280,9 +280,6 @@ impl Collector {
                 self.opt_ty(scope, &a.return_type);
                 self.expr(scope, &a.body);
             }
-
-            // Non-exhaustive guard: future kinds default to no references.
-            _ => {}
         }
     }
 

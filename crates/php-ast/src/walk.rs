@@ -173,10 +173,18 @@ where
         StmtKind::ConstDecl { consts, .. } => consts
             .iter()
             .for_each(|c| walk_expr(&c.value, on_s, on_e, cross)),
-        // No nested expressions/statements (or a scope boundary we don't cross):
-        // Function/Class when !cross, Use, GroupUse, Goto, Label, HaltCompiler,
-        // InlineHtml, Nop, Error.
-        _ => {}
+        StmtKind::Return(None)
+        | StmtKind::Function(_)
+        | StmtKind::Class(_)
+        | StmtKind::Namespace { body: None, .. }
+        | StmtKind::Use(_)
+        | StmtKind::GroupUse { .. }
+        | StmtKind::Goto(_)
+        | StmtKind::Label(_)
+        | StmtKind::HaltCompiler(_)
+        | StmtKind::InlineHtml(_)
+        | StmtKind::Nop
+        | StmtKind::Error => {}
     }
 }
 
@@ -382,6 +390,7 @@ where
             }
         }
         ExprKind::Exit(Some(x)) => go(x, on_s, on_e),
+        ExprKind::Exit(None) => {}
         ExprKind::Match { subject, arms } => {
             go(subject, on_s, on_e);
             for arm in arms {
@@ -393,18 +402,19 @@ where
         }
         ExprKind::Include { expr, .. } => go(expr, on_s, on_e),
         ExprKind::Isset(es) => es.iter().for_each(|e| go(e, on_s, on_e)),
-        // Closures / arrow fns are their own scopes: only descend when crossing.
-        ExprKind::Closure(c) if cross => {
-            walk_params(&c.params, on_s, on_e);
-            c.body.iter().for_each(|st| walk_stmt(st, on_s, on_e, true));
+        ExprKind::Closure(c) => {
+            if cross {
+                walk_params(&c.params, on_s, on_e);
+                c.body.iter().for_each(|st| walk_stmt(st, on_s, on_e, true));
+            }
         }
-        ExprKind::ArrowFn(a) if cross => {
-            walk_params(&a.params, on_s, on_e);
-            walk_expr(&a.body, on_s, on_e, true);
+        ExprKind::ArrowFn(a) => {
+            if cross {
+                walk_params(&a.params, on_s, on_e);
+                walk_expr(&a.body, on_s, on_e, true);
+            }
         }
         ExprKind::Paren(x) => go(x, on_s, on_e),
-        // `#[non_exhaustive]`; closures/arrow fns when !cross; anything new.
-        _ => {}
     }
 }
 

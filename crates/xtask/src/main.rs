@@ -4,6 +4,7 @@
 //!   corpus [DIR]        Parse every `.phpt` under DIR (default: php-src/Zend/tests)
 //!                       and report counts. The TDD Tier-C smoke check.
 //!   phpt-extract FILE   Print the `--FILE--` body of a single `.phpt`.
+//!   rule-manifest       Print analyzer rules/options for generated docs.
 //!   gen-tokens          (M1) Generate golden token fixtures via PHP. Requires PHP.
 
 use std::collections::BTreeMap;
@@ -14,7 +15,7 @@ use std::process::{Command, ExitCode, Stdio};
 
 use php_lexer::golden::{self, DEFAULT_IGNORED};
 use walkdir::WalkDir;
-use xtask::phpt;
+use xtask::{corpus, phpt};
 
 mod astdump;
 
@@ -52,6 +53,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("phpt-extract") => cmd_phpt_extract(args.get(1).map(PathBuf::from)),
+        Some("rule-manifest") => cmd_rule_manifest(),
         Some("gen-tokens") => cmd_gen_tokens(),
         Some("gen-stubs") => cmd_gen_stubs(),
         Some(other) => {
@@ -75,8 +77,40 @@ fn usage() {
          \x20 difftokens [DIR] [--limit N]\n\
          \x20                     diff our tokens vs PHP token_get_all over the corpus (requires PHP)\n\
          \x20 phpt-extract FILE   print the --FILE-- body of a .phpt\n\
+         \x20 rule-manifest       print analyzer rule/strictness manifest for docs\n\
          \x20 gen-tokens          generate golden token fixtures (requires PHP; M1)"
     );
+}
+
+/// Machine-readable manifest used by generated docs. TSV format:
+/// `rule<TAB>level<TAB>name` or `option<TAB>level<TAB>name`.
+fn cmd_rule_manifest() -> ExitCode {
+    for rule in php_rules::rule_manifest() {
+        println!("rule\t{}\t{}", rule.level, rule.name);
+    }
+    let options = [
+        (
+            8,
+            "checkNullables",
+            php_config::Level(8).rule_options().check_nullables,
+        ),
+        (
+            9,
+            "checkExplicitMixed",
+            php_config::Level(9).rule_options().check_explicit_mixed,
+        ),
+        (
+            10,
+            "checkImplicitMixed",
+            php_config::Level(10).rule_options().check_implicit_mixed,
+        ),
+    ];
+    for (level, name, enabled) in options {
+        if enabled {
+            println!("option\t{level}\t{name}");
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 /// Differential token check: lex every corpus `--FILE--` with both our lexer and
@@ -665,10 +699,6 @@ fn cmd_check(dir: Option<PathBuf>) -> ExitCode {
 }
 
 fn cmd_check_run(dir: Option<PathBuf>) -> ExitCode {
-    use php_index::ProjectIndex;
-    use php_reflect::ReflectionIndex;
-    use php_resolve::{index_file, resolve_references};
-    use php_rules::{analyze_file, FileAnalysis};
     use std::collections::BTreeMap;
 
     let dir = dir.unwrap_or_else(|| workspace_root().join("php-src/Zend/tests"));
@@ -677,69 +707,37 @@ fn cmd_check_run(dir: Option<PathBuf>) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Pass 1: parse every file into ONE shared interner (so cross-file symbols
-    // resolve) and build the project symbol + reflection indexes over it.
-    let mut interner = php_intern::Interner::new();
-    let mut project = ProjectIndex::with_builtins();
-    let mut reflection = ReflectionIndex::with_builtins();
-    let mut files_data: Vec<(String, String, php_ast::Program)> = Vec::new();
-    for entry in WalkDir::new(&dir).into_iter().filter_map(Result::ok) {
-        if entry.path().extension().and_then(|e| e.to_str()) != Some("phpt") {
-            continue;
+    let cases = corpus::phpt_cases(&dir);
+    let inputs = cases
+        .iter()
+        .map(|case| (case.label.clone(), case.source.clone()));
+    let (parsed, interner) = php_cli::parse_files(inputs);
+    let php_version = php_rules::PhpVersion::default();
+    let level = 10;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .stack_size(1 << 30)
+        .build()
+        .expect("build check thread pool");
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        pool.install(|| php_cli::analyze_parsed(&parsed, &interner, level, php_version, true))
+    }));
+    let (files, diags, panics, findings) = match outcome {
+        Ok(report) => (
+            report.files_analyzed as u64,
+            report.findings.len() as u64,
+            0u64,
+            report.findings,
+        ),
+        Err(_) => {
+            eprintln!("CHECK PANIC in product analysis driver");
+            (parsed.len() as u64, 0, 1, Vec::new())
         }
-        let Ok(text) = std::fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        let Some(source) = phpt::extract_file_section(&text) else {
-            continue;
-        };
-        let label = entry.path().display().to_string();
-        let (program, _diags) = php_parser::parse_into(&source, &mut interner);
-        project.add_file(&label, &index_file(&program, &interner));
-        reflection.add_file(&program, &interner);
-        files_data.push((label, source, program));
-    }
-
-    // Pass 2: run ALL rules at level max, isolating panics per file.
-    let (mut files, mut diags, mut panics) = (0u64, 0u64, 0u64);
+    };
     let mut by_code: BTreeMap<String, u64> = BTreeMap::new();
-    for (label, source, program) in &files_data {
-        files += 1;
-        let outcome = catch_unwind(AssertUnwindSafe(|| {
-            let refs = resolve_references(program, &interner);
-            let types = php_rules::type_map(&reflection, program, &interner);
-            let native_types = php_rules::native_type_map(&reflection, program, &interner);
-            let fa = FileAnalysis {
-                path: label,
-                source,
-                program,
-                interner: &interner,
-                project: &project,
-                reflection: &reflection,
-                resolved_refs: &refs,
-                types: &types,
-                native_types: &native_types,
-                php_version: php_rules::PhpVersion::default(),
-                treat_phpdoc_types_as_certain: true,
-                check_nullables: true, // xtask check runs at level 10
-            };
-            analyze_file(&fa, 10)
-                .into_iter()
-                .map(|d| d.code.unwrap_or("?").to_string())
-                .collect::<Vec<_>>()
-        }));
-        match outcome {
-            Ok(codes) => {
-                diags += codes.len() as u64;
-                for c in codes {
-                    *by_code.entry(c).or_default() += 1;
-                }
-            }
-            Err(_) => {
-                panics += 1;
-                eprintln!("CHECK PANIC on {label}");
-            }
-        }
+    for finding in findings {
+        let code = finding.identifier.unwrap_or("?").to_string();
+        *by_code.entry(code).or_default() += 1;
     }
     println!("checked {files} files at level max: {diags} diagnostics, {panics} panics");
     let mut rows: Vec<(&String, &u64)> = by_code.iter().collect();
@@ -1066,9 +1064,16 @@ fn cmd_gen_stubs() -> ExitCode {
         BTreeSet::new(),
         BTreeSet::new(),
     );
-    // Cap #4: typed function signatures, fqn (lowercased key) -> serialized line.
-    let mut typed_fns: BTreeMap<String, String> = BTreeMap::new();
-    let mut typed_classes: BTreeMap<String, String> = BTreeMap::new();
+    const STUB_VERSIONS: &[(u32, (u32, u32))] =
+        &[(80400, (8, 4)), (80500, (8, 5)), (80600, (8, 6))];
+    let mut typed_fns: BTreeMap<u32, BTreeMap<String, String>> = STUB_VERSIONS
+        .iter()
+        .map(|(id, _)| (*id, BTreeMap::new()))
+        .collect();
+    let mut typed_classes: BTreeMap<u32, BTreeMap<String, String>> = STUB_VERSIONS
+        .iter()
+        .map(|(id, _)| (*id, BTreeMap::new()))
+        .collect();
     let (mut files, mut parse_errors) = (0u64, 0u64);
     for entry in WalkDir::new(&stubs).into_iter().filter_map(Result::ok) {
         let path = entry.path();
@@ -1109,27 +1114,23 @@ fn cmd_gen_stubs() -> ExitCode {
         functions.extend(idx.functions.into_iter().map(|f| f.fqn));
         constants.extend(idx.constants.into_iter().map(|k| k.fqn));
 
-        // Cap #4: reflect each function/class to capture typed signatures.
-        php_resolve::for_each_region(&parsed.program.stmts, &parsed.interner, |scope, region| {
-            for st in region {
-                match &st.kind {
-                    php_ast::StmtKind::Function(f) => {
-                        let fr = php_reflect::reflect_function(scope, &parsed.interner, f);
-                        typed_fns.insert(
-                            fr.fqn.to_ascii_lowercase(),
-                            serialize_fn(f, &fr, &parsed.interner),
-                        );
-                    }
-                    php_ast::StmtKind::Class(c) => {
-                        let Some(name) = c.name else { continue };
-                        let fqn = scope.qualify(parsed.interner.resolve(name));
-                        let cr = php_reflect::reflect_class(scope, &parsed.interner, &fqn, c);
-                        typed_classes.insert(fqn.to_ascii_lowercase(), serialize_class(&cr));
-                    }
-                    _ => {}
-                }
+        let reflected = php_reflect::reflect_file(&parsed.program, &parsed.interner);
+        for rf in &reflected.functions {
+            for (id, target) in STUB_VERSIONS {
+                typed_fns.get_mut(id).expect("version map").insert(
+                    php_resolve::SymbolKey::function(&rf.reflection.fqn).into_string(),
+                    serialize_fn(rf.decl, &rf.reflection, &parsed.interner, *target),
+                );
             }
-        });
+        }
+        for rc in &reflected.classes {
+            for (id, _) in STUB_VERSIONS {
+                typed_classes.get_mut(id).expect("version map").insert(
+                    php_resolve::SymbolKey::class_like(&rc.reflection.fqn).into_string(),
+                    serialize_class(&rc.reflection),
+                );
+            }
+        }
     }
 
     let mut out = String::new();
@@ -1160,56 +1161,61 @@ fn cmd_gen_stubs() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Cap #4: write the typed-function manifest consumed by `ReflectionIndex::with_builtins`.
-    let fn_dest = root.join("crates/php-reflect/stubs/builtin-functions.txt");
-    let mut fn_out = String::new();
-    fn_out.push_str("# Typed built-in function signatures from JetBrains/phpstorm-stubs.\n");
-    fn_out.push_str("# Generated by `xtask gen-stubs`; do not edit. Keyed to our target PHP\n");
-    fn_out.push_str("# version (8.x). Format: fqn<TAB>return<TAB>p1;p2;...  where each param is\n");
-    fn_out.push_str("# name|type|flags (flags subset of r=by-ref v=variadic o=optional; empty\n");
-    fn_out.push_str("# type = mixed). Types are php_types::Type Display, re-parsed on load.\n");
-    for line in typed_fns.values() {
-        fn_out.push_str(line);
-        fn_out.push('\n');
-    }
-    if let Some(parent) = fn_dest.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Err(e) = std::fs::write(&fn_dest, &fn_out) {
-        eprintln!("write failed {}: {e}", fn_dest.display());
+    let reflect_stub_dir = root.join("crates/php-reflect/stubs");
+    if let Err(e) = std::fs::create_dir_all(&reflect_stub_dir) {
+        eprintln!("mkdir failed {}: {e}", reflect_stub_dir.display());
         return ExitCode::FAILURE;
     }
+    for (id, _) in STUB_VERSIONS {
+        let fn_dest = reflect_stub_dir.join(format!("builtin-functions-{id}.txt"));
+        let mut fn_out = String::new();
+        fn_out.push_str("# Typed built-in function signatures from JetBrains/phpstorm-stubs.\n");
+        fn_out.push_str(&format!(
+            "# Generated by `xtask gen-stubs`; do not edit. Target PHP version id: {id}.\n"
+        ));
+        fn_out.push_str("# Format: fqn<TAB>return<TAB>p1;p2;... where each param is\n");
+        fn_out.push_str("# name#type#flags (flags subset of r=by-ref v=variadic o=optional;\n");
+        fn_out.push_str("# empty type = mixed). Types are php_types::Type Display.\n");
+        for line in typed_fns.get(id).expect("version map").values() {
+            fn_out.push_str(line);
+            fn_out.push('\n');
+        }
+        if let Err(e) = std::fs::write(&fn_dest, &fn_out) {
+            eprintln!("write failed {}: {e}", fn_dest.display());
+            return ExitCode::FAILURE;
+        }
 
-    let class_dest = root.join("crates/php-reflect/stubs/builtin-classes.txt");
-    let mut class_out = String::new();
-    class_out
-        .push_str("# Built-in class/interface member signatures from JetBrains/phpstorm-stubs.\n");
-    class_out.push_str("# Generated by `xtask gen-stubs`; do not edit.\n");
-    class_out.push_str("# Format:\n");
-    class_out
-        .push_str("# class<TAB>kind<TAB>fqn<TAB>parents<TAB>interfaces<TAB>traits<TAB>flags\n");
-    class_out.push_str(
-        "# method<TAB>class<TAB>name<TAB>visibility<TAB>flags<TAB>return<TAB>native_return<TAB>params\n",
-    );
-    class_out.push_str(
-        "# property<TAB>class<TAB>name<TAB>visibility<TAB>flags<TAB>type<TAB>native_type\n",
-    );
-    class_out.push_str(
-        "# constant<TAB>class<TAB>name<TAB>visibility<TAB>flags<TAB>type<TAB>int_value\n",
-    );
-    for line in typed_classes.values() {
-        class_out.push_str(line);
-    }
-    if let Some(parent) = class_dest.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Err(e) = std::fs::write(&class_dest, &class_out) {
-        eprintln!("write failed {}: {e}", class_dest.display());
-        return ExitCode::FAILURE;
+        let class_dest = reflect_stub_dir.join(format!("builtin-classes-{id}.txt"));
+        let mut class_out = String::new();
+        class_out.push_str(
+            "# Built-in class/interface member signatures from JetBrains/phpstorm-stubs.\n",
+        );
+        class_out.push_str(&format!(
+            "# Generated by `xtask gen-stubs`; do not edit. Target PHP version id: {id}.\n"
+        ));
+        class_out.push_str("# Format:\n");
+        class_out
+            .push_str("# class<TAB>kind<TAB>fqn<TAB>parents<TAB>interfaces<TAB>traits<TAB>flags\n");
+        class_out.push_str(
+            "# method<TAB>class<TAB>name<TAB>visibility<TAB>flags<TAB>return<TAB>native_return<TAB>params\n",
+        );
+        class_out.push_str(
+            "# property<TAB>class<TAB>name<TAB>visibility<TAB>flags<TAB>type<TAB>native_type\n",
+        );
+        class_out.push_str(
+            "# constant<TAB>class<TAB>name<TAB>visibility<TAB>flags<TAB>type<TAB>int_value\n",
+        );
+        for line in typed_classes.get(id).expect("version map").values() {
+            class_out.push_str(line);
+        }
+        if let Err(e) = std::fs::write(&class_dest, &class_out) {
+            eprintln!("write failed {}: {e}", class_dest.display());
+            return ExitCode::FAILURE;
+        }
     }
 
     println!(
-        "parsed {files} stub files ({parse_errors} with parse errors) -> {}: {} functions, {} classes, {} interfaces, {} traits, {} enums, {} constants; {} typed fn signatures -> {}; {} typed classes -> {}",
+        "parsed {files} stub files ({parse_errors} with parse errors) -> {}: {} functions, {} classes, {} interfaces, {} traits, {} enums, {} constants; versioned typed manifests -> {}",
         dest.strip_prefix(&root).unwrap_or(&dest).display(),
         functions.len(),
         classes.len(),
@@ -1217,10 +1223,7 @@ fn cmd_gen_stubs() -> ExitCode {
         traits.len(),
         enums.len(),
         constants.len(),
-        typed_fns.len(),
-        fn_dest.strip_prefix(&root).unwrap_or(&fn_dest).display(),
-        typed_classes.len(),
-        class_dest.strip_prefix(&root).unwrap_or(&class_dest).display(),
+        reflect_stub_dir.strip_prefix(&root).unwrap_or(&reflect_stub_dir).display(),
     );
     ExitCode::SUCCESS
 }
@@ -1233,8 +1236,10 @@ fn serialize_fn(
     f: &php_ast::FunctionDecl,
     fr: &php_reflect::FunctionReflection,
     interner: &php_intern::Interner,
+    target_php: (u32, u32),
 ) -> String {
-    let ret = level_aware_type(&f.attrs, interner).unwrap_or_else(|| ty_str(&fr.return_type));
+    let ret =
+        level_aware_type(&f.attrs, interner, target_php).unwrap_or_else(|| ty_str(&fr.return_type));
 
     let params: Vec<String> = fr
         .params
@@ -1254,7 +1259,7 @@ fn serialize_fn(
             let ty = f
                 .params
                 .get(i)
-                .and_then(|ap| level_aware_type(&ap.attrs, interner))
+                .and_then(|ap| level_aware_type(&ap.attrs, interner, target_php))
                 .unwrap_or_else(|| ty_str(&p.ty));
             // Field sep `#` and param sep `;` never appear in a Type Display
             // (unions use `|`, generics `<,>`), so types are written verbatim.
@@ -1415,15 +1420,13 @@ fn ty_str(t: &php_types::Type) -> String {
     }
 }
 
-/// Our target PHP version for resolving `#[LanguageLevelTypeAware]` entries.
-const TARGET_PHP: (u32, u32) = (8, 6);
-
 /// If `attrs` contains a `#[LanguageLevelTypeAware(["V" => "T", …], default: "U")]`,
-/// return the type string for [`TARGET_PHP`]: the value of the highest version
+/// return the type string for `target_php`: the value of the highest version
 /// key `≤ target`, else the `default:`.
 fn level_aware_type(
     attrs: &[php_ast::AttributeGroup],
     interner: &php_intern::Interner,
+    target_php: (u32, u32),
 ) -> Option<String> {
     use php_ast::ExprKind;
     for g in attrs {
@@ -1453,7 +1456,7 @@ fn level_aware_type(
                         };
                         let ver = parse_ver(&String::from_utf8_lossy(kb));
                         let Some(ver) = ver else { continue };
-                        if ver <= TARGET_PHP && best.as_ref().is_none_or(|(bv, _)| ver >= *bv) {
+                        if ver <= target_php && best.as_ref().is_none_or(|(bv, _)| ver >= *bv) {
                             best = Some((ver, String::from_utf8_lossy(vb).into_owned()));
                         }
                     }

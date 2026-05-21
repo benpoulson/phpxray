@@ -73,10 +73,14 @@
 //!   `ConsistentConstructorRule` (param/visibility comparison vs parent constructor —
 //!   the `consistentConstructor` *attribute* requires a custom PHPDoc tag we don't model).
 
-use crate::{FileAnalysis, RuleEntry};
+use crate::{
+    decls,
+    members::{MemberAccessResolver, ResolveStatus},
+    symbols, FileAnalysis, RuleEntry,
+};
 use php_ast::{
-    BinOp, CastKind, ClassDecl, ClassKind, Expr, ExprKind, Member, MemberName, MethodDecl, Name,
-    NameFq, Stmt, StmtKind, Visibility,
+    BinOp, CastKind, ClassDecl, ClassKind, Expr, ExprKind, Member, MemberName, MethodDecl, Stmt,
+    StmtKind, Visibility,
 };
 use php_diagnostics::Diagnostic;
 use php_intern::Interner;
@@ -97,71 +101,7 @@ use std::collections::{HashMap, HashSet};
 /// and the [`Scope`] of its namespace region. Descends into nested declarations
 /// (blocks, control flow) so conditionally-declared classes are covered.
 fn for_each_class(fa: &FileAnalysis, mut f: impl FnMut(&Scope, &str, &ClassDecl)) {
-    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
-        for st in region {
-            walk_class_stmt(st, scope, fa.interner, &mut f);
-        }
-    });
-}
-
-fn walk_class_stmt(
-    st: &Stmt,
-    scope: &Scope,
-    interner: &Interner,
-    f: &mut impl FnMut(&Scope, &str, &ClassDecl),
-) {
-    match &st.kind {
-        StmtKind::Class(c) => {
-            if let Some(name) = c.name {
-                let fqn = scope.qualify(interner.resolve(name));
-                f(scope, &fqn, c);
-            }
-        }
-        StmtKind::Block(b) => b
-            .iter()
-            .for_each(|s| walk_class_stmt(s, scope, interner, f)),
-        StmtKind::If {
-            then, elseifs, els, ..
-        } => {
-            walk_class_stmt(then, scope, interner, f);
-            for e in elseifs {
-                walk_class_stmt(&e.body, scope, interner, f);
-            }
-            if let Some(e) = els {
-                walk_class_stmt(e, scope, interner, f);
-            }
-        }
-        StmtKind::While { body, .. }
-        | StmtKind::DoWhile { body, .. }
-        | StmtKind::For { body, .. }
-        | StmtKind::Foreach { body, .. } => walk_class_stmt(body, scope, interner, f),
-        StmtKind::Try {
-            body,
-            catches,
-            finally,
-        } => {
-            body.iter()
-                .for_each(|s| walk_class_stmt(s, scope, interner, f));
-            for c in catches {
-                c.body
-                    .iter()
-                    .for_each(|s| walk_class_stmt(s, scope, interner, f));
-            }
-            if let Some(fin) = finally {
-                fin.iter()
-                    .for_each(|s| walk_class_stmt(s, scope, interner, f));
-            }
-        }
-        StmtKind::Switch { cases, .. } => {
-            for case in cases {
-                case.body
-                    .iter()
-                    .for_each(|s| walk_class_stmt(s, scope, interner, f));
-            }
-        }
-        StmtKind::Declare { body: Some(b), .. } => walk_class_stmt(b, scope, interner, f),
-        _ => {}
-    }
+    decls::for_each_class_like(fa, &mut f);
 }
 
 /// Iterate the real methods of a class.
@@ -790,7 +730,7 @@ fn run_missing_return_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
 
 /// Whether a docblock declares a `@return` (incl. `@phpstan-`/`@psalm-return`).
 fn doc_has_return(doc: Option<&str>) -> bool {
-    doc.is_some_and(|d| d.contains("@return") || d.contains("-return"))
+    php_phpdoc::query::has_return_conservative(doc)
 }
 
 /// Walk the transitive supertypes of `class` (parents, interfaces, traits — and
@@ -867,22 +807,7 @@ fn inherited_param_typed(
 /// Whether a docblock declares a `@param … $name` (any `@param*` prefix), with
 /// `$name` matched as a whole variable token. Mirrors the function-rule helper.
 fn doc_has_param(doc: Option<&str>, name: &str) -> bool {
-    let Some(d) = doc else { return false };
-    let needle = format!("${name}");
-    let mut search = d;
-    while let Some(off) = search.find("@param") {
-        let after = &search[off + "@param".len()..];
-        let seg = after.split('@').next().unwrap_or(after);
-        if let Some(p) = seg.find(&needle) {
-            let end = p + needle.len();
-            let b = seg.as_bytes();
-            if end >= b.len() || !(b[end].is_ascii_alphanumeric() || b[end] == b'_') {
-                return true;
-            }
-        }
-        search = after;
-    }
-    false
+    php_phpdoc::query::has_param_conservative(doc, name)
 }
 
 /// `MissingMethodParameterTypehintRule` — a method parameter with no type.
@@ -1474,7 +1399,9 @@ fn run_union_method_access(fa: &FileAnalysis) -> Vec<Diagnostic> {
             return;
         };
         let recv_ty = fa.type_of(recv);
-        let Some((has_method, lacks_method)) = union_method_status(fa, &recv_ty, fa.interner.resolve(*name)) else {
+        let Some((has_method, lacks_method)) =
+            union_method_status(fa, &recv_ty, fa.interner.resolve(*name))
+        else {
             return;
         };
         if !(has_method && lacks_method) {
@@ -1530,6 +1457,7 @@ fn union_method_status(fa: &FileAnalysis, ty: &Type, method: &str) -> Option<(bo
 /// diagnostics. Visibility checks are deferred (need the calling class context).
 fn run_call_methods_typed(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
+    let resolver = MemberAccessResolver::new(fa);
     crate::walk::for_each_expr(fa.program, &mut |e| {
         let ExprKind::MethodCall { recv, method, .. } = &e.kind else {
             return;
@@ -1554,18 +1482,8 @@ fn run_call_methods_typed(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
         let mname = fa.interner.resolve(*name);
         let short = fqn.trim_start_matches('\\');
-        match fa.reflection.find_method(&fqn, mname) {
-            None => {
-                // __call accepts any method name.
-                if fa.reflection.find_method(&fqn, "__call").is_some() {
-                    return;
-                }
-                if fa
-                    .reflection
-                    .final_concrete_descendants_have_method(&fqn, mname)
-                {
-                    return;
-                }
+        match resolver.instance_method(&recv_ty, mname) {
+            ResolveStatus::Unknown => {
                 out.push(
                     Diagnostic::error(
                         e.span,
@@ -1574,7 +1492,7 @@ fn run_call_methods_typed(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     .with_code("method.notFound"),
                 );
             }
-            Some(_) => {
+            ResolveStatus::Known(_) | ResolveStatus::Opaque | ResolveStatus::Skipped => {
                 // Visibility (`method.private`/`method.protected`) needs the
                 // calling class context to avoid false positives on legal
                 // same-class cross-instance access; deferred. Existence only here.
@@ -1592,6 +1510,7 @@ fn run_call_methods_typed(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// context, so they're skipped here.
 fn run_static_call_named(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
+    let resolver = MemberAccessResolver::new(fa);
     for_each_class(fa, |scope, _, c| {
         if c.kind == ClassKind::Trait {
             return;
@@ -1624,18 +1543,15 @@ fn run_static_call_named(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     continue;
                 }
                 let mname = fa.interner.resolve(*name);
-                if fa.reflection.find_method(&fqn, mname).is_some()
-                    || fa.reflection.find_method(&fqn, "__callStatic").is_some()
-                {
-                    continue;
+                if matches!(resolver.static_method(&fqn, mname), ResolveStatus::Unknown) {
+                    out.push(
+                        Diagnostic::error(
+                            e.span,
+                            format!("Call to an undefined static method {fqn}::{mname}()."),
+                        )
+                        .with_code("staticMethod.notFound"),
+                    );
                 }
-                out.push(
-                    Diagnostic::error(
-                        e.span,
-                        format!("Call to an undefined static method {fqn}::{mname}()."),
-                    )
-                    .with_code("staticMethod.notFound"),
-                );
             }
         }
     });
@@ -1857,7 +1773,7 @@ fn method_accepts_named_arguments(fa: &FileAnalysis, class_fqn: &str, method: &s
     let mut found = false;
     let mut accepts = true;
     for_each_class(fa, |_, fqn, c| {
-        if found || !same_fqn(fqn, class_fqn) {
+        if found || !symbols::same_fqn(fqn, class_fqn) {
             return;
         }
         for m in methods(c) {
@@ -1884,7 +1800,7 @@ fn class_accepts_named_arguments(
     seen.push(key);
     let mut accepts = None;
     for_each_class(fa, |_, fqn, c| {
-        if same_fqn(fqn, class_fqn) {
+        if symbols::same_fqn(fqn, class_fqn) {
             accepts = Some(!doc_has_no_named_arguments(c.doc.as_deref()));
         }
     });
@@ -1902,12 +1818,7 @@ fn class_accepts_named_arguments(
 }
 
 fn doc_has_no_named_arguments(doc: Option<&str>) -> bool {
-    doc.is_some_and(|d| d.contains("@no-named-arguments"))
-}
-
-fn same_fqn(a: &str, b: &str) -> bool {
-    a.trim_start_matches('\\')
-        .eq_ignore_ascii_case(b.trim_start_matches('\\'))
+    php_phpdoc::query::has_no_named_arguments(doc)
 }
 
 // ---------------------------------------------------------------------------
@@ -2584,10 +2495,7 @@ fn run_incompatible_default_param(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// Whether the class docblock carries a `@consistent-constructor` tag (the marker
 /// phpstan honours; also accept the `@phpstan-`/`@psalm-` prefixed spellings).
 fn has_consistent_constructor_tag(_fa: &FileAnalysis, c: &ClassDecl) -> bool {
-    let Some(raw) = &c.doc else { return false };
-    raw.contains("@consistent-constructor")
-        || raw.contains("@phpstan-consistent-constructor")
-        || raw.contains("@psalm-consistent-constructor")
+    php_phpdoc::query::has_base_tag(c.doc.as_deref(), &["consistent-constructor"])
 }
 
 // ---------------------------------------------------------------------------
@@ -3093,247 +3001,54 @@ struct SelfOutDocCheck<'a, 'b> {
 
 impl SelfOutDocCheck<'_, '_> {
     fn check(&mut self, ty: &DocType) {
-        if let Some(word) = missing_iterable_word_doc(ty) {
-            self.out.push(
-                Diagnostic::error(
-                    self.span,
-                    format!(
-                        "Method {}::{}() has PHPDoc tag @phpstan-self-out with no value type specified in iterable type {word}.",
-                        self.class_short, self.method_name
-                    ),
-                )
-                .with_code("missingType.iterableValue"),
-            );
-        }
-
-        for (name, generics) in missing_generic_doc(
-            self.fa,
-            self.scope,
-            self.class_fqn,
-            self.class_templates,
-            ty,
-        ) {
-            self.out.push(
-                Diagnostic::error(
-                    self.span,
-                    format!(
-                        "Method {}::{}() has PHPDoc tag @phpstan-self-out with generic class {name} but does not specify its types: {generics}",
-                        self.class_short, self.method_name
-                    ),
-                )
-                .with_code("missingType.generics"),
-            );
-        }
-
-        if missing_callable_signature_doc(ty) {
-            self.out.push(
-                Diagnostic::error(
-                    self.span,
-                    format!(
-                        "Method {}::{}() has PHPDoc tag @phpstan-self-out with no signature specified for callable.",
-                        self.class_short, self.method_name
-                    ),
-                )
-                .with_code("missingType.callable"),
-            );
-        }
-    }
-}
-
-fn missing_iterable_word_doc(t: &DocType) -> Option<&'static str> {
-    match t {
-        DocType::Named(n) if n.eq_ignore_ascii_case("array") => Some("array"),
-        DocType::Named(n) if n.eq_ignore_ascii_case("iterable") => Some("iterable"),
-        DocType::Nullable(inner) | DocType::Array(inner) => missing_iterable_word_doc(inner),
-        DocType::Union(parts) | DocType::Intersection(parts) => {
-            parts.iter().find_map(missing_iterable_word_doc)
-        }
-        DocType::Generic { args, .. } => args.iter().find_map(missing_iterable_word_doc),
-        DocType::Shape { fields, .. } => {
-            fields.iter().find_map(|f| missing_iterable_word_doc(&f.ty))
-        }
-        DocType::Callable { params, ret, .. } => params
-            .iter()
-            .find_map(missing_iterable_word_doc)
-            .or_else(|| ret.as_deref().and_then(missing_iterable_word_doc)),
-        DocType::Conditional {
-            target, then, els, ..
-        } => missing_iterable_word_doc(target)
-            .or_else(|| missing_iterable_word_doc(then))
-            .or_else(|| missing_iterable_word_doc(els)),
-        _ => None,
-    }
-}
-
-fn missing_generic_doc(
-    fa: &FileAnalysis,
-    scope: &Scope,
-    class_fqn: &str,
-    class_templates: &[String],
-    t: &DocType,
-) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    collect_missing_generic_doc(fa, scope, class_fqn, class_templates, t, &mut out);
-    out
-}
-
-fn collect_missing_generic_doc(
-    fa: &FileAnalysis,
-    scope: &Scope,
-    class_fqn: &str,
-    class_templates: &[String],
-    t: &DocType,
-    out: &mut Vec<(String, String)>,
-) {
-    match t {
-        DocType::Named(n) => {
-            if let Some((name, templates)) =
-                generic_class_without_args(fa, scope, class_fqn, class_templates, n)
-            {
-                out.push((name, templates));
+        let ctx = crate::missing_type::DocGenericContext {
+            reflection: self.fa.reflection,
+            scope: self.scope,
+            class_fqn: Some(self.class_fqn),
+            current_class_templates: self.class_templates,
+            excluded_templates: &[],
+            skip_traits: false,
+        };
+        for issue in crate::missing_type::check_doc_type(ctx, ty) {
+            match issue {
+                crate::missing_type::MissingTypeIssue::IterableValue { word } => {
+                    self.out.push(
+                        Diagnostic::error(
+                            self.span,
+                            format!(
+                                "Method {}::{}() has PHPDoc tag @phpstan-self-out with no value type specified in iterable type {word}.",
+                                self.class_short, self.method_name
+                            ),
+                        )
+                        .with_code("missingType.iterableValue"),
+                    );
+                }
+                crate::missing_type::MissingTypeIssue::GenericArgs { name, templates } => {
+                    self.out.push(
+                        Diagnostic::error(
+                            self.span,
+                            format!(
+                                "Method {}::{}() has PHPDoc tag @phpstan-self-out with generic class {name} but does not specify its types: {templates}",
+                                self.class_short, self.method_name
+                            ),
+                        )
+                        .with_code("missingType.generics"),
+                    );
+                }
+                crate::missing_type::MissingTypeIssue::CallableSignature => {
+                    self.out.push(
+                        Diagnostic::error(
+                            self.span,
+                            format!(
+                                "Method {}::{}() has PHPDoc tag @phpstan-self-out with no signature specified for callable.",
+                                self.class_short, self.method_name
+                            ),
+                        )
+                        .with_code("missingType.callable"),
+                    );
+                }
             }
         }
-        DocType::Generic { args, .. } => {
-            for arg in args {
-                collect_missing_generic_doc(fa, scope, class_fqn, class_templates, arg, out);
-            }
-        }
-        DocType::Nullable(inner) | DocType::Array(inner) => {
-            collect_missing_generic_doc(fa, scope, class_fqn, class_templates, inner, out)
-        }
-        DocType::Union(parts) | DocType::Intersection(parts) => {
-            for p in parts {
-                collect_missing_generic_doc(fa, scope, class_fqn, class_templates, p, out);
-            }
-        }
-        DocType::Shape { fields, .. } => {
-            for f in fields {
-                collect_missing_generic_doc(fa, scope, class_fqn, class_templates, &f.ty, out);
-            }
-        }
-        DocType::Callable { params, ret, .. } => {
-            for p in params {
-                collect_missing_generic_doc(fa, scope, class_fqn, class_templates, p, out);
-            }
-            if let Some(ret) = ret {
-                collect_missing_generic_doc(fa, scope, class_fqn, class_templates, ret, out);
-            }
-        }
-        DocType::Conditional {
-            target, then, els, ..
-        } => {
-            for p in [target.as_ref(), then.as_ref(), els.as_ref()] {
-                collect_missing_generic_doc(fa, scope, class_fqn, class_templates, p, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn generic_class_without_args(
-    fa: &FileAnalysis,
-    scope: &Scope,
-    class_fqn: &str,
-    class_templates: &[String],
-    name: &str,
-) -> Option<(String, String)> {
-    if is_doc_keyword(name) {
-        return None;
-    }
-    let fqn = match name.to_ascii_lowercase().as_str() {
-        "self" | "static" | "$this" => class_fqn.to_string(),
-        _ => match scope.resolve_class(&name_from_doc(name)) {
-            Resolution::Fqn(fqn) => fqn,
-            Resolution::Fallback { namespaced, .. } => namespaced,
-            _ => return None,
-        },
-    };
-    let templates = if fqn
-        .trim_start_matches('\\')
-        .eq_ignore_ascii_case(class_fqn.trim_start_matches('\\'))
-    {
-        class_templates.to_vec()
-    } else {
-        fa.reflection.class(&fqn)?.templates.clone()
-    };
-    if templates.is_empty() {
-        return None;
-    }
-    let name = fa
-        .reflection
-        .class(&fqn)
-        .map(|r| r.fqn.trim_start_matches('\\').to_string())
-        .unwrap_or_else(|| fqn.trim_start_matches('\\').to_string());
-    Some((name, templates.join(", ")))
-}
-
-fn name_from_doc(text: &str) -> Name {
-    let fq = if text.starts_with("namespace\\") {
-        NameFq::Relative
-    } else if text.starts_with('\\') {
-        NameFq::Fq
-    } else {
-        NameFq::NotFq
-    };
-    Name {
-        span: Span::new(0, 0),
-        fq,
-        text: text.to_string(),
-    }
-}
-
-fn is_doc_keyword(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "array"
-            | "iterable"
-            | "callable"
-            | "int"
-            | "integer"
-            | "float"
-            | "double"
-            | "string"
-            | "bool"
-            | "boolean"
-            | "void"
-            | "never"
-            | "mixed"
-            | "object"
-            | "resource"
-            | "null"
-            | "true"
-            | "false"
-            | "scalar"
-            | "list"
-            | "non-empty-array"
-            | "non-empty-list"
-            | "class-string"
-    )
-}
-
-fn missing_callable_signature_doc(t: &DocType) -> bool {
-    match t {
-        DocType::Named(n) => n.eq_ignore_ascii_case("callable"),
-        DocType::Nullable(inner) | DocType::Array(inner) => missing_callable_signature_doc(inner),
-        DocType::Union(parts) | DocType::Intersection(parts) => {
-            parts.iter().any(missing_callable_signature_doc)
-        }
-        DocType::Generic { args, .. } => args.iter().any(missing_callable_signature_doc),
-        DocType::Shape { fields, .. } => {
-            fields.iter().any(|f| missing_callable_signature_doc(&f.ty))
-        }
-        DocType::Callable { params, ret, .. } => {
-            params.iter().any(missing_callable_signature_doc)
-                || ret.as_deref().is_some_and(missing_callable_signature_doc)
-        }
-        DocType::Conditional {
-            target, then, els, ..
-        } => {
-            missing_callable_signature_doc(target)
-                || missing_callable_signature_doc(then)
-                || missing_callable_signature_doc(els)
-        }
-        _ => false,
     }
 }
 

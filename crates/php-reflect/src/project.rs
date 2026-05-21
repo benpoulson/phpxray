@@ -15,21 +15,15 @@ use crate::{
 };
 use php_ast::{ClassDecl, ClassKind, Member, Program, Stmt, StmtKind};
 use php_intern::Interner;
-use php_resolve::{for_each_region, Scope};
-use php_types::{CallableSig, ShapeField, Type};
+use php_resolve::{for_each_region, Scope, SymbolKey, SymbolOrigin};
+use php_types::{PhpVersion, Type};
 use std::collections::HashMap;
 
 /// A map from `@template` names to the types bound for them along a hierarchy walk.
 type Subst = HashMap<String, Type>;
 
 /// How a parsed file participates in reflection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceKind {
-    /// User-facing analyzed source. May shadow a built-in reflection.
-    Analyzed,
-    /// Symbol-provider-only source. Must not shadow curated built-ins.
-    Scan,
-}
+pub type SourceKind = SymbolOrigin;
 
 /// A member found via hierarchy lookup, plus the class that declared it. Member
 /// types have generic template variables substituted for the query's bindings.
@@ -38,6 +32,155 @@ pub struct Found<T> {
     pub member: T,
     /// FQN of the class/interface/trait the member was declared on.
     pub declaring_class: String,
+}
+
+/// A reflected function plus the AST declaration it came from.
+#[derive(Debug)]
+pub struct ReflectedFunction<'a> {
+    pub decl: &'a php_ast::FunctionDecl,
+    pub reflection: FunctionReflection,
+}
+
+/// A reflected class-like declaration plus the AST declaration it came from.
+#[derive(Debug)]
+pub struct ReflectedClass<'a> {
+    pub decl: &'a ClassDecl,
+    pub reflection: ClassReflection,
+}
+
+/// The reflected declarations discovered in one parsed source unit.
+#[derive(Debug, Default)]
+pub struct ReflectedFile<'a> {
+    pub classes: Vec<ReflectedClass<'a>>,
+    pub functions: Vec<ReflectedFunction<'a>>,
+}
+
+/// Reflect every named class-like and function declaration in a parsed file.
+pub fn reflect_file<'a>(program: &'a Program, interner: &Interner) -> ReflectedFile<'a> {
+    let mut out = ReflectedFile::default();
+    for_each_region(&program.stmts, interner, |scope, region| {
+        for st in region {
+            visit_reflectable_decls(scope, st, &mut |scope, decl| match decl {
+                ReflectableDecl::Function(f) => {
+                    out.functions.push(ReflectedFunction {
+                        decl: f,
+                        reflection: reflect_function(scope, interner, f),
+                    });
+                }
+                ReflectableDecl::Class(c) => {
+                    let Some(name) = c.name else { return };
+                    let fqn = scope.qualify(interner.resolve(name));
+                    out.classes.push(ReflectedClass {
+                        decl: c,
+                        reflection: reflect_class(scope, interner, &fqn, c),
+                    });
+                }
+            });
+        }
+    });
+    out
+}
+
+enum ReflectableDecl<'a> {
+    Function(&'a php_ast::FunctionDecl),
+    Class(&'a ClassDecl),
+}
+
+fn visit_reflectable_decls<'a>(
+    scope: &Scope,
+    st: &'a php_ast::Stmt,
+    f: &mut impl FnMut(&Scope, ReflectableDecl<'a>),
+) {
+    match &st.kind {
+        StmtKind::Function(func) => {
+            f(scope, ReflectableDecl::Function(func));
+            for st in &func.body {
+                visit_reflectable_decls(scope, st, f);
+            }
+        }
+        StmtKind::Class(class) => {
+            f(scope, ReflectableDecl::Class(class));
+            for member in &class.members {
+                if let Member::Method(method) = member {
+                    if let Some(body) = &method.body {
+                        for st in body {
+                            visit_reflectable_decls(scope, st, f);
+                        }
+                    }
+                }
+            }
+        }
+        StmtKind::Block(body) => {
+            for st in body {
+                visit_reflectable_decls(scope, st, f);
+            }
+        }
+        StmtKind::If {
+            then, elseifs, els, ..
+        } => {
+            visit_reflectable_decls(scope, then, f);
+            for elseif in elseifs {
+                visit_reflectable_decls(scope, &elseif.body, f);
+            }
+            if let Some(els) = els {
+                visit_reflectable_decls(scope, els, f);
+            }
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::DoWhile { body, .. }
+        | StmtKind::For { body, .. }
+        | StmtKind::Foreach { body, .. } => visit_reflectable_decls(scope, body, f),
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            for st in body {
+                visit_reflectable_decls(scope, st, f);
+            }
+            for catch in catches {
+                for st in &catch.body {
+                    visit_reflectable_decls(scope, st, f);
+                }
+            }
+            if let Some(finally) = finally {
+                for st in finally {
+                    visit_reflectable_decls(scope, st, f);
+                }
+            }
+        }
+        StmtKind::Switch { cases, .. } => {
+            for case in cases {
+                for st in &case.body {
+                    visit_reflectable_decls(scope, st, f);
+                }
+            }
+        }
+        StmtKind::Declare {
+            body: Some(body), ..
+        } => {
+            visit_reflectable_decls(scope, body, f);
+        }
+        StmtKind::Expr(_)
+        | StmtKind::Echo(_)
+        | StmtKind::Return(_)
+        | StmtKind::Break(_)
+        | StmtKind::Continue(_)
+        | StmtKind::Goto(_)
+        | StmtKind::Label(_)
+        | StmtKind::Global(_)
+        | StmtKind::StaticVars(_)
+        | StmtKind::Unset(_)
+        | StmtKind::Declare { body: None, .. }
+        | StmtKind::Namespace { .. }
+        | StmtKind::Use(_)
+        | StmtKind::GroupUse { .. }
+        | StmtKind::ConstDecl { .. }
+        | StmtKind::HaltCompiler(_)
+        | StmtKind::InlineHtml(_)
+        | StmtKind::Nop
+        | StmtKind::Error => {}
+    }
 }
 
 /// All reflected classes/functions across a set of files, keyed for lookup.
@@ -65,12 +208,17 @@ impl ReflectionIndex {
     /// the same FQN. This is what makes `argument.type` / return inference work
     /// on `strlen`, `array_map`, … without any per-rule special-casing.
     pub fn with_builtins() -> Self {
+        Self::with_builtins_for(PhpVersion::default())
+    }
+
+    /// A fresh index pre-loaded with typed built-in signatures for `version`.
+    pub fn with_builtins_for(version: PhpVersion) -> Self {
         let mut idx = Self::new();
-        for fr in crate::builtins::builtin_functions() {
-            idx.functions.insert(key(&fr.fqn), fr);
+        for fr in crate::builtins::builtin_functions_for(version) {
+            idx.functions.insert(function_key(&fr.fqn), fr);
         }
-        for cr in crate::builtins::builtin_classes() {
-            idx.classes.insert(key(&cr.fqn), cr);
+        for cr in crate::builtins::builtin_classes_for(version) {
+            idx.classes.insert(class_key(&cr.fqn), cr);
         }
         idx
     }
@@ -93,12 +241,12 @@ impl ReflectionIndex {
 
     /// Look up a class by FQN (case-insensitive, leading `\` ignored).
     pub fn class(&self, fqn: &str) -> Option<&ClassReflection> {
-        self.classes.get(&key(fqn))
+        self.classes.get(&class_key(fqn))
     }
 
     /// Look up a function by FQN (case-insensitive, leading `\` ignored).
     pub fn function(&self, fqn: &str) -> Option<&FunctionReflection> {
-        self.functions.get(&key(fqn))
+        self.functions.get(&function_key(fqn))
     }
 
     /// Number of indexed classes.
@@ -113,7 +261,7 @@ impl ReflectionIndex {
     /// false positives should treat an *unknown* class leniently themselves.
     pub fn is_subclass_of(&self, sub: &str, sup: &str) -> bool {
         let mut visited = Vec::new();
-        self.is_sub(&key(sub), &key(sup), &mut visited)
+        self.is_sub(&class_key(sub), &class_key(sup), &mut visited)
     }
 
     fn is_sub(&self, sub_key: &str, sup_key: &str, visited: &mut Vec<String>) -> bool {
@@ -132,7 +280,7 @@ impl ReflectionIndex {
             .chain(&c.interfaces)
             .chain(&c.traits)
             .filter_map(|p| match p {
-                Type::Named { fqn, .. } => Some(key(fqn)),
+                Type::Named { fqn, .. } => Some(class_key(fqn)),
                 _ => None,
             })
             .any(|pk| self.is_sub(&pk, sup_key, visited))
@@ -173,10 +321,10 @@ impl ReflectionIndex {
             return false;
         }
 
-        let base_key = key(class_fqn);
+        let base_key = class_key(class_fqn);
         let mut saw_concrete = false;
         for class in self.classes.values() {
-            if key(&class.fqn) == base_key || !self.is_subclass_of(&class.fqn, class_fqn) {
+            if class_key(&class.fqn) == base_key || !self.is_subclass_of(&class.fqn, class_fqn) {
                 continue;
             }
             if !matches!(class.kind, ClassKind::Class | ClassKind::Enum) || class.is_abstract {
@@ -248,12 +396,12 @@ impl ReflectionIndex {
         visited: &mut Vec<String>,
         f: &mut impl FnMut(&ClassReflection, &Subst) -> Option<T>,
     ) -> Option<T> {
-        let k = key(fqn);
+        let k = class_key(fqn);
         if visited.contains(&k) {
             return None;
         }
         visited.push(k);
-        let class = self.classes.get(&key(fqn))?;
+        let class = self.classes.get(&class_key(fqn))?;
         if let Some(found) = f(class, &subst) {
             return Some(found);
         }
@@ -280,7 +428,7 @@ impl ReflectionIndex {
     /// through the outer substitution so bindings compose down the chain).
     fn compose(&self, pf: &str, args: &[Type], outer: &Subst) -> Subst {
         let mut map = Subst::new();
-        if let Some(parent) = self.classes.get(&key(pf)) {
+        if let Some(parent) = self.classes.get(&class_key(pf)) {
             for (name, arg) in parent.templates.iter().zip(args) {
                 map.insert(name.clone(), subst_type(arg, outer));
             }
@@ -295,77 +443,35 @@ impl ReflectionIndex {
         st: &php_ast::Stmt,
         kind: SourceKind,
     ) {
-        match &st.kind {
-            StmtKind::Class(c) => self.add_class(scope, interner, c, kind),
-            StmtKind::Function(f) => {
+        visit_reflectable_decls(scope, st, &mut |scope, decl| match decl {
+            ReflectableDecl::Class(c) => self.add_class(scope, interner, c, kind),
+            ReflectableDecl::Function(f) => {
                 let r = reflect_function(scope, interner, f);
                 if kind == SourceKind::Scan
-                    && self.functions.get(&key(&r.fqn)).is_some_and(|f| f.builtin)
+                    && self
+                        .functions
+                        .get(&function_key(&r.fqn))
+                        .is_some_and(|f| f.builtin)
                 {
                     return;
                 }
                 self.bodies
-                    .insert(key(&r.fqn), (f.body.clone(), scope.clone()));
-                self.functions.insert(key(&r.fqn), r);
+                    .insert(function_key(&r.fqn), (f.body.clone(), scope.clone()));
+                self.functions.insert(function_key(&r.fqn), r);
             }
-            // Descend into nested/conditional declarations, mirroring the symbol
-            // indexer so conditionally-declared classes are reflected too.
-            StmtKind::Block(b) => self.collect_all(scope, interner, b, kind),
-            StmtKind::If {
-                then, elseifs, els, ..
-            } => {
-                self.collect_stmt(scope, interner, then, kind);
-                for e in elseifs {
-                    self.collect_stmt(scope, interner, &e.body, kind);
-                }
-                if let Some(e) = els {
-                    self.collect_stmt(scope, interner, e, kind);
-                }
-            }
-            StmtKind::While { body, .. }
-            | StmtKind::DoWhile { body, .. }
-            | StmtKind::For { body, .. }
-            | StmtKind::Foreach { body, .. } => self.collect_stmt(scope, interner, body, kind),
-            StmtKind::Try {
-                body,
-                catches,
-                finally,
-            } => {
-                self.collect_all(scope, interner, body, kind);
-                for c in catches {
-                    self.collect_all(scope, interner, &c.body, kind);
-                }
-                if let Some(fin) = finally {
-                    self.collect_all(scope, interner, fin, kind);
-                }
-            }
-            StmtKind::Switch { cases, .. } => {
-                for case in cases {
-                    self.collect_all(scope, interner, &case.body, kind);
-                }
-            }
-            StmtKind::Declare { body: Some(b), .. } => self.collect_stmt(scope, interner, b, kind),
-            _ => {}
-        }
-    }
-
-    fn collect_all(
-        &mut self,
-        scope: &Scope,
-        interner: &Interner,
-        stmts: &[php_ast::Stmt],
-        kind: SourceKind,
-    ) {
-        for st in stmts {
-            self.collect_stmt(scope, interner, st, kind);
-        }
+        });
     }
 
     fn add_class(&mut self, scope: &Scope, interner: &Interner, c: &ClassDecl, kind: SourceKind) {
         // Anonymous classes have no FQN.
         let Some(name) = c.name else { return };
         let fqn = scope.qualify(interner.resolve(name));
-        if kind == SourceKind::Scan && self.classes.get(&key(&fqn)).is_some_and(|c| c.builtin) {
+        if kind == SourceKind::Scan
+            && self
+                .classes
+                .get(&class_key(&fqn))
+                .is_some_and(|c| c.builtin)
+        {
             return;
         }
         let r = reflect_class(scope, interner, &fqn, c);
@@ -375,19 +481,21 @@ impl ReflectionIndex {
                 if let Some(body) = &md.body {
                     let mname = interner.resolve(md.name).to_ascii_lowercase();
                     self.bodies.insert(
-                        format!("{}::{}", key(&fqn), mname),
+                        format!("{}::{}", class_key(&fqn), mname),
                         (body.clone(), scope.clone()),
                     );
                 }
             }
         }
-        self.classes.insert(key(&fqn), r);
+        self.classes.insert(class_key(&fqn), r);
     }
 
     /// The body + declaring scope of a free function, by FQN (for interprocedural
     /// return inference).
     pub fn function_body(&self, fqn: &str) -> Option<(&[Stmt], &Scope)> {
-        self.bodies.get(&key(fqn)).map(|(b, s)| (b.as_slice(), s))
+        self.bodies
+            .get(&function_key(fqn))
+            .map(|(b, s)| (b.as_slice(), s))
     }
 
     /// The body + declaring scope of a method on `declaring_class` (use the
@@ -396,16 +504,19 @@ impl ReflectionIndex {
         self.bodies
             .get(&format!(
                 "{}::{}",
-                key(declaring_class),
+                class_key(declaring_class),
                 name.to_ascii_lowercase()
             ))
             .map(|(b, s)| (b.as_slice(), s))
     }
 }
 
-/// Normalise an FQN to a lookup key: drop a leading `\`, lowercase.
-fn key(fqn: &str) -> String {
-    fqn.trim_start_matches('\\').to_ascii_lowercase()
+fn class_key(fqn: &str) -> String {
+    SymbolKey::class_like(fqn).into_string()
+}
+
+fn function_key(fqn: &str) -> String {
+    SymbolKey::function(fqn).into_string()
 }
 
 /// Apply a template substitution to a method's parameter and return types.
@@ -426,65 +537,19 @@ fn subst_type(ty: &Type, subst: &Subst) -> Type {
     if subst.is_empty() {
         return ty.clone();
     }
-    match ty {
-        Type::TemplateVar(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
-        Type::Nullable(inner) => Type::Nullable(Box::new(subst_type(inner, subst))),
-        Type::Union(parts) => Type::union(parts.iter().map(|p| subst_type(p, subst)).collect()),
-        Type::Intersection(parts) => {
-            Type::intersection(parts.iter().map(|p| subst_type(p, subst)).collect())
-        }
-        Type::List(inner) => Type::List(Box::new(subst_type(inner, subst))),
-        Type::Array(Some(kv)) => Type::Array(Some(Box::new((
-            subst_type(&kv.0, subst),
-            subst_type(&kv.1, subst),
-        )))),
-        Type::Iterable(Some(kv)) => Type::Iterable(Some(Box::new((
-            subst_type(&kv.0, subst),
-            subst_type(&kv.1, subst),
-        )))),
-        Type::ClassString(Some(inner)) => {
-            Type::ClassString(Some(Box::new(subst_type(inner, subst))))
-        }
-        Type::Named { fqn, args } => Type::Named {
-            fqn: fqn.clone(),
-            args: args.iter().map(|a| subst_type(a, subst)).collect(),
-        },
-        Type::Callable(Some(sig)) => Type::Callable(Some(Box::new(CallableSig {
-            params: sig.params.iter().map(|p| subst_type(p, subst)).collect(),
-            ret: subst_type(&sig.ret, subst),
-        }))),
-        Type::Shape { fields, sealed } => Type::Shape {
-            fields: fields
-                .iter()
-                .map(|f| ShapeField {
-                    key: f.key.clone(),
-                    optional: f.optional,
-                    ty: subst_type(&f.ty, subst),
-                })
-                .collect(),
-            sealed: *sealed,
-        },
-        Type::Conditional {
-            subject,
-            negated,
-            target,
-            then,
-            els,
-        } => Type::Conditional {
-            subject: subject.clone(),
-            negated: *negated,
-            target: Box::new(subst_type(target, subst)),
-            then: Box::new(subst_type(then, subst)),
-            els: Box::new(subst_type(els, subst)),
-        },
-        // Leaves and unparameterised forms are unchanged.
-        other => other.clone(),
-    }
+    ty.clone().map(&mut |part| match part {
+        Type::TemplateVar(name) => subst.get(&name).cloned().unwrap_or(Type::TemplateVar(name)),
+        Type::Union(parts) => Type::union(parts),
+        Type::Intersection(parts) => Type::intersection(parts),
+        other => other,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use php_resolve::SymbolKey;
+    use std::collections::BTreeSet;
 
     fn index(src: &str) -> ReflectionIndex {
         let r = php_parser::parse(src);
@@ -683,6 +748,118 @@ mod tests {
                 .return_type,
             Type::String
         );
+    }
+
+    #[test]
+    fn builtin_signatures_follow_selected_php_version() {
+        let idx84 = ReflectionIndex::with_builtins_for(PhpVersion::from_id(80400).unwrap());
+        assert_eq!(
+            idx84.function("array_multisort").unwrap().return_type,
+            Type::Bool
+        );
+
+        let idx85 = ReflectionIndex::with_builtins_for(PhpVersion::from_id(80500).unwrap());
+        assert_eq!(
+            idx85.function("array_multisort").unwrap().return_type,
+            Type::True
+        );
+
+        let idx86 = ReflectionIndex::with_builtins_for(PhpVersion::from_id(80600).unwrap());
+        assert_eq!(
+            idx86.function("array_multisort").unwrap().return_type,
+            Type::True
+        );
+
+        let below = ReflectionIndex::with_builtins_for(PhpVersion::from_id(70400).unwrap());
+        assert_eq!(
+            below.function("array_multisort").unwrap().return_type,
+            Type::Bool
+        );
+
+        let above = ReflectionIndex::with_builtins_for(PhpVersion::from_id(90000).unwrap());
+        assert_eq!(
+            above.function("array_multisort").unwrap().return_type,
+            Type::True
+        );
+    }
+
+    #[test]
+    fn builtin_names_match_typed_manifests_for_supported_versions() {
+        for id in [80400, 80500, 80600] {
+            let version = PhpVersion::from_id(id).unwrap();
+            let project = php_index::ProjectIndex::with_builtins_for(version);
+            let reflection = ReflectionIndex::with_builtins_for(version);
+
+            let project_functions: BTreeSet<_> = project
+                .functions()
+                .map(|f| SymbolKey::function(&f.fqn).into_string())
+                .collect();
+            let reflection_functions: BTreeSet<_> = reflection.functions.keys().cloned().collect();
+            assert_eq!(
+                project_functions, reflection_functions,
+                "builtin function manifest drift for PHP {id}"
+            );
+
+            let project_classes: BTreeSet<_> = project
+                .classes()
+                .map(|c| SymbolKey::class_like(&c.fqn).into_string())
+                .collect();
+            let reflection_classes: BTreeSet<_> = reflection.classes.keys().cloned().collect();
+            assert_eq!(
+                project_classes, reflection_classes,
+                "builtin class manifest drift for PHP {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn reflected_file_discovers_same_nested_declarations_as_project_index() {
+        let r = php_parser::parse(
+            r#"<?php
+            if (true) {
+                function conditional_fn(): int {}
+                class ConditionalClass {}
+            }
+            class Host {
+                public function boot(): void {
+                    function method_fn(): string {}
+                    class MethodClass {}
+                }
+            }"#,
+        );
+        assert!(!r.has_errors(), "parse errors");
+
+        let file_index = php_resolve::index_file(&r.program, &r.interner);
+        let mut project = php_index::ProjectIndex::new();
+        project.add_file("fixture.php", &file_index);
+
+        let mut reflection = ReflectionIndex::new();
+        reflection.add_file(&r.program, &r.interner);
+
+        for name in ["conditional_fn", "method_fn"] {
+            assert_eq!(
+                project.has_function(name),
+                reflection.function(name).is_some(),
+                "function discovery diverged for {name}"
+            );
+        }
+        for name in ["ConditionalClass", "Host", "MethodClass"] {
+            assert_eq!(
+                project.has_class(name),
+                reflection.class(name).is_some(),
+                "class discovery diverged for {name}"
+            );
+        }
+
+        let reflected = reflect_file(&r.program, &r.interner);
+        assert!(reflected
+            .functions
+            .iter()
+            .any(|f| f.reflection.fqn == "method_fn"));
+        assert!(reflected
+            .classes
+            .iter()
+            .any(|c| c.reflection.fqn == "MethodClass"));
     }
 
     #[test]

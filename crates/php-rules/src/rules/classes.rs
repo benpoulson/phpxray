@@ -76,7 +76,7 @@
 //!   unresolvable types, and generic-object arity/variance need richer PHPDoc
 //!   reflection than is available here.
 
-use crate::{unknown_symbols, walk, FileAnalysis, RuleEntry};
+use crate::{decls, symbols, unknown_symbols, walk, FileAnalysis, RuleEntry};
 use php_ast::{
     AttributeGroup, ClassDecl, ClassKind, Expr, ExprKind, Member, MemberName, MethodDecl, Name,
     Param, Stmt, StmtKind, Visibility,
@@ -119,51 +119,8 @@ fn for_each_class(
     interner: &Interner,
     mut f: impl FnMut(&Scope, &ClassDecl),
 ) {
-    fn visit(scope: &Scope, st: &Stmt, f: &mut impl FnMut(&Scope, &ClassDecl)) {
-        match &st.kind {
-            StmtKind::Class(c) => f(scope, c),
-            StmtKind::Block(b) => b.iter().for_each(|s| visit(scope, s, f)),
-            StmtKind::If {
-                then, elseifs, els, ..
-            } => {
-                visit(scope, then, f);
-                for e in elseifs {
-                    visit(scope, &e.body, f);
-                }
-                if let Some(e) = els {
-                    visit(scope, e, f);
-                }
-            }
-            StmtKind::While { body, .. }
-            | StmtKind::DoWhile { body, .. }
-            | StmtKind::For { body, .. }
-            | StmtKind::Foreach { body, .. } => visit(scope, body, f),
-            StmtKind::Try {
-                body,
-                catches,
-                finally,
-            } => {
-                body.iter().for_each(|s| visit(scope, s, f));
-                for c in catches {
-                    c.body.iter().for_each(|s| visit(scope, s, f));
-                }
-                if let Some(fin) = finally {
-                    fin.iter().for_each(|s| visit(scope, s, f));
-                }
-            }
-            StmtKind::Switch { cases, .. } => {
-                for c in cases {
-                    c.body.iter().for_each(|s| visit(scope, s, f));
-                }
-            }
-            StmtKind::Declare { body: Some(b), .. } => visit(scope, b, f),
-            _ => {}
-        }
-    }
-    for_each_region(&program.stmts, interner, |scope, region| {
-        for st in region {
-            visit(scope, st, &mut f);
-        }
+    decls::for_each_class_like_in(program, interner, &mut |scope, _, class| {
+        f(scope, class);
     });
 }
 
@@ -2791,28 +2748,30 @@ fn check_missing_phpdoc_type(
     span: php_span::Span,
     out: &mut Vec<Diagnostic>,
 ) {
-    if let Some(word) = missing_iterable_word(ty) {
-        out.push(
-            Diagnostic::error(span, missing_iterable_message(label, ctx, word))
-                .with_code("missingType.iterableValue"),
-        );
-    }
-
-    for (name, templates) in missing_generic_classes(fa, ty) {
-        out.push(
-            Diagnostic::error(
-                span,
-                missing_generics_message(label, ctx, &name, &templates),
-            )
-            .with_code("missingType.generics"),
-        );
-    }
-
-    if missing_callable_signature(ty) {
-        out.push(
-            Diagnostic::error(span, missing_callable_message(label, ctx))
-                .with_code("missingType.callable"),
-        );
+    for issue in crate::missing_type::check_type(fa.reflection, ty) {
+        match issue {
+            crate::missing_type::MissingTypeIssue::IterableValue { word } => {
+                out.push(
+                    Diagnostic::error(span, missing_iterable_message(label, ctx, word))
+                        .with_code("missingType.iterableValue"),
+                );
+            }
+            crate::missing_type::MissingTypeIssue::GenericArgs { name, templates } => {
+                out.push(
+                    Diagnostic::error(
+                        span,
+                        missing_generics_message(label, ctx, &name, &templates),
+                    )
+                    .with_code("missingType.generics"),
+                );
+            }
+            crate::missing_type::MissingTypeIssue::CallableSignature => {
+                out.push(
+                    Diagnostic::error(span, missing_callable_message(label, ctx))
+                        .with_code("missingType.callable"),
+                );
+            }
+        }
     }
 }
 
@@ -2954,124 +2913,6 @@ fn collect_known_traits_in_type(
             collect_known_traits_in_type(fa, els, seen, out);
         }
         _ => {}
-    }
-}
-
-fn missing_iterable_word(ty: &Type) -> Option<&'static str> {
-    match ty {
-        Type::Array(None) => Some("array"),
-        Type::Iterable(None) => Some("iterable"),
-        Type::Nullable(inner) | Type::List(inner) | Type::ClassString(Some(inner)) => {
-            missing_iterable_word(inner)
-        }
-        Type::Array(Some(kv)) | Type::Iterable(Some(kv)) => {
-            missing_iterable_word(&kv.0).or_else(|| missing_iterable_word(&kv.1))
-        }
-        Type::Named { args, .. } => args.iter().find_map(missing_iterable_word),
-        Type::Callable(Some(sig)) => sig
-            .params
-            .iter()
-            .find_map(missing_iterable_word)
-            .or_else(|| missing_iterable_word(&sig.ret)),
-        Type::Shape { fields, .. } => fields.iter().find_map(|f| missing_iterable_word(&f.ty)),
-        Type::Union(parts) | Type::Intersection(parts) => {
-            parts.iter().find_map(missing_iterable_word)
-        }
-        Type::Conditional {
-            target, then, els, ..
-        } => missing_iterable_word(target)
-            .or_else(|| missing_iterable_word(then))
-            .or_else(|| missing_iterable_word(els)),
-        _ => None,
-    }
-}
-
-fn missing_generic_classes(fa: &FileAnalysis, ty: &Type) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    collect_missing_generic_classes(fa, ty, &mut seen, &mut out);
-    out
-}
-
-fn collect_missing_generic_classes(
-    fa: &FileAnalysis,
-    ty: &Type,
-    seen: &mut HashSet<String>,
-    out: &mut Vec<(String, String)>,
-) {
-    match ty {
-        Type::Named { fqn, args } => {
-            if args.is_empty() {
-                if let Some(class) = fa.reflection.class(fqn) {
-                    if !class.templates.is_empty() && seen.insert(class_key(fqn)) {
-                        out.push((display_fqn(&class.fqn), class.templates.join(", ")));
-                    }
-                }
-            }
-            for arg in args {
-                collect_missing_generic_classes(fa, arg, seen, out);
-            }
-        }
-        Type::Nullable(inner) | Type::List(inner) | Type::ClassString(Some(inner)) => {
-            collect_missing_generic_classes(fa, inner, seen, out)
-        }
-        Type::Array(Some(kv)) | Type::Iterable(Some(kv)) => {
-            collect_missing_generic_classes(fa, &kv.0, seen, out);
-            collect_missing_generic_classes(fa, &kv.1, seen, out);
-        }
-        Type::Callable(Some(sig)) => {
-            for param in &sig.params {
-                collect_missing_generic_classes(fa, param, seen, out);
-            }
-            collect_missing_generic_classes(fa, &sig.ret, seen, out);
-        }
-        Type::Shape { fields, .. } => {
-            for field in fields {
-                collect_missing_generic_classes(fa, &field.ty, seen, out);
-            }
-        }
-        Type::Union(parts) | Type::Intersection(parts) => {
-            for part in parts {
-                collect_missing_generic_classes(fa, part, seen, out);
-            }
-        }
-        Type::Conditional {
-            target, then, els, ..
-        } => {
-            collect_missing_generic_classes(fa, target, seen, out);
-            collect_missing_generic_classes(fa, then, seen, out);
-            collect_missing_generic_classes(fa, els, seen, out);
-        }
-        _ => {}
-    }
-}
-
-fn missing_callable_signature(ty: &Type) -> bool {
-    match ty {
-        Type::Callable(None) => true,
-        Type::Nullable(inner) | Type::List(inner) | Type::ClassString(Some(inner)) => {
-            missing_callable_signature(inner)
-        }
-        Type::Array(Some(kv)) | Type::Iterable(Some(kv)) => {
-            missing_callable_signature(&kv.0) || missing_callable_signature(&kv.1)
-        }
-        Type::Named { args, .. } => args.iter().any(missing_callable_signature),
-        Type::Callable(Some(sig)) => {
-            sig.params.iter().any(missing_callable_signature)
-                || missing_callable_signature(&sig.ret)
-        }
-        Type::Shape { fields, .. } => fields.iter().any(|f| missing_callable_signature(&f.ty)),
-        Type::Union(parts) | Type::Intersection(parts) => {
-            parts.iter().any(missing_callable_signature)
-        }
-        Type::Conditional {
-            target, then, els, ..
-        } => {
-            missing_callable_signature(target)
-                || missing_callable_signature(then)
-                || missing_callable_signature(els)
-        }
-        _ => false,
     }
 }
 
@@ -3349,7 +3190,7 @@ fn run_allowed_subtypes(fa: &FileAnalysis) -> Vec<Diagnostic> {
             if parent_doc
                 .allowed
                 .iter()
-                .any(|allowed| same_fqn(allowed, &class_fqn))
+                .any(|allowed| symbols::same_fqn(allowed, &class_fqn))
             {
                 continue;
             }
@@ -3641,11 +3482,6 @@ fn class_key(fqn: &str) -> String {
 
 fn display_fqn(fqn: &str) -> String {
     fqn.trim_start_matches('\\').to_string()
-}
-
-fn same_fqn(a: &str, b: &str) -> bool {
-    a.trim_start_matches('\\')
-        .eq_ignore_ascii_case(b.trim_start_matches('\\'))
 }
 
 pub(crate) static RULES: &[RuleEntry] = &[
@@ -4951,7 +4787,10 @@ mod tests {
     fn psalm_inheritors_alias_is_enforced() {
         let src = "<?php /** @psalm-inheritors Good */ interface I {} \
             class Bad implements I {}";
-        assert_eq!(codes(src, run_allowed_subtypes), ["class.disallowedSubtype"]);
+        assert_eq!(
+            codes(src, run_allowed_subtypes),
+            ["class.disallowedSubtype"]
+        );
     }
 
     #[test]

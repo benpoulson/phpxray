@@ -61,7 +61,7 @@ pub fn index_file(program: &Program, interner: &Interner) -> FileIndex {
 /// non-braced run / global) and invoke `f` with each region's [`Scope`] (its
 /// namespace + `use` imports) and its statements. Shared by indexing, reference
 /// resolution, and the reflection layer.
-pub fn for_each_region(stmts: &[Stmt], i: &Interner, mut f: impl FnMut(&Scope, &[Stmt])) {
+pub fn for_each_region<'a>(stmts: &'a [Stmt], i: &Interner, mut f: impl FnMut(&Scope, &'a [Stmt])) {
     let mut idx = 0;
     while idx < stmts.len() {
         let (name, region, next) = match &stmts[idx].kind {
@@ -141,8 +141,18 @@ impl Indexer<'_> {
                 self.out.functions.push(FunctionSymbol {
                     fqn: scope.qualify(self.i.resolve(f.name)),
                 });
+                self.collect_all(scope, &f.body);
             }
-            StmtKind::Class(c) => self.collect_class(scope, c),
+            StmtKind::Class(c) => {
+                self.collect_class(scope, c);
+                for member in &c.members {
+                    if let Member::Method(method) = member {
+                        if let Some(body) = &method.body {
+                            self.collect_all(scope, body);
+                        }
+                    }
+                }
+            }
             StmtKind::ConstDecl { consts, .. } => {
                 for c in consts {
                     self.out.constants.push(ConstSymbol {

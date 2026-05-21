@@ -41,7 +41,11 @@
 //!   property-hook get/set body rules — need expression-type inference of the
 //!   access receiver / value, or virtual-property hook semantics beyond the AST.
 
-use crate::{walk, FileAnalysis, RuleEntry};
+use crate::{
+    decls,
+    members::{MemberAccessResolver, ResolveStatus},
+    symbols, walk, FileAnalysis, RuleEntry,
+};
 use php_ast::{
     AttributeGroup, ClassDecl, ClassKind, Expr, ExprKind, HookBody, Member, MemberName, Name,
     Param, Program, PropElem, PropertyDecl, PropertyHook, Stmt, StmtKind, Visibility,
@@ -76,132 +80,17 @@ fn span_of(p: &PropElem) -> Span {
     }
 }
 
-fn same_fqn(a: &str, b: &str) -> bool {
-    a.trim_start_matches('\\')
-        .eq_ignore_ascii_case(b.trim_start_matches('\\'))
-}
-
-/// Walk every property declaration in the program together with the class it
-/// belongs to. Property decls only live directly in class member lists, so we
-/// recurse over statements (including conditional/nested classes) collecting
-/// `(class, prop)` pairs.
-fn for_each_property(program: &Program, f: &mut impl FnMut(&ClassDecl, &PropertyDecl)) {
-    fn visit_stmts(stmts: &[Stmt], f: &mut impl FnMut(&ClassDecl, &PropertyDecl)) {
-        for s in stmts {
-            visit_stmt(s, f);
-        }
-    }
-    fn visit_stmt(s: &Stmt, f: &mut impl FnMut(&ClassDecl, &PropertyDecl)) {
-        match &s.kind {
-            StmtKind::Class(c) => {
-                for m in &c.members {
-                    if let Member::Property(pd) = m {
-                        f(c, pd);
-                    }
-                }
-            }
-            StmtKind::Namespace { body: Some(b), .. } => visit_stmts(b, f),
-            StmtKind::Block(b) => visit_stmts(b, f),
-            StmtKind::If {
-                then, elseifs, els, ..
-            } => {
-                visit_stmt(then, f);
-                for ei in elseifs {
-                    visit_stmt(&ei.body, f);
-                }
-                if let Some(e) = els {
-                    visit_stmt(e, f);
-                }
-            }
-            StmtKind::Function(fd) => visit_stmts(&fd.body, f),
-            _ => {}
-        }
-    }
-    visit_stmts(&program.stmts, f);
+/// Walk every property declaration in the file together with the class it
+/// belongs to.
+fn for_each_property(fa: &FileAnalysis, f: &mut impl FnMut(&ClassDecl, &PropertyDecl)) {
+    decls::for_each_property(fa, |_, class, property| f(class, property));
 }
 
 fn for_each_property_elem(
     fa: &FileAnalysis,
     f: &mut impl FnMut(&str, &ClassDecl, &PropertyDecl, &PropElem),
 ) {
-    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
-        for st in region {
-            visit_property_elem_stmt(fa, scope, st, f);
-        }
-    });
-}
-
-fn visit_property_elem_stmt(
-    fa: &FileAnalysis,
-    scope: &Scope,
-    st: &Stmt,
-    f: &mut impl FnMut(&str, &ClassDecl, &PropertyDecl, &PropElem),
-) {
-    match &st.kind {
-        StmtKind::Class(c) => {
-            let class_fqn = c
-                .name
-                .map(|n| scope.qualify(fa.interner.resolve(n)))
-                .unwrap_or_else(|| "class@anonymous".to_string());
-            for m in &c.members {
-                if let Member::Property(pd) = m {
-                    for elem in &pd.props {
-                        f(&class_fqn, c, pd, elem);
-                    }
-                }
-            }
-        }
-        StmtKind::Namespace { body: Some(b), .. } | StmtKind::Block(b) => {
-            b.iter()
-                .for_each(|s| visit_property_elem_stmt(fa, scope, s, f));
-        }
-        StmtKind::If {
-            then, elseifs, els, ..
-        } => {
-            visit_property_elem_stmt(fa, scope, then, f);
-            for e in elseifs {
-                visit_property_elem_stmt(fa, scope, &e.body, f);
-            }
-            if let Some(e) = els {
-                visit_property_elem_stmt(fa, scope, e, f);
-            }
-        }
-        StmtKind::While { body, .. }
-        | StmtKind::DoWhile { body, .. }
-        | StmtKind::For { body, .. }
-        | StmtKind::Foreach { body, .. } => visit_property_elem_stmt(fa, scope, body, f),
-        StmtKind::Try {
-            body,
-            catches,
-            finally,
-        } => {
-            body.iter()
-                .for_each(|s| visit_property_elem_stmt(fa, scope, s, f));
-            for c in catches {
-                c.body
-                    .iter()
-                    .for_each(|s| visit_property_elem_stmt(fa, scope, s, f));
-            }
-            if let Some(fin) = finally {
-                fin.iter()
-                    .for_each(|s| visit_property_elem_stmt(fa, scope, s, f));
-            }
-        }
-        StmtKind::Switch { cases, .. } => {
-            for case in cases {
-                case.body
-                    .iter()
-                    .for_each(|s| visit_property_elem_stmt(fa, scope, s, f));
-            }
-        }
-        StmtKind::Declare { body: Some(b), .. } => visit_property_elem_stmt(fa, scope, b, f),
-        StmtKind::Function(fd) => {
-            fd.body
-                .iter()
-                .for_each(|s| visit_property_elem_stmt(fa, scope, s, f));
-        }
-        _ => {}
-    }
+    decls::for_each_property_elem(fa, f);
 }
 
 // --- ReadOnlyPropertyRule (level 0) ----------------------------------------
@@ -210,7 +99,7 @@ fn visit_property_elem_stmt(
 /// type, must not have a default value, and must not be static.
 fn run_readonly_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    for_each_property(fa.program, &mut |_class, pd| {
+    for_each_property(fa, &mut |_class, pd| {
         if !pd.modifiers.is_readonly {
             return;
         }
@@ -281,7 +170,7 @@ fn has_readonly_doc(doc_raw: &str, base: &str) -> bool {
 /// `@psalm-allow-private-mutation` opt-out (which lets the property be mutated).
 fn run_readonly_phpdoc_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    for_each_property(fa.program, &mut |_class, pd| {
+    for_each_property(fa, &mut |_class, pd| {
         if pd.modifiers.is_readonly {
             return; // native readonly — handled by run_readonly_property
         }
@@ -331,7 +220,7 @@ fn property_decl_info(
     };
 
     for_each_property_elem(fa, &mut |class_fqn, _class, pd, elem| {
-        if !same_fqn(class_fqn, &found.declaring_class) {
+        if !symbols::same_fqn(class_fqn, &found.declaring_class) {
             return;
         }
         if fa.interner.resolve(elem.name) != prop {
@@ -371,9 +260,11 @@ fn can_write_property(
 ) -> bool {
     match write_visibility(info) {
         Visibility::Public => true,
-        Visibility::Private => current_class.is_some_and(|c| same_fqn(c, &info.declaring_class)),
+        Visibility::Private => {
+            current_class.is_some_and(|c| symbols::same_fqn(c, &info.declaring_class))
+        }
         Visibility::Protected => current_class.is_some_and(|c| {
-            same_fqn(c, &info.declaring_class)
+            symbols::same_fqn(c, &info.declaring_class)
                 || fa.reflection.is_subclass_of(c, &info.declaring_class)
         }),
     }
@@ -419,7 +310,7 @@ fn property_fetch_from_write_target(target: &Expr) -> Option<&Expr> {
 /// abstract-vs-hooks, readonly/static-vs-hooks, and virtual default-value.
 fn run_property_in_class(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    for_each_property(fa.program, &mut |class, pd| {
+    for_each_property(fa, &mut |class, pd| {
         if class.kind != ClassKind::Class {
             return; // interfaces handled by run_properties_in_interface
         }
@@ -560,7 +451,7 @@ fn any_hook_has_body(pd: &PropertyDecl) -> bool {
 /// returns on the FIRST matching error per property, in this exact order.
 fn run_properties_in_interface(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    for_each_property(fa.program, &mut |class, pd| {
+    for_each_property(fa, &mut |class, pd| {
         if class.kind != ClassKind::Interface {
             return;
         }
@@ -640,7 +531,7 @@ fn run_properties_in_interface(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// attribute check needs the attribute class's reflection and is deferred.)
 fn run_property_hook_attributes(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    for_each_property(fa.program, &mut |_class, pd| {
+    for_each_property(fa, &mut |_class, pd| {
         for elem in &pd.props {
             let Some(hooks) = &elem.hooks else { continue };
             for hook in hooks {
@@ -1074,79 +965,21 @@ fn property_readable_type_is_certain(
 }
 
 fn bare_iterable_words(ty: &Type) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    collect_bare_iterable_words(ty, &mut out);
-    out
-}
-
-fn collect_bare_iterable_words(ty: &Type, out: &mut Vec<&'static str>) {
-    match ty {
-        Type::Array(None) => out.push("array"),
-        Type::Iterable(None) => out.push("iterable"),
-        Type::Nullable(inner) => collect_bare_iterable_words(inner, out),
-        Type::Union(parts) | Type::Intersection(parts) => {
-            parts
-                .iter()
-                .for_each(|p| collect_bare_iterable_words(p, out));
-        }
-        _ => {}
-    }
+    crate::missing_type::type_iterable_words(ty)
 }
 
 fn non_generic_object_types_with_generic_class(
     fa: &FileAnalysis,
     ty: &Type,
 ) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    collect_non_generic_object_types_with_generic_class(fa, ty, &mut out);
-    out
-}
-
-fn collect_non_generic_object_types_with_generic_class(
-    fa: &FileAnalysis,
-    ty: &Type,
-    out: &mut Vec<(String, String)>,
-) {
-    match ty {
-        Type::Named { fqn, args } if args.is_empty() => {
-            if let Some(class) = fa.reflection.class(fqn) {
-                if !class.templates.is_empty() {
-                    out.push((
-                        fqn.trim_start_matches('\\').to_string(),
-                        class.templates.join(", "),
-                    ));
-                }
-            }
-        }
-        Type::Nullable(inner) => {
-            collect_non_generic_object_types_with_generic_class(fa, inner, out)
-        }
-        Type::Union(parts) | Type::Intersection(parts) => {
-            parts
-                .iter()
-                .for_each(|p| collect_non_generic_object_types_with_generic_class(fa, p, out));
-        }
-        _ => {}
-    }
+    crate::missing_type::type_generic_args_in_union(fa.reflection, ty)
 }
 
 fn callables_with_missing_signature(ty: &Type) -> Vec<String> {
-    let mut out = Vec::new();
-    collect_callables_with_missing_signature(ty, &mut out);
-    out
-}
-
-fn collect_callables_with_missing_signature(ty: &Type, out: &mut Vec<String>) {
-    match ty {
-        Type::Callable(None) => out.push("callable".to_string()),
-        Type::Nullable(inner) => collect_callables_with_missing_signature(inner, out),
-        Type::Union(parts) | Type::Intersection(parts) => {
-            parts
-                .iter()
-                .for_each(|p| collect_callables_with_missing_signature(p, out));
-        }
-        _ => {}
-    }
+    crate::missing_type::type_callable_signature_words(ty)
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
 
 fn hook_named<'a>(elem: &'a PropElem, fa: &FileAnalysis, name: &str) -> Option<&'a PropertyHook> {
@@ -1359,7 +1192,7 @@ fn expr_is_this_property(e: &Expr, prop: &str, fa: &FileAnalysis) -> bool {
 /// ascends own-first, so we search each parent rather than the class itself).
 fn run_overriding_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    for_each_property(fa.program, &mut |class, pd| {
+    for_each_property(fa, &mut |class, pd| {
         // Resolve the parent property (prototype) once per declaration name.
         for elem in &pd.props {
             let prop = fa.interner.resolve(elem.name).to_string();
@@ -1542,7 +1375,7 @@ fn run_access_properties(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 if let (ExprKind::Variable(v), MemberName::Ident(p)) = (&base.kind, name) {
                     if fa.interner.resolve(*v) == "this" {
                         let prop = fa.interner.resolve(*p);
-                        if class_is_fully_known(class, fa)
+                        if symbols::class_tree_fully_known(fa, class)
                             && fa.reflection.find_property(class, prop).is_none()
                             && fa.reflection.find_method(class, "__get").is_none()
                         {
@@ -1903,7 +1736,7 @@ fn missing_readonly_candidates(
                 MissingReadonlyKind::Native => info.is_native_readonly,
                 MissingReadonlyKind::PhpDoc => is_phpdoc && !info.is_native_readonly,
             };
-            if matches_kind && same_fqn(&info.declaring_class, class_fqn) {
+            if matches_kind && symbols::same_fqn(&info.declaring_class, class_fqn) {
                 props.push(MissingReadonlyProp {
                     name: prop.to_string(),
                     span: span_of(elem),
@@ -2323,7 +2156,7 @@ fn run_readonly_phpdoc_property_assign(fa: &FileAnalysis) -> Vec<Diagnostic> {
 
             let declaring = info.declaring_class.trim_start_matches('\\');
             let outside_declaring =
-                current_class.is_none_or(|c| !same_fqn(c, &info.declaring_class));
+                current_class.is_none_or(|c| !symbols::same_fqn(c, &info.declaring_class));
             if outside_declaring {
                 out.push(
                     Diagnostic::error(
@@ -2411,7 +2244,7 @@ fn run_access_private_property_through_static(fa: &FileAnalysis) -> Vec<Diagnost
             };
             if !info.is_static
                 || info.visibility != Visibility::Private
-                || !same_fqn(&info.declaring_class, current_class)
+                || !symbols::same_fqn(&info.declaring_class, current_class)
             {
                 return;
             }
@@ -2821,32 +2654,6 @@ fn walk_expr_local(e: &Expr, on_expr: &mut impl FnMut(&Expr)) {
     }
 }
 
-/// Conservative: the class and every ancestor it names are present in the
-/// reflection index (no unknown parent/interface/trait/mixin that might declare
-/// the property).
-fn class_is_fully_known(fqn: &str, fa: &FileAnalysis) -> bool {
-    fn known(fqn: &str, fa: &FileAnalysis, seen: &mut Vec<String>) -> bool {
-        let key = fqn.trim_start_matches('\\').to_ascii_lowercase();
-        if seen.contains(&key) {
-            return true;
-        }
-        seen.push(key);
-        let Some(c) = fa.reflection.class(fqn) else {
-            return false;
-        };
-        c.parents
-            .iter()
-            .chain(&c.interfaces)
-            .chain(&c.traits)
-            .chain(&c.mixins)
-            .all(|t| match t {
-                php_types::Type::Named { fqn, .. } => known(fqn, fa, seen),
-                _ => true,
-            })
-    }
-    known(fqn, fa, &mut Vec::new())
-}
-
 // --- type helpers (general property access) ---------------------------------
 
 /// If `ty` denotes a single, concrete object class (directly or under one level
@@ -2863,13 +2670,6 @@ fn sole_class(ty: &Type) -> Option<String> {
         Type::Nullable(inner) => sole_class(inner),
         _ => None,
     }
-}
-
-/// Conservative: the class and *every* ancestor it names are present in the
-/// reflection index (so no unknown parent/interface/trait/mixin can secretly
-/// declare the member). Shared with the `$this` rule's notion above.
-fn known_class_tree(fqn: &str, fa: &FileAnalysis) -> bool {
-    class_is_fully_known(fqn, fa)
 }
 
 /// Does `class_fqn` (or its hierarchy) declare a magic `__get`/`__set` that would
@@ -3110,7 +2910,6 @@ fn run_union_property_access_in_assign(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
-
 fn union_property_status(
     fa: &FileAnalysis,
     ty: &Type,
@@ -3130,7 +2929,7 @@ fn union_property_status(
             return None;
         };
         let class = fqn.trim_start_matches('\\');
-        if !known_class_tree(class, fa) {
+        if !symbols::class_tree_fully_known(fa, class) {
             return None;
         }
         if fa.reflection.class(class).map(|c| c.kind) == Some(ClassKind::Interface) {
@@ -3179,29 +2978,21 @@ fn check_property_access(
     let Some(class) = sole_class(&base_ty) else {
         return;
     };
-    if !known_class_tree(&class, fa) {
-        return; // unresolved hierarchy → no judgement.
+    if matches!(
+        MemberAccessResolver::new(fa).instance_property(&base_ty, prop, write),
+        ResolveStatus::Unknown
+    ) {
+        out.push(
+            Diagnostic::error(
+                fetch.span,
+                format!(
+                    "Access to an undefined property {}::${prop}.",
+                    class.trim_start_matches('\\')
+                ),
+            )
+            .with_code("property.notFound"),
+        );
     }
-    // An interface declares no instance properties, so a property access on an
-    // interface-typed value always lands on the concrete runtime implementor (which
-    // may well define it). Reporting it absent would be a false positive.
-    if fa.reflection.class(&class).map(|c| c.kind) == Some(ClassKind::Interface) {
-        return;
-    }
-    if fa.reflection.find_property(&class, prop).is_some() || has_magic_accessor(&class, fa, write)
-    {
-        return;
-    }
-    out.push(
-        Diagnostic::error(
-            fetch.span,
-            format!(
-                "Access to an undefined property {}::${prop}.",
-                class.trim_start_matches('\\')
-            ),
-        )
-        .with_code("property.notFound"),
-    );
 }
 
 // --- AccessStaticPropertiesRule (level 0) ----------------------------------
@@ -3278,23 +3069,23 @@ fn check_static_property(
         Resolution::Fqn(f) => f.trim_start_matches('\\').to_string(),
         _ => return None,
     };
-    if !known_class_tree(&fqn, fa) {
+    if !symbols::class_tree_fully_known(fa, &fqn) {
         return None;
     }
     let prop = fa.interner.resolve(*p);
-    if fa.reflection.find_property(&fqn, prop).is_some() {
-        return None;
+    match MemberAccessResolver::new(fa).static_property(&fqn, prop) {
+        ResolveStatus::Unknown => Some(
+            Diagnostic::error(
+                e.span,
+                format!(
+                    "Access to an undefined static property {}::${prop}.",
+                    fqn.trim_start_matches('\\')
+                ),
+            )
+            .with_code("staticProperty.notFound"),
+        ),
+        ResolveStatus::Known(_) | ResolveStatus::Opaque | ResolveStatus::Skipped => None,
     }
-    Some(
-        Diagnostic::error(
-            e.span,
-            format!(
-                "Access to an undefined static property {}::${prop}.",
-                fqn.trim_start_matches('\\')
-            ),
-        )
-        .with_code("staticProperty.notFound"),
-    )
 }
 
 // --- AccessStaticPropertiesInAssignRule (level 0) --------------------------
@@ -3439,7 +3230,7 @@ fn run_reading_write_only(fa: &FileAnalysis) -> Vec<Diagnostic> {
         let Some(class) = receiver_class(fa, base) else {
             return;
         };
-        if !known_class_tree(&class, fa) {
+        if !symbols::class_tree_fully_known(fa, &class) {
             return;
         }
         let prop = fa.interner.resolve(*p);
@@ -3480,7 +3271,7 @@ fn run_writing_to_read_only(fa: &FileAnalysis) -> Vec<Diagnostic> {
         let Some(class) = receiver_class(fa, base) else {
             return;
         };
-        if !known_class_tree(&class, fa) {
+        if !symbols::class_tree_fully_known(fa, &class) {
             return;
         }
         let prop = fa.interner.resolve(*p);
@@ -3519,7 +3310,7 @@ fn receiver_class(fa: &FileAnalysis, base: &Expr) -> Option<String> {
 /// are ctor params, not `Member::Property`, so they're naturally excluded.
 fn run_invalid_callable_property_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    for_each_property(fa.program, &mut |class, pd| {
+    for_each_property(fa, &mut |class, pd| {
         let Some(ty) = &pd.ty else { return };
         if !type_mentions_callable(ty) {
             return;
@@ -3569,7 +3360,7 @@ fn type_mentions_callable(ty: &php_ast::Type) -> bool {
 /// of not being `Member::Property`.
 fn run_missing_property_typehint(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    for_each_property(fa.program, &mut |class, pd| {
+    for_each_property(fa, &mut |class, pd| {
         if pd.ty.is_some() {
             return; // has a native type.
         }
@@ -3594,7 +3385,7 @@ fn run_missing_property_typehint(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// Conservative scan of a raw docblock for an `@var` tag. Any occurrence — even
 /// partial — counts as "type specified", to avoid false positives.
 fn doc_has_var(doc: Option<&str>) -> bool {
-    doc.is_some_and(|d| d.contains("@var"))
+    php_phpdoc::query::has_var_conservative(doc)
 }
 
 // --- registry --------------------------------------------------------------
@@ -4903,10 +4694,7 @@ mod tests {
     fn union_property_access_missing_on_one_arm_is_flagged() {
         let src = "<?php class A { public int $p; } class B {} \
             /** @param A|B $x */ function f($x): int { return $x->p; }";
-        assert_eq!(
-            codes(src, run_union_property_access),
-            ["property.notFound"]
-        );
+        assert_eq!(codes(src, run_union_property_access), ["property.notFound"]);
     }
 
     #[test]

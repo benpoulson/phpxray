@@ -13,6 +13,7 @@
 //! parity against PHP's own `token_get_all()` output.
 
 mod lexer;
+pub mod number;
 mod token;
 
 pub mod golden;

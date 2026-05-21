@@ -58,9 +58,10 @@
 //!   phpstan's last-condition marker to avoid reports it suppresses.
 //! - `ConstantConditionInTraitRule` — trait-instantiation aware; out of scope.
 
-use crate::{walk, FileAnalysis, RuleEntry};
+use crate::{symbols, walk, FileAnalysis, RuleEntry};
 use php_ast::{
-    BinOp, ClassDecl, ElseIf, Expr, ExprKind, Member, MemberName, MethodDecl, Stmt, StmtKind, UnOp,
+    BinOp, ClassDecl, ClassKind, ElseIf, Expr, ExprKind, Member, MemberName, MethodDecl, Stmt,
+    StmtKind, UnOp,
 };
 use php_diagnostics::Diagnostic;
 use php_infer::{eval_const, ConstVal};
@@ -608,7 +609,7 @@ fn assertion_methods(fa: &FileAnalysis) -> HashMap<(String, String, bool), Asser
             };
             out.insert(
                 (
-                    fqn_key(class_fqn),
+                    symbols::fqn_key(class_fqn),
                     fa.interner.resolve(m.name).to_ascii_lowercase(),
                     m.modifiers.is_static,
                 ),
@@ -704,7 +705,7 @@ fn run_impossible_check_type_method_call(fa: &FileAnalysis) -> Vec<Diagnostic> {
             return;
         }
         let Some(assertion) = assertions.get(&(
-            fqn_key(&found.declaring_class),
+            symbols::fqn_key(&found.declaring_class),
             found.member.name.to_ascii_lowercase(),
             false,
         )) else {
@@ -762,7 +763,7 @@ fn run_impossible_check_type_static_method_call(fa: &FileAnalysis) -> Vec<Diagno
             return;
         }
         let Some(assertion) = assertions.get(&(
-            fqn_key(&found.declaring_class),
+            symbols::fqn_key(&found.declaring_class),
             found.member.name.to_ascii_lowercase(),
             true,
         )) else {
@@ -833,10 +834,6 @@ fn static_call_class(
             None
         }
     }
-}
-
-fn fqn_key(fqn: &str) -> String {
-    fqn.trim_start_matches('\\').to_ascii_lowercase()
 }
 
 fn for_each_class(fa: &FileAnalysis, mut f: impl FnMut(&Scope, &str, &ClassDecl)) {
@@ -1151,6 +1148,786 @@ fn run_void_match(fa: &FileAnalysis) -> Vec<Diagnostic> {
 }
 
 // ---------------------------------------------------------------------------
+// ConstantConditionInTraitRule — trait-context constant conditions
+// ---------------------------------------------------------------------------
+
+struct TraitInfo {
+    scope: Scope,
+    class: ClassDecl,
+}
+
+struct TraitCtx<'a> {
+    fa: &'a FileAnalysis<'a>,
+    scope: &'a Scope,
+    consumer_fqn: &'a str,
+    const_values: &'a HashMap<(String, String), ConstVal>,
+}
+
+fn run_constant_condition_in_trait(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut traits = HashMap::new();
+    let mut consumers: HashMap<String, Vec<String>> = HashMap::new();
+    let mut const_values = HashMap::new();
+
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            let StmtKind::Class(c) = &st.kind else {
+                continue;
+            };
+            let Some(name) = c.name else { continue };
+            let fqn = scope.qualify(fa.interner.resolve(name));
+            collect_foldable_class_constants(fa, &fqn, c, &mut const_values);
+            if c.kind == ClassKind::Trait {
+                traits.insert(
+                    class_key(&fqn),
+                    TraitInfo {
+                        scope: scope.clone(),
+                        class: c.clone(),
+                    },
+                );
+                continue;
+            }
+            if c.kind == ClassKind::Interface {
+                continue;
+            }
+            for m in &c.members {
+                let Member::TraitUse(tu) = m else { continue };
+                for tr in &tu.traits {
+                    if let Resolution::Fqn(trait_fqn) = scope.resolve_class(tr) {
+                        consumers
+                            .entry(class_key(&trait_fqn))
+                            .or_default()
+                            .push(fqn.clone());
+                    }
+                }
+            }
+        }
+    });
+
+    let mut out = Vec::new();
+    for (key, info) in traits {
+        let Some(using_classes) = consumers.get(&key) else {
+            continue;
+        };
+        for m in &info.class.members {
+            let Member::Method(method) = m else { continue };
+            let Some(body) = &method.body else { continue };
+            for st in body {
+                visit_trait_context_stmt(fa, &info, using_classes, &const_values, st, &mut out);
+            }
+        }
+    }
+    out
+}
+
+fn collect_foldable_class_constants(
+    fa: &FileAnalysis,
+    class_fqn: &str,
+    c: &ClassDecl,
+    out: &mut HashMap<(String, String), ConstVal>,
+) {
+    let key = class_key(class_fqn);
+    for m in &c.members {
+        let Member::ClassConst(cc) = m else { continue };
+        for ce in &cc.consts {
+            if let Some(v) = eval_const(&ce.value) {
+                out.insert((key.clone(), fa.interner.resolve(ce.name).to_string()), v);
+            }
+        }
+    }
+}
+
+fn visit_trait_context_stmt(
+    fa: &FileAnalysis,
+    info: &TraitInfo,
+    using_classes: &[String],
+    const_values: &HashMap<(String, String), ConstVal>,
+    st: &Stmt,
+    out: &mut Vec<Diagnostic>,
+) {
+    match &st.kind {
+        StmtKind::If {
+            cond,
+            then,
+            elseifs,
+            els,
+        } => {
+            if let Some(v) = stable_trait_bool(fa, info, using_classes, const_values, cond) {
+                out.push(diag(
+                    cond.span,
+                    format!("If condition is always {v}."),
+                    if v { "if.alwaysTrue" } else { "if.alwaysFalse" },
+                ));
+            }
+            collect_trait_context_expr_diags(fa, info, using_classes, const_values, cond, out);
+            visit_trait_context_stmt(fa, info, using_classes, const_values, then, out);
+            for ei in elseifs {
+                if let Some(v) = stable_trait_bool(fa, info, using_classes, const_values, &ei.cond)
+                {
+                    out.push(diag(
+                        ei.cond.span,
+                        format!("Elseif condition is always {v}."),
+                        if v {
+                            "elseif.alwaysTrue"
+                        } else {
+                            "elseif.alwaysFalse"
+                        },
+                    ));
+                }
+                collect_trait_context_expr_diags(
+                    fa,
+                    info,
+                    using_classes,
+                    const_values,
+                    &ei.cond,
+                    out,
+                );
+                visit_trait_context_stmt(fa, info, using_classes, const_values, &ei.body, out);
+            }
+            if let Some(els) = els {
+                visit_trait_context_stmt(fa, info, using_classes, const_values, els, out);
+            }
+        }
+        StmtKind::While { cond, body } => {
+            if let Some(v) = stable_trait_bool(fa, info, using_classes, const_values, cond) {
+                out.push(diag(
+                    cond.span,
+                    format!("While loop condition is always {v}."),
+                    if v {
+                        "while.alwaysTrue"
+                    } else {
+                        "while.alwaysFalse"
+                    },
+                ));
+            }
+            collect_trait_context_expr_diags(fa, info, using_classes, const_values, cond, out);
+            visit_trait_context_stmt(fa, info, using_classes, const_values, body, out);
+        }
+        StmtKind::DoWhile { body, cond } => {
+            visit_trait_context_stmt(fa, info, using_classes, const_values, body, out);
+            if let Some(v) = stable_trait_bool(fa, info, using_classes, const_values, cond) {
+                out.push(diag(
+                    cond.span,
+                    format!("Do-while loop condition is always {v}."),
+                    if v {
+                        "doWhile.alwaysTrue"
+                    } else {
+                        "doWhile.alwaysFalse"
+                    },
+                ));
+            }
+            collect_trait_context_expr_diags(fa, info, using_classes, const_values, cond, out);
+        }
+        StmtKind::Block(stmts) => {
+            for st in stmts {
+                visit_trait_context_stmt(fa, info, using_classes, const_values, st, out);
+            }
+        }
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            for st in body {
+                visit_trait_context_stmt(fa, info, using_classes, const_values, st, out);
+            }
+            for catch in catches {
+                for st in &catch.body {
+                    visit_trait_context_stmt(fa, info, using_classes, const_values, st, out);
+                }
+            }
+            if let Some(finally) = finally {
+                for st in finally {
+                    visit_trait_context_stmt(fa, info, using_classes, const_values, st, out);
+                }
+            }
+        }
+        StmtKind::Switch { subject, cases } => {
+            collect_trait_context_expr_diags(fa, info, using_classes, const_values, subject, out);
+            for case in cases {
+                if let Some(cond) = &case.test {
+                    collect_trait_context_expr_diags(
+                        fa,
+                        info,
+                        using_classes,
+                        const_values,
+                        cond,
+                        out,
+                    );
+                }
+                for st in &case.body {
+                    visit_trait_context_stmt(fa, info, using_classes, const_values, st, out);
+                }
+            }
+        }
+        StmtKind::For {
+            init,
+            cond,
+            update,
+            body,
+        } => {
+            for e in init.iter().chain(cond).chain(update) {
+                collect_trait_context_expr_diags(fa, info, using_classes, const_values, e, out);
+            }
+            visit_trait_context_stmt(fa, info, using_classes, const_values, body, out);
+        }
+        StmtKind::Foreach {
+            subject,
+            key,
+            value,
+            body,
+            ..
+        } => {
+            collect_trait_context_expr_diags(fa, info, using_classes, const_values, subject, out);
+            if let Some(key) = key {
+                collect_trait_context_expr_diags(fa, info, using_classes, const_values, key, out);
+            }
+            collect_trait_context_expr_diags(fa, info, using_classes, const_values, value, out);
+            visit_trait_context_stmt(fa, info, using_classes, const_values, body, out);
+        }
+        StmtKind::Declare { directives, body } => {
+            for (_, e) in directives {
+                collect_trait_context_expr_diags(fa, info, using_classes, const_values, e, out);
+            }
+            if let Some(body) = body {
+                visit_trait_context_stmt(fa, info, using_classes, const_values, body, out);
+            }
+        }
+        _ => collect_trait_context_stmt_exprs(fa, info, using_classes, const_values, st, out),
+    }
+}
+
+fn collect_trait_context_stmt_exprs(
+    fa: &FileAnalysis,
+    info: &TraitInfo,
+    using_classes: &[String],
+    const_values: &HashMap<(String, String), ConstVal>,
+    st: &Stmt,
+    out: &mut Vec<Diagnostic>,
+) {
+    match &st.kind {
+        StmtKind::Expr(e) | StmtKind::Return(Some(e)) => {
+            collect_trait_context_expr_diags(fa, info, using_classes, const_values, e, out);
+        }
+        StmtKind::Echo(exprs) | StmtKind::Global(exprs) | StmtKind::Unset(exprs) => {
+            for e in exprs {
+                collect_trait_context_expr_diags(fa, info, using_classes, const_values, e, out);
+            }
+        }
+        StmtKind::StaticVars(vars) => {
+            for v in vars {
+                if let Some(default) = &v.default {
+                    collect_trait_context_expr_diags(
+                        fa,
+                        info,
+                        using_classes,
+                        const_values,
+                        default,
+                        out,
+                    );
+                }
+            }
+        }
+        StmtKind::ConstDecl { consts, .. } => {
+            for c in consts {
+                collect_trait_context_expr_diags(
+                    fa,
+                    info,
+                    using_classes,
+                    const_values,
+                    &c.value,
+                    out,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_trait_context_expr_diags(
+    fa: &FileAnalysis,
+    info: &TraitInfo,
+    using_classes: &[String],
+    const_values: &HashMap<(String, String), ConstVal>,
+    root: &Expr,
+    out: &mut Vec<Diagnostic>,
+) {
+    walk::for_each_subexpr(root, &mut |e| match &e.kind {
+        ExprKind::Ternary { cond, .. } => {
+            if let Some(v) = stable_trait_bool(fa, info, using_classes, const_values, cond) {
+                out.push(diag(
+                    cond.span,
+                    format!("Ternary operator condition is always {v}."),
+                    if v {
+                        "ternary.alwaysTrue"
+                    } else {
+                        "ternary.alwaysFalse"
+                    },
+                ));
+            }
+        }
+        ExprKind::Unary {
+            op: UnOp::Not,
+            expr,
+        } => {
+            if let Some(v) = stable_trait_bool(fa, info, using_classes, const_values, expr) {
+                let result = !v;
+                out.push(diag(
+                    e.span,
+                    format!("Negated boolean expression is always {result}."),
+                    if result {
+                        "booleanNot.alwaysTrue"
+                    } else {
+                        "booleanNot.alwaysFalse"
+                    },
+                ));
+            }
+        }
+        ExprKind::Binary { op, lhs, rhs } => {
+            collect_trait_binary_side(fa, info, using_classes, const_values, *op, lhs, true, out);
+            collect_trait_binary_side(fa, info, using_classes, const_values, *op, rhs, false, out);
+            collect_trait_comparison(fa, info, using_classes, const_values, e, *op, lhs, rhs, out);
+        }
+        ExprKind::Match { subject, arms } => {
+            collect_trait_match(fa, info, using_classes, const_values, e, subject, arms, out);
+        }
+        _ => {}
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_trait_binary_side(
+    fa: &FileAnalysis,
+    info: &TraitInfo,
+    using_classes: &[String],
+    const_values: &HashMap<(String, String), ConstVal>,
+    op: BinOp,
+    side: &Expr,
+    left: bool,
+    out: &mut Vec<Diagnostic>,
+) {
+    let (prefix, sigil) = match op {
+        BinOp::BoolAnd | BinOp::LogicalAnd => ("booleanAnd", "&&"),
+        BinOp::BoolOr | BinOp::LogicalOr => ("booleanOr", "||"),
+        BinOp::LogicalXor => ("logicalXor", "xor"),
+        _ => return,
+    };
+    if let Some(v) = stable_trait_bool(fa, info, using_classes, const_values, side) {
+        out.push(diag(
+            side.span,
+            format!(
+                "{} side of {sigil} is always {v}.",
+                if left { "Left" } else { "Right" }
+            ),
+            side_code(prefix, left, v),
+        ));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_trait_comparison(
+    fa: &FileAnalysis,
+    info: &TraitInfo,
+    using_classes: &[String],
+    const_values: &HashMap<(String, String), ConstVal>,
+    e: &Expr,
+    op: BinOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    out: &mut Vec<Diagnostic>,
+) {
+    if !trait_expr_has_context(fa, e) {
+        return;
+    }
+    let Some(ConstVal::Bool(result)) = stable_trait_const(fa, info, using_classes, const_values, e)
+    else {
+        return;
+    };
+    let Some(l) = stable_trait_const_allow_literal(fa, info, using_classes, const_values, lhs)
+    else {
+        return;
+    };
+    let Some(r) = stable_trait_const_allow_literal(fa, info, using_classes, const_values, rhs)
+    else {
+        return;
+    };
+    match op {
+        BinOp::Identical | BinOp::NotIdentical => {
+            let sigil = if op == BinOp::Identical { "===" } else { "!==" };
+            let code = match (op, result) {
+                (BinOp::Identical, true) => "identical.alwaysTrue",
+                (BinOp::Identical, false) => "identical.alwaysFalse",
+                (BinOp::NotIdentical, true) => "notIdentical.alwaysTrue",
+                (BinOp::NotIdentical, false) => "notIdentical.alwaysFalse",
+                _ => return,
+            };
+            out.push(diag(
+                e.span,
+                format!(
+                    "Strict comparison using {sigil} between {} and {} will always evaluate to {result}.",
+                    l.describe(),
+                    r.describe()
+                ),
+                code,
+            ));
+        }
+        BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
+            let (sigil, ntype, loose) = match op {
+                BinOp::Eq => ("==", "equal", true),
+                BinOp::NotEq => ("!=", "notEqual", true),
+                BinOp::Lt => ("<", "smaller", false),
+                BinOp::Gt => (">", "greater", false),
+                BinOp::LtEq => ("<=", "smallerOrEqual", false),
+                BinOp::GtEq => (">=", "greaterOrEqual", false),
+                _ => return,
+            };
+            let code = match (ntype, result) {
+                ("equal", true) => "equal.alwaysTrue",
+                ("equal", false) => "equal.alwaysFalse",
+                ("notEqual", true) => "notEqual.alwaysTrue",
+                ("notEqual", false) => "notEqual.alwaysFalse",
+                ("smaller", true) => "smaller.alwaysTrue",
+                ("smaller", false) => "smaller.alwaysFalse",
+                ("greater", true) => "greater.alwaysTrue",
+                ("greater", false) => "greater.alwaysFalse",
+                ("smallerOrEqual", true) => "smallerOrEqual.alwaysTrue",
+                ("smallerOrEqual", false) => "smallerOrEqual.alwaysFalse",
+                ("greaterOrEqual", true) => "greaterOrEqual.alwaysTrue",
+                ("greaterOrEqual", false) => "greaterOrEqual.alwaysFalse",
+                _ => return,
+            };
+            let msg = if loose {
+                format!(
+                    "Loose comparison using {sigil} between {} and {} will always evaluate to {result}.",
+                    l.describe(),
+                    r.describe()
+                )
+            } else {
+                format!(
+                    "Comparison operation \"{sigil}\" between {} and {} is always {result}.",
+                    l.describe(),
+                    r.describe()
+                )
+            };
+            out.push(diag(e.span, msg, code));
+        }
+        _ => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_trait_match(
+    fa: &FileAnalysis,
+    info: &TraitInfo,
+    using_classes: &[String],
+    const_values: &HashMap<(String, String), ConstVal>,
+    e: &Expr,
+    subject: &Expr,
+    arms: &[php_ast::MatchArm],
+    out: &mut Vec<Diagnostic>,
+) {
+    if !trait_expr_has_context(fa, e) {
+        return;
+    }
+    let Some(subj) =
+        stable_trait_const_allow_literal(fa, info, using_classes, const_values, subject)
+    else {
+        return;
+    };
+    let mut folded: Vec<Vec<(Span, ConstVal)>> = Vec::new();
+    for arm in arms {
+        let Some(conds) = &arm.conds else { continue };
+        let mut vals = Vec::new();
+        for cond in conds {
+            let Some(v) =
+                stable_trait_const_allow_literal(fa, info, using_classes, const_values, cond)
+            else {
+                return;
+            };
+            vals.push((cond.span, v));
+        }
+        folded.push(vals);
+    }
+    let arms_count = folded.len();
+    let mut already_matched = false;
+    for (arm_idx, conds) in folded.iter().enumerate() {
+        for (span, v) in conds {
+            if already_matched {
+                continue;
+            }
+            if *v == subj {
+                if arm_idx != arms_count - 1 {
+                    out.push(diag(
+                        *span,
+                        "Match arm comparison is always true.",
+                        "match.alwaysTrue",
+                    ));
+                }
+                already_matched = true;
+            } else {
+                out.push(diag(
+                    *span,
+                    "Match arm comparison is always false.",
+                    "match.alwaysFalse",
+                ));
+            }
+        }
+    }
+}
+
+fn stable_trait_bool(
+    fa: &FileAnalysis,
+    info: &TraitInfo,
+    using_classes: &[String],
+    const_values: &HashMap<(String, String), ConstVal>,
+    e: &Expr,
+) -> Option<bool> {
+    if !trait_expr_has_context(fa, e) {
+        return None;
+    }
+    stable_trait_const(fa, info, using_classes, const_values, e).map(|v| v.truthy())
+}
+
+fn stable_trait_const(
+    fa: &FileAnalysis,
+    info: &TraitInfo,
+    using_classes: &[String],
+    const_values: &HashMap<(String, String), ConstVal>,
+    e: &Expr,
+) -> Option<ConstVal> {
+    if using_classes.is_empty() {
+        return None;
+    }
+    let mut result: Option<ConstVal> = None;
+    for consumer in using_classes {
+        let ctx = TraitCtx {
+            fa,
+            scope: &info.scope,
+            consumer_fqn: consumer,
+            const_values,
+        };
+        let v = trait_eval_const(&ctx, e)?;
+        if result.as_ref().is_some_and(|prev| *prev != v) {
+            return None;
+        }
+        result = Some(v);
+    }
+    result
+}
+
+fn stable_trait_const_allow_literal(
+    fa: &FileAnalysis,
+    info: &TraitInfo,
+    using_classes: &[String],
+    const_values: &HashMap<(String, String), ConstVal>,
+    e: &Expr,
+) -> Option<ConstVal> {
+    if trait_expr_has_context(fa, e) {
+        stable_trait_const(fa, info, using_classes, const_values, e)
+    } else {
+        eval_const(e)
+    }
+}
+
+fn trait_eval_const(ctx: &TraitCtx<'_>, e: &Expr) -> Option<ConstVal> {
+    use ConstVal::*;
+    match &e.kind {
+        ExprKind::Paren(inner) => trait_eval_const(ctx, inner),
+        ExprKind::Int(n) => Some(Int(*n)),
+        ExprKind::Float(f) => Some(Float(*f)),
+        ExprKind::Str(b) => Some(Str(b.clone())),
+        ExprKind::Name(n) => match n
+            .text
+            .trim_start_matches('\\')
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "true" => Some(Bool(true)),
+            "false" => Some(Bool(false)),
+            "null" => Some(Null),
+            _ => None,
+        },
+        ExprKind::ClassConst { class, name } => {
+            let MemberName::Ident(sym) = name else {
+                return None;
+            };
+            let class_fqn = trait_class_expr_fqn(ctx, class)?;
+            trait_class_const_value(ctx, &class_fqn, ctx.fa.interner.resolve(*sym))
+        }
+        ExprKind::Unary { op, expr } => {
+            let v = trait_eval_const(ctx, expr)?;
+            Some(match (op, v) {
+                (UnOp::Not, v) => Bool(!v.truthy()),
+                (UnOp::Minus, Int(n)) => Int(n.checked_neg()?),
+                (UnOp::Minus, Float(f)) => Float(-f),
+                (UnOp::Plus, Int(n)) => Int(n),
+                (UnOp::Plus, Float(f)) => Float(f),
+                _ => return None,
+            })
+        }
+        ExprKind::Binary { op, lhs, rhs } => trait_eval_binary(ctx, *op, lhs, rhs),
+        ExprKind::Instanceof { expr, class } => trait_instanceof(ctx, expr, class).map(Bool),
+        _ => None,
+    }
+}
+
+fn trait_eval_binary(ctx: &TraitCtx<'_>, op: BinOp, lhs: &Expr, rhs: &Expr) -> Option<ConstVal> {
+    use ConstVal::*;
+    match op {
+        BinOp::BoolAnd | BinOp::LogicalAnd => {
+            return Some(Bool(
+                trait_eval_const(ctx, lhs)?.truthy() && trait_eval_const(ctx, rhs)?.truthy(),
+            ));
+        }
+        BinOp::BoolOr | BinOp::LogicalOr => {
+            return Some(Bool(
+                trait_eval_const(ctx, lhs)?.truthy() || trait_eval_const(ctx, rhs)?.truthy(),
+            ));
+        }
+        _ => {}
+    }
+    let l = trait_eval_const(ctx, lhs)?;
+    let r = trait_eval_const(ctx, rhs)?;
+    Some(match op {
+        BinOp::Identical => Bool(l == r),
+        BinOp::NotIdentical => Bool(l != r),
+        BinOp::Eq => Bool(loose_const_eq(&l, &r)?),
+        BinOp::NotEq => Bool(!loose_const_eq(&l, &r)?),
+        BinOp::Lt => {
+            let (l, r) = numeric_pair(&l, &r)?;
+            Bool(l < r)
+        }
+        BinOp::Gt => {
+            let (l, r) = numeric_pair(&l, &r)?;
+            Bool(l > r)
+        }
+        BinOp::LtEq => {
+            let (l, r) = numeric_pair(&l, &r)?;
+            Bool(l <= r)
+        }
+        BinOp::GtEq => {
+            let (l, r) = numeric_pair(&l, &r)?;
+            Bool(l >= r)
+        }
+        BinOp::LogicalXor => Bool(l.truthy() ^ r.truthy()),
+        _ => return None,
+    })
+}
+
+fn loose_const_eq(l: &ConstVal, r: &ConstVal) -> Option<bool> {
+    if l == r {
+        return Some(true);
+    }
+    if let Some((a, b)) = numeric_pair(l, r) {
+        return Some(a == b);
+    }
+    match (l, r) {
+        (ConstVal::Bool(_), _) | (_, ConstVal::Bool(_)) => Some(l.truthy() == r.truthy()),
+        (ConstVal::Null, ConstVal::Str(s)) | (ConstVal::Str(s), ConstVal::Null) => {
+            Some(s.is_empty())
+        }
+        _ => None,
+    }
+}
+
+fn numeric_pair(l: &ConstVal, r: &ConstVal) -> Option<(f64, f64)> {
+    Some((const_number(l)?, const_number(r)?))
+}
+
+fn const_number(v: &ConstVal) -> Option<f64> {
+    match v {
+        ConstVal::Int(n) => Some(*n as f64),
+        ConstVal::Float(f) => Some(*f),
+        _ => None,
+    }
+}
+
+fn trait_instanceof(ctx: &TraitCtx<'_>, expr: &Expr, class: &Expr) -> Option<bool> {
+    let ExprKind::Variable(sym) = &expr.kind else {
+        return None;
+    };
+    if ctx.fa.interner.resolve(*sym) != "this" {
+        return None;
+    }
+    let target = trait_class_expr_fqn(ctx, class)?;
+    if !ctx.fa.class_fully_known(ctx.consumer_fqn) || !ctx.fa.class_fully_known(&target) {
+        return None;
+    }
+    if ctx.fa.reflection.is_subclass_of(ctx.consumer_fqn, &target) {
+        return Some(true);
+    }
+    let class = ctx.fa.reflection.class(ctx.consumer_fqn)?;
+    class.is_final.then_some(false)
+}
+
+fn trait_class_expr_fqn(ctx: &TraitCtx<'_>, e: &Expr) -> Option<String> {
+    let ExprKind::Name(name) = &e.kind else {
+        return None;
+    };
+    match ctx.scope.resolve_class(name) {
+        Resolution::Fqn(fqn) => Some(fqn),
+        Resolution::LateStatic(s) if s.eq_ignore_ascii_case("self") => {
+            Some(ctx.consumer_fqn.to_string())
+        }
+        Resolution::LateStatic(s) if s.eq_ignore_ascii_case("static") => {
+            Some(ctx.consumer_fqn.to_string())
+        }
+        Resolution::LateStatic(s) if s.eq_ignore_ascii_case("parent") => {
+            let class = ctx.fa.reflection.class(ctx.consumer_fqn)?;
+            class
+                .parents
+                .iter()
+                .find_map(named_type_fqn)
+                .map(str::to_string)
+        }
+        _ => None,
+    }
+}
+
+fn trait_class_const_value(ctx: &TraitCtx<'_>, class_fqn: &str, name: &str) -> Option<ConstVal> {
+    let found = ctx.fa.reflection.find_constant(class_fqn, name)?;
+    if let Some(v) = found.member.int_value {
+        return Some(ConstVal::Int(v));
+    }
+    ctx.const_values
+        .get(&(class_key(&found.declaring_class), name.to_string()))
+        .cloned()
+}
+
+fn trait_expr_has_context(fa: &FileAnalysis, e: &Expr) -> bool {
+    let mut found = false;
+    walk::for_each_subexpr(e, &mut |sub| match &sub.kind {
+        ExprKind::ClassConst { class, .. } => {
+            if matches!(
+                &class.kind,
+                ExprKind::Name(name)
+                    if matches!(name_keyword(&name.text).as_str(), "self" | "static" | "parent")
+            ) {
+                found = true;
+            }
+        }
+        ExprKind::Instanceof { expr, .. } => {
+            if matches!(&expr.kind, ExprKind::Variable(sym) if fa.interner.resolve(*sym) == "this")
+            {
+                found = true;
+            }
+        }
+        _ => {}
+    });
+    found
+}
+
+fn named_type_fqn(t: &Type) -> Option<&str> {
+    match t {
+        Type::Named { fqn, .. } => Some(fqn),
+        _ => None,
+    }
+}
+
+fn class_key(fqn: &str) -> String {
+    fqn.trim_start_matches('\\').to_ascii_lowercase()
+}
+
+// ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
@@ -1234,6 +2011,11 @@ pub(crate) static RULES: &[RuleEntry] = &[
         name: "comparison.voidMatch",
         level: 2,
         run: run_void_match,
+    },
+    RuleEntry {
+        name: "comparison.constantConditionInTrait",
+        level: 4,
+        run: run_constant_condition_in_trait,
     },
 ];
 
@@ -1745,5 +2527,74 @@ mod tests {
     fn non_void_match_assigned_is_clean() {
         let src = "<?php $x = match (1) { default => 'a' };";
         assert!(codes(src, run_void_match).is_empty());
+    }
+
+    // --- ConstantConditionInTraitRule ------------------------------------
+
+    #[test]
+    fn trait_context_self_constant_false_is_flagged() {
+        let src = r#"<?php
+            trait T { function m(): void { if (self::FLAG) {} } }
+            class C { use T; private const FLAG = false; }"#;
+        assert_eq!(
+            codes(src, run_constant_condition_in_trait),
+            ["if.alwaysFalse"]
+        );
+    }
+
+    #[test]
+    fn trait_context_different_consumer_values_are_suppressed() {
+        let src = r#"<?php
+            trait T { function m(): void { if (self::FLAG) {} } }
+            class A { use T; private const FLAG = false; }
+            class B { use T; private const FLAG = true; }"#;
+        assert!(codes(src, run_constant_condition_in_trait).is_empty());
+    }
+
+    #[test]
+    fn trait_context_this_instanceof_final_class_is_flagged_when_stable() {
+        let src = r#"<?php
+            final class C { use T; }
+            trait T { function m(): void { if ($this instanceof D) {} } }
+            final class D {}"#;
+        assert_eq!(
+            codes(src, run_constant_condition_in_trait),
+            ["if.alwaysFalse"]
+        );
+    }
+
+    #[test]
+    fn trait_context_constant_condition_families_are_checked() {
+        let src = r#"<?php
+            trait T {
+                function m(): void {
+                    $a = self::FLAG ? 1 : 2;
+                    $b = !self::FLAG;
+                    $c = self::FLAG && foo();
+                    while (self::FLAG) {}
+                    do {} while (self::FLAG);
+                    $d = self::N === 1;
+                    $e = self::N < 2;
+                    $f = match (self::N) { 1 => 'one', 2 => 'two' };
+                }
+            }
+            class C {
+                use T;
+                private const FLAG = false;
+                private const N = 1;
+            }"#;
+        assert_eq!(
+            codes(src, run_constant_condition_in_trait),
+            [
+                "ternary.alwaysFalse",
+                "booleanNot.alwaysTrue",
+                "booleanAnd.leftAlwaysFalse",
+                "while.alwaysFalse",
+                "doWhile.alwaysFalse",
+                "identical.alwaysTrue",
+                "smaller.alwaysTrue",
+                "match.alwaysTrue",
+            ]
+        );
     }
 }

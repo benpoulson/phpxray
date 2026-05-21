@@ -504,7 +504,9 @@ fn run_throws_void_property_hook(fa: &FileAnalysis) -> Vec<Diagnostic> {
             let StmtKind::Class(class) = &st.kind else {
                 continue;
             };
-            let Some(class_name) = class.name else { continue };
+            let Some(class_name) = class.name else {
+                continue;
+            };
             let class_display = scope.qualify(fa.interner.resolve(class_name));
             for member in &class.members {
                 let Member::Property(prop) = member else {

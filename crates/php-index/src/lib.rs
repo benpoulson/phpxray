@@ -9,7 +9,8 @@
 //! transitively for subtype queries.
 
 use php_ast::ClassKind;
-use php_resolve::FileIndex;
+use php_resolve::{display_fqn, FileIndex, SymbolKey, SymbolOrigin};
+use php_types::PhpVersion;
 use std::collections::{HashMap, HashSet};
 
 /// A class/interface/trait/enum known to the project.
@@ -23,6 +24,8 @@ pub struct ClassEntry {
     pub uses_traits: Vec<String>,
     /// File labels where this symbol is declared; more than one = a redeclaration.
     pub sources: Vec<String>,
+    /// Origin category for each corresponding entry in [`sources`](Self::sources).
+    pub origins: Vec<SourceKind>,
 }
 
 /// A function or constant known to the project.
@@ -30,16 +33,11 @@ pub struct ClassEntry {
 pub struct SymbolEntry {
     pub fqn: String,
     pub sources: Vec<String>,
+    pub origins: Vec<SourceKind>,
 }
 
 /// How a parsed file participates in the project index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceKind {
-    /// User-facing analyzed source. May shadow a built-in symbol.
-    Analyzed,
-    /// Symbol-provider-only source. Must not shadow curated built-ins.
-    Scan,
-}
+pub type SourceKind = SymbolOrigin;
 
 /// The aggregated symbol table for a whole project.
 #[derive(Debug, Default, Clone)]
@@ -63,6 +61,14 @@ impl ProjectIndex {
     /// existence checks. Built-in *hierarchies* and *types* are intentionally not
     /// captured here; they come from version-aware stubs at the type-system stage.
     pub fn with_builtins() -> Self {
+        Self::with_builtins_for(PhpVersion::default())
+    }
+
+    /// A project index pre-populated with PHP built-in names for `version`.
+    ///
+    /// Built-in names are currently version-stable in this manifest, so the
+    /// version is accepted to keep project/reflection construction on one API.
+    pub fn with_builtins_for(_version: PhpVersion) -> Self {
         let mut idx = Self::new();
         idx.load_builtins(BUILTINS);
         idx
@@ -98,17 +104,22 @@ impl ProjectIndex {
                 Sec::Functions => {
                     push_symbol(
                         &mut self.functions,
-                        line.to_ascii_lowercase(),
+                        SymbolKey::function(line).into_string(),
                         line,
                         "<builtin>",
+                        SourceKind::Builtin,
                     );
                 }
-                Sec::Constants => {
-                    push_symbol(&mut self.constants, line.to_string(), line, "<builtin>")
-                }
+                Sec::Constants => push_symbol(
+                    &mut self.constants,
+                    SymbolKey::constant(line).into_string(),
+                    line,
+                    "<builtin>",
+                    SourceKind::Builtin,
+                ),
                 Sec::Classes(kind) => {
                     self.classes
-                        .entry(line.to_ascii_lowercase())
+                        .entry(SymbolKey::class_like(line).into_string())
                         .or_insert_with(|| ClassEntry {
                             fqn: line.to_string(),
                             kind,
@@ -116,6 +127,7 @@ impl ProjectIndex {
                             implements: Vec::new(),
                             uses_traits: Vec::new(),
                             sources: vec!["<builtin>".to_string()],
+                            origins: vec![SourceKind::Builtin],
                         });
                 }
                 Sec::None => {}
@@ -137,14 +149,18 @@ impl ProjectIndex {
             if kind == SourceKind::Scan
                 && self
                     .classes
-                    .get(&c.fqn.to_ascii_lowercase())
+                    .get(&SymbolKey::class_like(&c.fqn).into_string())
                     .is_some_and(is_builtin_class)
             {
                 continue;
             }
-            match self.classes.entry(c.fqn.to_ascii_lowercase()) {
+            match self
+                .classes
+                .entry(SymbolKey::class_like(&c.fqn).into_string())
+            {
                 std::collections::hash_map::Entry::Occupied(mut e) => {
                     e.get_mut().sources.push(source.to_string());
+                    e.get_mut().origins.push(kind);
                 }
                 std::collections::hash_map::Entry::Vacant(e) => {
                     e.insert(ClassEntry {
@@ -154,36 +170,37 @@ impl ProjectIndex {
                         implements: c.implements.clone(),
                         uses_traits: c.uses_traits.clone(),
                         sources: vec![source.to_string()],
+                        origins: vec![kind],
                     });
                 }
             }
         }
         for f in &file.functions {
-            let key = f.fqn.to_ascii_lowercase();
+            let key = SymbolKey::function(&f.fqn).into_string();
             if kind == SourceKind::Scan && self.functions.get(&key).is_some_and(is_builtin_symbol) {
                 continue;
             }
-            push_symbol(&mut self.functions, key, &f.fqn, source);
+            push_symbol(&mut self.functions, key, &f.fqn, source, kind);
         }
         for k in &file.constants {
-            if kind == SourceKind::Scan && self.constants.get(&k.fqn).is_some_and(is_builtin_symbol)
-            {
+            let key = SymbolKey::constant(&k.fqn).into_string();
+            if kind == SourceKind::Scan && self.constants.get(&key).is_some_and(is_builtin_symbol) {
                 continue;
             }
-            push_symbol(&mut self.constants, k.fqn.clone(), &k.fqn, source);
+            push_symbol(&mut self.constants, key, &k.fqn, source, kind);
         }
     }
 
     // --- lookups (respecting PHP case rules) ----------------------------
 
     pub fn class(&self, fqn: &str) -> Option<&ClassEntry> {
-        self.classes.get(&normalize(fqn).to_ascii_lowercase())
+        self.classes.get(&SymbolKey::class_like(fqn).into_string())
     }
     pub fn function(&self, fqn: &str) -> Option<&SymbolEntry> {
-        self.functions.get(&normalize(fqn).to_ascii_lowercase())
+        self.functions.get(&SymbolKey::function(fqn).into_string())
     }
     pub fn constant(&self, fqn: &str) -> Option<&SymbolEntry> {
-        self.constants.get(normalize(fqn))
+        self.constants.get(&SymbolKey::constant(fqn).into_string())
     }
 
     pub fn has_class(&self, fqn: &str) -> bool {
@@ -206,8 +223,16 @@ impl ProjectIndex {
     pub fn function_count(&self) -> usize {
         self.functions.len()
     }
+    /// All indexed functions.
+    pub fn functions(&self) -> impl Iterator<Item = &SymbolEntry> {
+        self.functions.values()
+    }
     pub fn constant_count(&self) -> usize {
         self.constants.len()
+    }
+    /// All indexed constants.
+    pub fn constants(&self) -> impl Iterator<Item = &SymbolEntry> {
+        self.constants.values()
     }
 
     /// Classes (and interfaces/traits/enums) declared in more than one file.
@@ -225,7 +250,7 @@ impl ProjectIndex {
         let mut seen: HashSet<String> = HashSet::new();
         let mut stack: Vec<String> = self.supertypes(fqn);
         while let Some(name) = stack.pop() {
-            let key = name.to_ascii_lowercase();
+            let key = SymbolKey::class_like(&name).into_string();
             if !seen.insert(key) {
                 continue;
             }
@@ -238,13 +263,12 @@ impl ProjectIndex {
     /// Whether `sub` is `sup` or transitively extends/implements/uses it
     /// (case-insensitive, matching PHP class-name semantics).
     pub fn is_subclass_of(&self, sub: &str, sup: &str) -> bool {
-        let sup = normalize(sup);
-        if normalize(sub).eq_ignore_ascii_case(sup) {
+        if SymbolKey::class_like(sub) == SymbolKey::class_like(sup) {
             return true;
         }
         self.ancestors(sub)
             .iter()
-            .any(|a| a.eq_ignore_ascii_case(sup))
+            .any(|a| SymbolKey::class_like(a) == SymbolKey::class_like(sup))
     }
 
     /// The direct supertypes of a known class (its extends + implements + used
@@ -264,25 +288,30 @@ impl ProjectIndex {
 }
 
 fn is_builtin_class(e: &ClassEntry) -> bool {
-    e.sources.iter().any(|s| s == "<builtin>")
+    e.origins.contains(&SourceKind::Builtin) || e.sources.iter().any(|s| s == "<builtin>")
 }
 
 fn is_builtin_symbol(e: &SymbolEntry) -> bool {
-    e.sources.iter().any(|s| s == "<builtin>")
+    e.origins.contains(&SourceKind::Builtin) || e.sources.iter().any(|s| s == "<builtin>")
 }
 
-fn push_symbol(map: &mut HashMap<String, SymbolEntry>, key: String, fqn: &str, source: &str) {
+fn push_symbol(
+    map: &mut HashMap<String, SymbolEntry>,
+    key: String,
+    fqn: &str,
+    source: &str,
+    origin: SourceKind,
+) {
     map.entry(key)
-        .and_modify(|e| e.sources.push(source.to_string()))
+        .and_modify(|e| {
+            e.sources.push(source.to_string());
+            e.origins.push(origin);
+        })
         .or_insert_with(|| SymbolEntry {
-            fqn: fqn.to_string(),
+            fqn: display_fqn(fqn),
             sources: vec![source.to_string()],
+            origins: vec![origin],
         });
-}
-
-/// Drop a single leading namespace separator so `\App\X` and `App\X` are one key.
-fn normalize(fqn: &str) -> &str {
-    fqn.strip_prefix('\\').unwrap_or(fqn)
 }
 
 #[cfg(test)]
@@ -411,6 +440,40 @@ mod tests {
         idx.add_file("user.php", &index_file(&r.program, &r.interner));
         assert!(idx.has_class("App\\User"));
         assert!(idx.has_function("strlen"));
+    }
+
+    #[test]
+    fn source_origins_distinguish_builtin_scan_and_analyzed_symbols() {
+        let mut idx = ProjectIndex::with_builtins();
+        assert!(idx
+            .function("strlen")
+            .unwrap()
+            .origins
+            .contains(&SourceKind::Builtin));
+
+        let scan = php_parser::parse("<?php function strlen(): bool {} function helper(): void {}");
+        assert!(!scan.has_errors());
+        idx.add_file_as(
+            "scan.php",
+            &index_file(&scan.program, &scan.interner),
+            SourceKind::Scan,
+        );
+        assert_eq!(
+            idx.function("strlen").unwrap().origins,
+            [SourceKind::Builtin]
+        );
+        assert_eq!(idx.function("helper").unwrap().origins, [SourceKind::Scan]);
+
+        let analyzed = php_parser::parse("<?php function strlen(): bool {}");
+        assert!(!analyzed.has_errors());
+        idx.add_file(
+            "analyzed.php",
+            &index_file(&analyzed.program, &analyzed.interner),
+        );
+        assert_eq!(
+            idx.function("strlen").unwrap().origins,
+            [SourceKind::Builtin, SourceKind::Analyzed]
+        );
     }
 
     #[test]

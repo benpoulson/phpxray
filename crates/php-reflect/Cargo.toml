@@ -13,4 +13,5 @@ php-phpdoc.workspace = true
 php-types.workspace = true
 
 [dev-dependencies]
+php-index.workspace = true
 php-parser.workspace = true

@@ -9,6 +9,8 @@
 use regex::Regex;
 use serde::de::{self, Deserializer};
 use serde::Deserialize;
+use std::fmt;
+use std::str::FromStr;
 
 /// A resolved analyzer configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -90,7 +92,7 @@ impl Config {
     }
 }
 
-/// A strictness level: 0–9, or `max` (10).
+/// A strictness level: 0–9, or `max` (internally 10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Level(pub u8);
 
@@ -101,6 +103,70 @@ impl Level {
     /// The numeric value (0–10).
     pub fn value(self) -> u8 {
         self.0
+    }
+
+    /// Level-derived rule switches. This is the single place where product
+    /// strictness turns into rule-engine options.
+    pub fn rule_options(self) -> RuleOptions {
+        RuleOptions {
+            // phpstan's `checkNullables` turns on at level 8.
+            check_nullables: self.0 >= 8,
+            // Reserved now so strict-mixed rollout can be level-driven without
+            // adding another local `level >= ...` convention.
+            check_explicit_mixed: false,
+            check_implicit_mixed: false,
+        }
+    }
+}
+
+/// Rule-engine switches derived from [`Level`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuleOptions {
+    pub check_nullables: bool,
+    pub check_explicit_mixed: bool,
+    pub check_implicit_mixed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseLevelError {
+    value: String,
+}
+
+impl fmt::Display for ParseLevelError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid level {:?} (expected 0–9 or \"max\")",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for ParseLevelError {}
+
+impl FromStr for Level {
+    type Err = ParseLevelError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("max") {
+            return Ok(Level::MAX);
+        }
+        match s.parse::<u8>() {
+            Ok(n) if n <= 9 => Ok(Level(n)),
+            _ => Err(ParseLevelError {
+                value: s.to_string(),
+            }),
+        }
+    }
+}
+
+impl fmt::Display for Level {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if *self == Level::MAX {
+            f.write_str("max")
+        } else {
+            write!(f, "{}", self.0)
+        }
     }
 }
 
@@ -113,14 +179,11 @@ impl<'de> Deserialize<'de> for Level {
             Str(String),
         }
         match Repr::deserialize(d)? {
-            Repr::Int(n) if (0..=10).contains(&n) => Ok(Level(n as u8)),
+            Repr::Int(n) if (0..=9).contains(&n) => Ok(Level(n as u8)),
             Repr::Int(n) => Err(de::Error::custom(format!(
                 "level {n} is out of range (0–9 or \"max\")"
             ))),
-            Repr::Str(s) if s.eq_ignore_ascii_case("max") => Ok(Level::MAX),
-            Repr::Str(s) => Err(de::Error::custom(format!(
-                "invalid level {s:?} (expected 0–9 or \"max\")"
-            ))),
+            Repr::Str(s) => s.parse::<Level>().map_err(de::Error::custom),
         }
     }
 }
@@ -308,8 +371,20 @@ ignore:
         assert_eq!(Config::from_yaml("level: 0").unwrap().level, Level(0));
         assert_eq!(Config::from_yaml("level: max").unwrap().level, Level::MAX);
         assert_eq!(Config::from_yaml("level: MAX").unwrap().level, Level(10));
+        assert!(Config::from_yaml("level: 10").is_err());
         assert!(Config::from_yaml("level: 99").is_err());
         assert!(Config::from_yaml("level: nonsense").is_err());
+    }
+
+    #[test]
+    fn level_from_str_display_and_rule_options_are_canonical() {
+        assert_eq!("8".parse::<Level>().unwrap(), Level(8));
+        assert_eq!("max".parse::<Level>().unwrap(), Level::MAX);
+        assert!("10".parse::<Level>().is_err());
+        assert_eq!(Level(8).to_string(), "8");
+        assert_eq!(Level::MAX.to_string(), "max");
+        assert!(!Level(7).rule_options().check_nullables);
+        assert!(Level(8).rule_options().check_nullables);
     }
 
     #[test]

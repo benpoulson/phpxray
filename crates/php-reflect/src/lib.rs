@@ -19,7 +19,7 @@ pub use model::{
     attr_target, reflect_class, reflect_function, AttributeSpec, ClassReflection, ConstReflection,
     FunctionReflection, MethodReflection, ParamReflection, PropertyReflection,
 };
-pub use project::{Found, ReflectionIndex, SourceKind};
+pub use project::{reflect_file, Found, ReflectedFile, ReflectionIndex, SourceKind};
 
 /// Resolve a native PHP type declaration to a semantic [`Type`] in `scope`.
 pub fn resolve_ast_type(scope: &Scope, ty: &AstType) -> Type {

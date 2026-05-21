@@ -418,7 +418,7 @@ impl<'a> Dumper<'a> {
             } => vec![self.group_use(prefix, *kind, items)],
             StmtKind::Function(f) => vec![self.func_decl(f)],
             StmtKind::Class(c) => vec![self.class_decl(c)],
-            _ => vec![node("UNMAPPED_STMT", vec![])],
+            StmtKind::Error => vec![node("ERROR", vec![])],
         }
     }
 
@@ -786,7 +786,7 @@ impl<'a> Dumper<'a> {
     fn property_hook(&self, h: &PropertyHook) -> C {
         let gen = match &h.body {
             HookBody::Block(b) => gen_flag(b),
-            HookBody::Short(e) if expr_yields(e) => 16777216,
+            HookBody::Short(e) if queries::contains_yield_in_expr_scope(e) => 16777216,
             _ => 0,
         };
         let flag = modifiers_flag(&h.modifiers, false) | if h.by_ref { 4096 } else { 0 } | gen;
@@ -1087,7 +1087,11 @@ impl<'a> Dumper<'a> {
             ExprKind::ArrowFn(a) => {
                 let flag = if a.is_static { 16 } else { 0 }
                     | if a.by_ref { 4096 } else { 0 }
-                    | if expr_yields(&a.body) { 16777216 } else { 0 };
+                    | if queries::contains_yield_in_expr_scope(&a.body) {
+                        16777216
+                    } else {
+                        0
+                    };
                 C::N(
                     head("ARROW_FUNC", flag),
                     vec![
@@ -1131,7 +1135,6 @@ impl<'a> Dumper<'a> {
             ExprKind::YieldFrom(e) => node("YIELD_FROM", vec![("expr", self.expr(e))]),
             ExprKind::Paren(inner) => self.paren(inner),
             ExprKind::Error => C::N("ERROR".into(), vec![]),
-            _ => C::N("UNMAPPED_EXPR".into(), vec![]),
         }
     }
 
@@ -1603,139 +1606,10 @@ fn cast_code(k: CastKind) -> u32 {
 /// `ZEND_ACC_GENERATOR` (1<<24) if the body contains `yield`/`yield from`
 /// (not counting nested function-like scopes).
 fn gen_flag(body: &[Stmt]) -> u32 {
-    if body.iter().any(stmt_yields) {
+    if queries::contains_yield_in_scope(body) {
         16777216
     } else {
         0
-    }
-}
-
-fn stmt_yields(s: &Stmt) -> bool {
-    match &s.kind {
-        StmtKind::Expr(e) => expr_yields(e),
-        StmtKind::Echo(es) => es.iter().any(expr_yields),
-        StmtKind::Return(v) => v.as_ref().is_some_and(expr_yields),
-        StmtKind::Block(b) => b.iter().any(stmt_yields),
-        StmtKind::If {
-            cond,
-            then,
-            elseifs,
-            els,
-        } => {
-            expr_yields(cond)
-                || stmt_yields(then)
-                || elseifs
-                    .iter()
-                    .any(|e| expr_yields(&e.cond) || stmt_yields(&e.body))
-                || els.as_deref().is_some_and(stmt_yields)
-        }
-        StmtKind::While { cond, body } | StmtKind::DoWhile { body, cond } => {
-            expr_yields(cond) || stmt_yields(body)
-        }
-        StmtKind::For {
-            init,
-            cond,
-            update,
-            body,
-        } => init.iter().chain(cond).chain(update).any(expr_yields) || stmt_yields(body),
-        StmtKind::Foreach {
-            subject,
-            key,
-            value,
-            body,
-            ..
-        } => {
-            expr_yields(subject)
-                || key.as_ref().is_some_and(expr_yields)
-                || expr_yields(value)
-                || stmt_yields(body)
-        }
-        StmtKind::Switch { subject, cases } => {
-            expr_yields(subject)
-                || cases.iter().any(|c| {
-                    c.test.as_ref().is_some_and(expr_yields) || c.body.iter().any(stmt_yields)
-                })
-        }
-        StmtKind::Try {
-            body,
-            catches,
-            finally,
-        } => {
-            body.iter().any(stmt_yields)
-                || catches.iter().any(|c| c.body.iter().any(stmt_yields))
-                || finally.as_ref().is_some_and(|f| f.iter().any(stmt_yields))
-        }
-        StmtKind::Break(e) | StmtKind::Continue(e) => e.as_ref().is_some_and(expr_yields),
-        StmtKind::Global(vs) | StmtKind::Unset(vs) => vs.iter().any(expr_yields),
-        StmtKind::StaticVars(vs) => vs
-            .iter()
-            .any(|v| v.default.as_ref().is_some_and(expr_yields)),
-        // Declarations introduce a new scope (or contain no yields): don't descend.
-        _ => false,
-    }
-}
-
-fn expr_yields(e: &Expr) -> bool {
-    match &e.kind {
-        ExprKind::Yield { .. } | ExprKind::YieldFrom(_) => true,
-        ExprKind::Binary { lhs, rhs, .. }
-        | ExprKind::Assign { target: lhs, rhs }
-        | ExprKind::AssignRef { target: lhs, rhs }
-        | ExprKind::AssignOp {
-            target: lhs, rhs, ..
-        }
-        | ExprKind::Coalesce { lhs, rhs } => expr_yields(lhs) || expr_yields(rhs),
-        ExprKind::Unary { expr, .. }
-        | ExprKind::Cast { expr, .. }
-        | ExprKind::Clone(expr)
-        | ExprKind::Print(expr)
-        | ExprKind::Throw(expr)
-        | ExprKind::ErrorSuppress(expr)
-        | ExprKind::Empty(expr)
-        | ExprKind::PreInc(expr)
-        | ExprKind::PreDec(expr)
-        | ExprKind::PostInc(expr)
-        | ExprKind::PostDec(expr) => expr_yields(expr),
-        ExprKind::Ternary { cond, then, els } => {
-            expr_yields(cond) || then.as_deref().is_some_and(expr_yields) || expr_yields(els)
-        }
-        ExprKind::Call { callee, args } => {
-            expr_yields(callee) || args.iter().any(|a| expr_yields(&a.value))
-        }
-        ExprKind::MethodCall { recv, args, .. } => {
-            expr_yields(recv) || args.iter().any(|a| expr_yields(&a.value))
-        }
-        ExprKind::StaticCall { class, args, .. } => {
-            expr_yields(class) || args.iter().any(|a| expr_yields(&a.value))
-        }
-        ExprKind::New { class, args } => {
-            expr_yields(class) || args.iter().any(|a| expr_yields(&a.value))
-        }
-        ExprKind::Index { base, index } => {
-            expr_yields(base) || index.as_deref().is_some_and(expr_yields)
-        }
-        ExprKind::Prop { base, .. } => expr_yields(base),
-        ExprKind::StaticProp { class, .. } => expr_yields(class),
-        ExprKind::Instanceof { expr, class } => expr_yields(expr) || expr_yields(class),
-        ExprKind::Array { items, .. } => items.iter().any(|it| {
-            it.key.as_ref().is_some_and(expr_yields) || it.value.as_ref().is_some_and(expr_yields)
-        }),
-        ExprKind::Isset(vs) => vs.iter().any(expr_yields),
-        ExprKind::Match { subject, arms } => {
-            expr_yields(subject)
-                || arms.iter().any(|a| {
-                    a.conds
-                        .as_ref()
-                        .is_some_and(|cs| cs.iter().any(expr_yields))
-                        || expr_yields(&a.body)
-                })
-        }
-        ExprKind::Interpolated(parts) => parts.iter().any(expr_yields),
-        ExprKind::Exit(a) => a.as_deref().is_some_and(expr_yields),
-        ExprKind::Include { expr, .. } | ExprKind::Eval(expr) => expr_yields(expr),
-        ExprKind::Paren(inner) => expr_yields(inner),
-        // Closures / arrow fns / anonymous classes are separate scopes.
-        _ => false,
     }
 }
 

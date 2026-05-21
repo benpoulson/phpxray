@@ -70,38 +70,11 @@ enum KeyVal {
 /// Coerce a constant key value the way PHP coerces array keys: a string that is
 /// the canonical decimal form of an integer becomes that integer.
 fn coerce_string_key(bytes: &[u8]) -> KeyVal {
-    if let Some(n) = canonical_int_string(bytes) {
+    if let Some(n) = php_infer::arrays::canonical_int_string(bytes) {
         KeyVal::Int(n)
     } else {
         KeyVal::Str(bytes.to_vec())
     }
-}
-
-/// `Some(n)` iff `bytes` is the canonical base-10 representation of `n` (so PHP
-/// would coerce it to an int array key). Rejects leading zeros (`"01"`), a
-/// leading `+`, whitespace, and `"-0"`.
-fn canonical_int_string(bytes: &[u8]) -> Option<i64> {
-    if bytes.is_empty() {
-        return None;
-    }
-    let (neg, digits): (bool, &[u8]) = match bytes.first() {
-        Some(b'-') => (true, &bytes[1..]),
-        _ => (false, bytes),
-    };
-    if digits.is_empty() || !digits.iter().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    // No leading zeros, except the single literal "0".
-    if digits.len() > 1 && digits[0] == b'0' {
-        return None;
-    }
-    let s = std::str::from_utf8(bytes).ok()?;
-    let n: i64 = s.parse().ok()?;
-    // "-0" parses to 0 but is not canonical.
-    if neg && n == 0 {
-        return None;
-    }
-    Some(n)
 }
 
 /// The constant key value for a literal key expression, or `None` if it isn't a
@@ -451,7 +424,8 @@ fn definitely_offset_accessible(fa: &FileAnalysis, t: &Type) -> bool {
         Type::Array(_) | Type::List(_) | Type::Shape { .. } => true,
         Type::String | Type::LiteralString(_) | Type::ClassString(_) => true,
         Type::Named { fqn, .. } => {
-            fqn.trim_start_matches('\\').eq_ignore_ascii_case("ArrayAccess")
+            fqn.trim_start_matches('\\')
+                .eq_ignore_ascii_case("ArrayAccess")
                 || (fa.class_fully_known(fqn) && fa.reflection.is_subclass_of(fqn, "ArrayAccess"))
         }
         Type::Union(parts) => {
@@ -473,12 +447,16 @@ fn definitely_not_offset_accessible(fa: &FileAnalysis, t: &Type) -> bool {
         | Type::Resource
         | Type::LiteralInt(_) => true,
         Type::Named { fqn, .. } => {
-            !fqn.trim_start_matches('\\').eq_ignore_ascii_case("ArrayAccess")
+            !fqn.trim_start_matches('\\')
+                .eq_ignore_ascii_case("ArrayAccess")
                 && fa.class_fully_known(fqn)
                 && !fa.reflection.is_subclass_of(fqn, "ArrayAccess")
         }
         Type::Union(parts) => {
-            !parts.is_empty() && parts.iter().all(|p| definitely_not_offset_accessible(fa, p))
+            !parts.is_empty()
+                && parts
+                    .iter()
+                    .all(|p| definitely_not_offset_accessible(fa, p))
         }
         Type::Nullable(inner) => definitely_not_offset_accessible(fa, inner),
         _ => false,
@@ -575,7 +553,7 @@ fn key_type_string_status(t: &Type) -> StringKeyStatus {
 }
 
 fn shape_key_is_string(key: &str) -> bool {
-    canonical_int_string(key.as_bytes()).is_none()
+    php_infer::arrays::shape_key_is_string(key)
 }
 
 /// The key-type verdict used by `ArrayUnpackingRule` for PHP < 8.1. We do not
@@ -612,48 +590,18 @@ fn string_key_status(t: &Type) -> StringKeyStatus {
     }
 }
 
-enum ShapeOffsetStatus {
-    Missing,
-    Present,
-    Maybe,
-}
+type ShapeOffsetStatus = php_infer::arrays::ShapeOffsetPresence;
 
 fn const_shape_key(expr: &Expr) -> Option<String> {
-    match &expr.kind {
-        ExprKind::Str(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
-        ExprKind::Int(n) => Some(n.to_string()),
-        ExprKind::Paren(inner) => const_shape_key(inner),
-        _ => None,
-    }
+    php_infer::arrays::const_shape_key(expr)
 }
 
 fn shape_offset_status(base_ty: &Type, key: &str) -> Option<ShapeOffsetStatus> {
-    match base_ty {
-        Type::Shape { fields, sealed } => {
-            match fields.iter().find(|f| f.key.as_deref() == Some(key)) {
-                Some(field) if field.optional => Some(ShapeOffsetStatus::Maybe),
-                Some(_) => Some(ShapeOffsetStatus::Present),
-                None if key.parse::<usize>().is_ok() && fields.iter().any(|f| f.key.is_none()) => {
-                    Some(ShapeOffsetStatus::Maybe)
-                }
-                None if *sealed => Some(ShapeOffsetStatus::Missing),
-                None => Some(ShapeOffsetStatus::Maybe),
-            }
-        }
-        Type::Union(parts) if !parts.is_empty() => {
-            let mut saw_shape = false;
-            for part in parts {
-                match shape_offset_status(part, key)? {
-                    ShapeOffsetStatus::Missing => saw_shape = true,
-                    ShapeOffsetStatus::Present | ShapeOffsetStatus::Maybe => {
-                        return Some(ShapeOffsetStatus::Maybe);
-                    }
-                }
-            }
-            saw_shape.then_some(ShapeOffsetStatus::Missing)
-        }
-        _ => None,
-    }
+    php_infer::arrays::shape_offset_status(base_ty, key).map(|status| status.without_type())
+}
+
+fn shape_offset_maybe_reportable(base_ty: &Type, key: &str) -> bool {
+    php_infer::arrays::shape_offset_maybe_reportable(base_ty, key)
 }
 
 fn mark_index_subtree(expr: &Expr, spans: &mut HashSet<(u32, u32)>) {
@@ -987,6 +935,41 @@ fn run_nonexistent_offset_in_array_dim_fetch(fa: &FileAnalysis) -> Vec<Diagnosti
     out
 }
 
+fn run_maybe_nonexistent_offset_in_array_dim_fetch(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let write_spans = write_index_spans(fa);
+    let undefined_allowed = undefined_allowed_index_spans(fa);
+    let mut out = Vec::new();
+    walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Index {
+            base,
+            index: Some(dim),
+        } = &e.kind
+        else {
+            return;
+        };
+        let key = span_key(e.span);
+        if write_spans.contains(&key) || undefined_allowed.contains(&key) {
+            return;
+        }
+        let Some(shape_key) = const_shape_key(dim) else {
+            return;
+        };
+        let base_ty = fa.type_of(base);
+        if !shape_offset_maybe_reportable(&base_ty, &shape_key) {
+            return;
+        }
+        let dim_ty = fa.type_of(dim);
+        out.push(
+            Diagnostic::error(
+                e.span,
+                format!("Offset {dim_ty} might not exist on {base_ty}."),
+            )
+            .with_code("offsetAccess.notFound"),
+        );
+    });
+    out
+}
+
 /// Level-8 `checkNullables` strictness for offset access. We only report the
 /// unambiguous nullable-container slice: the non-null part is definitely
 /// offset-readable, and the read is not in `isset`/`empty`/`??` or an
@@ -1153,6 +1136,11 @@ pub(crate) static RULES: &[RuleEntry] = &[
         name: "offsetAccess.notFound",
         level: 3,
         run: run_nonexistent_offset_in_array_dim_fetch,
+    },
+    RuleEntry {
+        name: "offsetAccess.maybeNotFound",
+        level: 7,
+        run: run_maybe_nonexistent_offset_in_array_dim_fetch,
     },
     RuleEntry {
         name: "offsetAccess.nullable",
@@ -1733,6 +1721,28 @@ mod tests {
             run_nonexistent_offset_in_array_dim_fetch
         )
         .is_empty());
+    }
+
+    #[test]
+    fn optional_shape_offset_is_reported_as_maybe_missing() {
+        let src = r#"<?php
+            /** @param array{foo?:int} $a */
+            function f($a) { return $a['foo']; }"#;
+        assert_eq!(
+            codes(src, run_maybe_nonexistent_offset_in_array_dim_fetch),
+            ["offsetAccess.notFound"]
+        );
+    }
+
+    #[test]
+    fn union_shape_offset_is_reported_as_maybe_missing() {
+        let src = r#"<?php
+            /** @param array{foo:int}|array{bar:int} $a */
+            function f($a) { return $a['foo']; }"#;
+        assert_eq!(
+            codes(src, run_maybe_nonexistent_offset_in_array_dim_fetch),
+            ["offsetAccess.notFound"]
+        );
     }
 
     #[test]

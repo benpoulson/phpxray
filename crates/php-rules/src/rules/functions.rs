@@ -50,7 +50,11 @@
 //!   `MissingFunctionParameter/ReturnTypehintRule`, `ExistingClassesIn*Typehints`
 //!   (latter handled by unknown-symbol resolution) — all need the type system.
 
-use crate::{return_type_errors, FileAnalysis, RuleEntry};
+use crate::{
+    function_like,
+    members::{self, CallResolver, ResolveStatus},
+    return_type_errors, FileAnalysis, RuleEntry,
+};
 use php_ast::{
     BinOp, CastKind, ClassDecl, ClosureExpr, Expr, ExprKind, HookBody, Member, Param, Stmt,
     StmtKind,
@@ -218,14 +222,7 @@ fn run_variadic_parameters(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// with no value type — including through nullability and unions — the iterable
 /// word to report. The substrate of phpstan's `missingType.iterableValue` checks.
 pub(crate) fn bare_iterable_word(ty: &php_types::Type) -> Option<&'static str> {
-    use php_types::Type;
-    match ty {
-        Type::Array(None) => Some("array"),
-        Type::Iterable(None) => Some("iterable"),
-        Type::Nullable(inner) => bare_iterable_word(inner),
-        Type::Union(parts) => parts.iter().find_map(bare_iterable_word),
-        _ => None,
-    }
+    crate::missing_type::type_iterable_word(ty)
 }
 
 pub(crate) fn p_span(p: &Param) -> php_span::Span {
@@ -639,23 +636,12 @@ fn resolved_callee<'a>(
 
 /// Look up a function in the project/builtins honouring the global fallback, and
 /// return its canonical (declared) name if found.
-fn lookup_function_name(fa: &FileAnalysis, r: &ResolvedRef) -> Option<String> {
-    match &r.resolution {
-        Resolution::Fqn(fqn) => fa.project.function(fqn).map(|e| e.fqn.clone()),
-        Resolution::Fallback { namespaced, global } => fa
-            .project
-            .function(namespaced)
-            .or_else(|| fa.project.function(global))
-            .map(|e| e.fqn.clone()),
-        _ => None,
-    }
-}
-
 /// `CallToNonExistentFunctionRule` (the `function.notFound` half — `nameCase` is
 /// a separate rule below). A call `foo(...)` where `foo` resolves to neither a
 /// project function nor a built-in.
 fn run_call_to_non_existent_function(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let fmap = function_refs(fa.resolved_refs);
+    let resolver = CallResolver::new(fa);
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
         let ExprKind::Call { callee, .. } = &e.kind else {
@@ -664,15 +650,8 @@ fn run_call_to_non_existent_function(fa: &FileAnalysis) -> Vec<Diagnostic> {
         let Some(r) = resolved_callee(callee, &fmap) else {
             return;
         };
-        let known = match &r.resolution {
-            Resolution::Fqn(fqn) => fa.project.has_function(fqn),
-            Resolution::Fallback { namespaced, global } => {
-                fa.project.has_function(namespaced) || fa.project.has_function(global)
-            }
-            _ => true,
-        };
-        if !known {
-            let display = primary_name(r);
+        if matches!(resolver.function(r), ResolveStatus::Unknown) {
+            let display = members::primary_name(r);
             out.push(
                 Diagnostic::error(r.span, format!("Function {display} not found."))
                     .with_code("function.notFound"),
@@ -686,6 +665,7 @@ fn run_call_to_non_existent_function(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// spelling case-insensitively matches a known function but differs in case.
 fn run_function_name_case(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let fmap = function_refs(fa.resolved_refs);
+    let resolver = CallResolver::new(fa);
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
         let ExprKind::Call { callee, .. } = &e.kind else {
@@ -694,28 +674,20 @@ fn run_function_name_case(fa: &FileAnalysis) -> Vec<Diagnostic> {
         let Some(r) = resolved_callee(callee, &fmap) else {
             return;
         };
-        let Some(canonical) = lookup_function_name(fa, r) else {
+        let ResolveStatus::Known(target) = resolver.function(r) else {
             return;
         };
-        // The name the caller used (the resolution's chosen FQN candidate).
-        let called = match &r.resolution {
-            Resolution::Fqn(fqn) => fqn.clone(),
-            Resolution::Fallback { namespaced, global } => {
-                if fa.project.has_function(namespaced) {
-                    namespaced.clone()
-                } else {
-                    global.clone()
-                }
-            }
-            _ => return,
-        };
-        if canonical.eq_ignore_ascii_case(&called) && canonical != called {
+        if target
+            .canonical_fqn
+            .eq_ignore_ascii_case(&target.called_fqn)
+            && target.canonical_fqn != target.called_fqn
+        {
             out.push(
                 Diagnostic::error(
                     r.span,
                     format!(
-                        "Call to function {canonical}() with incorrect case: {}",
-                        primary_name(r)
+                        "Call to function {}() with incorrect case: {}",
+                        target.canonical_fqn, target.display_name
                     ),
                 )
                 .with_code("function.nameCase"),
@@ -725,28 +697,13 @@ fn run_function_name_case(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
-/// The function name as written for a message (`\Foo\bar` → `Foo\bar`).
-fn primary_name(r: &ResolvedRef) -> String {
-    r.name.trim_start_matches('\\').to_string()
-}
-
 /// The actual known function target for a resolved call. For PHP's unqualified
 /// namespaced fallback, prefer the namespaced function when the project defines
 /// it; only fall back to the global symbol when the namespaced candidate is
 /// absent. Built-in-specific rules must use this instead of blindly inspecting
 /// the fallback's global candidate.
 fn known_function_target<'a>(fa: &FileAnalysis, r: &'a ResolvedRef) -> Option<&'a str> {
-    match &r.resolution {
-        Resolution::Fqn(fqn) => fa.project.has_function(fqn).then_some(fqn.as_str()),
-        Resolution::Fallback { namespaced, global } => {
-            if fa.project.has_function(namespaced) {
-                Some(namespaced.as_str())
-            } else {
-                fa.project.has_function(global).then_some(global.as_str())
-            }
-        }
-        _ => None,
-    }
+    CallResolver::new(fa).known_function_fqn(r)
 }
 
 /// The unqualified lowercase tail of the actual known function target.
@@ -819,6 +776,54 @@ fn run_invoke_non_callable(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
     });
     out
+}
+
+fn run_invoke_maybe_non_callable(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    crate::walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Call { callee, args } = &e.kind else {
+            return;
+        };
+        if matches!(callee.kind, ExprKind::Name(_)) || args.iter().any(|a| a.placeholder) {
+            return;
+        }
+        let t = fa.type_of(callee);
+        if is_maybe_callable(&t) {
+            out.push(
+                Diagnostic::error(
+                    e.span,
+                    format!("Trying to invoke {t} but it might not be a callable."),
+                )
+                .with_code("callable.nonCallable"),
+            );
+        }
+    });
+    out
+}
+
+fn is_maybe_callable(t: &php_types::Type) -> bool {
+    let php_types::Type::Union(parts) = t else {
+        return false;
+    };
+    if parts.is_empty() {
+        return false;
+    }
+    let mut callable = false;
+    let mut non_callable = false;
+    for part in parts {
+        if is_definitely_callable(part) {
+            callable = true;
+        } else if is_definitely_not_callable(part) {
+            non_callable = true;
+        } else {
+            return false;
+        }
+    }
+    callable && non_callable
+}
+
+fn is_definitely_callable(t: &php_types::Type) -> bool {
+    matches!(t, php_types::Type::Callable(_))
 }
 
 fn is_definitely_not_callable(t: &php_types::Type) -> bool {
@@ -1108,7 +1113,7 @@ fn run_argument_count(fa: &FileAnalysis) -> Vec<Diagnostic> {
             .filter(|p| !p.optional && !p.variadic)
             .count();
         let max = func.params.len();
-        let display = primary_name(r);
+        let display = members::primary_name(r);
 
         if supplied < required {
             let (s_word, want_word) = (plural(supplied, "parameter"), plural(required, "required"));
@@ -1179,7 +1184,7 @@ fn run_argument_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
         {
             return;
         }
-        let display = primary_name(r);
+        let display = members::primary_name(r);
         for (i, arg) in args.iter().enumerate() {
             let Some(param) = func.params.get(i) else {
                 break;
@@ -1224,6 +1229,7 @@ fn plural(n: usize, word: &str) -> String {
 /// callable checks are deferred.
 fn run_function_callable(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let fmap = function_refs(fa.resolved_refs);
+    let resolver = CallResolver::new(fa);
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
         let ExprKind::Call { callee, args } = &e.kind else {
@@ -1236,17 +1242,13 @@ fn run_function_callable(fa: &FileAnalysis) -> Vec<Diagnostic> {
         let Some(r) = resolved_callee(callee, &fmap) else {
             return;
         };
-        let known = match &r.resolution {
-            Resolution::Fqn(fqn) => fa.project.has_function(fqn),
-            Resolution::Fallback { namespaced, global } => {
-                fa.project.has_function(namespaced) || fa.project.has_function(global)
-            }
-            _ => true,
-        };
-        if !known {
+        if matches!(resolver.function(r), ResolveStatus::Unknown) {
             out.push(
-                Diagnostic::error(r.span, format!("Function {} not found.", primary_name(r)))
-                    .with_code("function.notFound"),
+                Diagnostic::error(
+                    r.span,
+                    format!("Function {} not found.", members::primary_name(r)),
+                )
+                .with_code("function.notFound"),
             );
         }
     });
@@ -1775,8 +1777,8 @@ fn check_anonymous_return_expr(
         return;
     }
 
-    let checked = fa.lenient_src(actual.clone());
-    if crate::is_assignable(fa.reflection, &checked, declared) {
+    if function_like::return_value_assignable(fa.reflection, &actual, declared, fa.check_nullables)
+    {
         return;
     }
     out.push(
@@ -1999,49 +2001,14 @@ fn run_missing_function_iterable_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// Conservative scan of a raw docblock for a tag (e.g. `@return`). Any occurrence
 /// of the tag — even partial — counts as "specified", to avoid false positives.
 fn doc_has_tag(doc: Option<&str>, tag: &str) -> bool {
-    doc.is_some_and(|d| d.contains(tag))
+    php_phpdoc::query::raw_contains(doc, tag)
 }
 
 /// Conservative scan for an `@param ... $name` tag. We accept any `@param` tag
 /// that mentions `$name` as a whole word (or a bare `@param`, treating the doc as
 /// possibly-complete to stay false-positive-free).
 fn doc_has_param(doc: Option<&str>, name: &str) -> bool {
-    let Some(d) = doc else { return false };
-    // Scan every `@param` occurrence (anywhere — single-line `/** @param int $a */`
-    // or a multi-line block) and accept if `$name` appears as a whole variable
-    // token before the next `@` tag. `@param-out` etc. count too (any `@param`
-    // prefix satisfies the native-type requirement). Conservative: over-matching
-    // only suppresses a diagnostic, keeping us false-positive-free.
-    let mut search = d;
-    while let Some(off) = search.find("@param") {
-        let after = &search[off + "@param".len()..];
-        let segment = after.split('@').next().unwrap_or(after);
-        if word_boundary_var(segment, name) {
-            return true;
-        }
-        search = after;
-    }
-    false
-}
-
-/// Does `rest` mention `$name` as a complete variable token (so `$id` does not
-/// match `$identifier`)? Used by `doc_has_param`.
-fn word_boundary_var(rest: &str, name: &str) -> bool {
-    let needle = format!("${name}");
-    let bytes = rest.as_bytes();
-    let nlen = needle.len();
-    let mut i = 0;
-    while let Some(off) = rest[i..].find(&needle) {
-        let start = i + off;
-        let end = start + nlen;
-        let after_ok =
-            end >= bytes.len() || !(bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_');
-        if after_ok {
-            return true;
-        }
-        i = end;
-    }
-    false
+    php_phpdoc::query::has_param_conservative(doc, name)
 }
 
 // ---------------------------------------------------------------------------
@@ -2322,17 +2289,9 @@ fn function_no_discard_target(
 }
 
 fn reflection_function_fqn(fa: &FileAnalysis, r: &ResolvedRef) -> Option<String> {
-    match &r.resolution {
-        Resolution::Fqn(fqn) => fa.reflection.function(fqn).map(|_| fqn.clone()),
-        Resolution::Fallback { namespaced, global } => {
-            if fa.reflection.function(namespaced).is_some() {
-                Some(namespaced.clone())
-            } else {
-                fa.reflection.function(global).map(|_| global.clone())
-            }
-        }
-        _ => None,
-    }
+    CallResolver::new(fa)
+        .reflected_function(r)
+        .map(|(fqn, _)| fqn)
 }
 
 fn callable_no_discard_target(fa: &FileAnalysis, callee: &Expr) -> Option<NoDiscardFunctionTarget> {
@@ -3554,6 +3513,11 @@ pub(crate) static RULES: &[RuleEntry] = &[
         run: run_invoke_non_callable,
     },
     RuleEntry {
+        name: "callable.maybeNonCallable",
+        level: 7,
+        run: run_invoke_maybe_non_callable,
+    },
+    RuleEntry {
         name: "parameter.defaultValue",
         level: 2,
         run: run_incompatible_default_parameter,
@@ -3764,6 +3728,22 @@ mod tests {
         // A string may be a function name -> not flagged.
         let src = "<?php function f() { $s = 'strlen'; return $s('x'); }";
         assert!(codes(src, run_invoke_non_callable).is_empty());
+    }
+
+    #[test]
+    fn invoking_callable_or_int_is_maybe_non_callable() {
+        let src = "<?php /** @param callable|int $f */ function g($f) { $f(); }";
+        assert!(codes(src, run_invoke_non_callable).is_empty());
+        assert_eq!(
+            codes(src, run_invoke_maybe_non_callable),
+            ["callable.nonCallable"]
+        );
+    }
+
+    #[test]
+    fn invoking_string_or_int_is_not_a_safe_maybe_callable_report() {
+        let src = "<?php /** @param string|int $f */ function g($f) { $f(); }";
+        assert!(codes(src, run_invoke_maybe_non_callable).is_empty());
     }
 
     #[test]

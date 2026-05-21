@@ -2,7 +2,7 @@
 
 use clap::Parser;
 use php_cli::{baseline, report, run_with_options, RunOptions};
-use php_config::{Config, Level};
+use php_config::Config;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -45,9 +45,9 @@ fn main() -> ExitCode {
         config.paths = cli.paths.clone();
     }
     if let Some(l) = &cli.level {
-        match parse_level(l) {
-            Some(lv) => config.level = lv,
-            None => {
+        match l.parse() {
+            Ok(lv) => config.level = lv,
+            Err(_) => {
                 eprintln!("error: invalid level {l:?} (expected 0–9 or \"max\")");
                 return ExitCode::from(2);
             }
@@ -135,11 +135,4 @@ fn resolve_config(cli: &Cli) -> Result<(Config, PathBuf), ExitCode> {
         }
         None => Ok((Config::default(), cwd)),
     }
-}
-
-fn parse_level(s: &str) -> Option<Level> {
-    if s.eq_ignore_ascii_case("max") {
-        return Some(Level::MAX);
-    }
-    s.parse::<u8>().ok().filter(|n| *n <= 10).map(Level)
 }

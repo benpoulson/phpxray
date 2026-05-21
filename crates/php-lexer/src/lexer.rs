@@ -1273,36 +1273,11 @@ impl<'a> Lexer<'a> {
     /// (`i64::MAX`) is a `T_DNUMBER` in PHP, like the runtime promotes it.
     fn int_or_overflow_float(&self, start: usize) -> TokenKind {
         let text = &self.text[start..self.pos];
-        if int_literal_overflows_i64(text) {
+        if crate::number::int_literal_overflows_i64(text) {
             TokenKind::Float
         } else {
             TokenKind::Int
         }
-    }
-}
-
-/// Whether a (non-negative) integer literal overflows `i64::MAX`, accounting for
-/// `0x`/`0b`/`0o` prefixes, legacy `0NNN` octal, and `_` digit separators.
-fn int_literal_overflows_i64(text: &str) -> bool {
-    let cleaned: String = text.chars().filter(|&c| c != '_').collect();
-    let lower = cleaned.to_ascii_lowercase();
-    let (radix, digits) = if let Some(d) = lower.strip_prefix("0x") {
-        (16u32, d)
-    } else if let Some(d) = lower.strip_prefix("0b") {
-        (2, d)
-    } else if let Some(d) = lower.strip_prefix("0o") {
-        (8, d)
-    } else if cleaned.len() > 1
-        && cleaned.starts_with('0')
-        && cleaned.bytes().all(|b| (b'0'..=b'7').contains(&b))
-    {
-        (8, &cleaned[1..]) // legacy octal
-    } else {
-        (10, cleaned.as_str())
-    };
-    match u128::from_str_radix(digits, radix) {
-        Ok(v) => v > i64::MAX as u128,
-        Err(_) => true, // too large even for u128 → certainly a float
     }
 }
 

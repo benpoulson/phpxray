@@ -12,17 +12,22 @@
 //! we can't pin down resolves to [`Type::Mixed`] — inference is best-effort and
 //! never panics.
 
+pub mod arrays;
 mod assign;
 mod const_eval;
 mod definedness;
 mod flow;
+pub mod refine;
+mod returns;
 mod type_map;
 
 pub use assign::{
-    assignable_certain, is_assignable, is_castable_to_string, native_shape, strip_null_lenient,
+    assignable_certain, assignable_trinary, is_assignable, is_castable_to_string, native_shape,
+    Trinary,
 };
 pub use const_eval::{eval_const, ConstVal};
 pub use definedness::{undefined_variables, UndefVar};
+pub use refine::{strip_false, strip_falsy, strip_null_lenient, strip_null_strict};
 pub use type_map::{native_type_map, type_map, TypeMap};
 
 use php_ast::{BinOp, CastKind, Expr, ExprKind, MemberName, Name, UnOp};
@@ -134,12 +139,12 @@ impl<'a> TypeCtx<'a> {
                 // then-value is `a` with its falsy members (`null`/`false`) stripped.
                 let then_ty = match then {
                     Some(t) => self.infer(t),
-                    None => strip_falsy(self.infer(cond)),
+                    None => strip_falsy(&self.infer(cond)),
                 };
                 Type::union(vec![then_ty, self.infer(els)])
             }
             ExprKind::Coalesce { lhs, rhs } => {
-                Type::union(vec![strip_null(self.infer(lhs)), self.infer(rhs)])
+                Type::union(vec![strip_null_strict(&self.infer(lhs)), self.infer(rhs)])
             }
             ExprKind::PreInc(e)
             | ExprKind::PreDec(e)
@@ -164,8 +169,6 @@ impl<'a> TypeCtx<'a> {
             ExprKind::Yield { .. } | ExprKind::YieldFrom(_) => Type::Mixed,
             ExprKind::Include { .. } | ExprKind::Eval(_) => Type::Mixed,
             ExprKind::Error => Type::Mixed,
-            // `ExprKind` is `#[non_exhaustive]`; anything new infers as mixed.
-            _ => Type::Mixed,
         }
     }
 
@@ -254,7 +257,7 @@ impl<'a> TypeCtx<'a> {
     fn shape_fields(&self, items: &[php_ast::ArrayItem]) -> Option<Vec<php_types::ShapeField>> {
         let mut fields: Vec<php_types::ShapeField> = Vec::with_capacity(items.len());
         for it in items {
-            let key = const_key(it.key.as_ref()?)?;
+            let key = arrays::const_shape_key(it.key.as_ref()?)?;
             if fields
                 .iter()
                 .any(|f| f.key.as_deref() == Some(key.as_str()))
@@ -330,196 +333,7 @@ impl<'a> TypeCtx<'a> {
         args: &[php_ast::Arg],
         callee_class: Option<String>,
     ) -> Type {
-        let Some((body, callee_scope)) = body else {
-            return declared.clone();
-        };
-        // Only refine a *concrete* nullable (`?T` / `T|null`) — where pruning a
-        // guarded `return null` actually tightens the type. Bare `mixed` is left be.
-        let refinable = matches!(declared, Type::Nullable(_))
-            || matches!(declared, Type::Union(parts) if parts.contains(&Type::Null));
-        // Allow two interprocedural levels: a helper that returns `f(...)` whose own
-        // nullability depends on *its* arguments (e.g. `getResolvedName` ending in
-        // `FullyQualified::concat($ns, $name)`) needs the inner call refined too.
-        if self.depth >= 2 || !refinable {
-            return declared.clone();
-        }
-        let mut sub = TypeCtx {
-            index: self.index,
-            scope: callee_scope,
-            interner: self.interner,
-            class: callee_class,
-            vars: HashMap::new(),
-            depth: self.depth + 1,
-            native: self.native,
-        };
-        for (name, arg) in params.iter().zip(args) {
-            sub.vars.insert(name.clone(), self.infer(&arg.value));
-        }
-        let mut returns = Vec::new();
-        sub.collect_returns(body, &mut returns);
-        let collected = Type::union(returns);
-        if collected != Type::Never && crate::is_assignable(self.index, &collected, declared) {
-            collected
-        } else {
-            declared.clone()
-        }
-    }
-
-    /// Collect the types of the `return <expr>` statements reachable in `stmts`,
-    /// pruning `if` branches whose condition is statically known from the bound
-    /// **parameter** types (so a guarded `return null` the arguments rule out is
-    /// not collected). Deliberately does **not** track local assignments: a local
-    /// is only ever conditionally/loop-assigned in general, and treating such an
-    /// assignment as definite would unsoundly drop `null` from a `return $local`
-    /// (a real false-positive source). Unknown locals infer as `mixed`, which
-    /// keeps the refinement conservative — it can tighten returns built from
-    /// params/`new`/literals, never from flow-dependent locals.
-    fn collect_returns(&mut self, stmts: &[php_ast::Stmt], out: &mut Vec<Type>) {
-        use php_ast::StmtKind as S;
-        for s in stmts {
-            match &s.kind {
-                S::Return(Some(e)) => out.push(self.infer(e)),
-                S::Block(b) => self.collect_returns(b, out),
-                S::If {
-                    cond,
-                    then,
-                    elseifs,
-                    els,
-                } => self.collect_if_returns(cond, then, elseifs, els.as_deref(), out),
-                S::While { body, .. }
-                | S::DoWhile { body, .. }
-                | S::For { body, .. }
-                | S::Foreach { body, .. } => self.collect_returns(std::slice::from_ref(body), out),
-                S::Switch { cases, .. } => {
-                    for c in cases {
-                        self.collect_returns(&c.body, out);
-                    }
-                }
-                S::Try {
-                    body,
-                    catches,
-                    finally,
-                } => {
-                    self.collect_returns(body, out);
-                    for c in catches {
-                        self.collect_returns(&c.body, out);
-                    }
-                    if let Some(f) = finally {
-                        self.collect_returns(f, out);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// Collect returns from an `if` chain, pruning statically-dead branches.
-    fn collect_if_returns(
-        &mut self,
-        cond: &Expr,
-        then: &php_ast::Stmt,
-        elseifs: &[php_ast::ElseIf],
-        els: Option<&php_ast::Stmt>,
-        out: &mut Vec<Type>,
-    ) {
-        match self.static_truth(cond) {
-            Some(true) => self.collect_returns(std::slice::from_ref(then), out),
-            Some(false) => {
-                if let Some((first, rest)) = elseifs.split_first() {
-                    self.collect_if_returns(&first.cond, &first.body, rest, els, out)
-                } else if let Some(e) = els {
-                    self.collect_returns(std::slice::from_ref(e), out)
-                }
-            }
-            None => {
-                self.collect_returns(std::slice::from_ref(then), out);
-                for ei in elseifs {
-                    self.collect_returns(std::slice::from_ref(&ei.body), out);
-                }
-                if let Some(e) = els {
-                    self.collect_returns(std::slice::from_ref(e), out);
-                }
-            }
-        }
-    }
-
-    /// Statically evaluate a condition's truth under the current environment, for
-    /// dead-branch pruning in [`collect_returns`]. Only **sound** verdicts: a
-    /// `null`-comparison whose operand can't be null, `is_null`, and the boolean
-    /// connectives composed from them. `None` = unknown (no pruning).
-    fn static_truth(&self, cond: &Expr) -> Option<bool> {
-        match &cond.kind {
-            ExprKind::Paren(inner) => self.static_truth(inner),
-            ExprKind::Unary {
-                op: UnOp::Not,
-                expr,
-            } => self.static_truth(expr).map(|b| !b),
-            ExprKind::Binary {
-                op: BinOp::BoolAnd | BinOp::LogicalAnd,
-                lhs,
-                rhs,
-            } => match (self.static_truth(lhs), self.static_truth(rhs)) {
-                (Some(false), _) | (_, Some(false)) => Some(false),
-                (Some(true), Some(true)) => Some(true),
-                _ => None,
-            },
-            ExprKind::Binary {
-                op: BinOp::BoolOr | BinOp::LogicalOr,
-                lhs,
-                rhs,
-            } => match (self.static_truth(lhs), self.static_truth(rhs)) {
-                (Some(true), _) | (_, Some(true)) => Some(true),
-                (Some(false), Some(false)) => Some(false),
-                _ => None,
-            },
-            ExprKind::Binary {
-                op: op @ (BinOp::Identical | BinOp::Eq | BinOp::NotIdentical | BinOp::NotEq),
-                lhs,
-                rhs,
-            } => {
-                let eq = matches!(op, BinOp::Identical | BinOp::Eq);
-                // `$x === null` / `null === $x`: decided by whether the operand can be null.
-                if is_null_literal(lhs) || is_null_literal(rhs) {
-                    let other = if is_null_literal(lhs) { rhs } else { lhs };
-                    return null_truth(&self.infer(other)).map(|n| if eq { n } else { !n });
-                }
-                // `$type === Foo::BAR` between two known literal ints (e.g. an enum-like
-                // class constant passed as an argument): compare the values.
-                if let (Type::LiteralInt(a), Type::LiteralInt(b)) =
-                    (self.infer(lhs), self.infer(rhs))
-                {
-                    let same = a == b;
-                    return Some(if eq { same } else { !same });
-                }
-                None
-            }
-            // `a < b` / `<=` / `>` / `>=` between int-valued operands, decided when
-            // the operand ranges don't overlap (e.g. `1 < int<2, max>` is always
-            // true) — drives loop-iteration proof.
-            ExprKind::Binary {
-                op: op @ (BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq),
-                lhs,
-                rhs,
-            } => {
-                let a = int_bounds(&self.infer(lhs))?;
-                let b = int_bounds(&self.infer(rhs))?;
-                cmp_ranges(*op, a, b)
-            }
-            ExprKind::Call { callee, args } => {
-                let ExprKind::Name(n) = &callee.kind else {
-                    return None;
-                };
-                if !n
-                    .text
-                    .trim_start_matches('\\')
-                    .eq_ignore_ascii_case("is_null")
-                {
-                    return None;
-                }
-                null_truth(&self.infer(&args.first()?.value))
-            }
-            _ => None,
-        }
+        returns::refine_return(self, declared, body, params, args, callee_class)
     }
 
     /// Argument-dependent return types for selected built-ins. Returns `None` to
@@ -600,30 +414,12 @@ impl<'a> TypeCtx<'a> {
 
     /// The value (element) type of an array/list argument, if known.
     fn array_value_type(&self, arg: &php_ast::Arg) -> Option<Type> {
-        match self.infer(&arg.value) {
-            Type::Array(Some(kv)) => Some(kv.1.clone()),
-            Type::List(v) => Some(*v),
-            _ => None,
-        }
+        arrays::array_value_type(&self.infer(&arg.value))
     }
 
     /// The key type of an array/list/shape argument, if known (`list` → `int`).
     fn array_key_type(&self, arg: &php_ast::Arg) -> Option<Type> {
-        match self.infer(&arg.value) {
-            Type::Array(Some(kv)) => Some(kv.0.clone()),
-            Type::List(_) => Some(Type::Int),
-            Type::Shape { fields, .. } => Some(Type::union(
-                fields
-                    .iter()
-                    .map(|f| match &f.key {
-                        Some(k) if k.parse::<i64>().is_ok() => Type::Int,
-                        Some(_) => Type::String,
-                        None => Type::Int,
-                    })
-                    .collect(),
-            )),
-            _ => None,
-        }
+        arrays::array_key_type(&self.infer(&arg.value))
     }
 
     /// Return type of `$recv->method(...)`.
@@ -789,12 +585,14 @@ impl<'a> TypeCtx<'a> {
             Type::Shape { fields, sealed } => {
                 // A constant offset reads that field's type; otherwise the union of
                 // all field types (any of them could be selected).
-                match index.and_then(const_key) {
-                    Some(k) => fields
-                        .iter()
-                        .find(|f| f.key.as_deref() == Some(k.as_str()))
-                        .map(|f| f.ty.clone())
-                        .unwrap_or(Type::Mixed),
+                match index.and_then(arrays::const_shape_key) {
+                    Some(k) => {
+                        let shape = Type::Shape { fields, sealed };
+                        match arrays::shape_offset_status(&shape, &k) {
+                            Some(arrays::ShapeOffsetStatus::Present(ty)) => ty,
+                            _ => Type::Mixed,
+                        }
+                    }
                     None => {
                         let mut vals: Vec<Type> = fields.into_iter().map(|f| f.ty).collect();
                         if !sealed {
@@ -847,7 +645,7 @@ impl<'a> TypeCtx<'a> {
                 Type::LiteralInt(0),
                 Type::LiteralInt(1),
             ]),
-            Coalesce => Type::union(vec![strip_null(self.infer(lhs)), self.infer(rhs)]),
+            Coalesce => Type::union(vec![strip_null_strict(&self.infer(lhs)), self.infer(rhs)]),
             Add | Sub | Mul | Div | Pow => self.arith(op, self.infer(lhs), self.infer(rhs)),
             Pipe => Type::Mixed,
         }
@@ -920,7 +718,7 @@ impl<'a> TypeCtx<'a> {
     /// the access was made on (`bound`). A method declared `: self` on `Factory`
     /// returns `Factory`. Recurses through composite types.
     fn bind_relative(&self, ty: Type, bound: &str) -> Type {
-        match ty {
+        ty.map(&mut |part| match part {
             Type::SelfType | Type::StaticType => Type::Named {
                 fqn: bound.to_string(),
                 args: vec![],
@@ -930,33 +728,8 @@ impl<'a> TypeCtx<'a> {
                 .class(bound)
                 .and_then(|c| c.parents.first().cloned())
                 .unwrap_or(Type::Parent),
-            Type::Nullable(inner) => self.bind_relative(*inner, bound).nullable(),
-            Type::Union(parts) => Type::union(
-                parts
-                    .into_iter()
-                    .map(|p| self.bind_relative(p, bound))
-                    .collect(),
-            ),
-            Type::Intersection(parts) => Type::intersection(
-                parts
-                    .into_iter()
-                    .map(|p| self.bind_relative(p, bound))
-                    .collect(),
-            ),
-            Type::Array(Some(kv)) => Type::Array(Some(Box::new((
-                self.bind_relative(kv.0, bound),
-                self.bind_relative(kv.1, bound),
-            )))),
-            Type::List(inner) => Type::List(Box::new(self.bind_relative(*inner, bound))),
-            Type::Named { fqn, args } => Type::Named {
-                fqn,
-                args: args
-                    .into_iter()
-                    .map(|a| self.bind_relative(a, bound))
-                    .collect(),
-            },
             other => other,
-        }
+        })
     }
 
     /// The class FQN to query members on, given a value's type.
@@ -1064,34 +837,6 @@ fn magic_constant(name: &str) -> Option<Type> {
     }
 }
 
-/// Drop `null` from a type (for `??` / nullsafe narrowing).
-fn strip_null(t: Type) -> Type {
-    match t {
-        Type::Null => Type::Never,
-        Type::Nullable(inner) => *inner,
-        Type::Union(parts) => Type::union(parts.into_iter().filter(|p| *p != Type::Null).collect()),
-        other => other,
-    }
-}
-
-/// Drop the always-falsy members (`null`, `false`) from a type — the value the
-/// truthy branch of `a ?: b` (short ternary) yields when `a` is taken.
-fn strip_falsy(t: Type) -> Type {
-    match t {
-        Type::Null | Type::False => Type::Never,
-        Type::Bool => Type::True,
-        Type::Nullable(inner) => strip_falsy(*inner),
-        Type::Union(parts) => Type::union(
-            parts
-                .into_iter()
-                .filter(|p| !matches!(p, Type::Null | Type::False))
-                .map(strip_falsy)
-                .collect(),
-        ),
-        other => other,
-    }
-}
-
 /// `+$x` / `-$x`: numeric, preserving int vs float when known.
 /// Apply a unary `+`/`-` to a type, preserving literal ints (negating them when
 /// `neg`) and distributing over a union; non-literal operands fall back to
@@ -1137,18 +882,6 @@ fn instance_of(t: Type) -> Type {
     }
 }
 
-/// The constant array-key spelled by an expression, if it is a literal string or
-/// integer (`'foo'` → `foo`, `5` → `5`). Used for array-shape keys and constant
-/// shape-offset reads. Non-literal keys yield `None`.
-fn const_key(e: &Expr) -> Option<String> {
-    match &e.kind {
-        ExprKind::Str(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
-        ExprKind::Int(n) => Some(n.to_string()),
-        ExprKind::Paren(inner) => const_key(inner),
-        _ => None,
-    }
-}
-
 /// Static verdict for "is this type `null`?": `Some(true)` if it is exactly null,
 /// `Some(false)` if it cannot be null, `None` if it might be (union with null,
 /// `mixed`). Drives `=== null` / `is_null` dead-branch pruning.
@@ -1184,14 +917,16 @@ fn is_null_literal(e: &Expr) -> bool {
     }
 }
 
-/// Whether `t` is, or contains (within a union/nullable), `mixed`/`unknown`.
+/// Whether `t` is, or contains, `mixed`/`unknown`.
 fn contains_mixed(t: &Type) -> bool {
-    match t {
-        Type::Mixed | Type::ExplicitMixed | Type::Unknown(_) => true,
-        Type::Union(parts) => parts.iter().any(contains_mixed),
-        Type::Nullable(inner) => contains_mixed(inner),
-        _ => false,
-    }
+    let mut found = false;
+    let _ = t.clone().map(&mut |part| {
+        if matches!(part, Type::Mixed | Type::ExplicitMixed | Type::Unknown(_)) {
+            found = true;
+        }
+        part
+    });
+    found
 }
 
 fn is_string_ty(t: &Type) -> bool {

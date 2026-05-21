@@ -158,7 +158,7 @@ fn scan_stmt_exprs_for_this_assign(
     out: &mut Vec<Diagnostic>,
 ) {
     let implements_array_access =
-        enclosing_class.is_some_and(|c| fa.project.is_subclass_of(c, "ArrayAccess"));
+        enclosing_class.is_some_and(|c| fa.reflection.is_subclass_of(c, "ArrayAccess"));
     if implements_array_access {
         return;
     }
@@ -571,13 +571,7 @@ fn combined_templates(class_templates: &[String], method_doc: Option<&str>) -> V
 }
 
 fn doc_tag_base_priority(name: &str) -> (&str, i8) {
-    if let Some(rest) = name.strip_prefix("phpstan-") {
-        (rest, 2)
-    } else if let Some(rest) = name.strip_prefix("psalm-") {
-        (rest, 1)
-    } else {
-        (name, 0)
-    }
+    php_phpdoc::query::base_priority(name)
 }
 
 fn straight_line_final_vars(
@@ -1188,31 +1182,14 @@ fn type_is_uncertain(ty: &Type) -> bool {
     }
 }
 
-enum ShapeOffsetStatus {
-    Missing,
-    Present(Type),
-    Maybe,
-}
+type ShapeOffsetStatus = php_infer::arrays::ShapeOffsetStatus;
 
 fn shape_offset_status(base_ty: &Type, key: &str) -> Option<ShapeOffsetStatus> {
-    let Type::Shape { fields, sealed } = base_ty else {
-        return None;
-    };
-    match fields.iter().find(|f| f.key.as_deref() == Some(key)) {
-        Some(field) if !field.optional => Some(ShapeOffsetStatus::Present(field.ty.clone())),
-        Some(_) => Some(ShapeOffsetStatus::Maybe),
-        None if *sealed => Some(ShapeOffsetStatus::Missing),
-        None => Some(ShapeOffsetStatus::Maybe),
-    }
+    php_infer::arrays::shape_offset_status(base_ty, key)
 }
 
 fn const_shape_key(expr: &Expr) -> Option<String> {
-    match &expr.kind {
-        ExprKind::Str(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
-        ExprKind::Int(n) => Some(n.to_string()),
-        ExprKind::Paren(inner) => const_shape_key(inner),
-        _ => None,
-    }
+    php_infer::arrays::const_shape_key(expr)
 }
 
 fn is_always_defined_name(name: &str) -> bool {

@@ -9,43 +9,26 @@
 //! (e.g. `string` where `int` is wanted, or two unrelated *known* classes).
 
 use php_reflect::ReflectionIndex;
-use php_types::{ShapeField, Type};
+use php_types::Type;
 
-/// Remove `null` from a type, returning the non-nullable remainder. A type that
-/// is *purely* `null` is returned unchanged (there's nothing left to strip to).
-///
-/// This implements phpstan's `checkNullables` strictness gate: below level 8,
-/// phpstan strips `null` from the *value* type before a type-compatibility check
-/// (argument/return/property), so passing a nullable value where a non-null type
-/// is expected is not reported until level 8+. Passing a *literal* `null` is still
-/// reported at every level (hence the pure-`null` carve-out).
-pub fn strip_null_lenient(t: &Type) -> Type {
-    match t {
-        Type::Null => Type::Null,
-        Type::Nullable(inner) => (**inner).clone(),
-        Type::Union(parts) => {
-            let kept: Vec<Type> = parts
-                .iter()
-                .filter(|p| !matches!(p, Type::Null))
-                .cloned()
-                .collect();
-            if kept.is_empty() {
-                Type::Null
-            } else {
-                Type::union(kept)
-            }
-        }
-        other => other.clone(),
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trinary {
+    Yes,
+    Maybe,
+    No,
 }
 
-/// The key type of a shape field: an integer-valued literal key is `int`,
-/// otherwise `string` (a positional field, no key, is treated as `int`).
-fn shape_key_type(f: &ShapeField) -> Type {
-    match &f.key {
-        Some(k) if k.parse::<i64>().is_ok() => Type::Int,
-        Some(_) => Type::String,
-        None => Type::Int,
+impl Trinary {
+    pub fn from_bool(v: bool) -> Self {
+        if v {
+            Trinary::Yes
+        } else {
+            Trinary::No
+        }
+    }
+
+    pub fn is_yes(self) -> bool {
+        matches!(self, Trinary::Yes)
     }
 }
 
@@ -139,7 +122,7 @@ pub fn is_assignable(index: &ReflectionIndex, value: &Type, target: &Type) -> bo
     // Leniency escapes: top/bottom and anything we couldn't resolve.
     match (value, target) {
         (_, Mixed | ExplicitMixed) => return true, // everything fits mixed
-        (Never, _) => return true, // never is the bottom type
+        (Never, _) => return true,                 // never is the bottom type
         (Mixed | ExplicitMixed, _) => return true, // mixed value — don't flag by default
         (Unknown(_), _) | (_, Unknown(_)) => return true,
         // A template variable's concrete type is unknown (bounded by its
@@ -185,6 +168,88 @@ pub fn is_assignable(index: &ReflectionIndex, value: &Type, target: &Type) -> bo
     }
 
     assignable_atom(index, value, target)
+}
+
+pub fn assignable_trinary(index: &ReflectionIndex, value: &Type, target: &Type) -> Trinary {
+    use Type::*;
+
+    // Leniency escapes: top/bottom and anything we couldn't resolve.
+    match (value, target) {
+        (_, Mixed | ExplicitMixed) => return Trinary::Yes, // everything fits mixed
+        (Never, _) => return Trinary::Yes,                 // never is the bottom type
+        (Mixed | ExplicitMixed, _) => return Trinary::Maybe,
+        (Unknown(_), _) | (_, Unknown(_)) => return Trinary::Maybe,
+        // A template variable's concrete type is unknown (bounded by its
+        // `@template T of …`, which we don't track) — stay lenient either way.
+        (TemplateVar(_), _) | (_, TemplateVar(_)) => return Trinary::Maybe,
+        _ => {}
+    }
+    if value == target {
+        return Trinary::Yes;
+    }
+
+    // PHP's `/` and `**` yield a *benevolent* `int|float` (phpstan's
+    // `BenevolentUnionType`). With `checkBenevolentUnionTypes` off — phpstan's
+    // default at *every* level — a benevolent union satisfies a target if *any*
+    // member does, so `$even / 2` (typed `int|float`) is accepted where `int` is
+    // expected. We can't distinguish a benevolent union from a declared
+    // `int|float`, so a declared one is likewise lenient toward a numeric target;
+    // that's a safe under-report (phpstan would flag the declared case only at
+    // level 8+), never a false positive.
+    if let Union(parts) = value {
+        let numeric = parts
+            .iter()
+            .all(|p| matches!(p, Int | Float | LiteralInt(_) | IntRange { .. }))
+            && parts.iter().any(|p| matches!(p, Float));
+        if numeric && matches!(target, Int | Float) {
+            return Trinary::Yes;
+        }
+    }
+    // A union value is assignable only if *every* member is.
+    if let Union(parts) = value {
+        if parts
+            .iter()
+            .all(|p| assignable_trinary(index, p, target).is_yes())
+        {
+            return Trinary::Yes;
+        }
+        if parts
+            .iter()
+            .all(|p| matches!(assignable_trinary(index, p, target), Trinary::No))
+        {
+            return Trinary::No;
+        }
+        return Trinary::Maybe;
+    }
+    // `?A` (value) ⊑ target iff both `A` and `null` are.
+    if let Nullable(v) = value {
+        return assignable_trinary(index, &Union(vec![(**v).clone(), Null]), target);
+    }
+
+    // A union/nullable target accepts the value if *any* arm does.
+    match target {
+        Nullable(t) => {
+            return assignable_trinary(index, value, &Union(vec![(**t).clone(), Null]));
+        }
+        Union(parts) => {
+            if parts
+                .iter()
+                .any(|t| assignable_trinary(index, value, t).is_yes())
+            {
+                return Trinary::Yes;
+            }
+            if parts
+                .iter()
+                .all(|t| matches!(assignable_trinary(index, value, t), Trinary::No))
+            {
+                return Trinary::No;
+            }
+            return Trinary::Maybe;
+        }
+        _ => {}
+    }
+
+    Trinary::from_bool(assignable_atom(index, value, target))
 }
 
 /// Atomic (non-union, non-nullable) assignability: scalar widening, array/iterable
@@ -247,7 +312,8 @@ fn assignable_atom(index: &ReflectionIndex, value: &Type, target: &Type) -> bool
         }
         // shape ⊑ array<K,V>: each field's key and value must fit the element types.
         (Shape { fields, .. }, Array(Some(kv))) => fields.iter().all(|f| {
-            is_assignable(index, &shape_key_type(f), &kv.0) && is_assignable(index, &f.ty, &kv.1)
+            is_assignable(index, &crate::arrays::shape_field_key_type(f), &kv.0)
+                && is_assignable(index, &f.ty, &kv.1)
         }),
         // shape ⊑ list<V>: lenient on key/order, check the value types.
         (Shape { fields, .. }, List(v)) => fields.iter().all(|f| is_assignable(index, &f.ty, v)),
@@ -287,6 +353,7 @@ fn assignable_atom(index: &ReflectionIndex, value: &Type, target: &Type) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use php_types::ShapeField;
 
     fn empty_index() -> ReflectionIndex {
         ReflectionIndex::new()

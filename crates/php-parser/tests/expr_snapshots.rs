@@ -203,7 +203,6 @@ fn render(e: &Expr, i: &Interner) -> String {
         ),
         Paren(inner) => render(inner, i),
         Error => "<error>".into(),
-        _ => "<unknown>".into(),
     }
 }
 
@@ -979,7 +978,7 @@ fn render_stmt(s: &Stmt, i: &Interner) -> String {
                 .collect();
             format!("(const {})", cs.join(" "))
         }
-        _ => "(unknown)".into(),
+        StmtKind::HaltCompiler(off) => format!("(halt-compiler {off})"),
     }
 }
 

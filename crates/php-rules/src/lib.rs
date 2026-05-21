@@ -10,16 +10,24 @@ use php_diagnostics::Diagnostic;
 use php_index::ProjectIndex;
 use php_resolve::{RefKind, Resolution, ResolvedRef};
 
+pub(crate) mod decls;
+pub(crate) mod function_like;
+pub(crate) mod members;
+pub(crate) mod missing_type;
 mod registry;
 mod return_type;
 mod rules;
+pub(crate) mod symbols;
 pub use php_ast::walk;
 #[cfg(test)]
 mod testutil;
 pub use php_infer::{
     is_assignable, is_castable_to_string, native_type_map, type_map, undefined_variables, TypeMap,
 };
-pub use registry::{analyze_file, rules_for_level, FileAnalysis, PhpVersion, RuleEntry};
+pub use php_types::PhpVersion;
+pub use registry::{
+    analyze_file, rule_manifest, rules_for_level, FileAnalysis, RuleEntry, RuleManifestEntry,
+};
 pub use return_type::return_type_errors;
 
 /// Report every reference in `refs` whose target is unknown to `index` (neither

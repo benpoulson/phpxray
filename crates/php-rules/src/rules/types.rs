@@ -16,13 +16,12 @@
 use crate::{walk, FileAnalysis, RuleEntry};
 use php_ast::{
     ArrowFn, ClassDecl, ClosureExpr, Expr, ExprKind, FunctionDecl, Member, MemberName, MethodDecl,
-    Param, Stmt,
-    PropertyHook, StmtKind, Type, TypeKind,
+    Param, PropertyHook, Stmt, StmtKind, Type, TypeKind,
 };
 use php_diagnostics::Diagnostic;
 use php_reflect::{reflect_class, reflect_function};
 use php_resolve::{for_each_region, RefKind, Resolution, ResolvedRef, Scope};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The reserved keywords that may only appear *standalone*, never as a member of
 /// a union or nullable type. Mirrors phpstan's `ONLY_STANDALONE_TYPES`.
@@ -195,7 +194,9 @@ fn run_explicit_mixed_strictness(fa: &FileAnalysis) -> Vec<Diagnostic> {
 }
 
 fn run_implicit_mixed_strictness(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    run_strict_mixed(fa, true)
+    let mut out = run_explicit_mixed_strictness(fa);
+    check_implicit_param_argument_mixed(fa, &mut out);
+    out
 }
 
 fn run_strict_mixed(fa: &FileAnalysis, include_implicit: bool) -> Vec<Diagnostic> {
@@ -209,6 +210,37 @@ fn run_strict_mixed(fa: &FileAnalysis, include_implicit: bool) -> Vec<Diagnostic
 
 fn strict_mixed_source(ty: &php_types::Type, include_implicit: bool) -> bool {
     ty.contains_explicit_mixed() || (include_implicit && ty.contains_implicit_mixed())
+}
+
+fn direct_implicit_mixed_param_arg(
+    fa: &FileAnalysis,
+    expr: &Expr,
+    implicit_params: &HashSet<String>,
+) -> bool {
+    let ExprKind::Variable(sym) = &expr.kind else {
+        return false;
+    };
+    implicit_params.contains(fa.interner.resolve(*sym))
+        && matches!(fa.type_of(expr), php_types::Type::Mixed)
+}
+
+fn implicit_param_names(params: &[Param], doc: Option<&str>, fa: &FileAnalysis) -> HashSet<String> {
+    let documented: HashSet<String> = doc
+        .map(php_phpdoc::parse)
+        .map(|doc| {
+            doc.params
+                .into_iter()
+                .filter_map(|p| p.ty.and(p.name))
+                .collect()
+        })
+        .unwrap_or_default();
+    params
+        .iter()
+        .filter_map(|p| {
+            let name = fa.interner.resolve(p.name);
+            (p.ty.is_none() && !documented.contains(name)).then(|| name.to_string())
+        })
+        .collect()
 }
 
 fn concrete_target(ty: &php_types::Type) -> bool {
@@ -251,11 +283,7 @@ fn reflected_function_target(fa: &FileAnalysis, r: &ResolvedRef) -> Option<Strin
     }
 }
 
-fn check_function_call_mixed(
-    fa: &FileAnalysis,
-    include_implicit: bool,
-    out: &mut Vec<Diagnostic>,
-) {
+fn check_function_call_mixed(fa: &FileAnalysis, include_implicit: bool, out: &mut Vec<Diagnostic>) {
     let fmap = function_refs(fa.resolved_refs);
     walk::for_each_expr(fa.program, &mut |e| {
         let ExprKind::Call { callee, args } = &e.kind else {
@@ -282,7 +310,9 @@ fn check_function_call_mixed(
         }
         let display = r.name.trim_start_matches('\\');
         for (i, arg) in args.iter().enumerate() {
-            let Some(param) = func.params.get(i) else { break };
+            let Some(param) = func.params.get(i) else {
+                break;
+            };
             if param.variadic || !concrete_target(&param.ty) {
                 break;
             }
@@ -305,11 +335,246 @@ fn check_function_call_mixed(
     });
 }
 
-fn check_method_call_mixed(
+fn check_implicit_param_argument_mixed(fa: &FileAnalysis, out: &mut Vec<Diagnostic>) {
+    let fmap = function_refs(fa.resolved_refs);
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            match &st.kind {
+                StmtKind::Function(f) => {
+                    let implicit = implicit_param_names(&f.params, f.doc.as_deref(), fa);
+                    if implicit.is_empty() {
+                        continue;
+                    }
+                    for st in &f.body {
+                        check_implicit_param_argument_stmt(fa, &implicit, &fmap, st, out);
+                    }
+                }
+                StmtKind::Class(c) => {
+                    let Some(name) = c.name else { continue };
+                    let class_fqn = scope.qualify(fa.interner.resolve(name));
+                    if !fa.class_fully_known(&class_fqn) {
+                        continue;
+                    }
+                    for m in &c.members {
+                        let Member::Method(md) = m else { continue };
+                        let Some(body) = &md.body else { continue };
+                        let implicit = implicit_param_names(&md.params, md.doc.as_deref(), fa);
+                        if implicit.is_empty() {
+                            continue;
+                        }
+                        for st in body {
+                            check_implicit_param_argument_stmt(fa, &implicit, &fmap, st, out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+fn check_implicit_param_argument_stmt(
     fa: &FileAnalysis,
-    include_implicit: bool,
+    implicit_params: &HashSet<String>,
+    fmap: &HashMap<(u32, u32), &ResolvedRef>,
+    st: &Stmt,
     out: &mut Vec<Diagnostic>,
 ) {
+    walk::for_each_stmt_in_stmt(st, &mut |nested| {
+        check_implicit_param_argument_direct_stmt(fa, implicit_params, fmap, nested, out);
+    });
+}
+
+fn check_implicit_param_argument_direct_stmt(
+    fa: &FileAnalysis,
+    implicit_params: &HashSet<String>,
+    fmap: &HashMap<(u32, u32), &ResolvedRef>,
+    st: &Stmt,
+    out: &mut Vec<Diagnostic>,
+) {
+    match &st.kind {
+        StmtKind::Expr(e) | StmtKind::Return(Some(e)) => {
+            check_implicit_param_argument_expr(fa, implicit_params, fmap, e, out);
+        }
+        StmtKind::Echo(exprs) | StmtKind::Global(exprs) | StmtKind::Unset(exprs) => {
+            for e in exprs {
+                check_implicit_param_argument_expr(fa, implicit_params, fmap, e, out);
+            }
+        }
+        StmtKind::If { cond, .. }
+        | StmtKind::While { cond, .. }
+        | StmtKind::DoWhile { cond, .. } => {
+            check_implicit_param_argument_expr(fa, implicit_params, fmap, cond, out);
+        }
+        StmtKind::For {
+            init, cond, update, ..
+        } => {
+            for e in init.iter().chain(cond).chain(update) {
+                check_implicit_param_argument_expr(fa, implicit_params, fmap, e, out);
+            }
+        }
+        StmtKind::Foreach {
+            subject,
+            key,
+            value,
+            ..
+        } => {
+            check_implicit_param_argument_expr(fa, implicit_params, fmap, subject, out);
+            if let Some(key) = key {
+                check_implicit_param_argument_expr(fa, implicit_params, fmap, key, out);
+            }
+            check_implicit_param_argument_expr(fa, implicit_params, fmap, value, out);
+        }
+        StmtKind::Switch { subject, cases } => {
+            check_implicit_param_argument_expr(fa, implicit_params, fmap, subject, out);
+            for case in cases {
+                if let Some(test) = &case.test {
+                    check_implicit_param_argument_expr(fa, implicit_params, fmap, test, out);
+                }
+            }
+        }
+        StmtKind::StaticVars(vars) => {
+            for v in vars {
+                if let Some(default) = &v.default {
+                    check_implicit_param_argument_expr(fa, implicit_params, fmap, default, out);
+                }
+            }
+        }
+        StmtKind::Declare { directives, .. } => {
+            for (_, e) in directives {
+                check_implicit_param_argument_expr(fa, implicit_params, fmap, e, out);
+            }
+        }
+        StmtKind::ConstDecl { consts, .. } => {
+            for c in consts {
+                check_implicit_param_argument_expr(fa, implicit_params, fmap, &c.value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn check_implicit_param_argument_expr(
+    fa: &FileAnalysis,
+    implicit_params: &HashSet<String>,
+    fmap: &HashMap<(u32, u32), &ResolvedRef>,
+    root: &Expr,
+    out: &mut Vec<Diagnostic>,
+) {
+    walk::for_each_subexpr(root, &mut |e| match &e.kind {
+        ExprKind::Call { callee, args } => {
+            check_implicit_param_function_args(fa, implicit_params, fmap, callee, args, out);
+        }
+        ExprKind::MethodCall {
+            recv, method, args, ..
+        } => {
+            check_implicit_param_method_args(fa, implicit_params, recv, method, args, out);
+        }
+        _ => {}
+    });
+}
+
+fn check_implicit_param_function_args(
+    fa: &FileAnalysis,
+    implicit_params: &HashSet<String>,
+    fmap: &HashMap<(u32, u32), &ResolvedRef>,
+    callee: &Expr,
+    args: &[php_ast::Arg],
+    out: &mut Vec<Diagnostic>,
+) {
+    if args
+        .iter()
+        .any(|a| a.spread || a.placeholder || a.name.is_some())
+    {
+        return;
+    }
+    let Some(r) = resolved_callee(callee, fmap) else {
+        return;
+    };
+    let Some(fqn) = reflected_function_target(fa, r) else {
+        return;
+    };
+    let Some(func) = fa.reflection.function(&fqn) else {
+        return;
+    };
+    let display = r.name.trim_start_matches('\\');
+    for (i, arg) in args.iter().enumerate() {
+        let Some(param) = func.params.get(i) else {
+            break;
+        };
+        if param.variadic || !concrete_target(&param.ty) {
+            break;
+        }
+        if direct_implicit_mixed_param_arg(fa, &arg.value, implicit_params) {
+            out.push(
+                Diagnostic::error(
+                    arg.value.span,
+                    format!(
+                        "Parameter #{} ${} of function {display} expects {}, mixed given.",
+                        i + 1,
+                        param.name,
+                        param.ty
+                    ),
+                )
+                .with_code("argument.type"),
+            );
+        }
+    }
+}
+
+fn check_implicit_param_method_args(
+    fa: &FileAnalysis,
+    implicit_params: &HashSet<String>,
+    recv: &Expr,
+    method: &MemberName,
+    args: &[php_ast::Arg],
+    out: &mut Vec<Diagnostic>,
+) {
+    if args
+        .iter()
+        .any(|a| a.spread || a.placeholder || a.name.is_some())
+    {
+        return;
+    }
+    let Some(fqn) = named_fqn(&fa.type_of(recv)) else {
+        return;
+    };
+    let MemberName::Ident(name) = method else {
+        return;
+    };
+    let mname = fa.interner.resolve(*name);
+    let Some(found) = fa.reflection.find_method(&fqn, mname) else {
+        return;
+    };
+    if found.member.magic {
+        return;
+    }
+    let short = fqn.trim_start_matches('\\');
+    for (i, arg) in args.iter().enumerate() {
+        let Some(param) = found.member.params.get(i) else {
+            break;
+        };
+        if param.variadic || !concrete_target(&param.ty) {
+            break;
+        }
+        if direct_implicit_mixed_param_arg(fa, &arg.value, implicit_params) {
+            out.push(
+                Diagnostic::error(
+                    arg.value.span,
+                    format!(
+                        "Parameter #{} ${} of method {short}::{mname}() expects {}, mixed given.",
+                        i + 1,
+                        param.name,
+                        param.ty
+                    ),
+                )
+                .with_code("argument.type"),
+            );
+        }
+    }
+}
+
+fn check_method_call_mixed(fa: &FileAnalysis, include_implicit: bool, out: &mut Vec<Diagnostic>) {
     walk::for_each_expr(fa.program, &mut |e| {
         let ExprKind::MethodCall {
             recv, method, args, ..
@@ -496,11 +761,7 @@ fn check_return_stmts(
     }
 }
 
-fn check_member_access_mixed(
-    fa: &FileAnalysis,
-    include_implicit: bool,
-    out: &mut Vec<Diagnostic>,
-) {
+fn check_member_access_mixed(fa: &FileAnalysis, include_implicit: bool, out: &mut Vec<Diagnostic>) {
     walk::for_each_expr(fa.program, &mut |e| match &e.kind {
         ExprKind::MethodCall { recv, method, .. } => {
             if !strict_mixed_source(&fa.type_of(recv), include_implicit) {
@@ -538,7 +799,9 @@ fn check_member_access_mixed(
             } else {
                 "Cannot access an offset on mixed.".to_string()
             };
-            out.push(Diagnostic::error(e.span, message).with_code("offsetAccess.nonOffsetAccessible"));
+            out.push(
+                Diagnostic::error(e.span, message).with_code("offsetAccess.nonOffsetAccessible"),
+            );
         }
         _ => {}
     });
@@ -753,21 +1016,16 @@ mod tests {
 
     #[test]
     fn explicit_mixed_argument_is_flagged_at_level_9_strictness() {
-        let src = "<?php function takesInt(int $i): void {} function f(mixed $x): void { takesInt($x); }";
-        assert_eq!(
-            codes(src, run_explicit_mixed_strictness),
-            ["argument.type"]
-        );
+        let src =
+            "<?php function takesInt(int $i): void {} function f(mixed $x): void { takesInt($x); }";
+        assert_eq!(codes(src, run_explicit_mixed_strictness), ["argument.type"]);
     }
 
     #[test]
     fn implicit_mixed_argument_waits_for_level_10_strictness() {
         let src = "<?php function takesInt(int $i): void {} function f($x): void { takesInt($x); }";
         assert!(codes(src, run_explicit_mixed_strictness).is_empty());
-        assert_eq!(
-            codes(src, run_implicit_mixed_strictness),
-            ["argument.type"]
-        );
+        assert_eq!(codes(src, run_implicit_mixed_strictness), ["argument.type"]);
     }
 
     #[test]

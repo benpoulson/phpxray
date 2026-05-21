@@ -7,7 +7,7 @@
 //! so it runs in parallel across the global Rayon worker pool.
 
 use indicatif::{ProgressBar, ProgressStyle};
-use php_config::{Config, ExcludeMatcher};
+use php_config::{Config, ExcludeMatcher, Level};
 use php_diagnostics::Severity;
 use php_index::{ProjectIndex, SourceKind as ProjectSourceKind};
 use php_reflect::{ReflectionIndex, SourceKind as ReflectSourceKind};
@@ -159,6 +159,7 @@ pub fn run_with_options(config: &Config, root: &Path, options: RunOptions) -> Re
         config.level.value(),
         php_version,
         config.treat_phpdoc_types_as_certain,
+        config.level.rule_options().check_nullables,
         &progress,
     );
     let sources: HashMap<&str, &str> = parsed
@@ -188,6 +189,7 @@ pub fn analyze_parsed(
         level,
         php_version,
         treat_phpdoc_types_as_certain,
+        Level(level).rule_options().check_nullables,
         &Progress::hidden(),
     )
 }
@@ -198,12 +200,13 @@ fn analyze_parsed_progress(
     level: u8,
     php_version: php_rules::PhpVersion,
     treat_phpdoc_types_as_certain: bool,
+    check_nullables: bool,
     progress: &Progress,
 ) -> Report {
     // Build the shared immutable indexes once, over the one shared interner.
     let indexing = progress.counter(parsed.len(), "Indexing files");
-    let mut project = ProjectIndex::with_builtins();
-    let mut reflection = ReflectionIndex::with_builtins();
+    let mut project = ProjectIndex::with_builtins_for(php_version);
+    let mut reflection = ReflectionIndex::with_builtins_for(php_version);
     for f in parsed {
         let project_kind = if f.analyze {
             ProjectSourceKind::Analyzed
@@ -227,20 +230,21 @@ fn analyze_parsed_progress(
         analyzed_count,
         format!("Analyzing files on {workers} workers"),
     );
+    let ctx = AnalysisContext {
+        interner,
+        level,
+        php_version,
+        treat_phpdoc_types_as_certain,
+        check_nullables,
+        project: &project,
+        reflection: &reflection,
+    };
     let mut findings_by_file = parsed
         .par_iter()
         .enumerate()
         .filter(|(_, f)| f.analyze)
         .map(|(idx, f)| {
-            let findings = analyze_one_file(
-                f,
-                interner,
-                level,
-                php_version,
-                treat_phpdoc_types_as_certain,
-                &project,
-                &reflection,
-            );
+            let findings = analyze_one_file(f, &ctx);
             analyzing.inc(1);
             (idx, findings)
         })
@@ -257,15 +261,17 @@ fn analyze_parsed_progress(
     }
 }
 
-fn analyze_one_file(
-    f: &ParsedFile,
-    interner: &php_intern::Interner,
+struct AnalysisContext<'a> {
+    interner: &'a php_intern::Interner,
     level: u8,
     php_version: php_rules::PhpVersion,
     treat_phpdoc_types_as_certain: bool,
-    project: &ProjectIndex,
-    reflection: &ReflectionIndex,
-) -> Vec<Finding> {
+    check_nullables: bool,
+    project: &'a ProjectIndex,
+    reflection: &'a ReflectionIndex,
+}
+
+fn analyze_one_file(f: &ParsedFile, ctx: &AnalysisContext<'_>) -> Vec<Finding> {
     let mut findings = Vec::new();
     let line_index = LineIndex::new(&f.source);
     for d in &f.diagnostics {
@@ -280,25 +286,24 @@ fn analyze_one_file(
         });
     }
 
-    let refs = resolve_references(&f.program, interner);
-    let types = php_rules::type_map(reflection, &f.program, interner);
-    let native_types = php_rules::native_type_map(reflection, &f.program, interner);
+    let refs = resolve_references(&f.program, ctx.interner);
+    let types = php_rules::type_map(ctx.reflection, &f.program, ctx.interner);
+    let native_types = php_rules::native_type_map(ctx.reflection, &f.program, ctx.interner);
     let fa = FileAnalysis {
         path: &f.path,
         source: &f.source,
         program: &f.program,
-        interner,
-        project,
-        reflection,
+        interner: ctx.interner,
+        project: ctx.project,
+        reflection: ctx.reflection,
         resolved_refs: &refs,
         types: &types,
         native_types: &native_types,
-        php_version,
-        treat_phpdoc_types_as_certain,
-        // phpstan's `checkNullables` turns on at level 8.
-        check_nullables: level >= 8,
+        php_version: ctx.php_version,
+        treat_phpdoc_types_as_certain: ctx.treat_phpdoc_types_as_certain,
+        check_nullables: ctx.check_nullables,
     };
-    for d in analyze_file(&fa, level) {
+    for d in analyze_file(&fa, ctx.level) {
         let lc = line_index.line_col(d.primary.range().start as u32);
         findings.push(Finding {
             path: f.path.clone(),

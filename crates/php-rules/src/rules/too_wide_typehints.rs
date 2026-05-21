@@ -41,7 +41,7 @@
 //!   final-scope/inheritance semantics to match phpstan without FPs.
 //! - `TooWidePropertyHookParameterType*` — needs hook-specific param-out tracking.
 
-use crate::{walk, FileAnalysis, RuleEntry};
+use crate::{symbols, walk, FileAnalysis, RuleEntry};
 use php_ast::{
     ArrowFn, ClassDecl, ClosureExpr, Expr, ExprKind, FunctionDecl, HookBody, Member, MemberName,
     MethodDecl, Param, Program, PropElem, PropertyDecl, PropertyHook, Stmt, StmtKind,
@@ -1075,7 +1075,7 @@ fn static_property_name_if_static(name: &MemberName, fa: &FileAnalysis) -> Optio
 fn receiver_is_this(base: &Expr, class_fqn: &str, fa: &FileAnalysis, ctx: &TypeCtx<'_>) -> bool {
     match &base.kind {
         ExprKind::Variable(sym) if fa.interner.resolve(*sym) == "this" => true,
-        _ => sole_class(&ctx.infer(base)).is_some_and(|fqn| same_fqn(&fqn, class_fqn)),
+        _ => sole_class(&ctx.infer(base)).is_some_and(|fqn| symbols::same_fqn(&fqn, class_fqn)),
     }
 }
 
@@ -1097,7 +1097,7 @@ fn receiver_may_be_this(
 fn static_class_matches_current(class: &Expr, class_fqn: &str, ctx: &TypeCtx<'_>) -> Option<bool> {
     match &class.kind {
         ExprKind::Name(n) => match ctx.scope.resolve_class(n) {
-            Resolution::Fqn(fqn) => Some(same_fqn(&fqn, class_fqn)),
+            Resolution::Fqn(fqn) => Some(symbols::same_fqn(&fqn, class_fqn)),
             Resolution::LateStatic(s) if matches!(s.as_str(), "self" | "static") => Some(true),
             Resolution::LateStatic(_) => Some(false),
             Resolution::BuiltinType(_) | Resolution::Fallback { .. } => Some(false),
@@ -1116,11 +1116,6 @@ fn sole_class(ty: &Type) -> Option<String> {
         Type::Nullable(inner) => sole_class(inner),
         _ => None,
     }
-}
-
-fn same_fqn(a: &str, b: &str) -> bool {
-    a.trim_start_matches('\\')
-        .eq_ignore_ascii_case(b.trim_start_matches('\\'))
 }
 
 // ---------------------------------------------------------------------------

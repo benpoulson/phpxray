@@ -4,7 +4,7 @@
 //! Checklist: docs/phpstan-rules.md. Add each rule as a `RuleEntry` to
 //! `RULES` (with a phpstan-style identifier on its diagnostics).
 
-use crate::{walk, FileAnalysis, RuleEntry};
+use crate::{symbols, walk, FileAnalysis, RuleEntry};
 use php_ast::{
     ClassDecl, ClassKind, Expr, ExprKind, Member, Name, NameFq, Stmt, StmtKind, Visibility,
 };
@@ -652,7 +652,7 @@ fn check_missing_generic_ancestor(check: GenericAncestorCheck<'_>, out: &mut Vec
 
 fn reflected_has_args(reflected: &[Type], ancestor_fqn: &str) -> bool {
     reflected.iter().any(|ty| match ty {
-        Type::Named { fqn, args } => same_fqn(fqn, ancestor_fqn) && !args.is_empty(),
+        Type::Named { fqn, args } => symbols::same_fqn(fqn, ancestor_fqn) && !args.is_empty(),
         _ => false,
     })
 }
@@ -671,7 +671,11 @@ fn same_file_required_templates_of_kind(
 ) -> Option<Vec<String>> {
     let mut found = None;
     for_each_class_like(fa, |_scope, class, fqn, _span| {
-        if found.is_some() || !fqn.as_deref().is_some_and(|f| same_fqn(f, ancestor_fqn)) {
+        if found.is_some()
+            || !fqn
+                .as_deref()
+                .is_some_and(|f| symbols::same_fqn(f, ancestor_fqn))
+        {
             return;
         }
         if kind.is_some_and(|k| class.kind != k) {
@@ -831,11 +835,6 @@ fn skip_ws_back(bytes: &[u8], mut pos: usize) -> usize {
 
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
-}
-
-fn same_fqn(a: &str, b: &str) -> bool {
-    a.trim_start_matches('\\')
-        .eq_ignore_ascii_case(b.trim_start_matches('\\'))
 }
 
 fn run_method_tag_templates(fa: &FileAnalysis, traits_only: bool) -> Vec<Diagnostic> {
