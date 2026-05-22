@@ -165,7 +165,15 @@ impl<'a> Parser<'a> {
 
     fn error_here(&mut self, msg: &str) {
         let span = self.tokens[self.pos].span;
-        self.diags.push(Diagnostic::error(span, msg.to_string()));
+        let code = if msg.starts_with("expected ") {
+            "parse.expected"
+        } else if msg.starts_with("unexpected ") {
+            "parse.unexpected"
+        } else {
+            "parse.error"
+        };
+        self.diags
+            .push(Diagnostic::error(span, msg.to_string()).with_code(code));
     }
 
     fn node(&self, start: u32, kind: ExprKind) -> Expr {

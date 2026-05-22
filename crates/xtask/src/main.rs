@@ -683,10 +683,10 @@ fn cmd_infer(dir: Option<PathBuf>) -> ExitCode {
     }
 }
 
-/// M-T7: the **multi-file driver** — index a whole project (reflection), then
-/// run the type rules (currently the return-type rule) over each file. Reports
-/// the total diagnostics and a sample, and asserts 0 panics. Over the Zend
-/// corpus (intentionally weird code) this is mostly a false-positive gauge.
+/// Product-driver corpus smoke: parse the Zend corpus through `php-cli`, build
+/// the shared project/reflection indexes, and run the analyzer at level max.
+/// Reports diagnostic counts and asserts 0 panics; over intentionally weird
+/// corpus code this is mostly a false-positive and stability gauge.
 fn cmd_check(dir: Option<PathBuf>) -> ExitCode {
     // Left-associative chains in the corpus produce very deep ASTs; the recursive
     // visitors (infer/flow/walk) need a large stack (same as `astdiff`).
@@ -1038,12 +1038,10 @@ fn cmd_phpt_extract(path: Option<PathBuf>) -> ExitCode {
 
 /// Generate golden token fixtures: for every `test-fixtures/tokens/*.php`, run
 /// the PHP oracle and (over)write the paired `*.tokens`. Requires `php` on PATH.
-/// Regenerate the committed built-in-names manifest (`crates/php-index/stubs/
-/// builtins.txt`) by parsing the **phpstorm-stubs** submodule with our own
-/// parser + resolver and collecting declared FQNs. No PHP needed; the manifest
-/// is committed and CI never runs this. Names only — version-aware *types* come
-/// from the same stubs at the type-system stage. Covers all bundled + PECL
-/// extensions (sqlsrv, oci8, redis, …), not just what a local PHP build loads.
+/// Regenerate committed builtin manifests by parsing the **phpstorm-stubs**
+/// submodule with our own parser/resolver/reflector. No PHP needed; manifests
+/// are committed and CI never runs this. Names and typed versioned views are
+/// derived from the same parsed stub pass.
 fn cmd_gen_stubs() -> ExitCode {
     use std::collections::BTreeSet;
     let root = workspace_root();

@@ -5,9 +5,8 @@
 //! contexts, heredoc/nowdoc, the post-`->` property context, etc.), plus
 //! lexer→parser feedback (the `&` token split, context-sensitive keywords).
 //!
-//! M1 implements the scripting core: the `INITIAL` (HTML) and `ST_IN_SCRIPTING`
-//! states. String interpolation and heredoc/nowdoc (M2) and the `&` split / token
-//! feedback (M3) build on the state stack already present in [`lexer`].
+//! The implementation covers the scripting core, interpolation/heredoc states,
+//! contextual tokens, and the PHP-compatible numeric classification path.
 //!
 //! [`golden`] is the golden-token test harness used to assert byte-for-byte
 //! parity against PHP's own `token_get_all()` output.
@@ -55,5 +54,26 @@ mod tests {
     fn int_type_is_identifier_not_keyword() {
         // `int` is not a reserved keyword in PHP — it is a plain T_STRING.
         assert_eq!(names("<?php int"), ["T_OPEN_TAG", "T_STRING"]);
+    }
+
+    #[test]
+    fn lexer_diagnostics_have_stable_codes() {
+        let (_, diags) = tokenize("<?php /*");
+        assert_eq!(
+            diags.first().and_then(|d| d.code),
+            Some("lexer.unterminatedComment")
+        );
+
+        let (_, diags) = tokenize("<?php \"");
+        assert_eq!(
+            diags.first().and_then(|d| d.code),
+            Some("lexer.unterminatedString")
+        );
+
+        let (_, diags) = tokenize("<?php \x01");
+        assert_eq!(
+            diags.first().and_then(|d| d.code),
+            Some("lexer.unexpectedCharacter")
+        );
     }
 }

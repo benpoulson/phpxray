@@ -555,11 +555,16 @@ mod tests {
         let parse = report
             .findings
             .iter()
-            .find(|f| f.path == "bad.php" && f.identifier.is_none())
+            .find(|f| f.path == "bad.php" && f.identifier == Some("parse.expected"))
             .unwrap();
         assert_eq!(parse.line, 2);
         assert!(parse.column > 1, "{parse:?}");
         assert_eq!(parse.severity, Severity::Error);
+        assert!(
+            report.findings.iter().all(|f| f.identifier.is_some()),
+            "{:?}",
+            report.findings
+        );
     }
 
     #[test]

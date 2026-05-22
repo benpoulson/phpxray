@@ -802,10 +802,10 @@ impl<'a> Lexer<'a> {
             self.pos += 1;
         }
         if !terminated {
-            self.diags.push(Diagnostic::error(
-                Span::from_range(start..self.pos),
-                "unterminated comment",
-            ));
+            self.diags.push(
+                Diagnostic::error(Span::from_range(start..self.pos), "unterminated comment")
+                    .with_code("lexer.unterminatedComment"),
+            );
         }
         let is_doc = self.pos - start >= 4
             && self.bytes[start + 2] == b'*'
@@ -858,10 +858,13 @@ impl<'a> Lexer<'a> {
             self.pos += 1;
         }
         if !terminated {
-            self.diags.push(Diagnostic::error(
-                Span::from_range(start..self.pos),
-                "unterminated string literal",
-            ));
+            self.diags.push(
+                Diagnostic::error(
+                    Span::from_range(start..self.pos),
+                    "unterminated string literal",
+                )
+                .with_code("lexer.unterminatedString"),
+            );
         }
         self.push(TokenKind::String, start);
     }
@@ -1189,10 +1192,13 @@ impl<'a> Lexer<'a> {
             b']' => (RBracket, 1),
             b'`' => (Backtick, 1),
             _ => {
-                self.diags.push(Diagnostic::error(
-                    Span::from_range(self.pos..self.pos + 1),
-                    format!("unexpected character {:?}", c as char),
-                ));
+                self.diags.push(
+                    Diagnostic::error(
+                        Span::from_range(self.pos..self.pos + 1),
+                        format!("unexpected character {:?}", c as char),
+                    )
+                    .with_code("lexer.unexpectedCharacter"),
+                );
                 (Unknown, 1)
             }
         };

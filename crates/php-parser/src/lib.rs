@@ -3,8 +3,8 @@
 //!
 //! `parse` is **total**: it never panics and always returns a tree (with explicit
 //! error nodes) plus diagnostics, so error recovery composes without changing
-//! callers. M4 implements the statement skeleton and the full expression core;
-//! declarations, control flow, closures, `match`, etc. arrive in M5–M8.
+//! callers. It covers expressions, control flow, declarations, classes, closures,
+//! attributes, and the modern syntax needed by the analyzer pipeline.
 
 mod parser;
 
