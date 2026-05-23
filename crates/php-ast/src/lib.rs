@@ -24,6 +24,7 @@ use php_intern::Symbol;
 use php_span::Span;
 use std::fmt;
 
+pub mod literals;
 pub mod queries;
 pub mod walk;
 
@@ -41,11 +42,10 @@ pub struct Program {
 pub struct Stmt {
     pub span: Span,
     pub kind: StmtKind,
-    /// A preceding `/** … */` doc-comment carrying an *inline type annotation*
-    /// (`@var`), kept so flow analysis can honour `/** @var int $x */`. Only set
-    /// when the doc contains such an annotation; `None` otherwise (declaration
-    /// doc-comments are attached to the declaration node instead).
-    pub doc: Option<Box<str>>,
+    /// A preceding `/** … */` doc-comment attached at statement position.
+    /// Declaration nodes keep their own doc fields too; semantic passes decide
+    /// whether a statement doc is meaningful, such as an inline `@var`.
+    pub doc: Option<String>,
 }
 
 impl Stmt {

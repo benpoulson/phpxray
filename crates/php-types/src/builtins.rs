@@ -1,0 +1,275 @@
+//! Shared built-in stub manifest loading.
+//!
+//! The generated manifests live in this crate so both the names-only project
+//! index and the typed reflection index consume one version-selected source.
+
+use crate::PhpVersion;
+
+pub const BUILTIN_SOURCE: &str = "<builtin>";
+
+const BUILTIN_FUNCTIONS_80400: &str = include_str!("../stubs/builtin-functions-80400.txt");
+const BUILTIN_FUNCTIONS_80500: &str = include_str!("../stubs/builtin-functions-80500.txt");
+const BUILTIN_FUNCTIONS_80600: &str = include_str!("../stubs/builtin-functions-80600.txt");
+const BUILTIN_CLASSES_80400: &str = include_str!("../stubs/builtin-classes-80400.txt");
+const BUILTIN_CLASSES_80500: &str = include_str!("../stubs/builtin-classes-80500.txt");
+const BUILTIN_CLASSES_80600: &str = include_str!("../stubs/builtin-classes-80600.txt");
+const BUILTIN_CONSTANTS_80400: &str = include_str!("../stubs/builtin-constants-80400.txt");
+const BUILTIN_CONSTANTS_80500: &str = include_str!("../stubs/builtin-constants-80500.txt");
+const BUILTIN_CONSTANTS_80600: &str = include_str!("../stubs/builtin-constants-80600.txt");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinClassKind {
+    Class,
+    Interface,
+    Trait,
+    Enum,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinParam<'a> {
+    pub name: &'a str,
+    pub ty: &'a str,
+    pub flags: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltinFunction<'a> {
+    pub fqn: &'a str,
+    pub return_type: &'a str,
+    pub params: Vec<BuiltinParam<'a>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuiltinClassRecord<'a> {
+    Class {
+        kind: BuiltinClassKind,
+        fqn: &'a str,
+        parents: Vec<&'a str>,
+        interfaces: Vec<&'a str>,
+        traits: Vec<&'a str>,
+        flags: &'a str,
+    },
+    Method {
+        class: &'a str,
+        name: &'a str,
+        visibility: &'a str,
+        flags: &'a str,
+        return_type: &'a str,
+        native_return: &'a str,
+        params: Vec<BuiltinParam<'a>>,
+    },
+    Property {
+        class: &'a str,
+        name: &'a str,
+        visibility: &'a str,
+        flags: &'a str,
+        ty: &'a str,
+        native_ty: &'a str,
+    },
+    Constant {
+        class: &'a str,
+        name: &'a str,
+        visibility: &'a str,
+        flags: &'a str,
+        ty: &'a str,
+        int_value: Option<i64>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinConstant<'a> {
+    pub fqn: &'a str,
+}
+
+pub fn selected_manifest_id(version: PhpVersion) -> u32 {
+    match version.id() {
+        id if id < 80500 => 80400,
+        id if id < 80600 => 80500,
+        _ => 80600,
+    }
+}
+
+pub fn raw_function_manifest_for(version: PhpVersion) -> &'static str {
+    match selected_manifest_id(version) {
+        80400 => BUILTIN_FUNCTIONS_80400,
+        80500 => BUILTIN_FUNCTIONS_80500,
+        _ => BUILTIN_FUNCTIONS_80600,
+    }
+}
+
+pub fn raw_class_manifest_for(version: PhpVersion) -> &'static str {
+    match selected_manifest_id(version) {
+        80400 => BUILTIN_CLASSES_80400,
+        80500 => BUILTIN_CLASSES_80500,
+        _ => BUILTIN_CLASSES_80600,
+    }
+}
+
+pub fn raw_constant_manifest_for(version: PhpVersion) -> &'static str {
+    match selected_manifest_id(version) {
+        80400 => BUILTIN_CONSTANTS_80400,
+        80500 => BUILTIN_CONSTANTS_80500,
+        _ => BUILTIN_CONSTANTS_80600,
+    }
+}
+
+pub fn functions_for(version: PhpVersion) -> Vec<BuiltinFunction<'static>> {
+    raw_function_manifest_for(version)
+        .lines()
+        .filter_map(parse_function)
+        .collect()
+}
+
+pub fn class_records_for(version: PhpVersion) -> Vec<BuiltinClassRecord<'static>> {
+    raw_class_manifest_for(version)
+        .lines()
+        .filter_map(parse_class_record)
+        .collect()
+}
+
+pub fn constants_for(version: PhpVersion) -> Vec<BuiltinConstant<'static>> {
+    raw_constant_manifest_for(version)
+        .lines()
+        .filter_map(parse_constant)
+        .collect()
+}
+
+fn parse_function(line: &'static str) -> Option<BuiltinFunction<'static>> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let mut fields = line.split('\t');
+    Some(BuiltinFunction {
+        fqn: fields.next()?,
+        return_type: fields.next().unwrap_or(""),
+        params: parse_params(fields.next().unwrap_or("")),
+    })
+}
+
+fn parse_class_record(line: &'static str) -> Option<BuiltinClassRecord<'static>> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let mut fields = line.split('\t');
+    match fields.next()? {
+        "class" => Some(BuiltinClassRecord::Class {
+            kind: parse_kind(fields.next().unwrap_or("class")),
+            fqn: fields.next().unwrap_or(""),
+            parents: parse_named_list(fields.next().unwrap_or("")),
+            interfaces: parse_named_list(fields.next().unwrap_or("")),
+            traits: parse_named_list(fields.next().unwrap_or("")),
+            flags: fields.next().unwrap_or(""),
+        }),
+        "method" => Some(BuiltinClassRecord::Method {
+            class: fields.next().unwrap_or(""),
+            name: fields.next().unwrap_or(""),
+            visibility: fields.next().unwrap_or("public"),
+            flags: fields.next().unwrap_or(""),
+            return_type: fields.next().unwrap_or(""),
+            native_return: fields.next().unwrap_or(""),
+            params: parse_params(fields.next().unwrap_or("")),
+        }),
+        "property" => Some(BuiltinClassRecord::Property {
+            class: fields.next().unwrap_or(""),
+            name: fields.next().unwrap_or(""),
+            visibility: fields.next().unwrap_or("public"),
+            flags: fields.next().unwrap_or(""),
+            ty: fields.next().unwrap_or(""),
+            native_ty: fields.next().unwrap_or(""),
+        }),
+        "constant" => Some(BuiltinClassRecord::Constant {
+            class: fields.next().unwrap_or(""),
+            name: fields.next().unwrap_or(""),
+            visibility: fields.next().unwrap_or("public"),
+            flags: fields.next().unwrap_or(""),
+            ty: fields.next().unwrap_or(""),
+            int_value: fields.next().and_then(|s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    s.parse::<i64>().ok()
+                }
+            }),
+        }),
+        _ => None,
+    }
+}
+
+fn parse_constant(line: &'static str) -> Option<BuiltinConstant<'static>> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    Some(BuiltinConstant { fqn: line })
+}
+
+fn parse_params(s: &'static str) -> Vec<BuiltinParam<'static>> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    s.split(';')
+        .filter_map(|p| {
+            let mut fields = p.split('#');
+            Some(BuiltinParam {
+                name: fields.next()?,
+                ty: fields.next().unwrap_or(""),
+                flags: fields.next().unwrap_or(""),
+            })
+        })
+        .collect()
+}
+
+fn parse_kind(s: &str) -> BuiltinClassKind {
+    match s {
+        "interface" => BuiltinClassKind::Interface,
+        "trait" => BuiltinClassKind::Trait,
+        "enum" => BuiltinClassKind::Enum,
+        _ => BuiltinClassKind::Class,
+    }
+}
+
+fn parse_named_list(s: &'static str) -> Vec<&'static str> {
+    s.split(',').filter(|p| !p.is_empty()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_selection_clamps_to_supported_versions() {
+        assert_eq!(
+            selected_manifest_id(PhpVersion::from_id(70400).unwrap()),
+            80400
+        );
+        assert_eq!(
+            selected_manifest_id(PhpVersion::from_id(80400).unwrap()),
+            80400
+        );
+        assert_eq!(
+            selected_manifest_id(PhpVersion::from_id(80500).unwrap()),
+            80500
+        );
+        assert_eq!(
+            selected_manifest_id(PhpVersion::from_id(80600).unwrap()),
+            80600
+        );
+        assert_eq!(
+            selected_manifest_id(PhpVersion::from_id(90000).unwrap()),
+            80600
+        );
+    }
+
+    #[test]
+    fn parses_function_class_and_constant_manifests() {
+        let version = PhpVersion::from_id(80400).unwrap();
+        assert!(functions_for(version).iter().any(|f| f.fqn == "strlen"));
+        assert!(class_records_for(version).iter().any(|r| matches!(
+            r,
+            BuiltinClassRecord::Class { fqn, .. } if *fqn == "Exception"
+        )));
+        assert!(constants_for(version).iter().any(|c| c.fqn == "PHP_EOL"));
+    }
+}

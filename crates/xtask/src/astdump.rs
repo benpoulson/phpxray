@@ -1250,7 +1250,10 @@ impl<'a> Dumper<'a> {
         // (zend_ast_create_concat_op): two scalar operands collapse to one
         // string. No other operator is folded into the AST.
         if op == BinOp::Concat {
-            if let (Some(mut a), Some(b)) = (fold_zval_str(lhs), fold_zval_str(rhs)) {
+            if let (Some(mut a), Some(b)) = (
+                literals::fold_scalar_concat_expr(lhs),
+                literals::fold_scalar_concat_expr(rhs),
+            ) {
                 a.extend_from_slice(&b);
                 return C::BStr(a);
             }
@@ -1467,92 +1470,17 @@ fn modifiers_flag(m: &Modifiers, default_public: bool) -> u32 {
 }
 
 /// A constant *string* call target (`"foo"`, `("a"."b")`, parenthesized) used as
-/// a callee, which PHP resolves to a function name. Unlike [`fold_zval_str`] this
-/// rejects bare numeric literals (`5()` keeps an integer callee).
+/// a callee, which PHP resolves to a function name. Unlike
+/// [`literals::fold_scalar_concat_expr`] this rejects bare numeric literals
+/// (`5()` keeps an integer callee).
 fn callee_const_string(e: &Expr) -> Option<Vec<u8>> {
     match &e.kind {
         ExprKind::Str(s) => Some(s.clone()),
         ExprKind::Paren(inner) => callee_const_string(inner),
         ExprKind::Binary {
             op: BinOp::Concat, ..
-        } => fold_zval_str(e),
+        } => literals::fold_scalar_concat_expr(e),
         _ => None,
-    }
-}
-
-/// Fold a constant-expression operand of `.` to its PHP byte-string value,
-/// recursing through nested constant concatenations. Returns `None` for anything
-/// that is not a literal scalar (variables, named constants, `true`/`false`/
-/// `null`, other operators), which PHP leaves un-folded.
-fn fold_zval_str(e: &Expr) -> Option<Vec<u8>> {
-    match &e.kind {
-        ExprKind::Str(s) => Some(s.clone()),
-        ExprKind::Int(i) => Some(i.to_string().into_bytes()),
-        ExprKind::Float(f) => Some(php_runtime_float(*f).into_bytes()),
-        ExprKind::Binary {
-            op: BinOp::Concat,
-            lhs,
-            rhs,
-        } => {
-            let mut a = fold_zval_str(lhs)?;
-            a.extend_from_slice(&fold_zval_str(rhs)?);
-            Some(a)
-        }
-        // Parentheses are transparent to constant folding.
-        ExprKind::Paren(inner) => fold_zval_str(inner),
-        _ => None,
-    }
-}
-
-/// PHP's runtime float→string conversion (precision 14, `%G`-style), used when a
-/// float operand is folded into a constant concatenation. Distinct from the
-/// `var_export` form used for float *leaves*.
-fn php_runtime_float(f: f64) -> String {
-    if f.is_nan() {
-        return "NAN".into();
-    }
-    if f.is_infinite() {
-        return if f > 0.0 { "INF".into() } else { "-INF".into() };
-    }
-    if f == 0.0 {
-        return if f.is_sign_negative() {
-            "-0".into()
-        } else {
-            "0".into()
-        };
-    }
-    const P: i32 = 14;
-    // Read the true decimal exponent from a scientific rendering.
-    let sci = format!("{:.*E}", (P - 1) as usize, f);
-    let epos = sci.find('E').unwrap();
-    let exp: i32 = sci[epos + 1..].parse().unwrap();
-    if (-4..P).contains(&exp) {
-        let prec = (P - 1 - exp).max(0) as usize;
-        let mut s = format!("{f:.prec$}");
-        if s.contains('.') {
-            while s.ends_with('0') {
-                s.pop();
-            }
-            if s.ends_with('.') {
-                s.pop();
-            }
-        }
-        s
-    } else {
-        let mut mant = sci[..epos].to_string();
-        if mant.contains('.') {
-            while mant.ends_with('0') {
-                mant.pop();
-            }
-            if mant.ends_with('.') {
-                mant.pop();
-            }
-        }
-        if !mant.contains('.') {
-            mant.push_str(".0");
-        }
-        let sign = if exp < 0 { "-" } else { "+" };
-        format!("{mant}E{sign}{}", exp.abs())
     }
 }
 

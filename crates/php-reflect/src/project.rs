@@ -809,6 +809,19 @@ mod tests {
                 project_classes, reflection_classes,
                 "builtin class manifest drift for PHP {id}"
             );
+
+            let project_constants: BTreeSet<_> = project
+                .constants()
+                .map(|c| SymbolKey::constant(&c.fqn).into_string())
+                .collect();
+            let manifest_constants: BTreeSet<_> = php_types::builtins::constants_for(version)
+                .into_iter()
+                .map(|c| SymbolKey::constant(c.fqn).into_string())
+                .collect();
+            assert_eq!(
+                project_constants, manifest_constants,
+                "builtin constant manifest drift for PHP {id}"
+            );
         }
     }
 

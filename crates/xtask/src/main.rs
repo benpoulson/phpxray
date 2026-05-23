@@ -135,26 +135,12 @@ fn cmd_difftokens(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let mut files: Vec<PathBuf> = WalkDir::new(&dir)
-        .into_iter()
-        .filter_map(Result::ok)
-        .map(|e| e.into_path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("phpt"))
-        .collect();
-    files.sort();
-
     let (mut checked, mut matched) = (0usize, 0usize);
     let mut by_oracle: BTreeMap<String, usize> = BTreeMap::new();
     let mut examples: Vec<String> = Vec::new();
 
-    for path in files.into_iter().take(limit) {
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Some(source) = phpt::extract_file_section(&text) else {
-            continue;
-        };
-        let Some(golden_text) = run_php_tokens(&helper, &source) else {
+    for case in corpus::phpt_cases(&dir).into_iter().take(limit) {
+        let Some(golden_text) = run_php_tokens(&helper, &case.source) else {
             continue;
         };
         let Ok(oracle) = golden::parse(&golden_text) else {
@@ -163,8 +149,8 @@ fn cmd_difftokens(args: &[String]) -> ExitCode {
         let oracle = golden::filter_ignored(&oracle, DEFAULT_IGNORED);
 
         let ours = match catch_unwind(AssertUnwindSafe(|| {
-            let (toks, _) = php_lexer::tokenize(&source);
-            golden::from_tokens(&toks, &source)
+            let (toks, _) = php_lexer::tokenize(&case.source);
+            golden::from_tokens(&toks, &case.source)
         })) {
             Ok(v) => v,
             Err(_) => continue,
@@ -184,7 +170,7 @@ fn cmd_difftokens(args: &[String]) -> ExitCode {
                 if !deferred && examples.len() < 20 {
                     examples.push(format!(
                         "  {}: oracle={o} ours={u}",
-                        path.file_name().unwrap().to_string_lossy()
+                        case.path.file_name().unwrap().to_string_lossy()
                     ));
                 }
             }
@@ -266,32 +252,18 @@ fn astdiff_run(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let mut files: Vec<PathBuf> = WalkDir::new(&dir)
-        .into_iter()
-        .filter_map(Result::ok)
-        .map(|e| e.into_path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("phpt"))
-        .collect();
-    files.sort();
-
     let (mut checked, mut matched, mut we_errored) = (0usize, 0usize, 0usize);
     let mut buckets: BTreeMap<String, (usize, String)> = BTreeMap::new();
 
-    for path in files.into_iter().take(limit) {
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Some(source) = phpt::extract_file_section(&text) else {
-            continue;
-        };
-        let Some(oracle) = run_php(&helper, &source) else {
+    for case in corpus::phpt_cases(&dir).into_iter().take(limit) {
+        let Some(oracle) = run_php(&helper, &case.source) else {
             continue;
         };
         let oracle = oracle.trim_ascii_end();
         if oracle == b"<<PARSE_ERROR>>" {
             continue; // PHP rejects this source; not an AST-match candidate.
         }
-        let parsed = match catch_unwind(AssertUnwindSafe(|| php_parser::parse(&source))) {
+        let parsed = match catch_unwind(AssertUnwindSafe(|| php_parser::parse(&case.source))) {
             Ok(p) => p,
             Err(_) => continue,
         };
@@ -300,7 +272,7 @@ fn astdiff_run(args: &[String]) -> ExitCode {
             we_errored += 1;
             continue;
         }
-        let ours = astdump::dump(&parsed.program, &source, &parsed.interner);
+        let ours = astdump::dump(&parsed.program, &case.source, &parsed.interner);
         let ours = ours.trim_ascii_end();
         if ours == oracle {
             matched += 1;
@@ -316,7 +288,10 @@ fn astdiff_run(args: &[String]) -> ExitCode {
         if entry.1.is_empty() {
             entry.1 = format!(
                 "{}  [oracle: {} | ours: {}]",
-                path.strip_prefix(&root).unwrap_or(&path).display(),
+                case.path
+                    .strip_prefix(&root)
+                    .unwrap_or(&case.path)
+                    .display(),
                 o.trim(),
                 u.trim()
             );
@@ -401,19 +376,10 @@ fn cmd_resolve(dir: Option<PathBuf>) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let (mut files, mut panics, mut classes, mut refs, mut diags) = (0u64, 0u64, 0u64, 0u64, 0u64);
-    for entry in WalkDir::new(&dir).into_iter().filter_map(Result::ok) {
-        if entry.path().extension().and_then(|e| e.to_str()) != Some("phpt") {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        let Some(source) = phpt::extract_file_section(&text) else {
-            continue;
-        };
+    for case in corpus::phpt_cases(&dir) {
         files += 1;
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            let r = php_parser::parse(&source);
+            let r = php_parser::parse(&case.source);
             let idx = php_resolve::index_file(&r.program, &r.interner);
             let refs = php_resolve::resolve_references(&r.program, &r.interner);
             let diags = php_resolve::diagnostics(&r.program, &r.interner);
@@ -427,7 +393,7 @@ fn cmd_resolve(dir: Option<PathBuf>) -> ExitCode {
             }
             Err(_) => {
                 panics += 1;
-                eprintln!("RESOLVE PANIC on {}", entry.path().display());
+                eprintln!("RESOLVE PANIC on {}", case.path.display());
             }
         }
     }
@@ -452,30 +418,21 @@ fn cmd_index(dir: Option<PathBuf>) -> ExitCode {
     }
     let mut index = php_index::ProjectIndex::new();
     let mut files = 0u64;
-    for entry in WalkDir::new(&dir).into_iter().filter_map(Result::ok) {
-        if entry.path().extension().and_then(|e| e.to_str()) != Some("phpt") {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        let Some(source) = phpt::extract_file_section(&text) else {
-            continue;
-        };
+    for case in corpus::phpt_cases(&dir) {
         files += 1;
-        let label = entry
-            .path()
+        let label = case
+            .path
             .strip_prefix(&dir)
-            .unwrap_or(entry.path())
+            .unwrap_or(&case.path)
             .display()
             .to_string();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            let r = php_parser::parse(&source);
+            let r = php_parser::parse(&case.source);
             php_resolve::index_file(&r.program, &r.interner)
         }));
         match outcome {
             Ok(file_index) => index.add_file(&label, &file_index),
-            Err(_) => eprintln!("INDEX PANIC on {}", entry.path().display()),
+            Err(_) => eprintln!("INDEX PANIC on {}", case.path.display()),
         }
     }
     let dup = index.duplicate_classes().count();
@@ -500,24 +457,15 @@ fn cmd_reflect(dir: Option<PathBuf>) -> ExitCode {
     }
     let mut index = php_reflect::ReflectionIndex::new();
     let (mut files, mut panics) = (0u64, 0u64);
-    for entry in WalkDir::new(&dir).into_iter().filter_map(Result::ok) {
-        if entry.path().extension().and_then(|e| e.to_str()) != Some("phpt") {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        let Some(source) = phpt::extract_file_section(&text) else {
-            continue;
-        };
+    for case in corpus::phpt_cases(&dir) {
         files += 1;
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            let r = php_parser::parse(&source);
+            let r = php_parser::parse(&case.source);
             index.add_file(&r.program, &r.interner);
         }));
         if outcome.is_err() {
             panics += 1;
-            eprintln!("REFLECT PANIC on {}", entry.path().display());
+            eprintln!("REFLECT PANIC on {}", case.path.display());
         }
     }
     println!(
@@ -552,20 +500,11 @@ fn cmd_infer(dir: Option<PathBuf>) -> ExitCode {
     // re-parse in pass 2).
     let mut index = ReflectionIndex::new();
     let mut sources: Vec<(String, String)> = Vec::new();
-    for entry in WalkDir::new(&dir).into_iter().filter_map(Result::ok) {
-        if entry.path().extension().and_then(|e| e.to_str()) != Some("phpt") {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        let Some(source) = phpt::extract_file_section(&text) else {
-            continue;
-        };
-        let label = entry.path().display().to_string();
-        let r = php_parser::parse(&source);
+    for case in corpus::phpt_cases(&dir) {
+        let label = case.path.display().to_string();
+        let r = php_parser::parse(&case.source);
         index.add_file(&r.program, &r.interner);
-        sources.push((label, source));
+        sources.push((label, case.source));
     }
 
     // Recursive descent: analyse each function/method body, descending into
@@ -868,34 +807,21 @@ fn cmd_corpus(dir: Option<PathBuf>) -> ExitCode {
     println!("scanning {}", dir.display());
 
     let mut s = CorpusStats::default();
-    for entry in WalkDir::new(&dir).into_iter().filter_map(Result::ok) {
-        if entry.file_type().is_dir() {
-            continue;
-        }
-        if entry.path().extension().and_then(|e| e.to_str()) != Some("phpt") {
-            continue;
-        }
+    for case in corpus::phpt_cases(&dir) {
         s.total += 1;
-        let Ok(text) = std::fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        let Some(source) = phpt::extract_file_section(&text) else {
-            s.no_file += 1;
-            continue;
-        };
-        if phpt::expects_parse_error(&text) {
+        if case.expects_parse_error {
             s.expects_error += 1;
         }
         // Lexer stress: M1 lexing may produce wrong tokens for not-yet-supported
         // constructs (heredoc, interpolation), but it must never panic.
-        match catch_unwind(AssertUnwindSafe(|| php_lexer::tokenize(&source))) {
+        match catch_unwind(AssertUnwindSafe(|| php_lexer::tokenize(&case.source))) {
             Ok(_) => {}
             Err(_) => {
                 s.lex_panicked += 1;
-                eprintln!("LEX PANIC on {}", entry.path().display());
+                eprintln!("LEX PANIC on {}", case.path.display());
             }
         }
-        match catch_unwind(AssertUnwindSafe(|| php_parser::parse(&source))) {
+        match catch_unwind(AssertUnwindSafe(|| php_parser::parse(&case.source))) {
             Ok(result) => {
                 if result.has_errors() {
                     s.parsed_with_errors += 1;
@@ -905,7 +831,7 @@ fn cmd_corpus(dir: Option<PathBuf>) -> ExitCode {
             }
             Err(_) => {
                 s.panicked += 1;
-                eprintln!("PANIC parsing {}", entry.path().display());
+                eprintln!("PANIC parsing {}", case.path.display());
             }
         }
     }
@@ -941,28 +867,19 @@ fn cmd_triage(dir: Option<PathBuf>) -> ExitCode {
     let mut by_msg: BTreeMap<String, (usize, Vec<String>)> = BTreeMap::new();
     let mut total = 0usize;
 
-    for entry in WalkDir::new(&dir).into_iter().filter_map(Result::ok) {
-        if entry.path().extension().and_then(|e| e.to_str()) != Some("phpt") {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        if phpt::expects_parse_error(&text) {
+    for case in corpus::phpt_cases(&dir) {
+        if case.expects_parse_error {
             continue; // intentional error — not our worklist
         }
-        let Some(source) = phpt::extract_file_section(&text) else {
-            continue;
-        };
-        let Ok(result) = catch_unwind(AssertUnwindSafe(|| php_parser::parse(&source))) else {
+        let Ok(result) = catch_unwind(AssertUnwindSafe(|| php_parser::parse(&case.source))) else {
             continue;
         };
         let Some(first) = result.diagnostics.iter().find(|d| d.is_error()) else {
             continue;
         };
         total += 1;
-        let name = entry
-            .path()
+        let name = case
+            .path
             .file_name()
             .unwrap()
             .to_string_lossy()
@@ -1036,17 +953,13 @@ fn cmd_phpt_extract(path: Option<PathBuf>) -> ExitCode {
     }
 }
 
-/// Generate golden token fixtures: for every `test-fixtures/tokens/*.php`, run
-/// the PHP oracle and (over)write the paired `*.tokens`. Requires `php` on PATH.
 /// Regenerate committed builtin manifests by parsing the **phpstorm-stubs**
 /// submodule with our own parser/resolver/reflector. No PHP needed; manifests
-/// are committed and CI never runs this. Names and typed versioned views are
-/// derived from the same parsed stub pass.
+/// are committed and CI never runs this.
 fn cmd_gen_stubs() -> ExitCode {
     use std::collections::BTreeSet;
     let root = workspace_root();
     let stubs = root.join("vendor/phpstorm-stubs");
-    let dest = root.join("crates/php-index/stubs/builtins.txt");
     if !stubs.is_dir() {
         eprintln!(
             "phpstorm-stubs not present: {} (run `git submodule update --init`)",
@@ -1054,14 +967,7 @@ fn cmd_gen_stubs() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    let (mut functions, mut classes, mut interfaces, mut traits, mut enums, mut constants) = (
-        BTreeSet::new(),
-        BTreeSet::new(),
-        BTreeSet::new(),
-        BTreeSet::new(),
-        BTreeSet::new(),
-        BTreeSet::new(),
-    );
+    let mut constants = BTreeSet::new();
     const STUB_VERSIONS: &[(u32, (u32, u32))] =
         &[(80400, (8, 4)), (80500, (8, 5)), (80600, (8, 6))];
     let mut typed_fns: BTreeMap<u32, BTreeMap<String, String>> = STUB_VERSIONS
@@ -1100,16 +1006,6 @@ fn cmd_gen_stubs() -> ExitCode {
             parse_errors += 1;
         }
         let idx = php_resolve::index_file(&parsed.program, &parsed.interner);
-        for c in idx.classes {
-            let set = match c.kind {
-                php_ast::ClassKind::Class => &mut classes,
-                php_ast::ClassKind::Interface => &mut interfaces,
-                php_ast::ClassKind::Trait => &mut traits,
-                php_ast::ClassKind::Enum => &mut enums,
-            };
-            set.insert(c.fqn);
-        }
-        functions.extend(idx.functions.into_iter().map(|f| f.fqn));
         constants.extend(idx.constants.into_iter().map(|k| k.fqn));
 
         let reflected = php_reflect::reflect_file(&parsed.program, &parsed.interner);
@@ -1131,41 +1027,13 @@ fn cmd_gen_stubs() -> ExitCode {
         }
     }
 
-    let mut out = String::new();
-    out.push_str(
-        "# Built-in symbol names from JetBrains/phpstorm-stubs (submodule) — existence only.\n",
-    );
-    out.push_str("# Generated by `xtask gen-stubs`; do not edit. Names are version-stable;\n");
-    out.push_str("# signatures/types are version-dependent and come from the stubs later.\n");
-    let section = |out: &mut String, name: &str, items: &BTreeSet<String>| {
-        out.push_str(&format!("[{name}]\n"));
-        for i in items {
-            out.push_str(i);
-            out.push('\n');
-        }
-    };
-    section(&mut out, "functions", &functions);
-    section(&mut out, "classes", &classes);
-    section(&mut out, "interfaces", &interfaces);
-    section(&mut out, "traits", &traits);
-    section(&mut out, "enums", &enums);
-    section(&mut out, "constants", &constants);
-
-    if let Some(parent) = dest.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Err(e) = std::fs::write(&dest, &out) {
-        eprintln!("write failed {}: {e}", dest.display());
-        return ExitCode::FAILURE;
-    }
-
-    let reflect_stub_dir = root.join("crates/php-reflect/stubs");
-    if let Err(e) = std::fs::create_dir_all(&reflect_stub_dir) {
-        eprintln!("mkdir failed {}: {e}", reflect_stub_dir.display());
+    let stub_dir = root.join("crates/php-types/stubs");
+    if let Err(e) = std::fs::create_dir_all(&stub_dir) {
+        eprintln!("mkdir failed {}: {e}", stub_dir.display());
         return ExitCode::FAILURE;
     }
     for (id, _) in STUB_VERSIONS {
-        let fn_dest = reflect_stub_dir.join(format!("builtin-functions-{id}.txt"));
+        let fn_dest = stub_dir.join(format!("builtin-functions-{id}.txt"));
         let mut fn_out = String::new();
         fn_out.push_str("# Typed built-in function signatures from JetBrains/phpstorm-stubs.\n");
         fn_out.push_str(&format!(
@@ -1183,7 +1051,7 @@ fn cmd_gen_stubs() -> ExitCode {
             return ExitCode::FAILURE;
         }
 
-        let class_dest = reflect_stub_dir.join(format!("builtin-classes-{id}.txt"));
+        let class_dest = stub_dir.join(format!("builtin-classes-{id}.txt"));
         let mut class_out = String::new();
         class_out.push_str(
             "# Built-in class/interface member signatures from JetBrains/phpstorm-stubs.\n",
@@ -1210,18 +1078,35 @@ fn cmd_gen_stubs() -> ExitCode {
             eprintln!("write failed {}: {e}", class_dest.display());
             return ExitCode::FAILURE;
         }
+
+        let const_dest = stub_dir.join(format!("builtin-constants-{id}.txt"));
+        let mut const_out = String::new();
+        const_out.push_str("# Built-in global constants from JetBrains/phpstorm-stubs.\n");
+        const_out.push_str(&format!(
+            "# Generated by `xtask gen-stubs`; do not edit. Target PHP version id: {id}.\n"
+        ));
+        const_out.push_str("# Format: fqn\n");
+        for constant in &constants {
+            const_out.push_str(constant);
+            const_out.push('\n');
+        }
+        if let Err(e) = std::fs::write(&const_dest, &const_out) {
+            eprintln!("write failed {}: {e}", const_dest.display());
+            return ExitCode::FAILURE;
+        }
     }
 
+    let function_count = typed_fns.get(&80400).map(BTreeMap::len).unwrap_or_default();
+    let class_count = typed_classes
+        .get(&80400)
+        .map(BTreeMap::len)
+        .unwrap_or_default();
     println!(
-        "parsed {files} stub files ({parse_errors} with parse errors) -> {}: {} functions, {} classes, {} interfaces, {} traits, {} enums, {} constants; versioned typed manifests -> {}",
-        dest.strip_prefix(&root).unwrap_or(&dest).display(),
-        functions.len(),
-        classes.len(),
-        interfaces.len(),
-        traits.len(),
-        enums.len(),
+        "parsed {files} stub files ({parse_errors} with parse errors) -> {}: {} functions, {} class-like symbols, {} constants",
+        stub_dir.strip_prefix(&root).unwrap_or(&stub_dir).display(),
+        function_count,
+        class_count,
         constants.len(),
-        reflect_stub_dir.strip_prefix(&root).unwrap_or(&reflect_stub_dir).display(),
     );
     ExitCode::SUCCESS
 }

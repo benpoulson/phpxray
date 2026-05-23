@@ -10,6 +10,8 @@
 
 use std::fmt;
 
+pub mod builtins;
+
 /// The target PHP version of an analyzed project, encoded as phpstan-style
 /// version id (`8.4` -> `80400`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

@@ -12,7 +12,10 @@
 //! loose `==`, string ordering, integer overflow) yields `None` rather than a
 //! guess.
 
-use php_ast::{BinOp, Expr, ExprKind, UnOp};
+use php_ast::{
+    literals::{scalar_to_string_bytes, ScalarStringValue},
+    BinOp, Expr, ExprKind, UnOp,
+};
 
 /// A folded compile-time value.
 #[derive(Clone, Debug, PartialEq)]
@@ -215,11 +218,11 @@ fn as_f64(v: &ConstVal) -> Option<f64> {
 /// String form for `.` concatenation.
 fn concat_bytes(v: &ConstVal) -> Vec<u8> {
     match v {
-        ConstVal::Str(b) => b.clone(),
-        ConstVal::Int(n) => n.to_string().into_bytes(),
-        ConstVal::Float(f) => f.to_string().into_bytes(),
-        ConstVal::Bool(true) => b"1".to_vec(),
-        ConstVal::Bool(false) | ConstVal::Null => Vec::new(),
+        ConstVal::Str(b) => scalar_to_string_bytes(ScalarStringValue::Str(b)),
+        ConstVal::Int(n) => scalar_to_string_bytes(ScalarStringValue::Int(*n)),
+        ConstVal::Float(f) => scalar_to_string_bytes(ScalarStringValue::Float(*f)),
+        ConstVal::Bool(b) => scalar_to_string_bytes(ScalarStringValue::Bool(*b)),
+        ConstVal::Null => scalar_to_string_bytes(ScalarStringValue::Null),
     }
 }
 

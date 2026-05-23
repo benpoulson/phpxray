@@ -1,17 +1,16 @@
-//! A project-wide symbol index (reflection layer): aggregates the per-file
+//! A project-wide symbol index: aggregates the per-file
 //! [`FileIndex`](php_resolve::FileIndex)es produced by name resolution into one
 //! queryable map of every class/function/constant declared across the project.
 //!
-//! This is what the type system and cross-file rules build on. Lookups respect
-//! PHP's case rules — class and function names are case-insensitive, constants
-//! case-sensitive — while preserving each symbol's canonical (declared) casing.
-//! Class hierarchies (`extends`/`implements`/used traits) can be walked
-//! transitively for subtype queries.
+//! This layer owns existence and source/origin metadata. Typed reflection and
+//! hierarchy queries live in `php-reflect`. Lookups respect PHP's case rules —
+//! class and function names are case-insensitive, constants case-sensitive —
+//! while preserving each symbol's canonical (declared) casing.
 
 use php_ast::ClassKind;
 use php_resolve::{display_fqn, FileIndex, SymbolKey, SymbolOrigin};
-use php_types::PhpVersion;
-use std::collections::{HashMap, HashSet};
+use php_types::{builtins, PhpVersion};
+use std::collections::HashMap;
 
 /// A class/interface/trait/enum known to the project.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,91 +46,70 @@ pub struct ProjectIndex {
     constants: HashMap<String, SymbolEntry>, // key: exact FQN (case-sensitive)
 }
 
-/// The committed manifest of built-in symbol names (see `xtask gen-stubs`).
-const BUILTINS: &str = include_str!("../stubs/builtins.txt");
-
 impl ProjectIndex {
     pub fn new() -> Self {
         Self::default()
     }
 
     /// A project index pre-populated with PHP's built-in functions, classes,
-    /// interfaces, traits, enums and constants (names only — see `xtask
-    /// gen-stubs`). Names are version-stable, so a single snapshot is safe for
-    /// existence checks. Built-in *hierarchies* and *types* are intentionally not
-    /// captured here; they come from version-aware stubs at the type-system stage.
+    /// interfaces, traits, enums and constants.
     pub fn with_builtins() -> Self {
         Self::with_builtins_for(PhpVersion::default())
     }
 
-    /// A project index pre-populated with PHP built-in names for `version`.
-    ///
-    /// Built-in names are currently version-stable in this manifest, so the
-    /// version is accepted to keep project/reflection construction on one API.
-    pub fn with_builtins_for(_version: PhpVersion) -> Self {
+    /// A project index pre-populated with PHP built-in names for `version`, using
+    /// the same versioned manifests as typed reflection.
+    pub fn with_builtins_for(version: PhpVersion) -> Self {
         let mut idx = Self::new();
-        idx.load_builtins(BUILTINS);
+        idx.load_builtins(version);
         idx
     }
 
-    fn load_builtins(&mut self, manifest: &str) {
-        #[derive(Clone, Copy)]
-        enum Sec {
-            None,
-            Functions,
-            Classes(ClassKind),
-            Constants,
+    fn load_builtins(&mut self, version: PhpVersion) {
+        for f in builtins::functions_for(version) {
+            push_symbol(
+                &mut self.functions,
+                SymbolKey::function(f.fqn).into_string(),
+                f.fqn,
+                builtins::BUILTIN_SOURCE,
+                SourceKind::Builtin,
+            );
         }
-        let mut sec = Sec::None;
-        for line in manifest.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
+        for c in builtins::constants_for(version) {
+            push_symbol(
+                &mut self.constants,
+                SymbolKey::constant(c.fqn).into_string(),
+                c.fqn,
+                builtins::BUILTIN_SOURCE,
+                SourceKind::Builtin,
+            );
+        }
+        for record in builtins::class_records_for(version) {
+            let builtins::BuiltinClassRecord::Class {
+                kind,
+                fqn,
+                parents,
+                interfaces,
+                traits,
+                ..
+            } = record
+            else {
+                continue;
+            };
+            if fqn.is_empty() {
                 continue;
             }
-            if let Some(head) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-                sec = match head {
-                    "functions" => Sec::Functions,
-                    "classes" => Sec::Classes(ClassKind::Class),
-                    "interfaces" => Sec::Classes(ClassKind::Interface),
-                    "traits" => Sec::Classes(ClassKind::Trait),
-                    "enums" => Sec::Classes(ClassKind::Enum),
-                    "constants" => Sec::Constants,
-                    _ => Sec::None,
-                };
-                continue;
-            }
-            match sec {
-                Sec::Functions => {
-                    push_symbol(
-                        &mut self.functions,
-                        SymbolKey::function(line).into_string(),
-                        line,
-                        "<builtin>",
-                        SourceKind::Builtin,
-                    );
-                }
-                Sec::Constants => push_symbol(
-                    &mut self.constants,
-                    SymbolKey::constant(line).into_string(),
-                    line,
-                    "<builtin>",
-                    SourceKind::Builtin,
-                ),
-                Sec::Classes(kind) => {
-                    self.classes
-                        .entry(SymbolKey::class_like(line).into_string())
-                        .or_insert_with(|| ClassEntry {
-                            fqn: line.to_string(),
-                            kind,
-                            extends: Vec::new(),
-                            implements: Vec::new(),
-                            uses_traits: Vec::new(),
-                            sources: vec!["<builtin>".to_string()],
-                            origins: vec![SourceKind::Builtin],
-                        });
-                }
-                Sec::None => {}
-            }
+            self.classes
+                .entry(SymbolKey::class_like(fqn).into_string())
+                .or_insert_with(|| ClassEntry {
+                    fqn: fqn.to_string(),
+                    kind: builtin_class_kind(kind),
+                    extends: parents.into_iter().map(str::to_string).collect(),
+                    implements: interfaces.into_iter().map(str::to_string).collect(),
+                    uses_traits: traits.into_iter().map(str::to_string).collect(),
+                    sources: vec![builtins::BUILTIN_SOURCE.to_string()],
+                    origins: vec![SourceKind::Builtin],
+                });
         }
     }
 
@@ -239,60 +217,23 @@ impl ProjectIndex {
     pub fn duplicate_classes(&self) -> impl Iterator<Item = &ClassEntry> {
         self.classes.values().filter(|c| c.sources.len() > 1)
     }
-
-    // --- hierarchy ------------------------------------------------------
-
-    /// All transitive supertypes of `fqn` — parent classes, implemented
-    /// interfaces, and used traits, reachable through the index. Excludes `fqn`
-    /// itself; cycles and unknown links are handled gracefully.
-    pub fn ancestors(&self, fqn: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut stack: Vec<String> = self.supertypes(fqn);
-        while let Some(name) = stack.pop() {
-            let key = SymbolKey::class_like(&name).into_string();
-            if !seen.insert(key) {
-                continue;
-            }
-            stack.extend(self.supertypes(&name));
-            out.push(name);
-        }
-        out
-    }
-
-    /// Whether `sub` is `sup` or transitively extends/implements/uses it
-    /// (case-insensitive, matching PHP class-name semantics).
-    pub fn is_subclass_of(&self, sub: &str, sup: &str) -> bool {
-        if SymbolKey::class_like(sub) == SymbolKey::class_like(sup) {
-            return true;
-        }
-        self.ancestors(sub)
-            .iter()
-            .any(|a| SymbolKey::class_like(a) == SymbolKey::class_like(sup))
-    }
-
-    /// The direct supertypes of a known class (its extends + implements + used
-    /// traits); empty if the class is not in the index.
-    fn supertypes(&self, fqn: &str) -> Vec<String> {
-        match self.class(fqn) {
-            Some(c) => c
-                .extends
-                .iter()
-                .chain(&c.implements)
-                .chain(&c.uses_traits)
-                .cloned()
-                .collect(),
-            None => Vec::new(),
-        }
-    }
 }
 
 fn is_builtin_class(e: &ClassEntry) -> bool {
-    e.origins.contains(&SourceKind::Builtin) || e.sources.iter().any(|s| s == "<builtin>")
+    e.origins.contains(&SourceKind::Builtin)
 }
 
 fn is_builtin_symbol(e: &SymbolEntry) -> bool {
-    e.origins.contains(&SourceKind::Builtin) || e.sources.iter().any(|s| s == "<builtin>")
+    e.origins.contains(&SourceKind::Builtin)
+}
+
+fn builtin_class_kind(kind: builtins::BuiltinClassKind) -> ClassKind {
+    match kind {
+        builtins::BuiltinClassKind::Class => ClassKind::Class,
+        builtins::BuiltinClassKind::Interface => ClassKind::Interface,
+        builtins::BuiltinClassKind::Trait => ClassKind::Trait,
+        builtins::BuiltinClassKind::Enum => ClassKind::Enum,
+    }
 }
 
 fn push_symbol(
@@ -385,30 +326,6 @@ mod tests {
     }
 
     #[test]
-    fn ancestors_span_extends_implements_and_traits_across_files() {
-        let idx = project(&[
-            ("base.php", "<?php namespace App; class Base implements Jsonable {} interface Jsonable {}"),
-            ("model.php", "<?php namespace App; class User extends Base { use HasTimestamps; } trait HasTimestamps {}"),
-        ]);
-        let mut anc = idx.ancestors("App\\User");
-        anc.sort();
-        assert_eq!(anc, ["App\\Base", "App\\HasTimestamps", "App\\Jsonable"]);
-    }
-
-    #[test]
-    fn is_subclass_of_is_transitive_and_reflexive() {
-        let idx = project(&[(
-            "a.php",
-            "<?php namespace App; interface Arrayable {} class Base implements Arrayable {} class User extends Base {}",
-        )]);
-        assert!(idx.is_subclass_of("App\\User", "App\\User")); // reflexive
-        assert!(idx.is_subclass_of("App\\User", "App\\Base")); // direct
-        assert!(idx.is_subclass_of("App\\User", "App\\Arrayable")); // transitive via interface
-        assert!(idx.is_subclass_of("app\\user", "APP\\BASE")); // case-insensitive
-        assert!(!idx.is_subclass_of("App\\Base", "App\\User")); // not the other way
-    }
-
-    #[test]
     fn builtins_are_loaded_with_correct_case_rules() {
         let idx = ProjectIndex::with_builtins();
         // Functions: case-insensitive.
@@ -474,17 +391,5 @@ mod tests {
             idx.function("strlen").unwrap().origins,
             [SourceKind::Builtin, SourceKind::Analyzed]
         );
-    }
-
-    #[test]
-    fn ancestors_tolerate_unknown_links_and_cycles() {
-        let idx = project(&[(
-            "a.php",
-            "<?php namespace App; class A extends B {} class B extends A {} class C extends Missing {}",
-        )]);
-        // Cyclic A/B: each is the other's ancestor, no infinite loop.
-        assert!(idx.is_subclass_of("App\\A", "App\\B"));
-        // Unknown parent is reported but not resolved further.
-        assert_eq!(idx.ancestors("App\\C"), ["App\\Missing"]);
     }
 }

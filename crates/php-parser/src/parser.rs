@@ -14,6 +14,12 @@ use php_span::Span;
 /// total. Real code nests far below this; PHP itself imposes similar limits.
 const MAX_DEPTH: u32 = 256;
 
+enum StaticMemberName {
+    Property(MemberName),
+    DollarExpr(Expr),
+    ConstOrMethod(MemberName),
+}
+
 pub struct Parser<'a> {
     src: &'a str,
     tokens: Vec<Token>,
@@ -220,12 +226,6 @@ impl<'a> Parser<'a> {
         }
         let start = self.cur_start();
         let doc = self.doc_before(start);
-        // An inline `/** @var T $x */` is kept on the statement for flow analysis
-        // (captured before `doc` is moved into a declaration parser below).
-        let inline_var = doc
-            .as_ref()
-            .filter(|d| d.contains("@var"))
-            .map(|d| d.clone().into_boxed_str());
         let kind = match self.peek() {
             T::Semicolon => {
                 self.bump();
@@ -291,18 +291,18 @@ impl<'a> Parser<'a> {
                 kind
             }
             // --- declarations ---
-            T::Attribute => self.parse_attributed_decl(doc),
+            T::Attribute => self.parse_attributed_decl(doc.clone()),
             T::Keyword(Kw::Function) if self.is_function_decl() => {
-                StmtKind::Function(self.parse_function_decl(Vec::new(), doc))
+                StmtKind::Function(self.parse_function_decl(Vec::new(), doc.clone()))
             }
             T::Keyword(Kw::Abstract | Kw::Final | Kw::Class | Kw::Interface | Kw::Trait) => {
-                StmtKind::Class(self.parse_class_like(Vec::new(), doc))
+                StmtKind::Class(self.parse_class_like(Vec::new(), doc.clone()))
             }
             T::Keyword(Kw::Readonly) if self.readonly_starts_class() => {
-                StmtKind::Class(self.parse_class_like(Vec::new(), doc))
+                StmtKind::Class(self.parse_class_like(Vec::new(), doc.clone()))
             }
             T::Keyword(Kw::Enum) if self.nth(1) == T::Identifier => {
-                StmtKind::Class(self.parse_class_like(Vec::new(), doc))
+                StmtKind::Class(self.parse_class_like(Vec::new(), doc.clone()))
             }
             T::Keyword(Kw::Const) => {
                 let consts = self.parse_const_elems();
@@ -338,7 +338,9 @@ impl<'a> Parser<'a> {
         };
         self.depth -= 1;
         let mut stmt = Stmt::new(self.span_to(start), kind);
-        stmt.doc = inline_var;
+        if stmt_allows_raw_doc(&stmt.kind) {
+            stmt.doc = doc;
+        }
         stmt
     }
 
@@ -818,38 +820,69 @@ impl<'a> Parser<'a> {
 
     /// Parse a (possibly qualified) name into an AST [`Name`].
     fn parse_name(&mut self) -> Name {
-        match self.peek() {
-            T::Identifier | T::NameQualified | T::NameFullyQualified | T::NameRelative => {
-                let t = self.bump();
-                let fq = match t.kind {
-                    T::NameFullyQualified => NameFq::Fq,
-                    T::NameRelative => NameFq::Relative,
-                    _ => NameFq::NotFq,
-                };
-                Name {
-                    span: t.span,
-                    fq,
-                    text: self.text(t).to_string(),
-                }
-            }
-            T::Keyword(_) => {
-                // A reserved word used as a name segment (e.g. in `use`).
-                let t = self.bump();
-                Name {
-                    span: t.span,
-                    fq: NameFq::NotFq,
-                    text: self.text(t).to_string(),
-                }
-            }
-            _ => {
-                self.error_here("expected a name");
-                Name {
-                    span: Span::at(self.cur_start()),
-                    fq: NameFq::NotFq,
-                    text: String::new(),
-                }
-            }
+        if self.name_token_allows_keywords(self.peek()) {
+            let t = self.bump();
+            self.name_from_token(t)
+        } else {
+            self.error_here("expected a name");
+            self.empty_name()
         }
+    }
+
+    fn parse_expr_name(&mut self) -> Name {
+        if self.name_token(self.peek()) {
+            let t = self.bump();
+            self.name_from_token(t)
+        } else {
+            self.error_here("expected a name");
+            self.empty_name()
+        }
+    }
+
+    fn parse_type_simple_name(&mut self) -> Name {
+        if self.type_name_token(self.peek()) {
+            let t = self.bump();
+            self.name_from_token(t)
+        } else {
+            self.error_here("expected a type");
+            self.empty_name()
+        }
+    }
+
+    fn name_from_token(&self, t: Token) -> Name {
+        let fq = match t.kind {
+            T::NameFullyQualified => NameFq::Fq,
+            T::NameRelative => NameFq::Relative,
+            _ => NameFq::NotFq,
+        };
+        Name {
+            span: t.span,
+            fq,
+            text: self.text(t).to_string(),
+        }
+    }
+
+    fn empty_name(&self) -> Name {
+        Name {
+            span: Span::at(self.cur_start()),
+            fq: NameFq::NotFq,
+            text: String::new(),
+        }
+    }
+
+    fn name_token(&self, kind: T) -> bool {
+        matches!(
+            kind,
+            T::Identifier | T::NameQualified | T::NameFullyQualified | T::NameRelative
+        )
+    }
+
+    fn name_token_allows_keywords(&self, kind: T) -> bool {
+        self.name_token(kind) || matches!(kind, T::Keyword(_))
+    }
+
+    fn type_name_token(&self, kind: T) -> bool {
+        self.name_token(kind) || matches!(kind, T::Keyword(Kw::Array | Kw::Callable | Kw::Static))
     }
 
     fn expect_label_name(&mut self) -> Symbol {
@@ -1441,35 +1474,7 @@ impl<'a> Parser<'a> {
 
     fn parse_type_name(&mut self) -> Type {
         let start = self.cur_start();
-        let name = match self.peek() {
-            T::Identifier
-            | T::NameQualified
-            | T::NameFullyQualified
-            | T::NameRelative
-            | T::Keyword(Kw::Array)
-            | T::Keyword(Kw::Callable)
-            | T::Keyword(Kw::Static) => {
-                let t = self.bump();
-                let fq = match t.kind {
-                    T::NameFullyQualified => NameFq::Fq,
-                    T::NameRelative => NameFq::Relative,
-                    _ => NameFq::NotFq,
-                };
-                Name {
-                    span: t.span,
-                    fq,
-                    text: self.text(t).to_string(),
-                }
-            }
-            _ => {
-                self.error_here("expected a type");
-                Name {
-                    span: Span::at(self.cur_start()),
-                    fq: NameFq::NotFq,
-                    text: String::new(),
-                }
-            }
-        };
+        let name = self.parse_type_simple_name();
         Type {
             span: self.span_to(start),
             kind: TypeKind::Simple(name),
@@ -1791,7 +1796,10 @@ impl<'a> Parser<'a> {
             }
             T::String => {
                 let t = self.bump();
-                self.node(start, ExprKind::Str(decode_string_literal(self.text(t))))
+                self.node(
+                    start,
+                    ExprKind::Str(literals::decode_string_literal(self.text(t))),
+                )
             }
             T::DoubleQuote => self.parse_interp(T::DoubleQuote),
             T::Backtick => self.parse_interp(T::Backtick),
@@ -2184,20 +2192,8 @@ impl<'a> Parser<'a> {
 
     fn parse_name_expr(&mut self) -> Expr {
         let start = self.cur_start();
-        let t = self.bump();
-        let fq = match t.kind {
-            T::NameFullyQualified => NameFq::Fq,
-            T::NameRelative => NameFq::Relative,
-            _ => NameFq::NotFq,
-        };
-        self.node(
-            start,
-            ExprKind::Name(Name {
-                span: t.span,
-                fq,
-                text: self.text(t).to_string(),
-            }),
-        )
+        let name = self.parse_expr_name();
+        self.node(start, ExprKind::Name(name))
     }
 
     fn parse_variable_variable(&mut self) -> Expr {
@@ -2325,10 +2321,11 @@ impl<'a> Parser<'a> {
 
     fn parse_static_access(&mut self, class: Expr, start: u32) -> Expr {
         self.bump(); // `::`
-        match self.peek() {
-            T::Variable => {
-                let t = self.bump();
-                let name = MemberName::Var(self.intern_var(t));
+        let Some(target) = self.parse_static_member_name("expected member name after `::`") else {
+            return self.node(start, ExprKind::Error);
+        };
+        match target {
+            StaticMemberName::Property(name) => {
                 if self.at(T::LParen) {
                     let args = self.parse_args();
                     self.node(
@@ -2349,12 +2346,7 @@ impl<'a> Parser<'a> {
                     )
                 }
             }
-            // `Foo::$$var` / `Foo::${expr}` — a static member whose name is the
-            // expression after the leading `$`. A static *call* keeps the
-            // simple-variable's outer VAR wrapper (`Foo::${e}()` → method =
-            // VAR(e)); a static *property* drops it (prop = e).
-            T::Dollar => {
-                let inner = self.parse_static_prop_name();
+            StaticMemberName::DollarExpr(inner) => {
                 if self.at(T::LParen) {
                     let m = self.node(start, ExprKind::VariableVariable(Box::new(inner)));
                     let name = MemberName::Expr(Box::new(m));
@@ -2378,11 +2370,7 @@ impl<'a> Parser<'a> {
                     )
                 }
             }
-            T::LBrace => {
-                self.bump();
-                let inner = self.parse_expr(0);
-                self.expect(T::RBrace, "`}`");
-                let name = MemberName::Expr(Box::new(inner));
+            StaticMemberName::ConstOrMethod(name) => {
                 if self.at(T::LParen) {
                     let args = self.parse_args();
                     self.node(
@@ -2402,47 +2390,14 @@ impl<'a> Parser<'a> {
                         },
                     )
                 }
-            }
-            T::Identifier | T::Keyword(_) => {
-                let t = self.bump();
-                let name = MemberName::Ident(self.intern_tok(t));
-                if self.at(T::LParen) {
-                    let args = self.parse_args();
-                    self.node(
-                        start,
-                        ExprKind::StaticCall {
-                            class: Box::new(class),
-                            method: name,
-                            args,
-                        },
-                    )
-                } else {
-                    self.node(
-                        start,
-                        ExprKind::ClassConst {
-                            class: Box::new(class),
-                            name,
-                        },
-                    )
-                }
-            }
-            _ => {
-                self.error_here("expected member name after `::`");
-                self.node(start, ExprKind::Error)
             }
         }
     }
 
     fn parse_member_name(&mut self) -> MemberName {
         match self.peek() {
-            T::Identifier | T::Keyword(_) => MemberName::Ident({
-                let t = self.bump();
-                self.intern_tok(t)
-            }),
-            T::Variable => MemberName::Var({
-                let t = self.bump();
-                self.intern_var(t)
-            }),
+            T::Identifier | T::Keyword(_) => self.parse_ident_member_name(),
+            T::Variable => self.parse_variable_member_name(),
             T::LBrace => {
                 self.bump();
                 let e = self.parse_expr(0);
@@ -2456,6 +2411,42 @@ impl<'a> Parser<'a> {
             _ => {
                 self.error_here("expected member name");
                 MemberName::Ident(self.interner.intern(""))
+            }
+        }
+    }
+
+    fn parse_ident_member_name(&mut self) -> MemberName {
+        let t = self.bump();
+        MemberName::Ident(self.intern_tok(t))
+    }
+
+    fn parse_variable_member_name(&mut self) -> MemberName {
+        let t = self.bump();
+        MemberName::Var(self.intern_var(t))
+    }
+
+    fn parse_braced_member_name(&mut self) -> MemberName {
+        self.bump();
+        let e = self.parse_expr(0);
+        self.expect(T::RBrace, "`}`");
+        MemberName::Expr(Box::new(e))
+    }
+
+    fn parse_static_member_name(&mut self, error: &str) -> Option<StaticMemberName> {
+        match self.peek() {
+            T::Variable => Some(StaticMemberName::Property(
+                self.parse_variable_member_name(),
+            )),
+            T::Dollar => Some(StaticMemberName::DollarExpr(self.parse_static_prop_name())),
+            T::LBrace => Some(StaticMemberName::ConstOrMethod(
+                self.parse_braced_member_name(),
+            )),
+            T::Identifier | T::Keyword(_) => Some(StaticMemberName::ConstOrMethod(
+                self.parse_ident_member_name(),
+            )),
+            _ => {
+                self.error_here(error);
+                None
             }
         }
     }
@@ -2681,58 +2672,29 @@ impl<'a> Parser<'a> {
                 }
                 T::DoubleColon => {
                     self.bump();
-                    match self.peek() {
-                        // `Class::$prop` is a static property access.
-                        T::Variable => {
-                            let t = self.bump();
-                            let name = MemberName::Var(self.intern_var(t));
-                            self.node(
-                                start,
-                                ExprKind::StaticProp {
-                                    class: Box::new(e),
-                                    name,
-                                },
-                            )
-                        }
-                        // `Class::$$x` / `Class::${expr}` — computed static prop.
-                        T::Dollar => {
-                            let inner = self.parse_static_prop_name();
-                            let name = MemberName::Expr(Box::new(inner));
-                            self.node(
-                                start,
-                                ExprKind::StaticProp {
-                                    class: Box::new(e),
-                                    name,
-                                },
-                            )
-                        }
-                        // `Class::{expr}` — computed class constant.
-                        T::LBrace => {
-                            self.bump();
-                            let inner = self.parse_expr(0);
-                            self.expect(T::RBrace, "`}`");
-                            let name = MemberName::Expr(Box::new(inner));
-                            self.node(
-                                start,
-                                ExprKind::ClassConst {
-                                    class: Box::new(e),
-                                    name,
-                                },
-                            )
-                        }
-                        T::Identifier | T::Keyword(_) => {
-                            let t = self.bump();
-                            let name = MemberName::Ident(self.intern_tok(t));
-                            self.node(
-                                start,
-                                ExprKind::ClassConst {
-                                    class: Box::new(e),
-                                    name,
-                                },
-                            )
-                        }
-                        _ => {
-                            self.error_here("expected member after `::`");
+                    match self.parse_static_member_name("expected member after `::`") {
+                        Some(StaticMemberName::Property(name)) => self.node(
+                            start,
+                            ExprKind::StaticProp {
+                                class: Box::new(e),
+                                name,
+                            },
+                        ),
+                        Some(StaticMemberName::DollarExpr(inner)) => self.node(
+                            start,
+                            ExprKind::StaticProp {
+                                class: Box::new(e),
+                                name: MemberName::Expr(Box::new(inner)),
+                            },
+                        ),
+                        Some(StaticMemberName::ConstOrMethod(name)) => self.node(
+                            start,
+                            ExprKind::ClassConst {
+                                class: Box::new(e),
+                                name,
+                            },
+                        ),
+                        None => {
                             let name = MemberName::Ident(self.interner.intern(""));
                             self.node(
                                 start,
@@ -2796,7 +2758,7 @@ impl<'a> Parser<'a> {
             0
         };
         self.expect(T::EndHeredoc, "heredoc end marker");
-        process_heredoc_body(&mut parts, indent);
+        literals::normalize_heredoc_parts(&mut parts, indent);
         // PHP collapses a purely-literal heredoc/nowdoc to a plain string.
         match parts.len() {
             0 => self.node(start, ExprKind::Str(Vec::new())),
@@ -2829,7 +2791,7 @@ impl<'a> Parser<'a> {
                     let s = if raw {
                         self.text(t).as_bytes().to_vec()
                     } else {
-                        decode_double(self.text(t), quote)
+                        literals::decode_double(self.text(t), quote)
                     };
                     parts.push(self.node(t.span.start, ExprKind::Str(s)));
                 }
@@ -2887,7 +2849,7 @@ impl<'a> Parser<'a> {
     /// canonical integer string (round-trips through i64); `-0`, `00`, `0x0`, and
     /// out-of-range values stay strings.
     fn interp_offset_node(&self, start: u32, txt: String) -> Expr {
-        match canonical_int_key(&txt) {
+        match literals::canonical_int_key(&txt) {
             Some(n) => self.node(start, ExprKind::Int(n)),
             None => self.node(start, ExprKind::Str(txt.into_bytes())),
         }
@@ -2916,7 +2878,7 @@ impl<'a> Parser<'a> {
                 let txt = self.text(t).to_string();
                 // PHP parses the positive magnitude first; `-0` and a magnitude
                 // that overflows i64 (even if its negation would fit) stay strings.
-                match canonical_int_key(&txt) {
+                match literals::canonical_int_key(&txt) {
                     Some(n) if n != 0 => self.node(start, ExprKind::Int(-n)),
                     _ => self.node(start, ExprKind::Str(format!("-{txt}").into_bytes())),
                 }
@@ -3095,11 +3057,8 @@ fn cast_kind(k: T) -> Option<CastKind> {
 
 // --- literal value decoding ------------------------------------------------
 
-/// Whether `s` is a canonical integer string (it round-trips through i64): `0`
-/// or `-?[1-9][0-9]*` within range. Used for array/interpolation integer keys.
-fn canonical_int_key(s: &str) -> Option<i64> {
-    let n: i64 = s.parse().ok()?;
-    (n.to_string() == s).then_some(n)
+fn stmt_allows_raw_doc(kind: &StmtKind) -> bool {
+    !matches!(kind, StmtKind::Function(_) | StmtKind::Class(_))
 }
 
 fn parse_int(text: &str) -> i64 {
@@ -3108,202 +3067,4 @@ fn parse_int(text: &str) -> i64 {
 
 fn parse_float(text: &str) -> f64 {
     php_lexer::number::parse_float_literal(text)
-}
-
-/// Post-process a heredoc/nowdoc body: remove the single trailing newline that
-/// precedes the closing marker, then strip up to `indent` leading whitespace
-/// characters from the start of every body line (PHP 7.3+ flexible syntax).
-fn process_heredoc_body(parts: &mut [Expr], indent: usize) {
-    // 1. Drop the final newline (it terminates the last content line and is not
-    //    part of the string value).
-    if let Some(last) = parts.last_mut() {
-        if let ExprKind::Str(s) = &mut last.kind {
-            if s.last() == Some(&b'\n') {
-                s.pop();
-                if s.last() == Some(&b'\r') {
-                    s.pop();
-                }
-            }
-        }
-    }
-    // 2. Strip the closing marker's indentation from each line.
-    if indent == 0 {
-        return;
-    }
-    let mut at_line_start = true;
-    for p in parts.iter_mut() {
-        match &mut p.kind {
-            ExprKind::Str(s) => {
-                if !s.is_empty() {
-                    *s = dedent_line_starts(s, indent, at_line_start);
-                    at_line_start = s.last() == Some(&b'\n');
-                }
-            }
-            // A non-literal part (interpolation) sits mid-line.
-            _ => at_line_start = false,
-        }
-    }
-}
-
-/// Remove up to `indent` leading whitespace (space/tab) bytes at the start of
-/// each line of `s`. `at_line_start` says whether `s` begins a fresh line.
-fn dedent_line_starts(s: &[u8], indent: usize, at_line_start: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(s.len());
-    let mut skip = if at_line_start { indent } else { 0 };
-    for &ch in s {
-        if skip > 0 && (ch == b' ' || ch == b'\t') {
-            skip -= 1;
-            continue;
-        }
-        skip = 0;
-        out.push(ch);
-        if ch == b'\n' {
-            skip = indent;
-        }
-    }
-    out
-}
-
-/// Decode a `T_CONSTANT_ENCAPSED_STRING` lexeme (with quotes and optional `b`
-/// prefix) to its byte-string value, applying single- or double-quote rules.
-fn decode_string_literal(text: &str) -> Vec<u8> {
-    let b = text.as_bytes();
-    let body = if b.len() > 1 && (b[0] == b'b' || b[0] == b'B') && (b[1] == b'"' || b[1] == b'\'') {
-        &text[1..]
-    } else {
-        text
-    };
-    let bb = body.as_bytes();
-    if bb.len() < 2 {
-        return Vec::new();
-    }
-    let inner = &body[1..body.len() - 1];
-    if bb[0] == b'\'' {
-        decode_single(inner)
-    } else {
-        decode_double(inner, Some(b'"'))
-    }
-}
-
-/// Single-quoted: only `\\` and `\'` are escapes; everything else is literal.
-fn decode_single(s: &str) -> Vec<u8> {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'\\' && i + 1 < b.len() && (b[i + 1] == b'\\' || b[i + 1] == b'\'') {
-            out.push(b[i + 1]);
-            i += 2;
-        } else {
-            out.push(b[i]);
-            i += 1;
-        }
-    }
-    out
-}
-
-/// Double-quoted / heredoc / backtick escape rules. PHP strings are byte
-/// sequences, so escapes like `\xff`/`\377` yield raw bytes. `quote` is the
-/// delimiter-specific escapable quote (`\"` in double-quotes, `` \` `` in
-/// backticks, `None` in heredoc).
-fn decode_double(s: &str, quote: Option<u8>) -> Vec<u8> {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] != b'\\' {
-            out.push(b[i]);
-            i += 1;
-            continue;
-        }
-        i += 1;
-        if i >= b.len() {
-            out.push(b'\\');
-            break;
-        }
-        // The closing-delimiter quote is escapable (`\"` / `` \` ``).
-        if Some(b[i]) == quote {
-            out.push(b[i]);
-            i += 1;
-            continue;
-        }
-        match b[i] {
-            b'n' => {
-                out.push(b'\n');
-                i += 1;
-            }
-            b't' => {
-                out.push(b'\t');
-                i += 1;
-            }
-            b'r' => {
-                out.push(b'\r');
-                i += 1;
-            }
-            b'v' => {
-                out.push(0x0b);
-                i += 1;
-            }
-            b'f' => {
-                out.push(0x0c);
-                i += 1;
-            }
-            b'e' => {
-                out.push(0x1b);
-                i += 1;
-            }
-            b'\\' => {
-                out.push(b'\\');
-                i += 1;
-            }
-            b'$' => {
-                out.push(b'$');
-                i += 1;
-            }
-            b'0'..=b'7' => {
-                let mut val = 0u32;
-                let mut n = 0;
-                while n < 3 && i < b.len() && (b'0'..=b'7').contains(&b[i]) {
-                    val = val * 8 + (b[i] - b'0') as u32;
-                    i += 1;
-                    n += 1;
-                }
-                out.push((val & 0xff) as u8);
-            }
-            b'x' if i + 1 < b.len() && b[i + 1].is_ascii_hexdigit() => {
-                i += 1;
-                let mut val = 0u32;
-                let mut n = 0;
-                while n < 2 && i < b.len() && b[i].is_ascii_hexdigit() {
-                    val = val * 16 + (b[i] as char).to_digit(16).unwrap();
-                    i += 1;
-                    n += 1;
-                }
-                out.push((val & 0xff) as u8);
-            }
-            b'u' if i + 1 < b.len() && b[i + 1] == b'{' => {
-                i += 2;
-                let mut val = 0u32;
-                while i < b.len() && b[i] != b'}' {
-                    if let Some(d) = (b[i] as char).to_digit(16) {
-                        val = val * 16 + d;
-                    }
-                    i += 1;
-                }
-                if i < b.len() {
-                    i += 1; // `}`
-                }
-                // `\u{…}` encodes the code point as UTF-8 (PHP's behavior).
-                if let Some(ch) = char::from_u32(val) {
-                    let mut buf = [0u8; 4];
-                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-                }
-            }
-            _ => {
-                // Unrecognized escape: backslash is literal.
-                out.push(b'\\');
-            }
-        }
-    }
-    out
 }
