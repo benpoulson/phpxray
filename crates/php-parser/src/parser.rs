@@ -30,8 +30,8 @@ pub struct Parser<'a> {
     diags: Vec<Diagnostic>,
     depth: u32,
     /// Doc-comments are kept out of the parse stream (so they never disrupt
-    /// parsing) and attached to declarations by source position. `(end, text)`,
-    /// in source order.
+    /// parsing) and attached to following declarations/statements by source
+    /// position. `(end, text)`, in source order.
     docs: Vec<(u32, String)>,
 }
 
@@ -59,7 +59,7 @@ impl<'a> Parser<'a> {
     }
 
     /// The doc-comment immediately preceding `offset` (only whitespace between),
-    /// if any — used to attach docs to the following declaration.
+    /// if any.
     fn doc_before(&self, offset: u32) -> Option<String> {
         for (end, text) in self.docs.iter().rev() {
             if *end <= offset {

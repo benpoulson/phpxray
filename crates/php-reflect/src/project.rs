@@ -751,6 +751,31 @@ mod tests {
     }
 
     #[test]
+    fn builtin_generic_class_templates_substitute_through_extends() {
+        let r = php_parser::parse(
+            r#"<?php
+            class User {}
+            /** @extends \ArrayObject<int, User> */
+            class Users extends \ArrayObject {}
+            "#,
+        );
+        assert!(!r.has_errors(), "parse errors");
+        let mut idx = ReflectionIndex::with_builtins();
+        idx.add_file(&r.program, &r.interner);
+
+        assert_eq!(
+            idx.class("ArrayObject").unwrap().templates,
+            ["TKey", "TValue"]
+        );
+        assert_eq!(
+            idx.class("Users").unwrap().parents[0].to_string(),
+            "ArrayObject<int, User>"
+        );
+        let offset_get = idx.find_method("Users", "offsetGet").unwrap();
+        assert_eq!(offset_get.member.return_type.to_string(), "User|null");
+    }
+
+    #[test]
     fn builtin_signatures_follow_selected_php_version() {
         let idx84 = ReflectionIndex::with_builtins_for(PhpVersion::from_id(80400).unwrap());
         assert_eq!(

@@ -23,7 +23,7 @@ pub(crate) fn run_version(
     assert!(!r.has_errors(), "parse errors in test source: {src}");
     let mut project = ProjectIndex::with_builtins();
     project.add_file("test.php", &index_file(&r.program, &r.interner));
-    let mut reflection = ReflectionIndex::new();
+    let mut reflection = ReflectionIndex::with_builtins_for(php_version);
     reflection.add_file(&r.program, &r.interner);
     let refs = resolve_references(&r.program, &r.interner);
     let types = type_map(&reflection, &r.program, &r.interner);

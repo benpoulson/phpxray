@@ -3891,6 +3891,38 @@ mod tests {
     }
 
     #[test]
+    fn undefined_method_inside_closure_body_is_flagged() {
+        let src = "<?php class C {} function f(): void { $c = new C(); $cb = function () use ($c): void { $c->missing(); }; }";
+        assert!(codes(src, run_call_methods_typed).contains(&"method.notFound"));
+    }
+
+    #[test]
+    fn undefined_method_inside_array_map_callback_is_flagged() {
+        let src = r#"<?php
+            class User {}
+            /** @param list<User> $users */
+            function f(array $users): void {
+                array_map(fn($u) => $u->missing(), $users);
+            }
+        "#;
+        assert!(codes(src, run_call_methods_typed).contains(&"method.notFound"));
+    }
+
+    #[test]
+    fn undefined_method_on_array_map_result_is_flagged() {
+        let src = r#"<?php
+            class Child {}
+            class User { public function child(): Child {} }
+            /** @param list<User> $users */
+            function f(array $users): void {
+                $children = array_map(fn(User $u) => $u->child(), $users);
+                $children[0]->missing();
+            }
+        "#;
+        assert!(codes(src, run_call_methods_typed).contains(&"method.notFound"));
+    }
+
+    #[test]
     fn existing_method_on_typed_local_clean() {
         let src = "<?php class C { public function a(): void {} } function f(): void { $c = new C(); $c->a(); }";
         assert!(codes(src, run_call_methods_typed).is_empty());

@@ -28,7 +28,7 @@ pub(crate) fn builtin_functions_for(version: PhpVersion) -> Vec<FunctionReflecti
             params: f
                 .params
                 .into_iter()
-                .map(|p| reflected_param(p, &scope))
+                .map(|p| reflected_param(p, &scope, &[]))
                 .collect(),
             return_type: deser_type(f.return_type, &scope),
             native_return: deser_type(f.return_type, &scope),
@@ -70,7 +70,7 @@ pub(crate) fn builtin_classes_for(version: PhpVersion) -> Vec<ClassReflection> {
                     parents: named_types(parents),
                     interfaces: named_types(interfaces),
                     traits: named_types(traits),
-                    templates: Vec::new(),
+                    templates: builtin_class_templates(fqn),
                     methods: Vec::new(),
                     properties: Vec::new(),
                     constants: Vec::new(),
@@ -93,6 +93,7 @@ pub(crate) fn builtin_classes_for(version: PhpVersion) -> Vec<ClassReflection> {
                 let Some(cr) = ensure_class(&mut classes, class) else {
                     continue;
                 };
+                let templates = cr.templates.clone();
                 cr.methods.push(MethodReflection {
                     name: name.to_string(),
                     visibility: parse_visibility(visibility),
@@ -101,9 +102,9 @@ pub(crate) fn builtin_classes_for(version: PhpVersion) -> Vec<ClassReflection> {
                     is_final: flags.contains('f'),
                     params: params
                         .into_iter()
-                        .map(|p| reflected_param(p, &scope))
+                        .map(|p| reflected_param(p, &scope, &templates))
                         .collect(),
-                    return_type: deser_type(return_type, &scope),
+                    return_type: deser_type_with_templates(return_type, &scope, &templates),
                     explicit_return: true,
                     native_return: deser_type(native_return, &scope),
                     templates: Vec::new(),
@@ -124,12 +125,13 @@ pub(crate) fn builtin_classes_for(version: PhpVersion) -> Vec<ClassReflection> {
                 let Some(cr) = ensure_class(&mut classes, class) else {
                     continue;
                 };
+                let templates = cr.templates.clone();
                 cr.properties.push(PropertyReflection {
                     name: name.to_string(),
                     visibility: parse_visibility(visibility),
                     is_static: flags.contains('s'),
                     is_readonly: flags.contains('r'),
-                    ty: deser_type(ty, &scope),
+                    ty: deser_type_with_templates(ty, &scope, &templates),
                     native_ty: deser_type(native_ty, &scope),
                     has_default: false,
                     access: php_phpdoc::PropertyAccess::ReadWrite,
@@ -147,10 +149,11 @@ pub(crate) fn builtin_classes_for(version: PhpVersion) -> Vec<ClassReflection> {
                 let Some(cr) = ensure_class(&mut classes, class) else {
                     continue;
                 };
+                let templates = cr.templates.clone();
                 cr.constants.push(ConstReflection {
                     name: name.to_string(),
                     visibility: parse_visibility(visibility),
-                    ty: deser_type(ty, &scope),
+                    ty: deser_type_with_templates(ty, &scope, &templates),
                     is_final: flags.contains('f'),
                     int_value,
                 });
@@ -160,8 +163,8 @@ pub(crate) fn builtin_classes_for(version: PhpVersion) -> Vec<ClassReflection> {
     classes
 }
 
-fn reflected_param(p: BuiltinParam<'_>, scope: &Scope) -> ParamReflection {
-    let ty = deser_type(p.ty, scope);
+fn reflected_param(p: BuiltinParam<'_>, scope: &Scope, templates: &[String]) -> ParamReflection {
+    let ty = deser_type_with_templates(p.ty, scope, templates);
     ParamReflection {
         name: p.name.to_string(),
         native_ty: ty.clone(),
@@ -175,11 +178,15 @@ fn reflected_param(p: BuiltinParam<'_>, scope: &Scope) -> ParamReflection {
 }
 
 fn deser_type(s: &str, scope: &Scope) -> Type {
+    deser_type_with_templates(s, scope, &[])
+}
+
+fn deser_type_with_templates(s: &str, scope: &Scope, templates: &[String]) -> Type {
     if s.is_empty() {
         return Type::Mixed;
     }
     match php_phpdoc::parse_type(s) {
-        Some(dt) => resolve_doc_type(scope, &[], &dt),
+        Some(dt) => resolve_doc_type(scope, templates, &dt),
         None => Type::Mixed,
     }
 }
@@ -211,6 +218,16 @@ fn named_types(names: Vec<&str>) -> Vec<Type> {
         .collect()
 }
 
+fn builtin_class_templates(fqn: &str) -> Vec<String> {
+    let names: &[&str] = match fqn.trim_start_matches('\\').to_ascii_lowercase().as_str() {
+        "traversable" | "iteratoraggregate" | "iterator" | "seekableiterator" | "arrayaccess"
+        | "arrayobject" | "splfixedarray" | "weakmap" => &["TKey", "TValue"],
+        "generator" => &["TKey", "TYield", "TSend", "TReturn"],
+        _ => &[],
+    };
+    names.iter().map(|name| (*name).to_string()).collect()
+}
+
 fn ensure_class<'a>(
     classes: &'a mut Vec<ClassReflection>,
     fqn: &str,
@@ -230,7 +247,7 @@ fn ensure_class<'a>(
         parents: Vec::new(),
         interfaces: Vec::new(),
         traits: Vec::new(),
-        templates: Vec::new(),
+        templates: builtin_class_templates(fqn),
         methods: Vec::new(),
         properties: Vec::new(),
         constants: Vec::<ConstReflection>::new(),

@@ -30,7 +30,9 @@ pub use definedness::{undefined_variables, UndefVar};
 pub use refine::{strip_false, strip_falsy, strip_null_lenient, strip_null_strict};
 pub use type_map::{native_type_map, type_map, TypeMap};
 
-use php_ast::{BinOp, CastKind, Expr, ExprKind, MemberName, Name, UnOp};
+use php_ast::{
+    Arg, ArrowFn, BinOp, CastKind, ClosureExpr, Expr, ExprKind, MemberName, Name, Param, UnOp,
+};
 use php_intern::Interner;
 use php_reflect::ReflectionIndex;
 use php_resolve::{Resolution, Scope};
@@ -293,25 +295,18 @@ impl<'a> TypeCtx<'a> {
                 .map(|f| self.function_callable_type(f))
                 .unwrap_or(Type::Callable(None));
         }
-        // A few built-ins have argument-dependent return types that a static stub
-        // can't express (it gives the worst-case union); model the common ones so
-        // their result doesn't poison downstream type checks.
-        let fname = n
-            .text
-            .trim_start_matches('\\')
-            .rsplit('\\')
-            .next()
-            .unwrap_or(&n.text)
-            .to_ascii_lowercase();
-        if let Some(t) = self.dynamic_return(&fname, args) {
-            return t;
-        }
         match self.function_reflection(n) {
             Some(f) if self.native => f.native_return.clone(),
+            Some(f) if f.builtin => {
+                let fname = last_segment(&f.fqn).to_ascii_lowercase();
+                self.dynamic_return(&fname, args)
+                    .unwrap_or_else(|| f.return_type.clone())
+            }
             Some(f) => {
+                let declared = self.bound_call_return(&f.params, &f.return_type, args);
                 let params: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
                 let body = self.index.function_body(&f.fqn);
-                self.refine_return(&f.return_type, body, &params, args, None)
+                self.refine_return(&declared, body, &params, args, None)
             }
             None => Type::Mixed,
         }
@@ -339,6 +334,10 @@ impl<'a> TypeCtx<'a> {
     /// Argument-dependent return types for selected built-ins. Returns `None` to
     /// fall back to the stub signature.
     fn dynamic_return(&self, fname: &str, args: &[php_ast::Arg]) -> Option<Type> {
+        if !args_are_plain_positional(args) {
+            return None;
+        }
+
         // The string-replace family returns the *subject*'s shape: a string
         // subject yields a string, an array subject an array. The stub can only
         // say `string|array`, which then poisons every downstream string use.
@@ -362,8 +361,11 @@ impl<'a> TypeCtx<'a> {
         // stubs return a bare `array`, losing the value type and cascading into
         // downstream `array<K,V>` argument/return mismatches.
         match fname {
+            "array_map" => self.array_map_return(args),
+            "array_keys" => Some(Type::List(Box::new(self.array_key_type(args.first()?)?))),
             // `array_values(array<K,V>)` → `list<V>`.
             "array_values" => Some(Type::List(Box::new(self.array_value_type(args.first()?)?))),
+            "array_column" => self.array_column_return(args),
             // These keep the value type (keys may change, but value type holds);
             // returning the input array type is correct and false-positive-safe.
             "array_filter" | "array_reverse" | "array_unique" | "array_slice" | "array_splice"
@@ -412,6 +414,39 @@ impl<'a> TypeCtx<'a> {
         }
     }
 
+    fn array_map_return(&self, args: &[Arg]) -> Option<Type> {
+        if self.native {
+            return None;
+        }
+        let callback = args.first()?;
+        let inferred_params: Vec<Type> = args
+            .iter()
+            .skip(1)
+            .map(|a| self.array_value_type(a).unwrap_or(Type::Mixed))
+            .collect();
+        if inferred_params.is_empty() {
+            return None;
+        }
+        let ret = self.callback_return_type(callback, &inferred_params)?;
+        (!template_observation_is_imprecise(&ret)).then(|| Type::List(Box::new(ret)))
+    }
+
+    fn array_column_return(&self, args: &[Arg]) -> Option<Type> {
+        let rows = arrays::array_value_type(&self.infer(&args.first()?.value))?;
+        let value_key = const_shape_key_arg(args.get(1)?)?;
+        let value = shape_present_type(&rows, &value_key)?;
+        match args.get(2) {
+            None => Some(Type::List(Box::new(value))),
+            Some(arg) => match nullable_const_shape_key_arg(arg)? {
+                None => Some(Type::List(Box::new(value))),
+                Some(index_key) => {
+                    let key = shape_present_type(&rows, &index_key)?;
+                    Some(Type::Array(Some(Box::new((key, value)))))
+                }
+            },
+        }
+    }
+
     /// The value (element) type of an array/list argument, if known.
     fn array_value_type(&self, arg: &php_ast::Arg) -> Option<Type> {
         arrays::array_value_type(&self.infer(&arg.value))
@@ -420,6 +455,128 @@ impl<'a> TypeCtx<'a> {
     /// The key type of an array/list/shape argument, if known (`list` → `int`).
     fn array_key_type(&self, arg: &php_ast::Arg) -> Option<Type> {
         arrays::array_key_type(&self.infer(&arg.value))
+    }
+
+    fn bound_call_return(
+        &self,
+        params: &[php_reflect::ParamReflection],
+        declared: &Type,
+        args: &[Arg],
+    ) -> Type {
+        let Some(subst) = self.bind_call_templates(params, args) else {
+            return declared.clone();
+        };
+        subst_templates(declared, &subst, true)
+    }
+
+    fn bind_call_templates(
+        &self,
+        params: &[php_reflect::ParamReflection],
+        args: &[Arg],
+    ) -> Option<HashMap<String, Type>> {
+        if !args_are_plain_positional(args) {
+            return None;
+        }
+        let mut raw = HashMap::<String, Vec<Type>>::new();
+        let mut ai = 0;
+        for p in params {
+            if p.variadic {
+                while let Some(arg) = args.get(ai) {
+                    bind_templates_from_types(&p.ty, &self.infer(&arg.value), &mut raw);
+                    ai += 1;
+                }
+                break;
+            }
+            let Some(arg) = args.get(ai) else {
+                break;
+            };
+            bind_templates_from_types(&p.ty, &self.infer(&arg.value), &mut raw);
+            ai += 1;
+        }
+        Some(finalize_subst(raw))
+    }
+
+    fn callback_return_type(&self, callback: &Arg, inferred_params: &[Type]) -> Option<Type> {
+        match &peel_paren(&callback.value).kind {
+            ExprKind::ArrowFn(a) => {
+                let child = self.arrow_child(a, inferred_params);
+                let body = child.infer(&a.body);
+                Some(self.prefer_precise_callback_return(body, a.return_type.as_ref()))
+            }
+            ExprKind::Closure(c) => {
+                let mut child = self.closure_child(c, inferred_params);
+                let mut returns = Vec::new();
+                returns::collect_returns(&mut child, &c.body, &mut returns);
+                let body = if returns.is_empty() {
+                    Type::Null
+                } else {
+                    Type::union(returns)
+                };
+                Some(self.prefer_precise_callback_return(body, c.return_type.as_ref()))
+            }
+            _ => None,
+        }
+    }
+
+    fn prefer_precise_callback_return(&self, body: Type, declared: Option<&php_ast::Type>) -> Type {
+        if !template_observation_is_imprecise(&body) {
+            return body;
+        }
+        declared
+            .map(|t| self.bind_relative_to_current(php_reflect::resolve_ast_type(self.scope, t)))
+            .unwrap_or(body)
+    }
+
+    fn closure_child(&self, c: &ClosureExpr, inferred_params: &[Type]) -> TypeCtx<'a> {
+        let mut child = TypeCtx::new(self.index, self.scope, self.interner);
+        child.class = (!c.is_static).then(|| self.class.clone()).flatten();
+        child.depth = self.depth;
+        child.native = self.native;
+        for u in &c.uses {
+            let name = self.interner.resolve(u.name).to_string();
+            let ty = self.vars.get(&name).cloned().unwrap_or(Type::Mixed);
+            child.vars.insert(name, ty);
+        }
+        child.seed_callback_params(&c.params, inferred_params);
+        child
+    }
+
+    fn arrow_child(&self, a: &ArrowFn, inferred_params: &[Type]) -> TypeCtx<'a> {
+        let mut child = TypeCtx::new(self.index, self.scope, self.interner);
+        child.class = (!a.is_static).then(|| self.class.clone()).flatten();
+        child.depth = self.depth;
+        child.native = self.native;
+        child.vars = self.vars.clone();
+        if a.is_static {
+            strip_this_vars(&mut child.vars);
+        }
+        child.seed_callback_params(&a.params, inferred_params);
+        child
+    }
+
+    fn seed_callback_params(&mut self, params: &[Param], inferred: &[Type]) {
+        for (i, p) in params.iter().enumerate() {
+            let name = self.interner.resolve(p.name).to_string();
+            let ty = if let Some(t) = &p.ty {
+                let ty = php_reflect::resolve_ast_type(self.scope, t);
+                if p.variadic {
+                    Type::List(Box::new(ty))
+                } else {
+                    ty
+                }
+            } else if p.variadic {
+                let rest = &inferred[i.min(inferred.len())..];
+                let item = if rest.is_empty() {
+                    Type::Mixed
+                } else {
+                    Type::union(rest.to_vec())
+                };
+                Type::List(Box::new(item))
+            } else {
+                inferred.get(i).cloned().unwrap_or(Type::Mixed)
+            };
+            self.vars.insert(name, ty);
+        }
     }
 
     /// Return type of `$recv->method(...)`.
@@ -455,16 +612,12 @@ impl<'a> TypeCtx<'a> {
         let ret = match self.index.find_method(&fqn, &name) {
             Some(found) if self.native => self.bind_relative(found.member.native_return, &fqn),
             Some(found) => {
+                let declared =
+                    self.bound_call_return(&found.member.params, &found.member.return_type, args);
                 let params: Vec<String> =
                     found.member.params.iter().map(|p| p.name.clone()).collect();
                 let body = self.index.method_body(&found.declaring_class, &name);
-                let refined = self.refine_return(
-                    &found.member.return_type,
-                    body,
-                    &params,
-                    args,
-                    Some(fqn.clone()),
-                );
+                let refined = self.refine_return(&declared, body, &params, args, Some(fqn.clone()));
                 self.bind_relative(refined, &fqn)
             }
             None => Type::Mixed,
@@ -502,16 +655,12 @@ impl<'a> TypeCtx<'a> {
         match self.index.find_method(&fqn, &name) {
             Some(found) if self.native => self.bind_relative(found.member.native_return, &fqn),
             Some(found) => {
+                let declared =
+                    self.bound_call_return(&found.member.params, &found.member.return_type, args);
                 let params: Vec<String> =
                     found.member.params.iter().map(|p| p.name.clone()).collect();
                 let body = self.index.method_body(&found.declaring_class, &name);
-                let refined = self.refine_return(
-                    &found.member.return_type,
-                    body,
-                    &params,
-                    args,
-                    Some(fqn.clone()),
-                );
+                let refined = self.refine_return(&declared, body, &params, args, Some(fqn.clone()));
                 self.bind_relative(refined, &fqn)
             }
             None => Type::Mixed,
@@ -732,6 +881,13 @@ impl<'a> TypeCtx<'a> {
         })
     }
 
+    fn bind_relative_to_current(&self, ty: Type) -> Type {
+        match self.class.as_deref() {
+            Some(class) => self.bind_relative(ty, class),
+            None => ty,
+        }
+    }
+
     /// The class FQN to query members on, given a value's type.
     fn type_class_fqn(&self, t: &Type) -> Option<String> {
         match t {
@@ -825,6 +981,176 @@ fn cast_type(kind: CastKind) -> Type {
 
 fn is_first_class_callable(args: &[php_ast::Arg]) -> bool {
     args.iter().any(|a| a.placeholder)
+}
+
+fn args_are_plain_positional(args: &[Arg]) -> bool {
+    args.iter()
+        .all(|a| !a.spread && !a.placeholder && a.name.is_none())
+}
+
+fn peel_paren(e: &Expr) -> &Expr {
+    match &e.kind {
+        ExprKind::Paren(inner) => peel_paren(inner),
+        _ => e,
+    }
+}
+
+fn last_segment(name: &str) -> &str {
+    name.trim_start_matches('\\')
+        .rsplit('\\')
+        .next()
+        .unwrap_or(name)
+}
+
+fn const_shape_key_arg(arg: &Arg) -> Option<String> {
+    arrays::const_shape_key(peel_paren(&arg.value))
+}
+
+fn nullable_const_shape_key_arg(arg: &Arg) -> Option<Option<String>> {
+    if is_null_literal(peel_paren(&arg.value)) {
+        Some(None)
+    } else {
+        const_shape_key_arg(arg).map(Some)
+    }
+}
+
+fn shape_present_type(rows: &Type, key: &str) -> Option<Type> {
+    match arrays::shape_offset_status(rows, key)? {
+        arrays::ShapeOffsetStatus::Present(ty) => Some(ty),
+        arrays::ShapeOffsetStatus::Missing | arrays::ShapeOffsetStatus::Maybe => None,
+    }
+}
+
+fn bind_templates_from_types(param: &Type, arg: &Type, subst: &mut HashMap<String, Vec<Type>>) {
+    match param {
+        Type::TemplateVar(name) => {
+            if !template_observation_is_imprecise(arg) {
+                subst.entry(name.clone()).or_default().push(arg.clone());
+            }
+        }
+        Type::Nullable(inner) => bind_templates_from_types(inner, arg, subst),
+        Type::Union(parts) | Type::Intersection(parts) => {
+            for part in parts {
+                bind_templates_from_types(part, arg, subst);
+            }
+        }
+        Type::Array(Some(kv)) | Type::Iterable(Some(kv)) => {
+            let (arg_k, arg_v) = arrays::iter_key_value(arg);
+            bind_templates_from_types(&kv.0, &arg_k, subst);
+            bind_templates_from_types(&kv.1, &arg_v, subst);
+        }
+        Type::List(inner) => {
+            if let Some(v) = arrays::array_value_type(arg) {
+                bind_templates_from_types(inner, &v, subst);
+            }
+        }
+        Type::Named { fqn, args } => {
+            let Type::Named {
+                fqn: arg_fqn,
+                args: arg_args,
+            } = arg
+            else {
+                return;
+            };
+            if fqn.eq_ignore_ascii_case(arg_fqn) {
+                for (p, a) in args.iter().zip(arg_args) {
+                    bind_templates_from_types(p, a, subst);
+                }
+            }
+        }
+        Type::ClassString(Some(inner)) => {
+            if let Type::ClassString(Some(arg_inner)) = arg {
+                bind_templates_from_types(inner, arg_inner, subst);
+            }
+        }
+        Type::Callable(Some(sig)) => {
+            if let Type::Callable(Some(arg_sig)) = arg {
+                for (p, a) in sig.params.iter().zip(&arg_sig.params) {
+                    bind_templates_from_types(p, a, subst);
+                }
+                bind_templates_from_types(&sig.ret, &arg_sig.ret, subst);
+            }
+        }
+        Type::Shape { fields, .. } => {
+            if let Type::Shape {
+                fields: arg_fields, ..
+            } = arg
+            {
+                for field in fields {
+                    let Some(key) = &field.key else { continue };
+                    if let Some(arg_field) =
+                        arg_fields.iter().find(|f| f.key.as_deref() == Some(key))
+                    {
+                        bind_templates_from_types(&field.ty, &arg_field.ty, subst);
+                    }
+                }
+            }
+        }
+        Type::Array(None)
+        | Type::Iterable(None)
+        | Type::Callable(None)
+        | Type::ClassString(None)
+        | Type::Conditional { .. }
+        | Type::Mixed
+        | Type::ExplicitMixed
+        | Type::Never
+        | Type::Void
+        | Type::Null
+        | Type::Bool
+        | Type::True
+        | Type::False
+        | Type::Int
+        | Type::IntRange { .. }
+        | Type::Float
+        | Type::String
+        | Type::Object
+        | Type::Resource
+        | Type::SelfType
+        | Type::StaticType
+        | Type::Parent
+        | Type::LiteralInt(_)
+        | Type::LiteralString(_)
+        | Type::Unknown(_) => {}
+    }
+}
+
+fn finalize_subst(raw: HashMap<String, Vec<Type>>) -> HashMap<String, Type> {
+    raw.into_iter()
+        .map(|(name, observations)| (name, Type::union(observations)))
+        .collect()
+}
+
+fn subst_templates(ty: &Type, subst: &HashMap<String, Type>, unbound_to_mixed: bool) -> Type {
+    ty.clone().map(&mut |part| match part {
+        Type::TemplateVar(name) => subst.get(&name).cloned().unwrap_or_else(|| {
+            if unbound_to_mixed {
+                Type::Mixed
+            } else {
+                Type::TemplateVar(name)
+            }
+        }),
+        Type::Union(parts) => Type::union(parts),
+        Type::Intersection(parts) => Type::intersection(parts),
+        other => other,
+    })
+}
+
+fn template_observation_is_imprecise(t: &Type) -> bool {
+    let mut imprecise = false;
+    let _ = t.clone().map(&mut |part| {
+        if matches!(
+            part,
+            Type::Mixed | Type::ExplicitMixed | Type::Unknown(_) | Type::TemplateVar(_)
+        ) {
+            imprecise = true;
+        }
+        part
+    });
+    imprecise
+}
+
+fn strip_this_vars(vars: &mut HashMap<String, Type>) {
+    vars.retain(|k, _| k != "this" && !k.starts_with("this->"));
 }
 
 /// The type of a magic constant (`__LINE__`, `__FILE__`, …), if `name` is one.
@@ -1002,7 +1328,7 @@ mod tests {
         let full = format!("<?php {src}");
         let r = php_parser::parse(&full);
         assert!(!r.has_errors(), "parse errors in: {src}");
-        let mut index = ReflectionIndex::new();
+        let mut index = ReflectionIndex::with_builtins();
         index.add_file(&r.program, &r.interner);
         (index, r.interner, r.program)
     }

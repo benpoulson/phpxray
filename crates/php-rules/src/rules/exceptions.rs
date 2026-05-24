@@ -1105,12 +1105,12 @@ mod tests {
     }
 
     #[test]
-    fn unindexed_hierarchy_is_not_guessed() {
-        // Built-in SPL hierarchy isn't indexed → no subclass link proven → no
-        // report (under-report rather than risk a false positive).
+    fn builtin_hierarchy_is_known_for_dead_catch() {
+        // Built-in SPL hierarchy is indexed, so RuntimeException is known to be
+        // covered by the earlier Exception catch.
         let src = r#"<?php
             function f() { try {} catch (\Exception $e) {} catch (\RuntimeException $e) {} }"#;
-        assert!(codes(src, run_dead_catch).is_empty());
+        assert_eq!(codes(src, run_dead_catch), ["catch.alreadyCaught"]);
     }
 
     // --- ThrowsVoidFunctionWithExplicitThrowPointRule --------------------

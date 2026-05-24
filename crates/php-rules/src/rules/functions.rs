@@ -4149,6 +4149,59 @@ mod tests {
     }
 
     #[test]
+    fn argument_type_inside_arrow_body_is_flagged() {
+        let src = "<?php function takes_int(int $x): void {} function f(): void { $cb = fn(string $s) => takes_int($s); }";
+        assert_eq!(codes(src, run_argument_types), ["argument.type"]);
+    }
+
+    #[test]
+    fn argument_type_inside_array_filter_callback_is_flagged() {
+        let src = r#"<?php
+        function takes_int(int $x): void {}
+        /** @param array<string, string> $items */
+        function f(array $items): void {
+            array_filter($items, fn($v) => takes_int($v));
+        }
+        "#;
+        assert_eq!(codes(src, run_argument_types), ["argument.type"]);
+    }
+
+    #[test]
+    fn argument_type_inside_preg_replace_callback_is_flagged() {
+        let src = r#"<?php
+        function takes_string(string $x): void {}
+        function f(string $s): void {
+            preg_replace_callback('/x/', fn($matches) => takes_string($matches), $s);
+        }
+        "#;
+        assert_eq!(codes(src, run_argument_types), ["argument.type"]);
+    }
+
+    #[test]
+    fn argument_type_from_precise_array_keys_result_is_flagged() {
+        let src = r#"<?php
+        function takes_int(int $x): void {}
+        /** @param array<string, string> $items */
+        function f(array $items): void {
+            takes_int(array_keys($items)[0]);
+        }
+        "#;
+        assert_eq!(codes(src, run_argument_types), ["argument.type"]);
+    }
+
+    #[test]
+    fn argument_type_from_precise_array_column_result_is_flagged() {
+        let src = r#"<?php
+        function takes_int(int $x): void {}
+        /** @param list<array{name: string}> $rows */
+        function f(array $rows): void {
+            takes_int(array_column($rows, 'name')[0]);
+        }
+        "#;
+        assert_eq!(codes(src, run_argument_types), ["argument.type"]);
+    }
+
+    #[test]
     fn unknown_arg_type_is_lenient() {
         // $u is never assigned -> mixed -> no diagnostic.
         assert!(codes("<?php function f(int $x) {} f($u);", run_argument_types).is_empty());

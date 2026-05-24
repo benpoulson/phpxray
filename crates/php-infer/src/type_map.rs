@@ -5,10 +5,10 @@
 //! Per scope (the global region, each function, each method) we build a
 //! [`TypeCtx`], seed parameters (and `$this` for methods) from the reflected
 //! signature, then walk the body statement-by-statement: at each statement record
-//! the inferred type of every expression it contains (scope-bounded — not into
-//! nested function-likes) using the *current* flow environment, then advance the
-//! environment with the flow analysis. Closures/arrow-fns are left opaque for now
-//! (their inner expressions resolve to `mixed`); narrowing is a later milestone.
+//! the inferred type of every expression it contains using the *current* flow
+//! environment, then advance the environment with the flow analysis. Closure and
+//! arrow bodies are recorded as child scopes, including direct callback params
+//! inferred from selected built-in call sites.
 
 use crate::TypeCtx;
 use php_ast::{walk, Member, Program, StmtKind};
@@ -183,7 +183,7 @@ mod tests {
     fn build(src: &str) -> (TypeMap, php_parser::ParseResult) {
         let r = php_parser::parse(src);
         assert!(!r.has_errors(), "parse errors: {src}");
-        let mut reflection = ReflectionIndex::new();
+        let mut reflection = ReflectionIndex::with_builtins();
         reflection.add_file(&r.program, &r.interner);
         let map = type_map(&reflection, &r.program, &r.interner);
         (map, r)
@@ -211,6 +211,70 @@ mod tests {
         let mut found: Option<String> = None;
         walk::for_each_expr(&r.program, &mut |e| {
             let ExprKind::MethodCall {
+                method: php_ast::MemberName::Ident(sym),
+                ..
+            } = &e.kind
+            else {
+                return;
+            };
+            if r.interner.resolve(*sym).eq_ignore_ascii_case(name) {
+                found = map
+                    .get(&key(e.span))
+                    .map(|t| t.to_string())
+                    .or_else(|| Some("<unmapped>".into()));
+            }
+        });
+        found.unwrap_or_else(|| "<not found>".into())
+    }
+
+    fn ty_of_last_var(src: &str, name: &str) -> String {
+        let (map, r) = build(src);
+        let mut found: Option<String> = None;
+        walk::for_each_expr(&r.program, &mut |e| {
+            let ExprKind::Variable(sym) = &e.kind else {
+                return;
+            };
+            if r.interner.resolve(*sym) == name {
+                found = map
+                    .get(&key(e.span))
+                    .map(|t| t.to_string())
+                    .or_else(|| Some("<unmapped>".into()));
+            }
+        });
+        found.unwrap_or_else(|| "<not found>".into())
+    }
+
+    fn ty_of_last_call(src: &str, name: &str) -> String {
+        let (map, r) = build(src);
+        let mut found: Option<String> = None;
+        walk::for_each_expr(&r.program, &mut |e| {
+            let ExprKind::Call { callee, .. } = &e.kind else {
+                return;
+            };
+            let ExprKind::Name(n) = &callee.kind else {
+                return;
+            };
+            let tail = n
+                .text
+                .trim_start_matches('\\')
+                .rsplit('\\')
+                .next()
+                .unwrap_or(&n.text);
+            if tail.eq_ignore_ascii_case(name) {
+                found = map
+                    .get(&key(e.span))
+                    .map(|t| t.to_string())
+                    .or_else(|| Some("<unmapped>".into()));
+            }
+        });
+        found.unwrap_or_else(|| "<not found>".into())
+    }
+
+    fn ty_of_last_static_call(src: &str, name: &str) -> String {
+        let (map, r) = build(src);
+        let mut found: Option<String> = None;
+        walk::for_each_expr(&r.program, &mut |e| {
+            let ExprKind::StaticCall {
                 method: php_ast::MemberName::Ident(sym),
                 ..
             } = &e.kind
@@ -304,6 +368,415 @@ mod tests {
         // Args must be in the map (infer itself skips them) — the string literal arg.
         let src = "<?php function f(int $x) {} f('s');";
         assert_eq!(ty_of(src, |e| matches!(&e.kind, ExprKind::Str(_))), "'s'");
+    }
+
+    #[test]
+    fn closure_param_types_inner_method_property_and_index() {
+        let src = r#"<?php
+        class Box {
+            /** @var list<string> */
+            public array $items = [];
+            public function label(): string {}
+        }
+        function f(): void {
+            $cb = function (Box $b): void {
+                $b->label();
+                $b->items[0];
+            };
+        }
+        "#;
+        assert_eq!(ty_of_last_method(src, "label"), "string");
+        assert_eq!(
+            ty_of(src, |e| matches!(&e.kind, ExprKind::Prop { .. })),
+            "list<string>"
+        );
+        assert_eq!(
+            ty_of(src, |e| matches!(&e.kind, ExprKind::Index { .. })),
+            "string"
+        );
+    }
+
+    #[test]
+    fn arrow_param_types_inner_method_property_and_index() {
+        let src = r#"<?php
+        class Box {
+            /** @var list<string> */
+            public array $items = [];
+            public function label(): string {}
+        }
+        function f(): void {
+            $cb = fn(Box $b) => [$b->label(), $b->items[0]];
+        }
+        "#;
+        assert_eq!(ty_of_last_method(src, "label"), "string");
+        assert_eq!(
+            ty_of(src, |e| matches!(&e.kind, ExprKind::Prop { .. })),
+            "list<string>"
+        );
+        assert_eq!(
+            ty_of(src, |e| matches!(&e.kind, ExprKind::Index { .. })),
+            "string"
+        );
+    }
+
+    #[test]
+    fn closure_use_captures_narrowed_outer_type() {
+        let src = r#"<?php
+        class Box { public function label(): string {} }
+        function f(object $x): void {
+            if ($x instanceof Box) {
+                $cb = function () use ($x): void {
+                    $x->label();
+                };
+            }
+        }
+        "#;
+        assert_eq!(ty_of_last_method(src, "label"), "string");
+    }
+
+    #[test]
+    fn arrow_auto_captures_outer_type() {
+        let src = r#"<?php
+        class Box { public function label(): string {} }
+        function f(): void {
+            $b = new Box();
+            $cb = fn() => $b->label();
+        }
+        "#;
+        assert_eq!(ty_of_last_method(src, "label"), "string");
+    }
+
+    #[test]
+    fn non_static_closure_preserves_this_static_closure_does_not() {
+        let non_static = r#"<?php
+        class Box { public function label(): string {} }
+        class C {
+            public Box $box;
+            public function f(): void {
+                $cb = function (): void { $this->box->label(); };
+            }
+        }
+        "#;
+        assert_eq!(ty_of_last_method(non_static, "label"), "string");
+
+        let static_closure = r#"<?php
+        class Box { public function label(): string {} }
+        class C {
+            public Box $box;
+            public function f(): void {
+                $cb = static function (): void { $this->box->label(); };
+            }
+        }
+        "#;
+        assert_eq!(ty_of_last_method(static_closure, "label"), "mixed");
+    }
+
+    #[test]
+    fn non_static_arrow_preserves_this_static_arrow_does_not() {
+        let non_static = r#"<?php
+        class Box { public function label(): string {} }
+        class C {
+            public Box $box;
+            public function f(): void {
+                $cb = fn() => $this->box->label();
+            }
+        }
+        "#;
+        assert_eq!(ty_of_last_method(non_static, "label"), "string");
+
+        let static_arrow = r#"<?php
+        class Box { public function label(): string {} }
+        class C {
+            public Box $box;
+            public function f(): void {
+                $cb = static fn() => $this->box->label();
+            }
+        }
+        "#;
+        assert_eq!(ty_of_last_method(static_arrow, "label"), "mixed");
+    }
+
+    #[test]
+    fn nested_closure_and_arrow_bodies_are_mapped() {
+        let src = r#"<?php
+        class Box { public function label(): string {} }
+        function f(): void {
+            $b = new Box();
+            $outer = function () use ($b): void {
+                $inner = fn() => $b->label();
+            };
+        }
+        "#;
+        assert_eq!(ty_of_last_method(src, "label"), "string");
+    }
+
+    #[test]
+    fn array_map_infers_arrow_param_from_list_value() {
+        let src = r#"<?php
+        class User { public function label(): string {} }
+        /** @param list<User> $users */
+        function f(array $users): void {
+            array_map(fn($u) => $u->label(), $users);
+        }
+        "#;
+        assert_eq!(ty_of_last_method(src, "label"), "string");
+    }
+
+    #[test]
+    fn array_map_infers_multiple_callback_params() {
+        let src = r#"<?php
+        class User { public function label(): string {} }
+        class Team { public function id(): int {} }
+        /**
+         * @param list<User> $users
+         * @param list<Team> $teams
+         */
+        function f(array $users, array $teams): void {
+            array_map(fn($u, $t) => [$u->label(), $t->id()], $users, $teams);
+        }
+        "#;
+        assert_eq!(ty_of_last_method(src, "label"), "string");
+        assert_eq!(ty_of_last_method(src, "id"), "int");
+    }
+
+    #[test]
+    fn array_filter_infers_value_key_and_both_modes() {
+        let src = r#"<?php
+        class User { public function label(): string {} }
+        /** @param array<string, User> $users */
+        function f(array $users): void {
+            array_filter($users, fn($u) => $u->label());
+            array_filter($users, fn($k) => $k, ARRAY_FILTER_USE_KEY);
+            array_filter($users, fn($u, $k) => [$u->label(), $k], ARRAY_FILTER_USE_BOTH);
+        }
+        "#;
+        assert_eq!(ty_of_last_method(src, "label"), "string");
+        assert_eq!(ty_of_last_var(src, "k"), "string");
+    }
+
+    #[test]
+    fn array_walk_infers_value_key_and_user_arg() {
+        let src = r#"<?php
+        class User { public function label(): string {} }
+        /** @param array<string, User> $users */
+        function f(array $users): void {
+            array_walk($users, function ($u, $k, $prefix): void {
+                $u->label();
+                $k;
+                $prefix;
+            }, 'p');
+        }
+        "#;
+        assert_eq!(ty_of_last_method(src, "label"), "string");
+        assert_eq!(ty_of_last_var(src, "k"), "string");
+        assert_eq!(ty_of_last_var(src, "prefix"), "'p'");
+    }
+
+    #[test]
+    fn sort_callbacks_infer_value_and_key_comparators() {
+        let src = r#"<?php
+        class User { public function label(): string {} }
+        /** @param array<string, User> $users */
+        function f(array $users): void {
+            usort($users, fn($a, $b) => $a->label() <=> $b->label());
+            uasort($users, fn($a, $b) => $a->label() <=> $b->label());
+            uksort($users, fn($ka, $kb) => $ka <=> $kb);
+        }
+        "#;
+        assert_eq!(ty_of_last_method(src, "label"), "string");
+        assert_eq!(ty_of_last_var(src, "ka"), "string");
+        assert_eq!(ty_of_last_var(src, "kb"), "string");
+    }
+
+    #[test]
+    fn preg_replace_callback_infers_matches_array() {
+        let src = r#"<?php
+        function f(string $s): void {
+            preg_replace_callback('/x/', fn($matches) => $matches[0], $s);
+        }
+        "#;
+        assert_eq!(
+            ty_of(src, |e| matches!(&e.kind, ExprKind::Index { .. })),
+            "string"
+        );
+    }
+
+    #[test]
+    fn explicit_callback_param_hint_is_not_overridden() {
+        let src = r#"<?php
+        class User { public function label(): string {} }
+        /** @param list<User> $users */
+        function f(array $users): void {
+            array_map(fn(string $u) => $u, $users);
+        }
+        "#;
+        assert_eq!(ty_of_last_var(src, "u"), "string");
+    }
+
+    #[test]
+    fn user_function_named_array_map_does_not_infer_callback_params() {
+        let src = r#"<?php
+        namespace App;
+        function array_map($callback, $array): void {}
+        class User { public function label(): string {} }
+        /** @param list<User> $users */
+        function f(array $users): void {
+            array_map(fn($u) => $u->label(), $users);
+        }
+        "#;
+        assert_eq!(ty_of_last_method(src, "label"), "mixed");
+    }
+
+    #[test]
+    fn userland_function_template_binds_direct_argument() {
+        let src = r#"<?php
+        class User {}
+        /**
+         * @template T
+         * @param T $x
+         * @return T
+         */
+        function id($x) {}
+        function f(User $u): void {
+            id($u);
+        }
+        "#;
+        assert_eq!(ty_of_last_call(src, "id"), "User");
+    }
+
+    #[test]
+    fn userland_function_template_binds_list_element() {
+        let src = r#"<?php
+        class User {}
+        /**
+         * @template T
+         * @param list<T> $items
+         * @return T
+         */
+        function first(array $items) {}
+        /** @param list<User> $users */
+        function f(array $users): void {
+            first($users);
+        }
+        "#;
+        assert_eq!(ty_of_last_call(src, "first"), "User");
+    }
+
+    #[test]
+    fn repeated_template_bindings_union_observations() {
+        let src = r#"<?php
+        /**
+         * @template T
+         * @param T $a
+         * @param T $b
+         * @return T
+         */
+        function either($a, $b) {}
+        either(1, 'x');
+        "#;
+        assert_eq!(ty_of_last_call(src, "either"), "1|'x'");
+    }
+
+    #[test]
+    fn mixed_template_argument_stays_lenient() {
+        let src = r#"<?php
+        /**
+         * @template T
+         * @param T $x
+         * @return T
+         */
+        function id($x) {}
+        function f($x): void {
+            id($x);
+        }
+        "#;
+        assert_eq!(ty_of_last_call(src, "id"), "mixed");
+    }
+
+    #[test]
+    fn method_level_templates_bind_for_instance_and_static_calls() {
+        let src = r#"<?php
+        class User {}
+        class Box {
+            /**
+             * @template T
+             * @param T $x
+             * @return T
+             */
+            public function id($x) {}
+            /**
+             * @template T
+             * @param T $x
+             * @return T
+             */
+            public static function sid($x) {}
+        }
+        function f(Box $b, User $u): void {
+            $b->id($u);
+            Box::sid($u);
+        }
+        "#;
+        assert_eq!(ty_of_last_method(src, "id"), "User");
+        assert_eq!(ty_of_last_static_call(src, "sid"), "User");
+    }
+
+    #[test]
+    fn array_map_return_uses_direct_callback_return_type() {
+        let src = r#"<?php
+        class Child {}
+        class User { public function child(): Child {} }
+        /** @param list<User> $users */
+        function f(array $users): void {
+            array_map(fn(User $u) => $u->child(), $users);
+        }
+        "#;
+        assert_eq!(ty_of_last_call(src, "array_map"), "list<Child>");
+    }
+
+    #[test]
+    fn array_key_value_and_column_returns_preserve_precision() {
+        let src = r#"<?php
+        class User {}
+        /**
+         * @param array<string, User> $users
+         * @param list<array{id: int, name: string}> $rows
+         */
+        function f(array $users, array $rows): void {
+            array_keys($users);
+            array_values($users);
+            array_column($rows, 'name');
+            array_column($rows, 'name', 'id');
+        }
+        "#;
+        assert_eq!(ty_of_last_call(src, "array_keys"), "list<string>");
+        assert_eq!(ty_of_last_call(src, "array_values"), "list<User>");
+        let (map, r) = build(src);
+        let mut columns = Vec::new();
+        walk::for_each_expr(&r.program, &mut |e| {
+            let ExprKind::Call { callee, .. } = &e.kind else {
+                return;
+            };
+            let ExprKind::Name(n) = &callee.kind else {
+                return;
+            };
+            if n.text.eq_ignore_ascii_case("array_column") {
+                columns.push(map.get(&key(e.span)).unwrap().to_string());
+            }
+        });
+        assert_eq!(columns, ["list<string>", "array<int, string>"]);
+    }
+
+    #[test]
+    fn builtin_class_templates_substitute_through_extends() {
+        let src = r#"<?php
+        class User {}
+        /** @extends \ArrayObject<int, User> */
+        class Users extends \ArrayObject {}
+        function f(Users $users): void {
+            $users->offsetGet(0);
+        }
+        "#;
+        assert_eq!(ty_of_last_method(src, "offsetGet"), "User|null");
     }
 
     #[test]

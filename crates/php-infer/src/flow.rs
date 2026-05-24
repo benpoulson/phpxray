@@ -12,10 +12,13 @@
 //! to drive diagnostics and never panics.
 
 use crate::{
+    arrays,
     refine::{strip_false, strip_falsy, strip_null_strict},
     TypeCtx,
 };
-use php_ast::{BinOp, Expr, ExprKind, FunctionDecl, Stmt, StmtKind, UnOp};
+use php_ast::{
+    Arg, ArrowFn, BinOp, ClosureExpr, Expr, ExprKind, FunctionDecl, Param, Stmt, StmtKind, UnOp,
+};
 use php_types::Type;
 use std::collections::HashMap;
 
@@ -411,6 +414,7 @@ impl TypeCtx<'_> {
             ExprKind::Call { callee, args } => {
                 self.rec_here(callee, map);
                 self.rec_args(args, map);
+                self.rec_builtin_callback_args(callee, args, map);
             }
             ExprKind::MethodCall {
                 recv, method, args, ..
@@ -464,10 +468,185 @@ impl TypeCtx<'_> {
                     self.rec_here(p, map);
                 }
             }
-            // Leaves and own-scope forms (closures/arrow-fns/yield) — nothing more
-            // to record at this scope (`e` itself is already recorded above).
+            ExprKind::Closure(c) => self.rec_closure(c, &[], map),
+            ExprKind::ArrowFn(a) => self.rec_arrow(a, &[], map),
+            // Leaves and yield-ish forms — nothing more to record at this scope
+            // (`e` itself is already recorded above).
             _ => {}
         }
+    }
+
+    fn rec_closure(&self, c: &ClosureExpr, inferred_params: &[Type], map: &mut RecMap) {
+        let mut vars = Env::new();
+        for u in &c.uses {
+            let name = self.interner.resolve(u.name).to_string();
+            let ty = self.vars.get(&name).cloned().unwrap_or(Type::Mixed);
+            vars.insert(name, ty);
+        }
+        self.seed_ast_params(&mut vars, &c.params, inferred_params);
+        let class = (!c.is_static).then(|| self.class.clone()).flatten();
+        self.record_child_block(class, vars, &c.body, map);
+    }
+
+    fn rec_arrow(&self, a: &ArrowFn, inferred_params: &[Type], map: &mut RecMap) {
+        let mut vars = self.vars.clone();
+        if a.is_static {
+            strip_this_vars(&mut vars);
+        }
+        self.seed_ast_params(&mut vars, &a.params, inferred_params);
+        let class = (!a.is_static).then(|| self.class.clone()).flatten();
+        self.record_child_expr(class, vars, &a.body, map);
+    }
+
+    fn seed_ast_params(&self, vars: &mut Env, params: &[Param], inferred: &[Type]) {
+        for (i, p) in params.iter().enumerate() {
+            let name = self.interner.resolve(p.name).to_string();
+            vars.insert(
+                name,
+                self.ast_param_local_type(p, &inferred[i.min(inferred.len())..]),
+            );
+        }
+    }
+
+    fn ast_param_local_type(&self, p: &Param, inferred: &[Type]) -> Type {
+        if self.native {
+            return if p.variadic {
+                Type::Array(None)
+            } else {
+                p.ty.as_ref()
+                    .map(|t| php_reflect::resolve_ast_type(self.scope, t))
+                    .unwrap_or_else(|| inferred.first().cloned().unwrap_or(Type::Mixed))
+            };
+        }
+        if let Some(ast_ty) =
+            p.ty.as_ref()
+                .map(|t| php_reflect::resolve_ast_type(self.scope, t))
+        {
+            if p.variadic {
+                Type::List(Box::new(ast_ty))
+            } else {
+                ast_ty
+            }
+        } else if p.variadic {
+            let item = if inferred.is_empty() {
+                Type::Mixed
+            } else {
+                Type::union(inferred.to_vec())
+            };
+            Type::List(Box::new(item))
+        } else {
+            inferred.first().cloned().unwrap_or(Type::Mixed)
+        }
+    }
+
+    fn rec_builtin_callback_args(&self, callee: &Expr, args: &[Arg], map: &mut RecMap) {
+        if !args_are_plain_positional(args) {
+            return;
+        }
+        let ExprKind::Name(name) = &callee.kind else {
+            return;
+        };
+        let Some(func) = self.function_reflection(name).filter(|f| f.builtin) else {
+            return;
+        };
+        let fname = last_segment(&func.fqn).to_ascii_lowercase();
+        match fname.as_str() {
+            "array_map" => {
+                let Some(callback) = args.first() else { return };
+                let inferred: Vec<Type> = args
+                    .iter()
+                    .skip(1)
+                    .map(|a| self.arg_array_value_type(a))
+                    .collect();
+                self.rec_callback_arg(callback, inferred, map);
+            }
+            "array_filter" => {
+                let (Some(array), Some(callback)) = (args.first(), args.get(1)) else {
+                    return;
+                };
+                let value = self.arg_array_value_type(array);
+                let key = self.arg_array_key_type(array);
+                let Some(inferred) = array_filter_callback_params(args, value, key) else {
+                    return;
+                };
+                self.rec_callback_arg(callback, inferred, map);
+            }
+            "array_walk" => {
+                let (Some(array), Some(callback)) = (args.first(), args.get(1)) else {
+                    return;
+                };
+                let mut inferred = vec![
+                    self.arg_array_value_type(array),
+                    self.arg_array_key_type(array),
+                ];
+                if let Some(user_arg) = args.get(2) {
+                    inferred.push(self.infer(&user_arg.value));
+                }
+                self.rec_callback_arg(callback, inferred, map);
+            }
+            "usort" | "uasort" => {
+                let (Some(array), Some(callback)) = (args.first(), args.get(1)) else {
+                    return;
+                };
+                let value = self.arg_array_value_type(array);
+                self.rec_callback_arg(callback, vec![value.clone(), value], map);
+            }
+            "uksort" => {
+                let (Some(array), Some(callback)) = (args.first(), args.get(1)) else {
+                    return;
+                };
+                let key = self.arg_array_key_type(array);
+                self.rec_callback_arg(callback, vec![key.clone(), key], map);
+            }
+            "preg_replace_callback" => {
+                let Some(callback) = args.get(1) else { return };
+                if !preg_replace_callback_flags_are_plain(args) {
+                    return;
+                }
+                self.rec_callback_arg(callback, vec![preg_match_array_type()], map);
+            }
+            _ => {}
+        }
+    }
+
+    fn rec_callback_arg(&self, arg: &Arg, inferred: Vec<Type>, map: &mut RecMap) {
+        match &peel_paren(&arg.value).kind {
+            ExprKind::Closure(c) => self.rec_closure(c, &inferred, map),
+            ExprKind::ArrowFn(a) => self.rec_arrow(a, &inferred, map),
+            _ => {}
+        }
+    }
+
+    fn arg_array_value_type(&self, arg: &Arg) -> Type {
+        arrays::array_value_type(&self.infer(&arg.value)).unwrap_or(Type::Mixed)
+    }
+
+    fn arg_array_key_type(&self, arg: &Arg) -> Type {
+        arrays::array_key_type(&self.infer(&arg.value)).unwrap_or(Type::Mixed)
+    }
+
+    fn record_child_block(
+        &self,
+        class: Option<String>,
+        vars: Env,
+        body: &[Stmt],
+        map: &mut RecMap,
+    ) {
+        let mut child = TypeCtx::new(self.index, self.scope, self.interner);
+        child.class = class;
+        child.vars = vars;
+        child.depth = self.depth;
+        child.native = self.native;
+        child.record_block(body, map);
+    }
+
+    fn record_child_expr(&self, class: Option<String>, vars: Env, e: &Expr, map: &mut RecMap) {
+        let mut child = TypeCtx::new(self.index, self.scope, self.interner);
+        child.class = class;
+        child.vars = vars;
+        child.depth = self.depth;
+        child.native = self.native;
+        child.rec_here(e, map);
     }
 
     fn rec_args(&mut self, args: &[php_ast::Arg], map: &mut RecMap) {
@@ -806,6 +985,76 @@ impl TypeCtx<'_> {
 fn span_key(e: &Expr) -> (u32, u32) {
     let r = e.span.range();
     (r.start as u32, r.end as u32)
+}
+
+fn args_are_plain_positional(args: &[Arg]) -> bool {
+    args.iter()
+        .all(|a| !a.spread && !a.placeholder && a.name.is_none())
+}
+
+fn peel_paren(e: &Expr) -> &Expr {
+    match &e.kind {
+        ExprKind::Paren(inner) => peel_paren(inner),
+        _ => e,
+    }
+}
+
+fn array_filter_callback_params(args: &[Arg], value: Type, key: Type) -> Option<Vec<Type>> {
+    match args.get(2).map(|a| &a.value) {
+        None => Some(vec![value]),
+        Some(mode) => match array_filter_mode(mode)? {
+            ArrayFilterMode::Value => Some(vec![value]),
+            ArrayFilterMode::Key => Some(vec![key]),
+            ArrayFilterMode::Both => Some(vec![value, key]),
+        },
+    }
+}
+
+enum ArrayFilterMode {
+    Value,
+    Key,
+    Both,
+}
+
+fn array_filter_mode(e: &Expr) -> Option<ArrayFilterMode> {
+    match int_lit(e) {
+        Some(0) => return Some(ArrayFilterMode::Value),
+        Some(1) => return Some(ArrayFilterMode::Both),
+        Some(2) => return Some(ArrayFilterMode::Key),
+        Some(_) => return None,
+        None => {}
+    }
+    let ExprKind::Name(n) = &peel_paren(e).kind else {
+        return None;
+    };
+    match global_const_text(&n.text)? {
+        "ARRAY_FILTER_USE_BOTH" => Some(ArrayFilterMode::Both),
+        "ARRAY_FILTER_USE_KEY" => Some(ArrayFilterMode::Key),
+        _ => None,
+    }
+}
+
+fn global_const_text(text: &str) -> Option<&str> {
+    let stripped = text.strip_prefix('\\').unwrap_or(text);
+    (!stripped.contains('\\')).then_some(stripped)
+}
+
+fn preg_replace_callback_flags_are_plain(args: &[Arg]) -> bool {
+    match args.get(5).map(|a| &a.value) {
+        None => true,
+        Some(flags) => int_lit(flags) == Some(0),
+    }
+}
+
+fn preg_match_array_type() -> Type {
+    Type::Array(Some(Box::new((
+        Type::union(vec![Type::Int, Type::String]),
+        Type::String,
+    ))))
+}
+
+fn strip_this_vars(vars: &mut Env) {
+    vars.retain(|k, _| k != "this" && !k.starts_with("this->"));
 }
 
 /// Apply narrowing facts to an environment in place.
