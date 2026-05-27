@@ -3938,6 +3938,42 @@ mod tests {
     }
 
     #[test]
+    fn undefined_method_inside_collection_map_callback_is_flagged() {
+        let src = r#"<?php
+            class User {}
+            /** @template T */
+            class Collection {
+                public function map(callable $callback) {}
+            }
+            /** @param Collection<User> $users */
+            function f(Collection $users): void {
+                $users->map(fn($u) => $u->missing());
+            }
+        "#;
+        assert!(codes(src, run_call_methods_typed).contains(&"method.notFound"));
+    }
+
+    #[test]
+    fn undefined_method_on_collection_map_result_is_flagged() {
+        let src = r#"<?php
+            class Child {}
+            class User { public function child(): Child {} }
+            /** @template T */
+            class Collection {
+                /** @return T */
+                public function first() {}
+                public function map(callable $callback) {}
+            }
+            /** @param Collection<User> $users */
+            function f(Collection $users): void {
+                $children = $users->map(fn($u) => $u->child());
+                $children->first()->missing();
+            }
+        "#;
+        assert!(codes(src, run_call_methods_typed).contains(&"method.notFound"));
+    }
+
+    #[test]
     fn existing_method_on_typed_local_clean() {
         let src = "<?php class C { public function a(): void {} } function f(): void { $c = new C(); $c->a(); }";
         assert!(codes(src, run_call_methods_typed).is_empty());

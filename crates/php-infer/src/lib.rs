@@ -67,6 +67,15 @@ impl CallableAlias {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CollectionMethod {
+    Map,
+    Filter,
+    Each,
+    Walk,
+    Reduce,
+}
+
 /// The context an expression is typed in.
 pub struct TypeCtx<'a> {
     /// Project-wide reflection (classes/functions with resolved member types).
@@ -479,6 +488,142 @@ impl<'a> TypeCtx<'a> {
         }
     }
 
+    fn collection_method_return(
+        &self,
+        recv_ty: &Type,
+        name: &str,
+        args: &[Arg],
+        fallback: &Type,
+    ) -> Option<Type> {
+        if self.native || !args_are_plain_positional(args) {
+            return None;
+        }
+        let method = collection_method(name)?;
+        let params = self.collection_callback_params(recv_ty, method, args)?;
+        let receiver = self.collection_receiver_type(recv_ty)?;
+        match method {
+            CollectionMethod::Map => {
+                let callback = args.first()?;
+                let ret = self.callback_return_type(callback, &params)?;
+                if template_observation_is_imprecise(&ret) {
+                    return None;
+                }
+                let mapped = self.collection_receiver_type_with_value(recv_ty, ret)?;
+                self.collection_same_receiver_override(fallback, recv_ty, &mapped)
+                    .then_some(mapped)
+            }
+            CollectionMethod::Filter => self
+                .collection_same_receiver_override(fallback, recv_ty, &receiver)
+                .then_some(receiver),
+            CollectionMethod::Each | CollectionMethod::Walk => {
+                collection_fallback_is_imprecise(fallback)
+                    .then_some(receiver)
+                    .filter(|r| self.collection_same_receiver_override(fallback, recv_ty, r))
+            }
+            CollectionMethod::Reduce => {
+                let callback = args.first()?;
+                let ret = self.callback_return_type(callback, &params)?;
+                if template_observation_is_imprecise(&ret) {
+                    return None;
+                }
+                (collection_fallback_is_imprecise(fallback)
+                    || is_assignable(self.index, &ret, fallback))
+                .then_some(ret)
+            }
+        }
+    }
+
+    fn collection_callback_params(
+        &self,
+        recv_ty: &Type,
+        method: CollectionMethod,
+        args: &[Arg],
+    ) -> Option<Vec<Type>> {
+        if self.native || !args_are_plain_positional(args) {
+            return None;
+        }
+        let (key, value) = self.collection_key_value(recv_ty)?;
+        match method {
+            CollectionMethod::Map
+            | CollectionMethod::Filter
+            | CollectionMethod::Each
+            | CollectionMethod::Walk => Some(vec![value, key]),
+            CollectionMethod::Reduce => {
+                let carry = args
+                    .get(1)
+                    .map(|arg| self.infer(&arg.value))
+                    .unwrap_or(Type::Mixed);
+                Some(vec![carry, value, key])
+            }
+        }
+    }
+
+    fn collection_key_value(&self, recv_ty: &Type) -> Option<(Type, Type)> {
+        let (fqn, args) = receiver_named_parts(recv_ty)?;
+        self.index.class(fqn)?;
+        match args.len() {
+            1 => {
+                let value = args[0].clone();
+                (!template_observation_is_imprecise(&value)).then_some((Type::Mixed, value))
+            }
+            n if n >= 2 => {
+                let key = args[0].clone();
+                let value = args[1].clone();
+                (!template_observation_is_imprecise(&key)
+                    && !template_observation_is_imprecise(&value))
+                .then_some((key, value))
+            }
+            _ => None,
+        }
+    }
+
+    fn collection_receiver_type(&self, recv_ty: &Type) -> Option<Type> {
+        let (fqn, args) = receiver_named_parts(recv_ty)?;
+        self.index.class(fqn)?;
+        (!args.is_empty()).then(|| Type::Named {
+            fqn: fqn.to_string(),
+            args: args.to_vec(),
+        })
+    }
+
+    fn collection_receiver_type_with_value(&self, recv_ty: &Type, value: Type) -> Option<Type> {
+        let (fqn, args) = receiver_named_parts(recv_ty)?;
+        self.index.class(fqn)?;
+        let replace_at = match args.len() {
+            1 => 0,
+            n if n >= 2 => 1,
+            _ => return None,
+        };
+        let mut args = args.to_vec();
+        args[replace_at] = value;
+        Some(Type::Named {
+            fqn: fqn.to_string(),
+            args,
+        })
+    }
+
+    fn collection_same_receiver_override(
+        &self,
+        fallback: &Type,
+        recv_ty: &Type,
+        replacement: &Type,
+    ) -> bool {
+        if collection_fallback_is_imprecise(fallback) {
+            return true;
+        }
+        let Some((fallback_fqn, _)) = receiver_named_parts(fallback) else {
+            return false;
+        };
+        let Some((recv_fqn, _)) = receiver_named_parts(recv_ty) else {
+            return false;
+        };
+        let Some((replacement_fqn, _)) = receiver_named_parts(replacement) else {
+            return false;
+        };
+        fallback_fqn.eq_ignore_ascii_case(recv_fqn)
+            && replacement_fqn.eq_ignore_ascii_case(recv_fqn)
+    }
+
     /// The value (element) type of an array/list argument, if known.
     fn array_value_type(&self, arg: &php_ast::Arg) -> Option<Type> {
         arrays::array_value_type(&self.infer(&arg.value))
@@ -788,13 +933,15 @@ impl<'a> TypeCtx<'a> {
         };
         if is_first_class_callable(args) {
             return self
-                .index
-                .find_method(&fqn, &name)
+                .find_method_for_receiver(&recv_ty, &fqn, &name)
                 .map(|found| self.method_callable_type(&found.member, &fqn))
                 .unwrap_or(Type::Callable(None));
         }
-        let ret = match self.index.find_method(&fqn, &name) {
-            Some(found) if self.native => self.bind_relative(found.member.native_return, &fqn),
+        let found = self.find_method_for_receiver(&recv_ty, &fqn, &name);
+        let ret = match &found {
+            Some(found) if self.native => {
+                self.bind_relative(found.member.native_return.clone(), &fqn)
+            }
             Some(found) => {
                 let declared =
                     self.bound_call_return(&found.member.params, &found.member.return_type, args);
@@ -805,6 +952,12 @@ impl<'a> TypeCtx<'a> {
                 self.bind_relative(refined, &fqn)
             }
             None => Type::Mixed,
+        };
+        let ret = if found.is_some() {
+            self.collection_method_return(&recv_ty, &name, args, &ret)
+                .unwrap_or(ret)
+        } else {
+            ret
         };
         if nullsafe {
             ret.nullable()
@@ -860,7 +1013,7 @@ impl<'a> TypeCtx<'a> {
         let Some(fqn) = self.type_class_fqn(&base_ty) else {
             return Type::Mixed;
         };
-        let ty = match self.index.find_property(&fqn, &prop) {
+        let ty = match self.find_property_for_receiver(&base_ty, &fqn, &prop) {
             Some(found) if self.native => found.member.native_ty,
             Some(found) => found.member.ty,
             None => Type::Mixed,
@@ -1091,6 +1244,36 @@ impl<'a> TypeCtx<'a> {
         }
     }
 
+    fn find_method_for_receiver(
+        &self,
+        recv_ty: &Type,
+        fqn: &str,
+        name: &str,
+    ) -> Option<php_reflect::Found<php_reflect::MethodReflection>> {
+        if self.native {
+            self.index.find_method(fqn, name)
+        } else {
+            self.index
+                .find_method_on_type(recv_ty, name)
+                .or_else(|| self.index.find_method(fqn, name))
+        }
+    }
+
+    fn find_property_for_receiver(
+        &self,
+        recv_ty: &Type,
+        fqn: &str,
+        name: &str,
+    ) -> Option<php_reflect::Found<php_reflect::PropertyReflection>> {
+        if self.native {
+            self.index.find_property(fqn, name)
+        } else {
+            self.index
+                .find_property_on_type(recv_ty, name)
+                .or_else(|| self.index.find_property(fqn, name))
+        }
+    }
+
     /// Look up a function's reflection from a name reference, honouring the
     /// namespaced-then-global fallback for unqualified calls.
     fn function_reflection(&self, n: &Name) -> Option<&php_reflect::FunctionReflection> {
@@ -1144,8 +1327,7 @@ impl<'a> TypeCtx<'a> {
 
         let recv_ty = self.infer(target);
         let fqn = self.type_class_fqn(&recv_ty)?;
-        self.index
-            .find_method(&fqn, &method_name)
+        self.find_method_for_receiver(&recv_ty, &fqn, &method_name)
             .map(|found| self.method_callable_type(&found.member, &fqn))
     }
 
@@ -1167,8 +1349,7 @@ impl<'a> TypeCtx<'a> {
 
     fn invokable_callable_type(&self, ty: &Type) -> Option<Type> {
         let fqn = self.type_class_fqn(ty)?;
-        self.index
-            .find_method(&fqn, "__invoke")
+        self.find_method_for_receiver(ty, &fqn, "__invoke")
             .map(|found| self.method_callable_type(&found.member, &fqn))
     }
 
@@ -1263,6 +1444,29 @@ fn last_segment(name: &str) -> &str {
         .rsplit('\\')
         .next()
         .unwrap_or(name)
+}
+
+fn collection_method(name: &str) -> Option<CollectionMethod> {
+    match name.to_ascii_lowercase().as_str() {
+        "map" => Some(CollectionMethod::Map),
+        "filter" => Some(CollectionMethod::Filter),
+        "each" => Some(CollectionMethod::Each),
+        "walk" => Some(CollectionMethod::Walk),
+        "reduce" => Some(CollectionMethod::Reduce),
+        _ => None,
+    }
+}
+
+fn receiver_named_parts(ty: &Type) -> Option<(&str, &[Type])> {
+    match ty {
+        Type::Named { fqn, args } => Some((fqn.as_str(), args.as_slice())),
+        Type::Nullable(inner) => receiver_named_parts(inner),
+        _ => None,
+    }
+}
+
+fn collection_fallback_is_imprecise(ty: &Type) -> bool {
+    template_observation_is_imprecise(ty)
 }
 
 fn const_shape_key_arg(arg: &Arg) -> Option<String> {
@@ -1397,7 +1601,7 @@ fn finalize_subst(raw: HashMap<String, Vec<Type>>) -> HashMap<String, Type> {
 
 fn subst_templates(ty: &Type, subst: &HashMap<String, Type>, unbound_to_mixed: bool) -> Type {
     ty.clone().map(&mut |part| match part {
-        Type::TemplateVar(name) => subst.get(&name).cloned().unwrap_or_else(|| {
+        Type::TemplateVar(name) => subst.get(&name).cloned().unwrap_or({
             if unbound_to_mixed {
                 Type::Mixed
             } else {

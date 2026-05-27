@@ -308,6 +308,27 @@ impl ReflectionIndex {
         )
     }
 
+    /// Resolve a method through the hierarchy of a concrete receiver type,
+    /// substituting the receiver's own generic arguments before walking parents.
+    pub fn find_method_on_type(
+        &self,
+        receiver: &Type,
+        name: &str,
+    ) -> Option<Found<MethodReflection>> {
+        let (fqn, subst) = self.receiver_named_subst(receiver)?;
+        let mut visited = Vec::new();
+        self.ascend(fqn, subst, &mut visited, &mut |class, subst| {
+            class
+                .methods
+                .iter()
+                .find(|m| m.name.eq_ignore_ascii_case(name))
+                .map(|m| Found {
+                    member: subst_method(m, subst),
+                    declaring_class: class.fqn.clone(),
+                })
+        })
+    }
+
     /// Whether every known concrete descendant of an abstract class/interface is
     /// final and exposes `method`. This is an intentionally narrow escape hatch
     /// for member-existence checks on abstract receiver types: if a library's
@@ -360,6 +381,30 @@ impl ReflectionIndex {
                     })
             },
         )
+    }
+
+    /// Resolve a property through the hierarchy of a concrete receiver type,
+    /// substituting the receiver's own generic arguments before walking parents.
+    pub fn find_property_on_type(
+        &self,
+        receiver: &Type,
+        name: &str,
+    ) -> Option<Found<PropertyReflection>> {
+        let (fqn, subst) = self.receiver_named_subst(receiver)?;
+        let mut visited = Vec::new();
+        self.ascend(fqn, subst, &mut visited, &mut |class, subst| {
+            class
+                .properties
+                .iter()
+                .find(|p| p.name == name)
+                .map(|p| Found {
+                    member: PropertyReflection {
+                        ty: subst_type(&p.ty, subst),
+                        ..p.clone()
+                    },
+                    declaring_class: class.fqn.clone(),
+                })
+        })
     }
 
     /// Resolve a class constant by name through the hierarchy. Constant names are
@@ -431,6 +476,24 @@ impl ReflectionIndex {
         if let Some(parent) = self.classes.get(&class_key(pf)) {
             for (name, arg) in parent.templates.iter().zip(args) {
                 map.insert(name.clone(), subst_type(arg, outer));
+            }
+        }
+        map
+    }
+
+    fn receiver_named_subst<'a>(&self, receiver: &'a Type) -> Option<(&'a str, Subst)> {
+        match receiver {
+            Type::Named { fqn, args } => Some((fqn.as_str(), self.receiver_subst(fqn, args))),
+            Type::Nullable(inner) => self.receiver_named_subst(inner),
+            _ => None,
+        }
+    }
+
+    fn receiver_subst(&self, fqn: &str, args: &[Type]) -> Subst {
+        let mut map = Subst::new();
+        if let Some(class) = self.classes.get(&class_key(fqn)) {
+            for (name, arg) in class.templates.iter().zip(args) {
+                map.insert(name.clone(), arg.clone());
             }
         }
         map
@@ -527,8 +590,10 @@ fn subst_method(m: &MethodReflection, subst: &Subst) -> MethodReflection {
     let mut out = m.clone();
     for p in &mut out.params {
         p.ty = subst_type(&p.ty, subst);
+        p.native_ty = subst_type(&p.native_ty, subst);
     }
     out.return_type = subst_type(&out.return_type, subst);
+    out.native_return = subst_type(&out.native_return, subst);
     out
 }
 
@@ -557,6 +622,20 @@ mod tests {
         let mut idx = ReflectionIndex::new();
         idx.add_file(&r.program, &r.interner);
         idx
+    }
+
+    fn named(fqn: &str) -> Type {
+        Type::Named {
+            fqn: fqn.into(),
+            args: vec![],
+        }
+    }
+
+    fn generic(fqn: &str, args: Vec<Type>) -> Type {
+        Type::Named {
+            fqn: fqn.into(),
+            args,
+        }
     }
 
     #[test]
@@ -661,6 +740,70 @@ mod tests {
                 args: vec![]
             }
         );
+    }
+
+    #[test]
+    fn receiver_generic_args_substitute_own_method() {
+        let idx = index(
+            r#"<?php
+            /** @template T */
+            class Collection {
+                /** @return T */
+                public function first() {}
+            }
+            class User {}"#,
+        );
+        let receiver = generic("Collection", vec![named("User")]);
+        let found = idx.find_method_on_type(&receiver, "first").unwrap();
+        assert_eq!(found.declaring_class, "Collection");
+        assert_eq!(found.member.return_type, named("User"));
+    }
+
+    #[test]
+    fn receiver_generic_args_substitute_own_property() {
+        let idx = index(
+            r#"<?php
+            /** @template T */
+            class Box {
+                /** @var T */
+                public $value;
+            }
+            class User {}"#,
+        );
+        let receiver = generic("Box", vec![named("User")]);
+        let found = idx.find_property_on_type(&receiver, "value").unwrap();
+        assert_eq!(found.declaring_class, "Box");
+        assert_eq!(found.member.ty, named("User"));
+    }
+
+    #[test]
+    fn receiver_generic_builtin_arrayobject_offset_get() {
+        let idx = ReflectionIndex::with_builtins();
+        let receiver = generic("ArrayObject", vec![Type::Int, named("User")]);
+        let found = idx.find_method_on_type(&receiver, "offsetGet").unwrap();
+        assert_eq!(found.member.return_type.to_string(), "User|null");
+    }
+
+    #[test]
+    fn receiver_substitution_composes_through_inherited_parent() {
+        let idx = index(
+            r#"<?php
+            /** @template T */
+            class ParentBox {
+                /** @return T */
+                public function get() {}
+            }
+            /**
+             * @template U
+             * @extends ParentBox<U>
+             */
+            class ChildBox extends ParentBox {}
+            class User {}"#,
+        );
+        let receiver = generic("ChildBox", vec![named("User")]);
+        let found = idx.find_method_on_type(&receiver, "get").unwrap();
+        assert_eq!(found.declaring_class, "ParentBox");
+        assert_eq!(found.member.return_type, named("User"));
     }
 
     #[test]

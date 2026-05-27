@@ -12,7 +12,7 @@
 //! to drive diagnostics and never panics.
 
 use crate::{
-    arrays,
+    arrays, collection_method,
     refine::{strip_false, strip_falsy, strip_null_strict},
     CallableAlias, TypeCtx,
 };
@@ -511,6 +511,7 @@ impl TypeCtx<'_> {
                 self.rec_here(recv, map);
                 self.rec_member(method, map);
                 self.rec_args(args, map);
+                self.rec_collection_callback_args(recv, method, args, map);
             }
             ExprKind::StaticCall {
                 class,
@@ -700,6 +701,31 @@ impl TypeCtx<'_> {
             }
             _ => {}
         }
+    }
+
+    fn rec_collection_callback_args(
+        &self,
+        recv: &Expr,
+        method: &php_ast::MemberName,
+        args: &[Arg],
+        map: &mut RecMap,
+    ) {
+        if !args_are_plain_positional(args) {
+            return;
+        }
+        let php_ast::MemberName::Ident(sym) = method else {
+            return;
+        };
+        let method_name = self.interner.resolve(*sym);
+        let Some(kind) = collection_method(method_name) else {
+            return;
+        };
+        let recv_ty = self.infer(recv);
+        let Some(inferred) = self.collection_callback_params(&recv_ty, kind, args) else {
+            return;
+        };
+        let Some(callback) = args.first() else { return };
+        self.rec_callback_arg(callback, inferred, map);
     }
 
     fn rec_callback_arg(&self, arg: &Arg, inferred: Vec<Type>, map: &mut RecMap) {

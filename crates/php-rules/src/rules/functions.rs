@@ -4216,6 +4216,25 @@ mod tests {
     }
 
     #[test]
+    fn argument_type_from_collection_map_result_is_flagged() {
+        let src = r#"<?php
+        class User { public function name(): string {} }
+        function takes_int(int $x): void {}
+        /** @template T */
+        class Collection {
+            /** @return T */
+            public function first() {}
+            public function map(callable $callback) {}
+        }
+        /** @param Collection<User> $users */
+        function f(Collection $users): void {
+            takes_int($users->map(fn($u) => $u->name())->first());
+        }
+        "#;
+        assert_eq!(codes(src, run_argument_types), ["argument.type"]);
+    }
+
+    #[test]
     fn unknown_arg_type_is_lenient() {
         // $u is never assigned -> mixed -> no diagnostic.
         assert!(codes("<?php function f(int $x) {} f($u);", run_argument_types).is_empty());

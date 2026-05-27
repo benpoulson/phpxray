@@ -4292,6 +4292,25 @@ mod tests {
     }
 
     #[test]
+    fn undefined_property_inside_collection_map_callback_is_flagged() {
+        let src = r#"<?php
+            class User {}
+            /** @template T */
+            class Collection {
+                public function map(callable $callback) {}
+            }
+            /** @param Collection<User> $users */
+            function f(Collection $users): void {
+                $users->map(fn($u) => $u->missing);
+            }
+        "#;
+        assert_eq!(
+            codes(src, run_access_properties_general),
+            ["property.notFound"]
+        );
+    }
+
+    #[test]
     fn undefined_property_on_userland_generic_result_is_flagged() {
         let src = r#"<?php
             class User {}

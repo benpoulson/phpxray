@@ -227,6 +227,27 @@ mod tests {
         found.unwrap_or_else(|| "<not found>".into())
     }
 
+    fn ty_of_last_prop(src: &str, name: &str) -> String {
+        let (map, r) = build(src);
+        let mut found: Option<String> = None;
+        walk::for_each_expr(&r.program, &mut |e| {
+            let ExprKind::Prop {
+                name: php_ast::MemberName::Ident(sym),
+                ..
+            } = &e.kind
+            else {
+                return;
+            };
+            if r.interner.resolve(*sym) == name {
+                found = map
+                    .get(&key(e.span))
+                    .map(|t| t.to_string())
+                    .or_else(|| Some("<unmapped>".into()));
+            }
+        });
+        found.unwrap_or_else(|| "<not found>".into())
+    }
+
     fn ty_of_last_var(src: &str, name: &str) -> String {
         let (map, r) = build(src);
         let mut found: Option<String> = None;
@@ -934,6 +955,200 @@ mod tests {
         }
         "#;
         assert_eq!(ty_of_last_method(src, "offsetGet"), "User|null");
+    }
+
+    #[test]
+    fn direct_receiver_generic_arrayobject_offset_get() {
+        let src = r#"<?php
+        class User {}
+        /** @param \ArrayObject<int, User> $users */
+        function f(\ArrayObject $users): void {
+            $users->offsetGet(0);
+        }
+        "#;
+        assert_eq!(ty_of_last_method(src, "offsetGet"), "User|null");
+    }
+
+    #[test]
+    fn direct_receiver_generic_property_substitutes_template() {
+        let src = r#"<?php
+        class User {}
+        /** @template T */
+        class Box {
+            /** @var T */
+            public $value;
+        }
+        /** @param Box<User> $box */
+        function f(Box $box): void {
+            $box->value;
+        }
+        "#;
+        assert_eq!(ty_of_last_prop(src, "value"), "User");
+    }
+
+    #[test]
+    fn collection_map_seeds_callback_and_rewrites_one_template_return() {
+        let src = r#"<?php
+        class Child {}
+        class User { public function child(): Child {} }
+        /** @template T */
+        class Collection {
+            /** @return T */
+            public function first() {}
+            public function map(callable $callback) {}
+        }
+        /** @param Collection<User> $users */
+        function f(Collection $users): void {
+            $children = $users->map(fn($u) => $u->child());
+            $children->first();
+        }
+        "#;
+        assert_eq!(ty_of_last_var(src, "u"), "User");
+        assert_eq!(ty_of_last_method(src, "child"), "Child");
+        assert_eq!(ty_of_last_method(src, "map"), "Collection<Child>");
+        assert_eq!(ty_of_last_method(src, "first"), "Child");
+    }
+
+    #[test]
+    fn collection_map_preserves_two_template_key() {
+        let src = r#"<?php
+        class Child {}
+        class User { public function child(): Child {} }
+        /**
+         * @template K
+         * @template V
+         */
+        class Map {
+            /** @return V */
+            public function first() {}
+            public function map(callable $callback) {}
+        }
+        /** @param Map<string, User> $users */
+        function f(Map $users): void {
+            $children = $users->map(function ($u, $k): Child {
+                $k;
+                return $u->child();
+            });
+            $children->first();
+        }
+        "#;
+        assert_eq!(ty_of_last_var(src, "u"), "User");
+        assert_eq!(ty_of_last_var(src, "k"), "string");
+        assert_eq!(ty_of_last_method(src, "map"), "Map<string, Child>");
+        assert_eq!(ty_of_last_method(src, "first"), "Child");
+    }
+
+    #[test]
+    fn collection_filter_preserves_receiver_and_seeds_callback() {
+        let src = r#"<?php
+        class User { public function active(): bool {} }
+        /** @template T */
+        class Collection {
+            /** @return T */
+            public function first() {}
+            public function filter(callable $callback) {}
+        }
+        /** @param Collection<User> $users */
+        function f(Collection $users): void {
+            $filtered = $users->filter(fn($u) => $u->active());
+            $filtered->first();
+        }
+        "#;
+        assert_eq!(ty_of_last_var(src, "u"), "User");
+        assert_eq!(ty_of_last_method(src, "active"), "bool");
+        assert_eq!(ty_of_last_method(src, "filter"), "Collection<User>");
+        assert_eq!(ty_of_last_method(src, "first"), "User");
+    }
+
+    #[test]
+    fn collection_each_and_walk_seed_callback_params() {
+        let src = r#"<?php
+        class User { public function label(): string {} }
+        /**
+         * @template K
+         * @template V
+         */
+        class Map {
+            public function each(callable $callback) {}
+            public function walk(callable $callback) {}
+        }
+        /** @param Map<string, User> $users */
+        function f(Map $users): void {
+            $users->each(fn($u, $k) => $u->label() . $k);
+            $users->walk(fn($u, $k) => $u->label() . $k);
+        }
+        "#;
+        assert_eq!(ty_of_last_var(src, "u"), "User");
+        assert_eq!(ty_of_last_var(src, "k"), "string");
+        assert_eq!(ty_of_last_method(src, "label"), "string");
+    }
+
+    #[test]
+    fn collection_reduce_seeds_params_and_returns_callback_return() {
+        let src = r#"<?php
+        class User { public function label(): string {} }
+        /**
+         * @template K
+         * @template V
+         */
+        class Map {
+            public function reduce(callable $callback, $initial = null) {}
+        }
+        /** @param Map<string, User> $users */
+        function f(Map $users): void {
+            $result = $users->reduce(function ($carry, $u, $k): string {
+                $carry;
+                return $u->label() . $k;
+            }, 0);
+        }
+        "#;
+        assert_eq!(ty_of_last_var(src, "carry"), "0");
+        assert_eq!(ty_of_last_var(src, "u"), "User");
+        assert_eq!(ty_of_last_var(src, "k"), "string");
+        assert_eq!(ty_of_last_method(src, "reduce"), "string");
+    }
+
+    #[test]
+    fn collection_explicit_callback_param_hint_is_not_overridden() {
+        let src = r#"<?php
+        class User {}
+        /** @template T */
+        class Collection {
+            public function map(callable $callback) {}
+        }
+        /** @param Collection<User> $users */
+        function f(Collection $users): void {
+            $users->map(fn(string $u) => $u);
+        }
+        "#;
+        assert_eq!(ty_of_last_var(src, "u"), "string");
+        assert_eq!(ty_of_last_method(src, "map"), "Collection<string>");
+    }
+
+    #[test]
+    fn collection_callback_inference_skips_named_args_and_unknown_receivers() {
+        let named_arg = r#"<?php
+        class User { public function child(): string {} }
+        /** @template T */
+        class Collection {
+            public function map(callable $callback) {}
+        }
+        /** @param Collection<User> $users */
+        function f(Collection $users): void {
+            $users->map(callback: fn($u) => $u->child());
+        }
+        "#;
+        assert_eq!(ty_of_last_method(named_arg, "child"), "mixed");
+        assert_eq!(ty_of_last_method(named_arg, "map"), "mixed");
+
+        let unknown_receiver = r#"<?php
+        class User { public function child(): string {} }
+        function f($users): void {
+            $users->map(fn($u) => $u->child());
+        }
+        "#;
+        assert_eq!(ty_of_last_method(unknown_receiver, "child"), "mixed");
+        assert_eq!(ty_of_last_method(unknown_receiver, "map"), "mixed");
     }
 
     #[test]
