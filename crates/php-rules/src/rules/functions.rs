@@ -4202,6 +4202,20 @@ mod tests {
     }
 
     #[test]
+    fn argument_type_from_callable_variable_array_map_result_is_flagged() {
+        let src = r#"<?php
+        class User { public function name(): string {} }
+        function takes_int(int $x): void {}
+        /** @param list<User> $users */
+        function f(array $users): void {
+            $cb = fn(User $u): string => $u->name();
+            takes_int(array_map($cb, $users)[0]);
+        }
+        "#;
+        assert_eq!(codes(src, run_argument_types), ["argument.type"]);
+    }
+
+    #[test]
     fn unknown_arg_type_is_lenient() {
         // $u is never assigned -> mixed -> no diagnostic.
         assert!(codes("<?php function f(int $x) {} f($u);", run_argument_types).is_empty());

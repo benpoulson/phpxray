@@ -734,6 +734,163 @@ mod tests {
     }
 
     #[test]
+    fn array_map_return_uses_method_callable_array() {
+        let src = r#"<?php
+        class Row {}
+        class Child {}
+        class Factory { public function make(Row $row): Child {} }
+        /** @param list<Row> $rows */
+        function f(Factory $factory, array $rows): void {
+            array_map([$factory, 'make'], $rows);
+        }
+        "#;
+        assert_eq!(ty_of_last_call(src, "array_map"), "list<Child>");
+    }
+
+    #[test]
+    fn array_map_return_uses_first_class_static_callable() {
+        let src = r#"<?php
+        class UserDto {
+            /** @param array{id: int} $row */
+            public static function fromArray(array $row): UserDto {}
+        }
+        /** @param list<array{id: int}> $rows */
+        function f(array $rows): void {
+            array_map(UserDto::fromArray(...), $rows);
+        }
+        "#;
+        assert_eq!(ty_of_last_call(src, "array_map"), "list<UserDto>");
+    }
+
+    #[test]
+    fn array_map_aliased_arrow_records_body_and_return() {
+        let src = r#"<?php
+        class Child {}
+        class User { public function child(): Child {} }
+        /** @param list<User> $users */
+        function f(array $users): void {
+            $cb = fn($u) => $u->child();
+            array_map($cb, $users);
+        }
+        "#;
+        assert_eq!(ty_of_last_var(src, "u"), "User");
+        assert_eq!(ty_of_last_method(src, "child"), "Child");
+        assert_eq!(ty_of_last_call(src, "array_map"), "list<Child>");
+    }
+
+    #[test]
+    fn callable_alias_survives_identical_branch_assignment() {
+        let src = r#"<?php
+        class Child {}
+        class User { public function child(): Child {} }
+        /** @param list<User> $users */
+        function f(array $users, bool $flag): void {
+            $base = fn(User $u): Child => $u->child();
+            if ($flag) {
+                $cb = $base;
+            } else {
+                $cb = $base;
+            }
+            array_map($cb, $users);
+        }
+        "#;
+        assert_eq!(ty_of_last_call(src, "array_map"), "list<Child>");
+    }
+
+    #[test]
+    fn callable_alias_drops_on_ambiguous_branch_assignment() {
+        let src = r#"<?php
+        class Child {}
+        class User { public function child(): Child {} }
+        function other(User $u): int {}
+        /** @param list<User> $users */
+        function f(array $users, bool $flag): void {
+            $base = fn(User $u): Child => $u->child();
+            if ($flag) {
+                $cb = $base;
+            } else {
+                $cb = 'other';
+            }
+            array_map($cb, $users);
+        }
+        "#;
+        assert_eq!(ty_of_last_call(src, "array_map"), "array");
+    }
+
+    #[test]
+    fn array_map_return_uses_literal_function_string() {
+        let src = r#"<?php
+        class Row {}
+        class Child {}
+        function make_child(Row $row): Child {}
+        /** @param list<Row> $rows */
+        function f(array $rows): void {
+            array_map('make_child', $rows);
+        }
+        "#;
+        assert_eq!(ty_of_last_call(src, "array_map"), "list<Child>");
+    }
+
+    #[test]
+    fn array_map_return_uses_literal_function_string_variable() {
+        let src = r#"<?php
+        class Row {}
+        class Child {}
+        function make_child(Row $row): Child {}
+        /** @param list<Row> $rows */
+        function f(array $rows): void {
+            $cb = 'make_child';
+            array_map($cb, $rows);
+        }
+        "#;
+        assert_eq!(ty_of_last_var(src, "cb"), "'make_child'");
+        assert_eq!(ty_of_last_call(src, "array_map"), "list<Child>");
+    }
+
+    #[test]
+    fn array_map_return_uses_invokable_object() {
+        let src = r#"<?php
+        class Row {}
+        class Child {}
+        class Factory { public function __invoke(Row $row): Child {} }
+        /** @param list<Row> $rows */
+        function f(Factory $factory, array $rows): void {
+            array_map($factory, $rows);
+        }
+        "#;
+        assert_eq!(ty_of_last_call(src, "array_map"), "list<Child>");
+    }
+
+    #[test]
+    fn preg_replace_callback_uses_aliased_arrow() {
+        let src = r#"<?php
+        function f(string $s): void {
+            $cb = fn($matches) => $matches[0];
+            preg_replace_callback('/x/', $cb, $s);
+        }
+        "#;
+        assert_eq!(
+            ty_of(src, |e| matches!(&e.kind, ExprKind::Index { .. })),
+            "string"
+        );
+    }
+
+    #[test]
+    fn named_function_callback_body_is_not_rerecorded() {
+        let src = r#"<?php
+        class User { public function label(): string {} }
+        function cb($u): void {
+            $u->label();
+        }
+        /** @param list<User> $users */
+        function f(array $users): void {
+            array_map('cb', $users);
+        }
+        "#;
+        assert_eq!(ty_of_last_method(src, "label"), "mixed");
+    }
+
+    #[test]
     fn array_key_value_and_column_returns_preserve_precision() {
         let src = r#"<?php
         class User {}

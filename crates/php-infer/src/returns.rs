@@ -29,6 +29,7 @@ pub(crate) fn refine_return(
         interner: caller.interner,
         class: callee_class,
         vars: HashMap::new(),
+        callables: HashMap::new(),
         depth: caller.depth + 1,
         native: caller.native,
     };

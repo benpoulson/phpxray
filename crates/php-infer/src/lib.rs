@@ -39,6 +39,34 @@ use php_resolve::{Resolution, Scope};
 use php_types::{CallableSig, Type};
 use std::collections::HashMap;
 
+type CallableAliases = HashMap<String, CallableAlias>;
+
+#[derive(Clone)]
+pub(crate) enum CallableAlias {
+    Closure {
+        id: (u32, u32),
+        expr: Box<ClosureExpr>,
+        vars: HashMap<String, Type>,
+        callables: CallableAliases,
+        class: Option<String>,
+    },
+    Arrow {
+        id: (u32, u32),
+        expr: Box<ArrowFn>,
+        vars: HashMap<String, Type>,
+        callables: CallableAliases,
+        class: Option<String>,
+    },
+}
+
+impl CallableAlias {
+    fn id(&self) -> (u32, u32) {
+        match self {
+            CallableAlias::Closure { id, .. } | CallableAlias::Arrow { id, .. } => *id,
+        }
+    }
+}
+
 /// The context an expression is typed in.
 pub struct TypeCtx<'a> {
     /// Project-wide reflection (classes/functions with resolved member types).
@@ -51,6 +79,9 @@ pub struct TypeCtx<'a> {
     pub class: Option<String>,
     /// Known local variable types, keyed by name (without `$`).
     pub vars: HashMap<String, Type>,
+    /// Flow-local callable aliases, keyed by variable name. This is private to
+    /// inference and keeps closure/arrow bodies available after `$cb = fn...`.
+    pub(crate) callables: CallableAliases,
     /// Interprocedural recursion depth for per-call return inference. 0 at the top
     /// level; a callee's body is analysed at depth+1. Bounded to one level so
     /// inference can't recurse without limit (mutual recursion, deep chains).
@@ -71,6 +102,7 @@ impl<'a> TypeCtx<'a> {
             interner,
             class: None,
             vars: HashMap::new(),
+            callables: HashMap::new(),
             depth: 0,
             native: false,
         }
@@ -514,7 +546,140 @@ impl<'a> TypeCtx<'a> {
                 };
                 Some(self.prefer_precise_callback_return(body, c.return_type.as_ref()))
             }
-            _ => None,
+            ExprKind::Variable(sym) => {
+                let name = self.interner.resolve(*sym);
+                if let Some(alias) = self.callables.get(name) {
+                    return Some(self.callable_alias_return_type(alias, inferred_params));
+                }
+                self.callable_expr_type(&callback.value)
+                    .and_then(|t| callback_signature_return(&t, inferred_params))
+            }
+            _ => self
+                .callable_expr_type(&callback.value)
+                .and_then(|t| callback_signature_return(&t, inferred_params)),
+        }
+    }
+
+    pub(crate) fn callable_expr_type(&self, e: &Expr) -> Option<Type> {
+        match &peel_paren(e).kind {
+            ExprKind::Closure(c) => Some(self.closure_callable_type(c)),
+            ExprKind::ArrowFn(a) => Some(self.arrow_callable_type(a)),
+            ExprKind::Variable(sym) => {
+                let name = self.interner.resolve(*sym);
+                self.vars.get(name).and_then(|t| match t {
+                    Type::Callable(_) => Some(t.clone()),
+                    Type::LiteralString(s) => self
+                        .function_reflection_from_text(s)
+                        .map(|f| self.function_callable_type(f)),
+                    _ => self.invokable_callable_type(t),
+                })
+            }
+            ExprKind::Str(bytes) => self
+                .literal_str(bytes)
+                .and_then(|name| self.function_reflection_from_text(&name))
+                .map(|f| self.function_callable_type(f)),
+            ExprKind::Array { items, .. } => self.callable_array_type(items),
+            ExprKind::Call { args, .. }
+            | ExprKind::MethodCall { args, .. }
+            | ExprKind::StaticCall { args, .. }
+                if is_first_class_callable(args) =>
+            {
+                match self.infer(e) {
+                    t @ Type::Callable(_) => Some(t),
+                    _ => None,
+                }
+            }
+            _ => self.invokable_callable_type(&self.infer(e)),
+        }
+    }
+
+    fn closure_callable_type(&self, c: &ClosureExpr) -> Type {
+        let params = c
+            .params
+            .iter()
+            .map(|p| self.ast_param_decl_type(p))
+            .collect();
+        let ret = if let Some(t) = &c.return_type {
+            self.bind_relative_to_current(php_reflect::resolve_ast_type(self.scope, t))
+        } else {
+            let mut child = self.closure_child(c, &[]);
+            let mut returns = Vec::new();
+            returns::collect_returns(&mut child, &c.body, &mut returns);
+            if returns.is_empty() {
+                Type::Null
+            } else {
+                Type::union(returns)
+            }
+        };
+        Type::Callable(Some(Box::new(CallableSig { params, ret })))
+    }
+
+    fn arrow_callable_type(&self, a: &ArrowFn) -> Type {
+        let params = a
+            .params
+            .iter()
+            .map(|p| self.ast_param_decl_type(p))
+            .collect();
+        let ret = if let Some(t) = &a.return_type {
+            self.bind_relative_to_current(php_reflect::resolve_ast_type(self.scope, t))
+        } else {
+            self.arrow_child(a, &[]).infer(&a.body)
+        };
+        Type::Callable(Some(Box::new(CallableSig { params, ret })))
+    }
+
+    fn ast_param_decl_type(&self, p: &Param) -> Type {
+        if self.native {
+            return if p.variadic {
+                Type::Array(None)
+            } else {
+                p.ty.as_ref()
+                    .map(|t| php_reflect::resolve_ast_type(self.scope, t))
+                    .unwrap_or(Type::Mixed)
+            };
+        }
+        match &p.ty {
+            Some(t) if p.variadic => {
+                Type::List(Box::new(php_reflect::resolve_ast_type(self.scope, t)))
+            }
+            Some(t) => php_reflect::resolve_ast_type(self.scope, t),
+            None if p.variadic => Type::List(Box::new(Type::Mixed)),
+            None => Type::Mixed,
+        }
+    }
+
+    fn callable_alias_return_type(&self, alias: &CallableAlias, inferred_params: &[Type]) -> Type {
+        match alias {
+            CallableAlias::Closure {
+                expr,
+                vars,
+                callables,
+                class,
+                ..
+            } => {
+                let mut child = self.child_with_env(class.clone(), vars.clone(), callables.clone());
+                child.seed_callback_params(&expr.params, inferred_params);
+                let mut returns = Vec::new();
+                returns::collect_returns(&mut child, &expr.body, &mut returns);
+                let body = if returns.is_empty() {
+                    Type::Null
+                } else {
+                    Type::union(returns)
+                };
+                self.prefer_precise_callback_return(body, expr.return_type.as_ref())
+            }
+            CallableAlias::Arrow {
+                expr,
+                vars,
+                callables,
+                class,
+                ..
+            } => {
+                let mut child = self.child_with_env(class.clone(), vars.clone(), callables.clone());
+                child.seed_callback_params(&expr.params, inferred_params);
+                let body = child.infer(&expr.body);
+                self.prefer_precise_callback_return(body, expr.return_type.as_ref())
+            }
         }
     }
 
@@ -535,7 +700,10 @@ impl<'a> TypeCtx<'a> {
         for u in &c.uses {
             let name = self.interner.resolve(u.name).to_string();
             let ty = self.vars.get(&name).cloned().unwrap_or(Type::Mixed);
-            child.vars.insert(name, ty);
+            child.vars.insert(name.clone(), ty);
+            if let Some(alias) = self.callables.get(&name) {
+                child.callables.insert(name, alias.clone());
+            }
         }
         child.seed_callback_params(&c.params, inferred_params);
         child
@@ -547,10 +715,26 @@ impl<'a> TypeCtx<'a> {
         child.depth = self.depth;
         child.native = self.native;
         child.vars = self.vars.clone();
+        child.callables = self.callables.clone();
         if a.is_static {
             strip_this_vars(&mut child.vars);
         }
         child.seed_callback_params(&a.params, inferred_params);
+        child
+    }
+
+    pub(crate) fn child_with_env(
+        &self,
+        class: Option<String>,
+        vars: HashMap<String, Type>,
+        callables: CallableAliases,
+    ) -> TypeCtx<'a> {
+        let mut child = TypeCtx::new(self.index, self.scope, self.interner);
+        child.class = class;
+        child.vars = vars;
+        child.callables = callables;
+        child.depth = self.depth;
+        child.native = self.native;
         child
     }
 
@@ -920,6 +1104,85 @@ impl<'a> TypeCtx<'a> {
         }
     }
 
+    fn function_reflection_from_text(
+        &self,
+        name: &str,
+    ) -> Option<&php_reflect::FunctionReflection> {
+        if name.contains('\\') || name.starts_with('\\') {
+            return self.index.function(name);
+        }
+        self.index
+            .function(&self.scope.qualify(name))
+            .or_else(|| self.index.function(name))
+    }
+
+    fn class_fqn_from_text(&self, name: &str) -> Option<String> {
+        if name.contains('\\') || name.starts_with('\\') {
+            return self.index.class(name).map(|c| c.fqn.clone());
+        }
+        self.index
+            .class(name)
+            .or_else(|| self.index.class(&self.scope.qualify(name)))
+            .map(|c| c.fqn.clone())
+    }
+
+    fn callable_array_type(&self, items: &[php_ast::ArrayItem]) -> Option<Type> {
+        let [target, method] = items else { return None };
+        if target.spread || method.spread || target.key.is_some() || method.key.is_some() {
+            return None;
+        }
+        let target = target.value.as_ref()?;
+        let method = method.value.as_ref()?;
+        let method_name = self.literal_str_expr(method)?;
+
+        if let Some(class) = self.class_fqn_from_callable_array_target(target) {
+            return self
+                .index
+                .find_method(&class, &method_name)
+                .map(|found| self.method_callable_type(&found.member, &class));
+        }
+
+        let recv_ty = self.infer(target);
+        let fqn = self.type_class_fqn(&recv_ty)?;
+        self.index
+            .find_method(&fqn, &method_name)
+            .map(|found| self.method_callable_type(&found.member, &fqn))
+    }
+
+    fn class_fqn_from_callable_array_target(&self, e: &Expr) -> Option<String> {
+        match &peel_paren(e).kind {
+            ExprKind::ClassConst { class, name } => {
+                let ident = self.member_ident(name)?;
+                if !ident.eq_ignore_ascii_case("class") {
+                    return None;
+                }
+                self.class_type(class).and_then(|t| self.type_class_fqn(&t))
+            }
+            ExprKind::Str(bytes) => self
+                .literal_str(bytes)
+                .and_then(|name| self.class_fqn_from_text(&name)),
+            _ => None,
+        }
+    }
+
+    fn invokable_callable_type(&self, ty: &Type) -> Option<Type> {
+        let fqn = self.type_class_fqn(ty)?;
+        self.index
+            .find_method(&fqn, "__invoke")
+            .map(|found| self.method_callable_type(&found.member, &fqn))
+    }
+
+    fn literal_str_expr(&self, e: &Expr) -> Option<String> {
+        match &peel_paren(e).kind {
+            ExprKind::Str(bytes) => self.literal_str(bytes),
+            _ => None,
+        }
+    }
+
+    fn literal_str(&self, bytes: &[u8]) -> Option<String> {
+        std::str::from_utf8(bytes).ok().map(str::to_string)
+    }
+
     fn function_callable_type(&self, f: &php_reflect::FunctionReflection) -> Type {
         let params = f
             .params
@@ -1012,6 +1275,18 @@ fn nullable_const_shape_key_arg(arg: &Arg) -> Option<Option<String>> {
     } else {
         const_shape_key_arg(arg).map(Some)
     }
+}
+
+fn callback_signature_return(callable: &Type, inferred_params: &[Type]) -> Option<Type> {
+    let Type::Callable(Some(sig)) = callable else {
+        return None;
+    };
+    let mut raw = HashMap::<String, Vec<Type>>::new();
+    for (param, inferred) in sig.params.iter().zip(inferred_params) {
+        bind_templates_from_types(param, inferred, &mut raw);
+    }
+    let subst = finalize_subst(raw);
+    Some(subst_templates(&sig.ret, &subst, true))
 }
 
 fn shape_present_type(rows: &Type, key: &str) -> Option<Type> {

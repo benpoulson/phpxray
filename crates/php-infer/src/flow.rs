@@ -14,7 +14,7 @@
 use crate::{
     arrays,
     refine::{strip_false, strip_falsy, strip_null_strict},
-    TypeCtx,
+    CallableAlias, TypeCtx,
 };
 use php_ast::{
     Arg, ArrowFn, BinOp, ClosureExpr, Expr, ExprKind, FunctionDecl, Param, Stmt, StmtKind, UnOp,
@@ -24,6 +24,11 @@ use std::collections::HashMap;
 
 /// A variable environment: name (without `$`) → type.
 type Env = HashMap<String, Type>;
+
+/// Flow-local callable aliases: variable name → direct closure/arrow target.
+type CallableEnv = HashMap<String, CallableAlias>;
+
+type FlowState = (Env, CallableEnv);
 
 /// The recording target for [`TypeCtx::record_block`]: a `span (start,end) → Type`
 /// map (the same shape as [`crate::TypeMap`]).
@@ -74,8 +79,14 @@ impl TypeCtx<'_> {
             ExprKind::Paren(inner) => self.apply_expr(inner),
             ExprKind::Assign { target, rhs } | ExprKind::AssignRef { target, rhs } => {
                 let t = self.apply_expr(rhs);
-                self.bind_target(target, &t);
-                t
+                let callable = self.callable_alias_from_expr(rhs);
+                let bound = if matches!(&peel_paren(rhs).kind, ExprKind::Str(_)) {
+                    t
+                } else {
+                    self.callable_expr_type(rhs).unwrap_or(t)
+                };
+                self.bind_target_with_callable(target, &bound, callable);
+                bound
             }
             ExprKind::AssignOp { op, target, rhs } => {
                 let t = self.binary_type(*op, target, rhs);
@@ -94,7 +105,8 @@ impl TypeCtx<'_> {
             ExprKind::Variable(sym) => {
                 let name = self.interner.resolve(*sym).to_string();
                 if name != "this" {
-                    self.vars.insert(name, ty.clone());
+                    self.vars.insert(name.clone(), ty.clone());
+                    self.callables.remove(&name);
                 }
             }
             ExprKind::Array { items, .. } => {
@@ -105,6 +117,83 @@ impl TypeCtx<'_> {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn bind_target_with_callable(
+        &mut self,
+        target: &Expr,
+        ty: &Type,
+        callable: Option<CallableAlias>,
+    ) {
+        match &target.kind {
+            ExprKind::Variable(sym) => {
+                let name = self.interner.resolve(*sym).to_string();
+                if name == "this" {
+                    return;
+                }
+                self.vars.insert(name.clone(), ty.clone());
+                match callable {
+                    Some(alias) => {
+                        self.callables.insert(name, alias);
+                    }
+                    None => {
+                        self.callables.remove(&name);
+                    }
+                }
+            }
+            ExprKind::Array { items, .. } => {
+                for it in items.iter() {
+                    if let Some(v) = &it.value {
+                        self.bind_target(v, &Type::Mixed);
+                    }
+                }
+            }
+            _ => self.bind_target(target, ty),
+        }
+    }
+
+    fn callable_alias_from_expr(&self, e: &Expr) -> Option<CallableAlias> {
+        match &peel_paren(e).kind {
+            ExprKind::Closure(c) => {
+                let mut vars = Env::new();
+                let mut callables = CallableEnv::new();
+                for u in &c.uses {
+                    let name = self.interner.resolve(u.name).to_string();
+                    vars.insert(
+                        name.clone(),
+                        self.vars.get(&name).cloned().unwrap_or(Type::Mixed),
+                    );
+                    if let Some(alias) = self.callables.get(&name) {
+                        callables.insert(name, alias.clone());
+                    }
+                }
+                Some(CallableAlias::Closure {
+                    id: span_key(e),
+                    expr: c.clone(),
+                    vars,
+                    callables,
+                    class: (!c.is_static).then(|| self.class.clone()).flatten(),
+                })
+            }
+            ExprKind::ArrowFn(a) => {
+                let mut vars = self.vars.clone();
+                if a.is_static {
+                    strip_this_vars(&mut vars);
+                }
+                Some(CallableAlias::Arrow {
+                    id: span_key(e),
+                    expr: a.clone(),
+                    vars,
+                    callables: self.callables.clone(),
+                    class: (!a.is_static).then(|| self.class.clone()).flatten(),
+                })
+            }
+            ExprKind::Variable(sym) => {
+                let name = self.interner.resolve(*sym);
+                self.callables.get(name).cloned()
+            }
+            _ => None,
         }
     }
 
@@ -478,14 +567,18 @@ impl TypeCtx<'_> {
 
     fn rec_closure(&self, c: &ClosureExpr, inferred_params: &[Type], map: &mut RecMap) {
         let mut vars = Env::new();
+        let mut callables = CallableEnv::new();
         for u in &c.uses {
             let name = self.interner.resolve(u.name).to_string();
             let ty = self.vars.get(&name).cloned().unwrap_or(Type::Mixed);
             vars.insert(name, ty);
+            if let Some(alias) = self.callables.get(self.interner.resolve(u.name)) {
+                callables.insert(self.interner.resolve(u.name).to_string(), alias.clone());
+            }
         }
         self.seed_ast_params(&mut vars, &c.params, inferred_params);
         let class = (!c.is_static).then(|| self.class.clone()).flatten();
-        self.record_child_block(class, vars, &c.body, map);
+        self.record_child_block(class, vars, callables, &c.body, map);
     }
 
     fn rec_arrow(&self, a: &ArrowFn, inferred_params: &[Type], map: &mut RecMap) {
@@ -495,7 +588,7 @@ impl TypeCtx<'_> {
         }
         self.seed_ast_params(&mut vars, &a.params, inferred_params);
         let class = (!a.is_static).then(|| self.class.clone()).flatten();
-        self.record_child_expr(class, vars, &a.body, map);
+        self.record_child_expr(class, vars, self.callables.clone(), &a.body, map);
     }
 
     fn seed_ast_params(&self, vars: &mut Env, params: &[Param], inferred: &[Type]) {
@@ -613,7 +706,40 @@ impl TypeCtx<'_> {
         match &peel_paren(&arg.value).kind {
             ExprKind::Closure(c) => self.rec_closure(c, &inferred, map),
             ExprKind::ArrowFn(a) => self.rec_arrow(a, &inferred, map),
+            ExprKind::Variable(sym) => {
+                let name = self.interner.resolve(*sym);
+                if let Some(alias) = self.callables.get(name) {
+                    self.rec_callable_alias(alias, &inferred, map);
+                }
+            }
             _ => {}
+        }
+    }
+
+    fn rec_callable_alias(&self, alias: &CallableAlias, inferred: &[Type], map: &mut RecMap) {
+        match alias {
+            CallableAlias::Closure {
+                expr,
+                vars,
+                callables,
+                class,
+                ..
+            } => {
+                let mut vars = vars.clone();
+                self.seed_ast_params(&mut vars, &expr.params, inferred);
+                self.record_child_block(class.clone(), vars, callables.clone(), &expr.body, map);
+            }
+            CallableAlias::Arrow {
+                expr,
+                vars,
+                callables,
+                class,
+                ..
+            } => {
+                let mut vars = vars.clone();
+                self.seed_ast_params(&mut vars, &expr.params, inferred);
+                self.record_child_expr(class.clone(), vars, callables.clone(), &expr.body, map);
+            }
         }
     }
 
@@ -629,21 +755,31 @@ impl TypeCtx<'_> {
         &self,
         class: Option<String>,
         vars: Env,
+        callables: CallableEnv,
         body: &[Stmt],
         map: &mut RecMap,
     ) {
         let mut child = TypeCtx::new(self.index, self.scope, self.interner);
         child.class = class;
         child.vars = vars;
+        child.callables = callables;
         child.depth = self.depth;
         child.native = self.native;
         child.record_block(body, map);
     }
 
-    fn record_child_expr(&self, class: Option<String>, vars: Env, e: &Expr, map: &mut RecMap) {
+    fn record_child_expr(
+        &self,
+        class: Option<String>,
+        vars: Env,
+        callables: CallableEnv,
+        e: &Expr,
+        map: &mut RecMap,
+    ) {
         let mut child = TypeCtx::new(self.index, self.scope, self.interner);
         child.class = class;
         child.vars = vars;
+        child.callables = callables;
         child.depth = self.depth;
         child.native = self.native;
         child.rec_here(e, map);
@@ -686,6 +822,7 @@ impl TypeCtx<'_> {
             let t = php_reflect::resolve_doc_type(self.scope, &[], &dt);
             let cur = self.vars.get(&name).cloned().unwrap_or(Type::Mixed);
             let narrowed = narrow_to(&cur, &t, self.index);
+            self.callables.remove(&name);
             self.vars.insert(name, narrowed);
         }
     }
@@ -807,17 +944,17 @@ impl TypeCtx<'_> {
             StmtKind::Switch { subject, cases } => {
                 self.rec_here(subject, map);
                 self.apply_expr(subject);
-                let base = self.vars.clone();
+                let base = self.flow_state();
                 let mut envs = vec![base.clone()];
                 for case in cases {
-                    self.vars = base.clone();
+                    self.set_flow_state(base.clone());
                     if let Some(t) = &case.test {
                         self.rec_here(t, map);
                     }
                     self.record_block(&case.body, map);
-                    envs.push(std::mem::take(&mut self.vars));
+                    envs.push(self.take_flow_state());
                 }
-                self.vars = merge(envs);
+                self.set_flow_state(merge_states(envs));
             }
             StmtKind::Try {
                 body,
@@ -861,23 +998,23 @@ impl TypeCtx<'_> {
         els: Option<&Stmt>,
         map: &mut RecMap,
     ) {
-        let base = self.vars.clone();
-        let mut envs: Vec<Env> = Vec::new();
+        let base = self.flow_state();
+        let mut envs: Vec<FlowState> = Vec::new();
 
         // Facts resolve against the branch-entry env (`base`); compute before the
         // then-branch mutates `self.vars`. (Mirrors `exec_if`.)
         let then_facts = self.narrow_facts(cond, true);
         let mut else_facts = self.narrow_facts(cond, false);
 
-        self.vars = base.clone();
+        self.set_flow_state(base.clone());
         self.apply_facts(&then_facts);
         self.record_stmt(then, map);
         if !always_terminates(then) {
-            envs.push(std::mem::take(&mut self.vars));
+            envs.push(self.take_flow_state());
         }
 
         for ei in elseifs {
-            self.vars = base.clone();
+            self.set_flow_state(base.clone());
             self.apply_facts(&else_facts);
             let pos = self.narrow_facts(&ei.cond, true);
             let neg = self.narrow_facts(&ei.cond, false);
@@ -886,36 +1023,40 @@ impl TypeCtx<'_> {
             self.apply_expr(&ei.cond);
             self.record_stmt(&ei.body, map);
             if !always_terminates(&ei.body) {
-                envs.push(std::mem::take(&mut self.vars));
+                envs.push(self.take_flow_state());
             }
             else_facts.extend(neg);
         }
 
         match els {
             Some(e) => {
-                self.vars = base.clone();
+                self.set_flow_state(base.clone());
                 self.apply_facts(&else_facts);
                 self.record_stmt(e, map);
                 if !always_terminates(e) {
-                    envs.push(std::mem::take(&mut self.vars));
+                    envs.push(self.take_flow_state());
                 }
             }
             None => {
-                let mut fall = base.clone();
+                let mut fall = base.0.clone();
                 apply_facts_to(&mut fall, &else_facts, self.index);
-                envs.push(fall);
+                envs.push((fall, base.1.clone()));
             }
         }
 
-        self.vars = if envs.is_empty() { base } else { merge(envs) };
+        if envs.is_empty() {
+            self.set_flow_state(base);
+        } else {
+            self.set_flow_state(merge_states(envs));
+        }
     }
 
     fn record_maybe(&mut self, body: &Stmt, map: &mut RecMap) {
         self.widen_loop_assignments(body);
-        let base = self.vars.clone();
+        let base = self.flow_state();
         self.record_stmt(body, map);
-        let after = std::mem::take(&mut self.vars);
-        self.vars = merge(vec![base, after]);
+        let after = self.take_flow_state();
+        self.set_flow_state(merge_states(vec![base, after]));
     }
 
     /// A loop that *definitely* runs at least once: record the body and keep its
@@ -950,9 +1091,10 @@ impl TypeCtx<'_> {
             if let Some(t) = self.vars.get(&name) {
                 let g = generalize_literal(t);
                 if &g != t {
-                    self.vars.insert(name, g);
+                    self.vars.insert(name.clone(), g);
                 }
             }
+            self.callables.remove(&name);
         }
     }
 
@@ -968,7 +1110,7 @@ impl TypeCtx<'_> {
         let subj_ty = self.apply_expr(subject);
         let (k, v) = crate::arrays::iter_key_value(&subj_ty);
         self.widen_loop_assignments(body);
-        let base = self.vars.clone();
+        let base = self.flow_state();
         if let Some(key) = key {
             self.bind_target(key, &k);
             self.rec_here(key, map);
@@ -976,8 +1118,24 @@ impl TypeCtx<'_> {
         self.bind_target(value, &v);
         self.rec_here(value, map);
         self.record_stmt(body, map);
-        let after = std::mem::take(&mut self.vars);
-        self.vars = merge(vec![base, after]);
+        let after = self.take_flow_state();
+        self.set_flow_state(merge_states(vec![base, after]));
+    }
+
+    fn flow_state(&self) -> FlowState {
+        (self.vars.clone(), self.callables.clone())
+    }
+
+    fn set_flow_state(&mut self, state: FlowState) {
+        self.vars = state.0;
+        self.callables = state.1;
+    }
+
+    fn take_flow_state(&mut self) -> FlowState {
+        (
+            std::mem::take(&mut self.vars),
+            std::mem::take(&mut self.callables),
+        )
     }
 }
 
@@ -1246,6 +1404,26 @@ fn merge(envs: Vec<Env>) -> Env {
         out.insert(k, Type::union(parts));
     }
     out
+}
+
+fn merge_states(states: Vec<FlowState>) -> FlowState {
+    if states.len() == 1 {
+        return states.into_iter().next().unwrap();
+    }
+    let vars = merge(states.iter().map(|(vars, _)| vars.clone()).collect());
+    let mut callables = CallableEnv::new();
+    let Some((_, first)) = states.first() else {
+        return (vars, callables);
+    };
+    for (name, alias) in first {
+        if states
+            .iter()
+            .all(|(_, env)| env.get(name).is_some_and(|other| other.id() == alias.id()))
+        {
+            callables.insert(name.clone(), alias.clone());
+        }
+    }
+    (vars, callables)
 }
 
 #[cfg(test)]

@@ -4276,6 +4276,22 @@ mod tests {
     }
 
     #[test]
+    fn undefined_property_inside_aliased_array_callback_is_flagged() {
+        let src = r#"<?php
+            class User {}
+            /** @param list<User> $users */
+            function f(array $users): void {
+                $cb = fn($u) => $u->missing;
+                array_map($cb, $users);
+            }
+        "#;
+        assert_eq!(
+            codes(src, run_access_properties_general),
+            ["property.notFound"]
+        );
+    }
+
+    #[test]
     fn undefined_property_on_userland_generic_result_is_flagged() {
         let src = r#"<?php
             class User {}
