@@ -6,10 +6,10 @@
 //! key/value variables, function parameters seed from their reflected types, and
 //! conditional branches merge by unioning each variable's type across paths.
 //!
-//! It is a single forward pass — loop bodies are analysed once (no fixpoint) and
-//! a variable assigned on only some paths widens to include its prior/`mixed`
-//! value. This is the approximation phpstan-style linters use; it is sound enough
-//! to drive diagnostics and never panics.
+//! It is a bounded forward pass: straight-line flow is single-pass, while loop
+//! bodies iterate a few times to stabilize loop-carried facts. A variable
+//! assigned on only some paths widens to include its prior/`mixed` value. This
+//! approximation is sound enough to drive diagnostics and never panics.
 
 use crate::{
     arrays, collection_method,
@@ -17,10 +17,11 @@ use crate::{
     CallableAlias, TypeCtx,
 };
 use php_ast::{
-    Arg, ArrowFn, BinOp, ClosureExpr, Expr, ExprKind, FunctionDecl, Param, Stmt, StmtKind, UnOp,
+    Arg, ArrowFn, BinOp, ClosureExpr, Expr, ExprKind, FunctionDecl, Name, Param, Stmt, StmtKind,
+    UnOp,
 };
 use php_types::Type;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// A variable environment: name (without `$`) → type.
 type Env = HashMap<String, Type>;
@@ -42,6 +43,8 @@ type RecMap = HashMap<(u32, u32), Type>;
 /// time against the place's current type, so a property's declared type (not
 /// `mixed`) is the baseline.
 type Fact = (String, Type);
+
+const LOOP_FIXPOINT_LIMIT: usize = 6;
 
 impl TypeCtx<'_> {
     /// Seed parameters from a function/method's reflected signature, then analyse
@@ -924,10 +927,11 @@ impl TypeCtx<'_> {
             StmtKind::While { cond, body } => {
                 self.rec_here(cond, map);
                 self.apply_expr(cond);
-                self.record_maybe(body, map);
+                let entry_facts = self.narrow_facts(cond, true);
+                self.record_maybe_loop(body, map, &entry_facts);
             }
             StmtKind::DoWhile { body, cond } => {
-                self.record_stmt(body, map);
+                self.record_definite_loop(body, map, &[]);
                 self.rec_here(cond, map);
                 self.apply_expr(cond);
             }
@@ -948,14 +952,18 @@ impl TypeCtx<'_> {
                 let definite = cond
                     .last()
                     .is_some_and(|c| crate::returns::static_truth(self, c) == Some(true));
+                let entry_facts = cond
+                    .last()
+                    .map(|c| self.narrow_facts(c, true))
+                    .unwrap_or_default();
                 for e in cond.iter().chain(update) {
                     self.rec_here(e, map);
                     self.apply_expr(e);
                 }
                 if definite {
-                    self.record_definite_loop(body, map);
+                    self.record_definite_loop(body, map, &entry_facts);
                 } else {
-                    self.record_maybe(body, map);
+                    self.record_maybe_loop(body, map, &entry_facts);
                 }
             }
             StmtKind::Foreach {
@@ -987,13 +995,7 @@ impl TypeCtx<'_> {
                 catches,
                 finally,
             } => {
-                self.record_block(body, map);
-                for c in catches {
-                    self.record_block(&c.body, map);
-                }
-                if let Some(f) = finally {
-                    self.record_block(f, map);
-                }
+                self.record_try(body, catches, finally.as_deref(), map);
             }
             // Other statements (global/unset/static/declare/const/return;/…) carry
             // no narrowing-sensitive branch bodies and bind no simple-variable types
@@ -1077,20 +1079,35 @@ impl TypeCtx<'_> {
         }
     }
 
-    fn record_maybe(&mut self, body: &Stmt, map: &mut RecMap) {
-        self.widen_loop_assignments(body);
-        let base = self.flow_state();
-        self.record_stmt(body, map);
-        let after = self.take_flow_state();
-        self.set_flow_state(merge_states(vec![base, after]));
+    fn record_maybe_loop(&mut self, body: &Stmt, map: &mut RecMap, entry_facts: &[Fact]) {
+        self.record_loop(body, map, entry_facts, true);
     }
 
-    /// A loop that *definitely* runs at least once: record the body and keep its
-    /// resulting environment (no merge with the pre-loop env), so an unconditional
-    /// body assignment is the variable's type after the loop.
-    fn record_definite_loop(&mut self, body: &Stmt, map: &mut RecMap) {
+    fn record_definite_loop(&mut self, body: &Stmt, map: &mut RecMap, entry_facts: &[Fact]) {
+        self.record_loop(body, map, entry_facts, false);
+    }
+
+    fn record_loop(&mut self, body: &Stmt, map: &mut RecMap, entry_facts: &[Fact], may_skip: bool) {
         self.widen_loop_assignments(body);
-        self.record_stmt(body, map);
+        let base = self.flow_state();
+        let mut current = base.clone();
+        for _ in 0..LOOP_FIXPOINT_LIMIT {
+            self.set_flow_state(current.clone());
+            self.apply_facts(entry_facts);
+            self.record_stmt(body, map);
+            let after = widen_loop_state(self.take_flow_state());
+            let next = if may_skip {
+                merge_states(vec![base.clone(), after])
+            } else {
+                after
+            };
+            if flow_state_same(&current, &next) {
+                self.set_flow_state(next);
+                return;
+            }
+            current = next;
+        }
+        self.set_flow_state(current);
     }
 
     /// Before recording a loop body, generalize the *literal* type of any simple
@@ -1101,7 +1118,7 @@ impl TypeCtx<'_> {
     /// so this single widening stands in for it (only literal scalars are touched).
     fn widen_loop_assignments(&mut self, body: &Stmt) {
         let interner = self.interner;
-        let mut assigned: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut assigned: HashSet<String> = HashSet::new();
         php_ast::walk::for_each_expr_in_scope(body, &mut |e: &Expr| {
             let target = match &e.kind {
                 ExprKind::Assign { target, .. }
@@ -1137,15 +1154,99 @@ impl TypeCtx<'_> {
         let (k, v) = crate::arrays::iter_key_value(&subj_ty);
         self.widen_loop_assignments(body);
         let base = self.flow_state();
-        if let Some(key) = key {
-            self.bind_target(key, &k);
-            self.rec_here(key, map);
+        let mut current = base.clone();
+        for _ in 0..LOOP_FIXPOINT_LIMIT {
+            self.set_flow_state(current.clone());
+            if let Some(key) = key {
+                self.bind_target(key, &k);
+                self.rec_here(key, map);
+            }
+            self.bind_target(value, &v);
+            self.rec_here(value, map);
+            self.record_stmt(body, map);
+            let after = widen_loop_state(self.take_flow_state());
+            let next = merge_states(vec![base.clone(), after]);
+            if flow_state_same(&current, &next) {
+                self.set_flow_state(next);
+                return;
+            }
+            current = next;
         }
-        self.bind_target(value, &v);
-        self.rec_here(value, map);
-        self.record_stmt(body, map);
-        let after = self.take_flow_state();
-        self.set_flow_state(merge_states(vec![base, after]));
+        self.set_flow_state(current);
+    }
+
+    fn record_try(
+        &mut self,
+        body: &[Stmt],
+        catches: &[php_ast::Catch],
+        finally: Option<&[Stmt]>,
+        map: &mut RecMap,
+    ) {
+        let base = self.flow_state();
+        let mut exits = Vec::new();
+
+        self.set_flow_state(base.clone());
+        self.record_block(body, map);
+        if !block_always_terminates(body) {
+            exits.push(self.take_flow_state());
+        }
+
+        for catch in catches {
+            self.set_flow_state(base.clone());
+            if let Some(var) = catch.var {
+                let name = self.interner.resolve(var).to_string();
+                let ty = self.catch_type(catch);
+                self.vars.insert(name.clone(), ty);
+                self.callables.remove(&name);
+            }
+            self.record_block(&catch.body, map);
+            if !block_always_terminates(&catch.body) {
+                exits.push(self.take_flow_state());
+            }
+        }
+
+        let merged = if exits.is_empty() {
+            base.clone()
+        } else {
+            merge_states(exits)
+        };
+
+        if let Some(finally) = finally {
+            self.set_flow_state(merged);
+            self.record_block(finally, map);
+            if block_always_terminates(finally) {
+                self.set_flow_state(base);
+            }
+        } else {
+            self.set_flow_state(merged);
+        }
+    }
+
+    fn catch_type(&self, catch: &php_ast::Catch) -> Type {
+        let types: Vec<Type> = catch
+            .types
+            .iter()
+            .filter_map(|n| self.name_class_type(n))
+            .collect();
+        if types.len() == catch.types.len() && !types.is_empty() {
+            Type::union(types)
+        } else {
+            Type::Mixed
+        }
+    }
+
+    fn name_class_type(&self, n: &Name) -> Option<Type> {
+        match self.scope.resolve_class(n) {
+            php_resolve::Resolution::Fqn(fqn) => Some(Type::Named { fqn, args: vec![] }),
+            php_resolve::Resolution::LateStatic(s) => match s.as_str() {
+                "self" => self.self_type(),
+                "static" => Some(Type::StaticType),
+                _ => self.parent_type(),
+            },
+            php_resolve::Resolution::BuiltinType(_) | php_resolve::Resolution::Fallback { .. } => {
+                None
+            }
+        }
     }
 
     fn flow_state(&self) -> FlowState {
@@ -1379,6 +1480,64 @@ fn generalize_literal(t: &Type) -> Type {
     }
 }
 
+fn widen_loop_state(state: FlowState) -> FlowState {
+    let (mut vars, callables) = state;
+    for ty in vars.values_mut() {
+        *ty = widen_loop_type(ty);
+    }
+    (vars, callables)
+}
+
+fn widen_loop_type(t: &Type) -> Type {
+    match t {
+        Type::Union(parts) if parts.len() > 8 => {
+            let widened = Type::union(parts.iter().map(generalize_literal).collect());
+            match &widened {
+                Type::Union(parts) if parts.len() > 8 => Type::Mixed,
+                _ => widened,
+            }
+        }
+        Type::Nullable(inner) => Type::nullable(widen_loop_type(inner)),
+        Type::Array(Some(kv)) => Type::Array(Some(Box::new((
+            widen_loop_type(&kv.0),
+            widen_loop_type(&kv.1),
+        )))),
+        Type::Iterable(Some(kv)) => Type::Iterable(Some(Box::new((
+            widen_loop_type(&kv.0),
+            widen_loop_type(&kv.1),
+        )))),
+        Type::List(inner) => Type::List(Box::new(widen_loop_type(inner))),
+        Type::Named { fqn, args } => Type::Named {
+            fqn: fqn.clone(),
+            args: args.iter().map(widen_loop_type).collect(),
+        },
+        Type::Shape { fields, sealed } => Type::Shape {
+            fields: fields
+                .iter()
+                .map(|f| php_types::ShapeField {
+                    key: f.key.clone(),
+                    optional: f.optional,
+                    ty: widen_loop_type(&f.ty),
+                })
+                .collect(),
+            sealed: *sealed,
+        },
+        _ => t.clone(),
+    }
+}
+
+fn flow_state_same(a: &FlowState, b: &FlowState) -> bool {
+    a.0 == b.0 && callable_env_same(&a.1, &b.1)
+}
+
+fn callable_env_same(a: &CallableEnv, b: &CallableEnv) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .all(|(name, alias)| b.get(name).is_some_and(|other| other.id() == alias.id()))
+}
+
 /// The last `\`-separated segment of a (possibly-qualified) name.
 fn last_segment(name: &str) -> &str {
     name.rsplit('\\').next().unwrap_or(name)
@@ -1405,6 +1564,10 @@ fn always_terminates(s: &Stmt) -> bool {
         }
         _ => false,
     }
+}
+
+fn block_always_terminates(stmts: &[Stmt]) -> bool {
+    stmts.last().is_some_and(always_terminates)
 }
 
 /// Merge several branch environments: a variable's merged type is the union of
@@ -1597,10 +1760,28 @@ mod tests {
     }
 
     #[test]
+    fn while_loop_literal_flag_widens_to_bool() {
+        let src = "function f(bool $c) { $x = false; while ($c) { $x = true; } $y = $x; }";
+        assert_eq!(var_after(src, "y"), "bool");
+    }
+
+    #[test]
+    fn do_while_body_assignment_is_definite() {
+        let src = "function f(bool $c) { do { $x = 'ran'; } while ($c); $y = $x; }";
+        assert_eq!(var_after(src, "y"), "'ran'");
+    }
+
+    #[test]
     fn negative_is_string_subtracts_from_union() {
         // The else-branch of `is_string($x)` removes the `string` arm of a union.
         let src = "function f(string|int $x) { if (is_string($x)) { return; } $y = $x; }";
         assert_eq!(var_after(src, "y"), "int");
+    }
+
+    #[test]
+    fn negative_is_string_on_mixed_stays_mixed() {
+        let src = "function f($x) { if (is_string($x)) { return; } $y = $x; }";
+        assert_eq!(var_after(src, "y"), "mixed");
     }
 
     #[test]
@@ -1667,6 +1848,30 @@ mod tests {
         // Sanity: without narrowing the nullable survives.
         let src = "function f(?int $x) { $y = $x; }";
         assert_eq!(var_after(src, "y"), "?int");
+    }
+
+    #[test]
+    fn try_catch_merges_try_and_catch_exits() {
+        let src = "class E extends Exception {} function f() { try { $x = 1; } catch (E $e) { $x = 's'; } $y = $x; }";
+        assert_eq!(var_after(src, "y"), "1|'s'");
+    }
+
+    #[test]
+    fn catch_variable_is_seeded_from_caught_type() {
+        let src = "class E extends Exception {} function f() { try { throw new E(); } catch (E $e) { $x = $e; } }";
+        assert_eq!(var_after(src, "x"), "E");
+    }
+
+    #[test]
+    fn finally_assignment_applies_to_surviving_exits() {
+        let src = "class E extends Exception {} function f() { try { $x = 1; } catch (E $e) { $x = 's'; } finally { $x = true; } $y = $x; }";
+        assert_eq!(var_after(src, "y"), "true");
+    }
+
+    #[test]
+    fn terminating_finally_does_not_leak_try_assignments() {
+        let src = "function f() { try { $x = 1; } finally { return; } $y = $x; }";
+        assert_eq!(var_after(src, "y"), "mixed");
     }
 
     #[test]

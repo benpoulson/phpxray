@@ -2810,6 +2810,9 @@ fn run_nullable_property_access(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// Interface arms are skipped to avoid false positives on properties declared by
 /// runtime implementors rather than by the interface type itself.
 fn run_union_property_access(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    if !fa.report_maybes {
+        return Vec::new();
+    }
     let suppressed = undefined_allowed_property_spans(fa.program);
     let assign_targets = assignment_target_spans(fa.program);
     let mut out = Vec::new();
@@ -2874,6 +2877,9 @@ fn run_access_properties_in_assign(fa: &FileAnalysis) -> Vec<Diagnostic> {
 }
 
 fn run_union_property_access_in_assign(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    if !fa.report_maybes {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     walk::for_each_expr(fa.program, &mut |e: &Expr| {
         let (ExprKind::Assign { target, .. } | ExprKind::AssignRef { target, .. }) = &e.kind else {

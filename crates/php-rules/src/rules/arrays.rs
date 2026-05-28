@@ -936,6 +936,9 @@ fn run_nonexistent_offset_in_array_dim_fetch(fa: &FileAnalysis) -> Vec<Diagnosti
 }
 
 fn run_maybe_nonexistent_offset_in_array_dim_fetch(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    if !fa.report_maybes {
+        return Vec::new();
+    }
     let write_spans = write_index_spans(fa);
     let undefined_allowed = undefined_allowed_index_spans(fa);
     let mut out = Vec::new();
@@ -1013,6 +1016,9 @@ fn run_nullable_offset_access(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// Level-7 `checkUnionTypes` / partial union offset access: report when an
 /// offset read is valid for some union arms but definitely invalid for others.
 fn run_union_offset_access(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    if !fa.report_maybes {
+        return Vec::new();
+    }
     let write_spans = write_index_spans(fa);
     let undefined_allowed = undefined_allowed_index_spans(fa);
     let mut out = Vec::new();

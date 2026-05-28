@@ -40,7 +40,10 @@ pub(crate) fn run_version(
         native_types: &native_types,
         php_version,
         treat_phpdoc_types_as_certain: true,
+        report_maybes: true,
         check_nullables: true,
+        check_explicit_mixed: true,
+        check_implicit_mixed: true,
     };
     rule(&fa)
 }

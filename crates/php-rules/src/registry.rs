@@ -42,11 +42,18 @@ pub struct FileAnalysis<'a> {
     /// always-true / impossible-type narrowing rules don't fire on redundancies
     /// only provable via PHPDoc-derived types.
     pub treat_phpdoc_types_as_certain: bool,
+    /// phpstan's `checkUnionTypes` / `reportMaybes` strictness gate (level 7+).
+    /// When `false`, partial union/nullable compatibility stays lenient.
+    pub report_maybes: bool,
     /// phpstan's `checkNullables` strictness gate (level 8+). When `false` (levels
     /// 0–7), the type-compatibility rules strip `null` from the *value* type before
     /// checking it — so passing a nullable value where a non-null type is expected
     /// is not reported until level 8 (matching phpstan exactly).
     pub check_nullables: bool,
+    /// phpstan's explicit `mixed` strictness gate (level 9+).
+    pub check_explicit_mixed: bool,
+    /// phpstan's implicit `mixed` strictness gate (`max`).
+    pub check_implicit_mixed: bool,
 }
 
 impl FileAnalysis<'_> {
@@ -75,16 +82,24 @@ impl FileAnalysis<'_> {
     /// the flag is off, a merged mismatch is suppressed if the **native** types are
     /// compatible — i.e. the discrepancy was only at the PHPDoc-refined level.
     pub fn accepts(&self, e: &Expr, target: &Type, native_target: &Type) -> bool {
-        if php_infer::is_assignable(self.reflection, &self.lenient_src(self.type_of(e)), target) {
+        if !crate::function_like::type_mismatch_reportable(
+            self.reflection,
+            &self.type_of(e),
+            target,
+            self.check_nullables,
+            self.report_maybes,
+        ) {
             return true;
         }
         if self.treat_phpdoc_types_as_certain {
             return false;
         }
-        php_infer::is_assignable(
+        !crate::function_like::type_mismatch_reportable(
             self.reflection,
-            &self.lenient_src(self.native_type_of(e)),
+            &self.native_type_of(e),
             native_target,
+            self.check_nullables,
+            self.report_maybes,
         )
     }
 
@@ -254,7 +269,10 @@ mod tests {
             native_types: &native_types,
             php_version: PhpVersion::default(),
             treat_phpdoc_types_as_certain: true,
+            report_maybes: true,
             check_nullables: true,
+            check_explicit_mixed: true,
+            check_implicit_mixed: true,
         };
 
         // Level 0: only the unknown-symbol rule fires.

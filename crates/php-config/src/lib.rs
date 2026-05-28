@@ -27,6 +27,9 @@ pub struct Config {
     pub scan_files: Vec<String>,
     /// Glob patterns to exclude from analysis (`fnmatch`-style; `*`, `**`, `?`).
     pub exclude: Vec<String>,
+    /// PHPStan-style exclusion split. `analyse` demotes matching files to
+    /// scan-only; `analyseAndScan` drops matching files entirely.
+    pub exclude_paths: ExcludePaths,
     /// File extensions to analyze (without the dot). Defaults to `["php"]`.
     pub extensions: Vec<String>,
     /// Target PHP version (e.g. `"8.4"`), if pinned.
@@ -53,6 +56,7 @@ impl Default for Config {
             scan_paths: Vec::new(),
             scan_files: Vec::new(),
             exclude: Vec::new(),
+            exclude_paths: ExcludePaths::default(),
             extensions: vec!["php".to_string()],
             php_version: None,
             baseline: None,
@@ -92,6 +96,16 @@ impl Config {
     }
 }
 
+/// PHPStan-style path exclusions.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ExcludePaths {
+    /// Exclude from rule analysis, but still scan/index/reflect.
+    pub analyse: Vec<String>,
+    /// Exclude from both rule analysis and scan/index/reflect.
+    pub analyse_and_scan: Vec<String>,
+}
+
 /// A strictness level: 0–9, or `max` (internally 10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Level(pub u8);
@@ -109,12 +123,13 @@ impl Level {
     /// strictness turns into rule-engine options.
     pub fn rule_options(self) -> RuleOptions {
         RuleOptions {
+            // phpstan's `checkUnionTypes` / `reportMaybes` turns on at level 7.
+            report_maybes: self.0 >= 7,
             // phpstan's `checkNullables` turns on at level 8.
             check_nullables: self.0 >= 8,
-            // Reserved now so strict-mixed rollout can be level-driven without
-            // adding another local `level >= ...` convention.
-            check_explicit_mixed: false,
-            check_implicit_mixed: false,
+            // Strict mixed checks turn on after nullable checks.
+            check_explicit_mixed: self.0 >= 9,
+            check_implicit_mixed: self.0 >= Self::MAX.0,
         }
     }
 }
@@ -122,6 +137,7 @@ impl Level {
 /// Rule-engine switches derived from [`Level`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuleOptions {
+    pub report_maybes: bool,
     pub check_nullables: bool,
     pub check_explicit_mixed: bool,
     pub check_implicit_mixed: bool,
@@ -260,6 +276,14 @@ impl ExcludeMatcher {
                 if let Ok(re) = Regex::new(&glob_to_regex(&format!("{dir}/**"))) {
                     regexes.push(re);
                 }
+                if !dir.contains('/') {
+                    if let Ok(re) = Regex::new(&glob_to_regex(&format!("**/{dir}"))) {
+                        regexes.push(re);
+                    }
+                    if let Ok(re) = Regex::new(&glob_to_regex(&format!("**/{dir}/**"))) {
+                        regexes.push(re);
+                    }
+                }
             }
         }
         ExcludeMatcher { regexes }
@@ -342,6 +366,12 @@ scanFiles:
 exclude:
   - tests/fixtures
   - "**/generated/*"
+excludePaths:
+  analyse:
+    - vendor
+  analyseAndScan:
+    - storage
+    - bootstrap/cache
 phpVersion: "8.4"
 ignore:
   - "/Cannot call method .* on null/"
@@ -354,6 +384,11 @@ ignore:
         assert_eq!(cfg.scan_paths, ["vendor"]);
         assert_eq!(cfg.scan_files, ["generated/stubs.php"]);
         assert_eq!(cfg.exclude, ["tests/fixtures", "**/generated/*"]);
+        assert_eq!(cfg.exclude_paths.analyse, ["vendor"]);
+        assert_eq!(
+            cfg.exclude_paths.analyse_and_scan,
+            ["storage", "bootstrap/cache"]
+        );
         assert_eq!(cfg.extensions, ["php"]); // default
         assert_eq!(cfg.php_version.as_deref(), Some("8.4"));
         assert!(cfg.report_unmatched_ignored); // default true
@@ -383,8 +418,14 @@ ignore:
         assert!("10".parse::<Level>().is_err());
         assert_eq!(Level(8).to_string(), "8");
         assert_eq!(Level::MAX.to_string(), "max");
+        assert!(!Level(6).rule_options().report_maybes);
+        assert!(Level(7).rule_options().report_maybes);
         assert!(!Level(7).rule_options().check_nullables);
         assert!(Level(8).rule_options().check_nullables);
+        assert!(!Level(8).rule_options().check_explicit_mixed);
+        assert!(Level(9).rule_options().check_explicit_mixed);
+        assert!(!Level(9).rule_options().check_implicit_mixed);
+        assert!(Level::MAX.rule_options().check_implicit_mixed);
     }
 
     #[test]
@@ -396,6 +437,8 @@ ignore:
         assert!(cfg.paths.is_empty());
         assert!(cfg.scan_paths.is_empty());
         assert!(cfg.scan_files.is_empty());
+        assert!(cfg.exclude_paths.analyse.is_empty());
+        assert!(cfg.exclude_paths.analyse_and_scan.is_empty());
     }
 
     #[test]
@@ -414,11 +457,19 @@ ignore:
 
     #[test]
     fn exclude_matching() {
-        let m = ExcludeMatcher::new(&["tests/fixtures".into(), "**/generated/*".into()]);
+        let m = ExcludeMatcher::new(&[
+            "tests/fixtures".into(),
+            "**/generated/*".into(),
+            "vendor".into(),
+        ]);
         // Bare directory excludes its files but not siblings.
         assert!(m.is_excluded("tests/fixtures/foo.php"));
         assert!(m.is_excluded("tests/fixtures"));
         assert!(!m.is_excluded("tests/foo.php"));
+        // A single bare directory name also excludes that directory at any depth.
+        assert!(m.is_excluded("vendor/composer/ClassLoader.php"));
+        assert!(m.is_excluded("packages/tool/vendor/composer/ClassLoader.php"));
+        assert!(!m.is_excluded("packages/tool/not-vendor/ClassLoader.php"));
         // `**/generated/*` matches with or without leading dirs, but not deeper.
         assert!(m.is_excluded("a/b/generated/x.php"));
         assert!(m.is_excluded("generated/x.php"));

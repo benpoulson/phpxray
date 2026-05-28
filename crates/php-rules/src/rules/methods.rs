@@ -1381,6 +1381,9 @@ fn run_nullable_method_access(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// type, and at least one arm has the method while at least one definitely does
 /// not.
 fn run_union_method_access(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    if !fa.report_maybes {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
         let ExprKind::MethodCall {

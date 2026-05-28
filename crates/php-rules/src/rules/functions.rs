@@ -80,6 +80,7 @@ fn run_return_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
         fa.native_types,
         fa.treat_phpdoc_types_as_certain,
         fa.check_nullables,
+        fa.report_maybes,
     )
 }
 
@@ -1777,8 +1778,13 @@ fn check_anonymous_return_expr(
         return;
     }
 
-    if function_like::return_value_assignable(fa.reflection, &actual, declared, fa.check_nullables)
-    {
+    if !function_like::type_mismatch_reportable(
+        fa.reflection,
+        &actual,
+        declared,
+        fa.check_nullables,
+        fa.report_maybes,
+    ) {
         return;
     }
     out.push(

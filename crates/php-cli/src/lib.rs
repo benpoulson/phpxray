@@ -7,7 +7,7 @@
 //! so it runs in parallel across the global Rayon worker pool.
 
 use indicatif::{ProgressBar, ProgressStyle};
-use php_config::{Config, ExcludeMatcher, Level};
+use php_config::{Config, ExcludeMatcher, Level, RuleOptions};
 use php_diagnostics::Severity;
 use php_index::{ProjectIndex, SourceKind as ProjectSourceKind};
 use php_reflect::{ReflectionIndex, SourceKind as ReflectSourceKind};
@@ -153,13 +153,14 @@ pub fn run_with_options(config: &Config, root: &Path, options: RunOptions) -> Re
         .as_deref()
         .and_then(php_rules::PhpVersion::parse)
         .unwrap_or_default();
+    let rule_options = config.level.rule_options();
     let report = analyze_parsed_progress(
         &parsed,
         &interner,
         config.level.value(),
         php_version,
         config.treat_phpdoc_types_as_certain,
-        config.level.rule_options().check_nullables,
+        rule_options,
         &progress,
     );
     let sources: HashMap<&str, &str> = parsed
@@ -189,7 +190,7 @@ pub fn analyze_parsed(
         level,
         php_version,
         treat_phpdoc_types_as_certain,
-        Level(level).rule_options().check_nullables,
+        Level(level).rule_options(),
         &Progress::hidden(),
     )
 }
@@ -200,7 +201,7 @@ fn analyze_parsed_progress(
     level: u8,
     php_version: php_rules::PhpVersion,
     treat_phpdoc_types_as_certain: bool,
-    check_nullables: bool,
+    rule_options: RuleOptions,
     progress: &Progress,
 ) -> Report {
     // Build the shared immutable indexes once, over the one shared interner.
@@ -235,7 +236,7 @@ fn analyze_parsed_progress(
         level,
         php_version,
         treat_phpdoc_types_as_certain,
-        check_nullables,
+        rule_options,
         project: &project,
         reflection: &reflection,
     };
@@ -266,7 +267,7 @@ struct AnalysisContext<'a> {
     level: u8,
     php_version: php_rules::PhpVersion,
     treat_phpdoc_types_as_certain: bool,
-    check_nullables: bool,
+    rule_options: RuleOptions,
     project: &'a ProjectIndex,
     reflection: &'a ReflectionIndex,
 }
@@ -301,7 +302,10 @@ fn analyze_one_file(f: &ParsedFile, ctx: &AnalysisContext<'_>) -> Vec<Finding> {
         native_types: &native_types,
         php_version: ctx.php_version,
         treat_phpdoc_types_as_certain: ctx.treat_phpdoc_types_as_certain,
-        check_nullables: ctx.check_nullables,
+        report_maybes: ctx.rule_options.report_maybes,
+        check_nullables: ctx.rule_options.check_nullables,
+        check_explicit_mixed: ctx.rule_options.check_explicit_mixed,
+        check_implicit_mixed: ctx.rule_options.check_implicit_mixed,
     };
     for d in analyze_file(&fa, ctx.level) {
         let lc = line_index.line_col(d.primary.range().start as u32);
@@ -327,15 +331,19 @@ struct DiscoveredFile {
 /// remains analyzed.
 fn discover_inputs(config: &Config, root: &Path) -> Vec<DiscoveredFile> {
     let mut files: BTreeMap<String, DiscoveredFile> = BTreeMap::new();
-    for path in discover_paths(&config.paths, config, root) {
-        insert_discovered(&mut files, root, path, true);
+    let hard_exclude = hard_exclude_matcher(config);
+    let analyze_exclude = ExcludeMatcher::new(&config.exclude_paths.analyse);
+
+    for path in discover_paths(&config.paths, config, root, &hard_exclude) {
+        let analyze = !analyze_exclude.is_excluded(&rel_path(&path, root));
+        insert_discovered(&mut files, root, path, analyze);
     }
-    for path in discover_paths(&config.scan_paths, config, root) {
+    for path in discover_paths(&config.scan_paths, config, root, &hard_exclude) {
         insert_discovered(&mut files, root, path, false);
     }
     for entry_path in &config.scan_files {
         let path = root.join(entry_path);
-        if path.is_file() {
+        if path.is_file() && !hard_exclude.is_excluded(&rel_path(&path, root)) {
             insert_discovered(&mut files, root, path, false);
         }
     }
@@ -357,8 +365,12 @@ fn insert_discovered(
 
 /// Collect every file under a configured path whose extension is configured and
 /// whose root-relative path is not excluded.
-fn discover_paths(paths: &[String], config: &Config, root: &Path) -> Vec<PathBuf> {
-    let exclude = ExcludeMatcher::new(&config.exclude);
+fn discover_paths(
+    paths: &[String],
+    config: &Config,
+    root: &Path,
+    hard_exclude: &ExcludeMatcher,
+) -> Vec<PathBuf> {
     let wanted_ext = |p: &Path| {
         p.extension()
             .and_then(|e| e.to_str())
@@ -368,12 +380,16 @@ fn discover_paths(paths: &[String], config: &Config, root: &Path) -> Vec<PathBuf
     let mut out = Vec::new();
     for entry_path in paths {
         let base = root.join(entry_path);
-        for found in WalkDir::new(&base).into_iter().filter_map(Result::ok) {
+        for found in WalkDir::new(&base)
+            .into_iter()
+            .filter_entry(|entry| !hard_exclude.is_excluded(&rel_path(entry.path(), root)))
+            .filter_map(Result::ok)
+        {
             let p = found.path();
             if !p.is_file() || !wanted_ext(p) {
                 continue;
             }
-            if exclude.is_excluded(&rel_path(p, root)) {
+            if hard_exclude.is_excluded(&rel_path(p, root)) {
                 continue;
             }
             out.push(p.to_path_buf());
@@ -382,6 +398,12 @@ fn discover_paths(paths: &[String], config: &Config, root: &Path) -> Vec<PathBuf
     out.sort();
     out.dedup();
     out
+}
+
+fn hard_exclude_matcher(config: &Config) -> ExcludeMatcher {
+    let mut patterns = config.exclude.clone();
+    patterns.extend(config.exclude_paths.analyse_and_scan.iter().cloned());
+    ExcludeMatcher::new(&patterns)
 }
 
 /// `path` relative to `root` (forward slashes); falls back to the full path.
@@ -465,6 +487,8 @@ impl ProgressStep {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     /// Analyze `(path, src)` files at `level` over one shared interner.
     fn analyze(files: &[(&str, &str)], level: u8) -> Report {
@@ -491,6 +515,22 @@ mod tests {
             level,
             php_rules::PhpVersion::default(),
             true,
+        )
+    }
+
+    fn analyze_with_phpdoc_certainty(
+        files: &[(&str, &str)],
+        level: u8,
+        treat_phpdoc_types_as_certain: bool,
+    ) -> Report {
+        let (parsed, interner) =
+            parse_files(files.iter().map(|(p, s)| (p.to_string(), s.to_string())));
+        analyze_parsed(
+            &parsed,
+            &interner,
+            level,
+            php_rules::PhpVersion::default(),
+            treat_phpdoc_types_as_certain,
         )
     }
 
@@ -536,6 +576,73 @@ mod tests {
             .findings
             .iter()
             .any(|f| f.identifier == Some("return.type")));
+    }
+
+    #[test]
+    fn level_7_reports_maybe_argument_and_return_types() {
+        let files = [(
+            "a.php",
+            "<?php\nfunction takesString(string $s): void {}\nfunction f(string|int $x): string { takesString($x); return $x; }\n",
+        )];
+        let l6: Vec<_> = analyze(&files, 6)
+            .findings
+            .into_iter()
+            .filter_map(|f| f.identifier)
+            .collect();
+        assert!(!l6.contains(&"argument.type"), "{l6:?}");
+        assert!(!l6.contains(&"return.type"), "{l6:?}");
+
+        let l7: Vec<_> = analyze(&files, 7)
+            .findings
+            .into_iter()
+            .filter_map(|f| f.identifier)
+            .collect();
+        assert!(l7.contains(&"argument.type"), "{l7:?}");
+        assert!(l7.contains(&"return.type"), "{l7:?}");
+    }
+
+    #[test]
+    fn mixed_strictness_waits_for_level_9_and_max() {
+        let files = [(
+            "a.php",
+            "<?php\nfunction takesInt(int $i): void {}\nfunction explicit(mixed $x): void { takesInt($x); }\nfunction implicit($x): void { takesInt($x); }\n",
+        )];
+        let l8 = analyze(&files, 8)
+            .findings
+            .into_iter()
+            .filter(|f| f.identifier == Some("argument.type"))
+            .count();
+        assert_eq!(l8, 0);
+
+        let l9 = analyze(&files, 9)
+            .findings
+            .into_iter()
+            .filter(|f| f.identifier == Some("argument.type"))
+            .count();
+        assert_eq!(l9, 1);
+
+        let max = analyze(&files, 10)
+            .findings
+            .into_iter()
+            .filter(|f| f.identifier == Some("argument.type"))
+            .count();
+        assert_eq!(max, 2);
+    }
+
+    #[test]
+    fn phpdoc_uncertain_suppresses_phpdoc_only_maybe_return() {
+        let files = [(
+            "a.php",
+            "<?php\n/** @param string|int $x */\nfunction f($x): string { return $x; }\n",
+        )];
+        assert!(analyze_with_phpdoc_certainty(&files, 7, true)
+            .findings
+            .iter()
+            .any(|f| f.identifier == Some("return.type")));
+        assert!(analyze_with_phpdoc_certainty(&files, 7, false)
+            .findings
+            .iter()
+            .all(|f| f.identifier != Some("return.type")));
     }
 
     #[test]
@@ -615,5 +722,79 @@ mod tests {
             "{:?}",
             report.findings
         );
+    }
+
+    #[test]
+    fn exclude_paths_analyse_demotes_files_to_scan_only() {
+        let root = temp_dir("exclude-paths-analyse");
+        write_file(&root, "app/use.php", "<?php new Vendor\\Thing();");
+        write_file(
+            &root,
+            "vendor/Thing.php",
+            "<?php namespace Vendor; class Thing {}",
+        );
+        write_file(&root, "vendor/bad.php", "<?php function broken( {}");
+        write_file(&root, "storage/nope.php", "<?php function broken( {}");
+
+        let config = Config::from_yaml(
+            r#"
+level: 9
+paths:
+  - .
+excludePaths:
+  analyse:
+    - vendor
+  analyseAndScan:
+    - storage
+"#,
+        )
+        .unwrap();
+
+        let report = run(&config, &root);
+
+        assert_eq!(report.files_analyzed, 1);
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|f| !f.path.starts_with("vendor/")),
+            "{:?}",
+            report.findings
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|f| !f.path.starts_with("storage/")),
+            "{:?}",
+            report.findings
+        );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.identifier == Some("class.notFound")),
+            "{:?}",
+            report.findings
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn write_file(root: &Path, path: &str, source: &str) {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, source).unwrap();
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("php-analyzer-{label}-{}-{now}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

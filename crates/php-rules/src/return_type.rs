@@ -14,7 +14,7 @@
 use crate::{decls, function_like};
 use php_ast::{ClassDecl, Expr, FunctionDecl, Member, Program, Stmt};
 use php_diagnostics::Diagnostic;
-use php_infer::{is_assignable, TypeMap};
+use php_infer::TypeMap;
 use php_intern::Interner;
 use php_reflect::{reflect_class, reflect_function, ReflectionIndex};
 use php_resolve::Scope;
@@ -41,6 +41,7 @@ struct Ret {
 /// returned expression carries its *narrowed* type — `return $x;` after
 /// `if ($x instanceof Foo) {…}` is checked as `Foo`, etc. We only walk the AST to
 /// pair each `return` with its enclosing function/method's declared return type.
+#[allow(clippy::too_many_arguments)]
 pub fn return_type_errors(
     index: &ReflectionIndex,
     program: &Program,
@@ -49,6 +50,7 @@ pub fn return_type_errors(
     native_types: &TypeMap,
     treat_phpdoc_certain: bool,
     check_nullables: bool,
+    report_maybes: bool,
 ) -> Vec<Diagnostic> {
     let cx = Cx {
         index,
@@ -57,6 +59,7 @@ pub fn return_type_errors(
         native_types,
         treat_phpdoc_certain,
         check_nullables,
+        report_maybes,
     };
     let mut out = Vec::new();
     decls::for_each_named_function_in(program, interner, &mut |scope, function| {
@@ -81,6 +84,8 @@ struct Cx<'a> {
     /// the returned value's type before checking — a nullable value satisfies a
     /// non-null declared return below level 8.
     check_nullables: bool,
+    /// phpstan's `checkUnionTypes` / `reportMaybes` (level 7+).
+    report_maybes: bool,
 }
 
 impl Cx<'_> {
@@ -135,11 +140,12 @@ impl Cx<'_> {
         // Unmapped (e.g. inside a closure the map leaves opaque) → `mixed` → lenient.
         let actual = self.types.get(&key(e)).cloned().unwrap_or(Type::Mixed);
         // checkNullables gate (level < 8): strip `null` from the returned value.
-        if function_like::return_value_assignable(
+        if !function_like::type_mismatch_reportable(
             self.index,
             &actual,
             &ret.declared,
             self.check_nullables,
+            self.report_maybes,
         ) {
             return;
         }
@@ -150,8 +156,13 @@ impl Cx<'_> {
                 .get(&key(e))
                 .cloned()
                 .unwrap_or(Type::Mixed);
-            let native = function_like::lenient_return_value(&native, self.check_nullables);
-            if is_assignable(self.index, &native, &ret.native_declared) {
+            if !function_like::type_mismatch_reportable(
+                self.index,
+                &native,
+                &ret.native_declared,
+                self.check_nullables,
+                self.report_maybes,
+            ) {
                 return;
             }
         }
@@ -180,10 +191,19 @@ mod tests {
         index.add_file(&r.program, &r.interner);
         let types = php_infer::type_map(&index, &r.program, &r.interner);
         let native = php_infer::native_type_map(&index, &r.program, &r.interner);
-        return_type_errors(&index, &r.program, &r.interner, &types, &native, true, true)
-            .into_iter()
-            .map(|d| d.message)
-            .collect()
+        return_type_errors(
+            &index,
+            &r.program,
+            &r.interner,
+            &types,
+            &native,
+            true,
+            true,
+            true,
+        )
+        .into_iter()
+        .map(|d| d.message)
+        .collect()
     }
 
     #[test]
