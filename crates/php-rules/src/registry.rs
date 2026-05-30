@@ -154,6 +154,46 @@ pub struct RuleEntry {
     pub run: fn(&FileAnalysis) -> Vec<Diagnostic>,
 }
 
+/// A diagnostic that may belong to a different analyzed file than the one whose
+/// call site triggered the rule. `path == None` means "the current file".
+#[derive(Debug, Clone)]
+pub struct LocatedDiagnostic {
+    pub path: Option<String>,
+    pub diagnostic: Diagnostic,
+}
+
+impl LocatedDiagnostic {
+    pub fn local(diagnostic: Diagnostic) -> Self {
+        Self {
+            path: None,
+            diagnostic,
+        }
+    }
+
+    pub fn at_path(path: impl Into<String>, diagnostic: Diagnostic) -> Self {
+        Self {
+            path: Some(path.into()),
+            diagnostic,
+        }
+    }
+}
+
+impl From<Diagnostic> for LocatedDiagnostic {
+    fn from(diagnostic: Diagnostic) -> Self {
+        Self::local(diagnostic)
+    }
+}
+
+/// A registered rule whose diagnostics may target another analyzed file.
+pub struct LocatedRuleEntry {
+    /// Stable rule name (the diagnostics it emits carry their own identifiers).
+    pub name: &'static str,
+    /// Minimum level at which this rule runs.
+    pub level: u8,
+    /// The check — pure over [`FileAnalysis`].
+    pub run: fn(&FileAnalysis) -> Vec<LocatedDiagnostic>,
+}
+
 /// Machine-readable rule metadata exported for docs/tooling. Keep this as a
 /// pure projection of the runtime registry so generated catalogs don't grow a
 /// second source of truth for analyzer coverage.
@@ -173,6 +213,15 @@ pub fn rule_manifest() -> Vec<RuleManifestEntry> {
             name: r.name,
             level: r.level,
         })
+        .chain(
+            crate::rules::LOCATED_CATEGORY_RULES
+                .iter()
+                .flat_map(|cat| cat.iter())
+                .map(|r| RuleManifestEntry {
+                    name: r.name,
+                    level: r.level,
+                }),
+        )
         .collect();
     out.sort_by(|a, b| a.level.cmp(&b.level).then(a.name.cmp(b.name)));
     out
@@ -187,11 +236,31 @@ pub fn rules_for_level(level: u8) -> impl Iterator<Item = &'static RuleEntry> {
         .filter(move |r| r.level <= level)
 }
 
+/// Located rules active at `level`.
+pub fn located_rules_for_level(level: u8) -> impl Iterator<Item = &'static LocatedRuleEntry> {
+    crate::rules::LOCATED_CATEGORY_RULES
+        .iter()
+        .flat_map(|cat| cat.iter())
+        .filter(move |r| r.level <= level)
+}
+
 /// Run every rule active at `level` over one file and collect the diagnostics.
 /// Pure over `fa` + the borrowed indexes — the engine's parallelizable unit.
 pub fn analyze_file(fa: &FileAnalysis, level: u8) -> Vec<Diagnostic> {
+    analyze_file_located(fa, level)
+        .into_iter()
+        .map(|d| d.diagnostic)
+        .collect()
+}
+
+/// Run every rule active at `level`, preserving path-aware diagnostics for the
+/// rules that can analyze context-specific bodies outside the current file.
+pub fn analyze_file_located(fa: &FileAnalysis, level: u8) -> Vec<LocatedDiagnostic> {
     let mut out = Vec::new();
     for rule in rules_for_level(level) {
+        out.extend((rule.run)(fa).into_iter().map(LocatedDiagnostic::local));
+    }
+    for rule in located_rules_for_level(level) {
         out.extend((rule.run)(fa));
     }
     out
@@ -235,6 +304,12 @@ mod tests {
             .iter()
             .flat_map(|cat| cat.iter())
             .map(|r| r.name)
+            .chain(
+                crate::rules::LOCATED_CATEGORY_RULES
+                    .iter()
+                    .flat_map(|cat| cat.iter())
+                    .map(|r| r.name),
+            )
             .collect();
         registry_names.sort();
         let mut sorted_manifest_names = manifest_names;

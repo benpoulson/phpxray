@@ -34,6 +34,36 @@ pub struct Found<T> {
     pub declaring_class: String,
 }
 
+/// Stored AST body metadata for a reflected function or method.
+#[derive(Debug, Clone)]
+struct BodyRecord {
+    body: Vec<Stmt>,
+    scope: Scope,
+    path: Option<String>,
+    source_kind: SourceKind,
+}
+
+/// A borrowed function/method body plus the source metadata needed by callers
+/// that emit diagnostics against that body.
+#[derive(Debug, Clone, Copy)]
+pub struct BodyMetadata<'a> {
+    pub body: &'a [Stmt],
+    pub scope: &'a Scope,
+    pub path: Option<&'a str>,
+    pub source_kind: SourceKind,
+}
+
+impl BodyRecord {
+    fn metadata(&self) -> BodyMetadata<'_> {
+        BodyMetadata {
+            body: self.body.as_slice(),
+            scope: &self.scope,
+            path: self.path.as_deref(),
+            source_kind: self.source_kind,
+        }
+    }
+}
+
 /// A reflected function plus the AST declaration it came from.
 #[derive(Debug)]
 pub struct ReflectedFunction<'a> {
@@ -191,11 +221,12 @@ pub struct ReflectionIndex {
     /// Lowercased FQN → function reflection.
     functions: HashMap<String, FunctionReflection>,
     /// Callable bodies + their declaring [`Scope`] for interprocedural per-call
-    /// return inference. Keyed by `key(fqn)` for free functions and
-    /// `key(declaring_class)::name_lower` for methods. The scope is kept so the
-    /// body's name references resolve in *their* namespace, not the caller's; this
-    /// is sound only because all files share one interner (symbols are global).
-    bodies: HashMap<String, (Vec<Stmt>, Scope)>,
+    /// return inference and context diagnostics. Keyed by `key(fqn)` for free
+    /// functions and `key(declaring_class)::name_lower` for methods. The scope is
+    /// kept so the body's name references resolve in *their* namespace, not the
+    /// caller's; this is sound only because all files share one interner (symbols
+    /// are global).
+    bodies: HashMap<String, BodyRecord>,
 }
 
 impl ReflectionIndex {
@@ -232,9 +263,22 @@ impl ReflectionIndex {
     /// Reflect every class and function in a parsed file, with scan-only files
     /// prevented from replacing curated built-in reflections.
     pub fn add_file_as(&mut self, program: &Program, interner: &Interner, kind: SourceKind) {
+        self.add_file_labeled_as(None, program, interner, kind);
+    }
+
+    /// Reflect every class and function in a parsed file and retain `path` for
+    /// body metadata. The legacy [`add_file_as`](Self::add_file_as) remains for
+    /// callers that only need signatures.
+    pub fn add_file_labeled_as(
+        &mut self,
+        path: Option<&str>,
+        program: &Program,
+        interner: &Interner,
+        kind: SourceKind,
+    ) {
         for_each_region(&program.stmts, interner, |scope, region| {
             for st in region {
-                self.collect_stmt(scope, interner, st, kind);
+                self.collect_stmt(scope, interner, st, kind, path);
             }
         });
     }
@@ -505,9 +549,10 @@ impl ReflectionIndex {
         interner: &Interner,
         st: &php_ast::Stmt,
         kind: SourceKind,
+        path: Option<&str>,
     ) {
         visit_reflectable_decls(scope, st, &mut |scope, decl| match decl {
-            ReflectableDecl::Class(c) => self.add_class(scope, interner, c, kind),
+            ReflectableDecl::Class(c) => self.add_class(scope, interner, c, kind, path),
             ReflectableDecl::Function(f) => {
                 let r = reflect_function(scope, interner, f);
                 if kind == SourceKind::Scan
@@ -518,14 +563,28 @@ impl ReflectionIndex {
                 {
                     return;
                 }
-                self.bodies
-                    .insert(function_key(&r.fqn), (f.body.clone(), scope.clone()));
+                self.bodies.insert(
+                    function_key(&r.fqn),
+                    BodyRecord {
+                        body: f.body.clone(),
+                        scope: scope.clone(),
+                        path: path.map(str::to_string),
+                        source_kind: kind,
+                    },
+                );
                 self.functions.insert(function_key(&r.fqn), r);
             }
         });
     }
 
-    fn add_class(&mut self, scope: &Scope, interner: &Interner, c: &ClassDecl, kind: SourceKind) {
+    fn add_class(
+        &mut self,
+        scope: &Scope,
+        interner: &Interner,
+        c: &ClassDecl,
+        kind: SourceKind,
+        path: Option<&str>,
+    ) {
         // Anonymous classes have no FQN.
         let Some(name) = c.name else { return };
         let fqn = scope.qualify(interner.resolve(name));
@@ -545,7 +604,12 @@ impl ReflectionIndex {
                     let mname = interner.resolve(md.name).to_ascii_lowercase();
                     self.bodies.insert(
                         format!("{}::{}", class_key(&fqn), mname),
-                        (body.clone(), scope.clone()),
+                        BodyRecord {
+                            body: body.clone(),
+                            scope: scope.clone(),
+                            path: path.map(str::to_string),
+                            source_kind: kind,
+                        },
                     );
                 }
             }
@@ -558,7 +622,15 @@ impl ReflectionIndex {
     pub fn function_body(&self, fqn: &str) -> Option<(&[Stmt], &Scope)> {
         self.bodies
             .get(&function_key(fqn))
-            .map(|(b, s)| (b.as_slice(), s))
+            .map(|r| (r.body.as_slice(), &r.scope))
+    }
+
+    /// Full body metadata for a free function, including source path/kind when
+    /// it was added through [`add_file_labeled_as`](Self::add_file_labeled_as).
+    pub fn function_body_meta(&self, fqn: &str) -> Option<BodyMetadata<'_>> {
+        self.bodies
+            .get(&function_key(fqn))
+            .map(BodyRecord::metadata)
     }
 
     /// The body + declaring scope of a method on `declaring_class` (use the
@@ -570,7 +642,18 @@ impl ReflectionIndex {
                 class_key(declaring_class),
                 name.to_ascii_lowercase()
             ))
-            .map(|(b, s)| (b.as_slice(), s))
+            .map(|r| (r.body.as_slice(), &r.scope))
+    }
+
+    /// Full body metadata for a method on `declaring_class`.
+    pub fn method_body_meta(&self, declaring_class: &str, name: &str) -> Option<BodyMetadata<'_>> {
+        self.bodies
+            .get(&format!(
+                "{}::{}",
+                class_key(declaring_class),
+                name.to_ascii_lowercase()
+            ))
+            .map(BodyRecord::metadata)
     }
 }
 
@@ -651,6 +734,54 @@ mod tests {
         assert!(idx.class("\\App\\User").is_some()); // leading backslash ignored
         assert!(idx.function("App\\helper").is_some());
         assert_eq!(idx.class_count(), 1);
+    }
+
+    #[test]
+    fn body_metadata_preserves_source_path_kind_and_scope() {
+        let r = php_parser::parse(
+            r#"<?php
+            namespace App;
+            function cb($x): void { helper($x); }
+            class Handler { public function map($x): void { helper($x); } }
+            "#,
+        );
+        assert!(!r.has_errors(), "parse errors");
+        let mut idx = ReflectionIndex::new();
+        idx.add_file_labeled_as(
+            Some("src/Callbacks.php"),
+            &r.program,
+            &r.interner,
+            SourceKind::Analyzed,
+        );
+
+        let old_fn = idx.function_body("App\\cb").unwrap();
+        assert_eq!(old_fn.1.namespace(), Some("App"));
+        let fn_meta = idx.function_body_meta("App\\cb").unwrap();
+        assert_eq!(fn_meta.path, Some("src/Callbacks.php"));
+        assert_eq!(fn_meta.source_kind, SourceKind::Analyzed);
+        assert_eq!(fn_meta.scope.namespace(), Some("App"));
+        assert!(!fn_meta.body.is_empty());
+
+        let old_method = idx.method_body("App\\Handler", "map").unwrap();
+        assert_eq!(old_method.1.namespace(), Some("App"));
+        let method_meta = idx.method_body_meta("App\\Handler", "map").unwrap();
+        assert_eq!(method_meta.path, Some("src/Callbacks.php"));
+        assert_eq!(method_meta.source_kind, SourceKind::Analyzed);
+        assert_eq!(method_meta.scope.namespace(), Some("App"));
+        assert!(!method_meta.body.is_empty());
+    }
+
+    #[test]
+    fn unlabeled_body_metadata_keeps_old_body_api_but_has_no_path() {
+        let r = php_parser::parse("<?php function cb(): void {}");
+        assert!(!r.has_errors(), "parse errors");
+        let mut idx = ReflectionIndex::new();
+        idx.add_file(&r.program, &r.interner);
+
+        assert!(idx.function_body("cb").is_some());
+        let meta = idx.function_body_meta("cb").unwrap();
+        assert_eq!(meta.path, None);
+        assert_eq!(meta.source_kind, SourceKind::Analyzed);
     }
 
     #[test]

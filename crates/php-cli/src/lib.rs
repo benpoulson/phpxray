@@ -12,7 +12,7 @@ use php_diagnostics::Severity;
 use php_index::{ProjectIndex, SourceKind as ProjectSourceKind};
 use php_reflect::{ReflectionIndex, SourceKind as ReflectSourceKind};
 use php_resolve::{index_file, resolve_references};
-use php_rules::{analyze_file, FileAnalysis};
+use php_rules::{analyze_file_located, FileAnalysis};
 use php_span::LineIndex;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
@@ -220,7 +220,7 @@ fn analyze_parsed_progress(
             ReflectSourceKind::Scan
         };
         project.add_file_as(&f.path, &index_file(&f.program, interner), project_kind);
-        reflection.add_file_as(&f.program, interner, reflect_kind);
+        reflection.add_file_labeled_as(Some(&f.path), &f.program, interner, reflect_kind);
         indexing.inc(1);
     }
     indexing.finish();
@@ -239,6 +239,11 @@ fn analyze_parsed_progress(
         rule_options,
         project: &project,
         reflection: &reflection,
+        sources: parsed
+            .iter()
+            .filter(|f| f.analyze)
+            .map(|f| (f.path.as_str(), f.source.as_str()))
+            .collect(),
     };
     let mut findings_by_file = parsed
         .par_iter()
@@ -270,6 +275,7 @@ struct AnalysisContext<'a> {
     rule_options: RuleOptions,
     project: &'a ProjectIndex,
     reflection: &'a ReflectionIndex,
+    sources: HashMap<&'a str, &'a str>,
 }
 
 fn analyze_one_file(f: &ParsedFile, ctx: &AnalysisContext<'_>) -> Vec<Finding> {
@@ -307,10 +313,19 @@ fn analyze_one_file(f: &ParsedFile, ctx: &AnalysisContext<'_>) -> Vec<Finding> {
         check_explicit_mixed: ctx.rule_options.check_explicit_mixed,
         check_implicit_mixed: ctx.rule_options.check_implicit_mixed,
     };
-    for d in analyze_file(&fa, ctx.level) {
-        let lc = line_index.line_col(d.primary.range().start as u32);
+    let mut target_line_indices: HashMap<String, LineIndex> = HashMap::new();
+    for located in analyze_file_located(&fa, ctx.level) {
+        let target_path = located.path.as_deref().unwrap_or(&f.path);
+        let Some(target_source) = ctx.sources.get(target_path) else {
+            continue;
+        };
+        let target_line_index = target_line_indices
+            .entry(target_path.to_string())
+            .or_insert_with(|| LineIndex::new(target_source));
+        let d = located.diagnostic;
+        let lc = target_line_index.line_col(d.primary.range().start as u32);
         findings.push(Finding {
-            path: f.path.clone(),
+            path: target_path.to_string(),
             line: lc.line,
             column: lc.col,
             message: d.message,
@@ -692,6 +707,134 @@ mod tests {
             "{:?}",
             report.findings
         );
+    }
+
+    #[test]
+    fn cross_file_literal_callback_reports_at_callback_body_path() {
+        let report = analyze(
+            &[
+                ("src/User.php", "<?php class User {}"),
+                (
+                    "src/Use.php",
+                    "<?php\n/** @param list<User> $users */\nfunction run(array $users): void { array_map('cb', $users); }\n",
+                ),
+                (
+                    "src/Callback.php",
+                    "<?php\nfunction cb($u): void { $u->missing(); }\n",
+                ),
+            ],
+            0,
+        );
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.identifier == Some("method.notFound"))
+            .unwrap();
+        assert_eq!(finding.path, "src/Callback.php");
+        assert_eq!(finding.line, 2);
+    }
+
+    #[test]
+    fn cross_file_method_callback_reports_at_method_body_path() {
+        let report = analyze(
+            &[
+                ("src/User.php", "<?php class User {}"),
+                (
+                    "src/Use.php",
+                    "<?php\n/** @param list<User> $users */\nfunction run(array $users, Mapper $mapper): void { array_map([$mapper, 'toDto'], $users); }\n",
+                ),
+                (
+                    "src/Mapper.php",
+                    "<?php\nclass Mapper {\n    public function toDto($u): void {\n        echo $u->missing;\n    }\n}\n",
+                ),
+            ],
+            0,
+        );
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.identifier == Some("property.notFound"))
+            .unwrap();
+        assert_eq!(finding.path, "src/Mapper.php");
+        assert_eq!(finding.line, 4);
+    }
+
+    #[test]
+    fn cross_file_callback_argument_and_return_type_use_target_path() {
+        let report = analyze(
+            &[
+                ("src/User.php", "<?php class User {}"),
+                (
+                    "src/Use.php",
+                    "<?php\n/** @param list<User> $users */\nfunction run(array $users): void { array_filter($users, 'cb'); }\n",
+                ),
+                (
+                    "src/Callback.php",
+                    "<?php\nfunction takes_string(string $s): void {}\nfunction cb($u): string {\n    takes_string($u);\n    return $u;\n}\n",
+                ),
+            ],
+            5,
+        );
+        let arg = report
+            .findings
+            .iter()
+            .find(|f| f.identifier == Some("argument.type"))
+            .unwrap();
+        assert_eq!(arg.path, "src/Callback.php");
+        assert_eq!(arg.line, 4);
+        let ret = report
+            .findings
+            .iter()
+            .find(|f| f.identifier == Some("return.type"))
+            .unwrap();
+        assert_eq!(ret.path, "src/Callback.php");
+        assert_eq!(ret.line, 5);
+    }
+
+    #[test]
+    fn scan_only_callback_bodies_do_not_emit_context_diagnostics() {
+        let report = analyze_with_modes(
+            &[
+                ("src/User.php", "<?php class User {}", true),
+                (
+                    "src/Use.php",
+                    "<?php\n/** @param list<User> $users */\nfunction run(array $users): void { array_map('cb', $users); }\n",
+                    true,
+                ),
+                (
+                    "vendor/Callback.php",
+                    "<?php\nfunction cb($u): void { $u->missing(); }\n",
+                    false,
+                ),
+            ],
+            0,
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|f| f.identifier != Some("method.notFound")),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn same_file_named_callback_still_reports_at_current_path() {
+        let report = analyze(
+            &[(
+                "src/Use.php",
+                "<?php\nclass User {}\n/** @param list<User> $users */\nfunction run(array $users): void { array_map('cb', $users); }\nfunction cb($u): void { $u->missing(); }\n",
+            )],
+            0,
+        );
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.identifier == Some("method.notFound"))
+            .unwrap();
+        assert_eq!(finding.path, "src/Use.php");
+        assert_eq!(finding.line, 5);
     }
 
     #[test]

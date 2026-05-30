@@ -1,57 +1,55 @@
-//! Context-sensitive diagnostics for same-file named callbacks.
+//! Context-sensitive diagnostics for named callbacks.
 //!
 //! The file-level type map stays global and conservative: named callback bodies
 //! are not re-recorded there because the same function/method can be called from
 //! multiple contexts. This module builds a temporary contextual map for one
 //! resolvable callback call site and runs a narrow set of existing diagnostics
-//! over the target body.
+//! over the target body. When the target is another analyzed file, diagnostics
+//! are reported against that file's path.
 
 use crate::{
     function_like,
     members::{self, MemberAccessResolver, ResolveStatus},
-    walk, FileAnalysis, RuleEntry,
+    walk, FileAnalysis, LocatedDiagnostic, LocatedRuleEntry,
 };
-use php_ast::{
-    Arg, ClassDecl, Expr, ExprKind, FunctionDecl, Member, MemberName, MethodDecl, Name, Program,
-    Stmt,
-};
+use php_ast::{Arg, Expr, ExprKind, MemberName, Name, Program, Stmt};
 use php_diagnostics::Diagnostic;
 use php_infer::{arrays, contextual_body_type_map, TypeMap};
-use php_reflect::{reflect_class, reflect_function, FunctionReflection, MethodReflection};
+use php_reflect::{FunctionReflection, MethodReflection, ParamReflection, SourceKind};
 use php_resolve::{for_each_region, Resolution, Scope};
 use php_types::Type;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 type SpanKey = (u32, u32);
-type DedupeKey = (SpanKey, SpanKey, &'static str, String);
+type DedupeKey = (Option<String>, SpanKey, &'static str, String);
 
-pub(crate) static RULES: &[RuleEntry] = &[
-    RuleEntry {
+pub(crate) static RULES: &[LocatedRuleEntry] = &[
+    LocatedRuleEntry {
         name: "callbackContext.member",
         level: 0,
         run: run_member,
     },
-    RuleEntry {
+    LocatedRuleEntry {
         name: "callbackContext.returnType",
         level: 3,
         run: run_return,
     },
-    RuleEntry {
+    LocatedRuleEntry {
         name: "callbackContext.argumentType",
         level: 5,
         run: run_argument,
     },
 ];
 
-fn run_member(fa: &FileAnalysis) -> Vec<Diagnostic> {
+fn run_member(fa: &FileAnalysis) -> Vec<LocatedDiagnostic> {
     collect(fa, ContextRule::Member)
 }
 
-fn run_return(fa: &FileAnalysis) -> Vec<Diagnostic> {
+fn run_return(fa: &FileAnalysis) -> Vec<LocatedDiagnostic> {
     collect(fa, ContextRule::Return)
 }
 
-fn run_argument(fa: &FileAnalysis) -> Vec<Diagnostic> {
+fn run_argument(fa: &FileAnalysis) -> Vec<LocatedDiagnostic> {
     collect(fa, ContextRule::Argument)
 }
 
@@ -62,34 +60,21 @@ enum ContextRule {
     Argument,
 }
 
-struct FunctionBody<'a> {
-    scope: Scope,
-    decl: &'a FunctionDecl,
-    refl: FunctionReflection,
-}
-
-struct MethodBody<'a> {
-    scope: Scope,
-    class_fqn: String,
-    decl: &'a MethodDecl,
-    refl: MethodReflection,
-}
-
-struct BodyIndex<'a> {
-    functions: HashMap<String, FunctionBody<'a>>,
-    methods: HashMap<(String, String), MethodBody<'a>>,
-}
-
-#[derive(Clone, Copy)]
-enum CallbackBody<'a> {
-    Function(&'a FunctionBody<'a>),
-    Method(&'a MethodBody<'a>),
+struct CallbackBody<'a> {
+    body: &'a [Stmt],
+    scope: &'a Scope,
+    path: Option<&'a str>,
+    source_kind: SourceKind,
+    class_fqn: Option<String>,
+    params: Vec<ParamReflection>,
+    return_type: Type,
+    native_return: Type,
+    label: String,
 }
 
 struct CallbackContext<'a> {
-    call_key: SpanKey,
-    body: CallbackBody<'a>,
     inferred: Vec<Type>,
+    body: CallbackBody<'a>,
 }
 
 struct Overlay<'a> {
@@ -139,12 +124,12 @@ impl Overlay<'_> {
     }
 }
 
-fn collect(fa: &FileAnalysis, rule: ContextRule) -> Vec<Diagnostic> {
-    let bodies = BodyIndex::new(fa);
-    let contexts = callback_contexts(fa, &bodies);
+fn collect(fa: &FileAnalysis, rule: ContextRule) -> Vec<LocatedDiagnostic> {
+    let contexts = callback_contexts(fa);
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for cx in contexts {
+        let target_path = cx.body.path.map(str::to_string);
         let overlay = cx.overlay(fa);
         let mut local = Vec::new();
         match rule {
@@ -152,184 +137,43 @@ fn collect(fa: &FileAnalysis, rule: ContextRule) -> Vec<Diagnostic> {
                 check_method_not_found(&overlay, cx.body.body(), &mut local);
                 check_property_not_found(&overlay, cx.body.body(), &mut local);
             }
-            ContextRule::Return => check_return_type(&overlay, cx.body, &mut local),
+            ContextRule::Return => check_return_type(&overlay, &cx.body, &mut local),
             ContextRule::Argument => check_argument_types(&overlay, cx.body.body(), &mut local),
         }
-        dedupe_from(&mut local, &mut seen, cx.call_key);
-        out.extend(local);
+        dedupe_from(&mut local, &mut seen, target_path.as_deref());
+        out.extend(local.into_iter().map(|diagnostic| match &target_path {
+            Some(path) => LocatedDiagnostic::at_path(path.clone(), diagnostic),
+            None => LocatedDiagnostic::local(diagnostic),
+        }));
     }
     out
 }
 
-impl<'a> BodyIndex<'a> {
-    fn new(fa: &'a FileAnalysis<'a>) -> Self {
-        let mut functions = HashMap::new();
-        let mut methods = HashMap::new();
-        for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
-            for st in region {
-                collect_bodies_stmt(fa, scope, st, &mut functions, &mut methods);
-            }
-        });
-        Self { functions, methods }
-    }
-
-    fn function(&self, fqn: &str) -> Option<&FunctionBody<'a>> {
-        self.functions.get(&fqn_key(fqn))
-    }
-
-    fn method(&self, class_fqn: &str, method: &str) -> Option<&MethodBody<'a>> {
-        self.methods
-            .get(&(fqn_key(class_fqn), method.to_ascii_lowercase()))
-    }
-}
-
-fn collect_bodies_stmt<'a>(
-    fa: &'a FileAnalysis<'a>,
-    scope: &Scope,
-    st: &'a Stmt,
-    functions: &mut HashMap<String, FunctionBody<'a>>,
-    methods: &mut HashMap<(String, String), MethodBody<'a>>,
-) {
-    match &st.kind {
-        php_ast::StmtKind::Function(f) => {
-            let refl = reflect_function(scope, fa.interner, f);
-            functions.insert(
-                fqn_key(&refl.fqn),
-                FunctionBody {
-                    scope: scope.clone(),
-                    decl: f,
-                    refl,
-                },
-            );
-        }
-        php_ast::StmtKind::Class(c) => collect_class_bodies(fa, scope, c, methods),
-        php_ast::StmtKind::Block(body)
-        | php_ast::StmtKind::Namespace {
-            body: Some(body), ..
-        } => {
-            for child in body {
-                collect_bodies_stmt(fa, scope, child, functions, methods);
-            }
-        }
-        php_ast::StmtKind::If {
-            then, elseifs, els, ..
-        } => {
-            collect_bodies_stmt(fa, scope, then, functions, methods);
-            for elseif in elseifs {
-                collect_bodies_stmt(fa, scope, &elseif.body, functions, methods);
-            }
-            if let Some(els) = els {
-                collect_bodies_stmt(fa, scope, els, functions, methods);
-            }
-        }
-        php_ast::StmtKind::While { body, .. }
-        | php_ast::StmtKind::DoWhile { body, .. }
-        | php_ast::StmtKind::For { body, .. }
-        | php_ast::StmtKind::Foreach { body, .. }
-        | php_ast::StmtKind::Declare {
-            body: Some(body), ..
-        } => collect_bodies_stmt(fa, scope, body, functions, methods),
-        php_ast::StmtKind::Switch { cases, .. } => {
-            for case in cases {
-                for child in &case.body {
-                    collect_bodies_stmt(fa, scope, child, functions, methods);
-                }
-            }
-        }
-        php_ast::StmtKind::Try {
-            body,
-            catches,
-            finally,
-        } => {
-            for child in body {
-                collect_bodies_stmt(fa, scope, child, functions, methods);
-            }
-            for catch in catches {
-                for child in &catch.body {
-                    collect_bodies_stmt(fa, scope, child, functions, methods);
-                }
-            }
-            if let Some(finally) = finally {
-                for child in finally {
-                    collect_bodies_stmt(fa, scope, child, functions, methods);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn collect_class_bodies<'a>(
-    fa: &'a FileAnalysis<'a>,
-    scope: &Scope,
-    class: &'a ClassDecl,
-    methods: &mut HashMap<(String, String), MethodBody<'a>>,
-) {
-    let Some(name) = class.name else { return };
-    let class_fqn = scope.qualify(fa.interner.resolve(name));
-    let refl = reflect_class(scope, fa.interner, &class_fqn, class);
-    for member in &class.members {
-        let Member::Method(method) = member else {
-            continue;
-        };
-        if method.body.is_none() {
-            continue;
-        }
-        let method_name = fa.interner.resolve(method.name);
-        let Some(mr) = refl
-            .methods
-            .iter()
-            .find(|m| !m.magic && m.name.eq_ignore_ascii_case(method_name))
-            .cloned()
-        else {
-            continue;
-        };
-        methods.insert(
-            (fqn_key(&class_fqn), method_name.to_ascii_lowercase()),
-            MethodBody {
-                scope: scope.clone(),
-                class_fqn: class_fqn.clone(),
-                decl: method,
-                refl: mr,
-            },
-        );
-    }
-}
-
 impl<'a> CallbackContext<'a> {
     fn overlay(&self, fa: &'a FileAnalysis<'a>) -> Overlay<'a> {
-        let (scope, class, params, body) = match self.body {
-            CallbackBody::Function(f) => (&f.scope, None, &f.refl.params, f.decl.body.as_slice()),
-            CallbackBody::Method(m) => (
-                &m.scope,
-                Some(m.class_fqn.clone()),
-                &m.refl.params,
-                m.decl.body.as_deref().unwrap_or(&[]),
-            ),
-        };
         let types = contextual_body_type_map(
             fa.reflection,
-            scope,
+            self.body.scope,
             fa.interner,
-            class.clone(),
-            params,
+            self.body.class_fqn.clone(),
+            &self.body.params,
             &self.inferred,
             false,
-            body,
+            self.body.body,
         );
         let native_types = contextual_body_type_map(
             fa.reflection,
-            scope,
+            self.body.scope,
             fa.interner,
-            class,
-            params,
+            self.body.class_fqn.clone(),
+            &self.body.params,
             &self.inferred,
             true,
-            body,
+            self.body.body,
         );
         Overlay {
             fa,
-            scope,
+            scope: self.body.scope,
             types,
             native_types,
         }
@@ -338,46 +182,26 @@ impl<'a> CallbackContext<'a> {
 
 impl<'a> CallbackBody<'a> {
     fn body(&self) -> &'a [Stmt] {
-        match self {
-            CallbackBody::Function(f) => &f.decl.body,
-            CallbackBody::Method(m) => m.decl.body.as_deref().unwrap_or(&[]),
-        }
+        self.body
     }
 
-    fn params(&self) -> &'a [php_reflect::ParamReflection] {
-        match self {
-            CallbackBody::Function(f) => &f.refl.params,
-            CallbackBody::Method(m) => &m.refl.params,
-        }
+    fn params(&self) -> &[ParamReflection] {
+        &self.params
     }
 
-    fn return_type(&self) -> (&'a Type, &'a Type, String) {
-        match self {
-            CallbackBody::Function(f) => (
-                &f.refl.return_type,
-                &f.refl.native_return,
-                format!("function {}()", f.refl.fqn),
-            ),
-            CallbackBody::Method(m) => (
-                &m.refl.return_type,
-                &m.refl.native_return,
-                format!("{}::{}()", m.class_fqn, m.refl.name),
-            ),
-        }
+    fn return_type(&self) -> (&Type, &Type, &str) {
+        (&self.return_type, &self.native_return, &self.label)
     }
 }
 
-fn callback_contexts<'a>(
-    fa: &'a FileAnalysis<'a>,
-    bodies: &'a BodyIndex<'a>,
-) -> Vec<CallbackContext<'a>> {
+fn callback_contexts<'a>(fa: &'a FileAnalysis<'a>) -> Vec<CallbackContext<'a>> {
     let mut out = Vec::new();
     for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
         let program = Program {
             stmts: region.to_vec(),
         };
         walk::for_each_expr(&program, &mut |e| {
-            collect_expr_context(fa, scope, bodies, e, &mut out);
+            collect_expr_context(fa, scope, e, &mut out);
         });
     });
     out
@@ -386,21 +210,20 @@ fn callback_contexts<'a>(
 fn collect_expr_context<'a>(
     fa: &'a FileAnalysis<'a>,
     scope: &Scope,
-    bodies: &'a BodyIndex<'a>,
     e: &Expr,
     out: &mut Vec<CallbackContext<'a>>,
 ) {
     match &e.kind {
         ExprKind::Call { callee, args } => {
             if let Some((callback, inferred)) = builtin_callback_seed(fa, scope, callee, args) {
-                push_context(fa, scope, bodies, e, callback, inferred, out);
+                push_context(fa, scope, callback, inferred, out);
             }
         }
         ExprKind::MethodCall {
             recv, method, args, ..
         } => {
             if let Some((callback, inferred)) = collection_callback_seed(fa, recv, method, args) {
-                push_context(fa, scope, bodies, e, callback, inferred, out);
+                push_context(fa, scope, callback, inferred, out);
             }
         }
         _ => {}
@@ -410,8 +233,6 @@ fn collect_expr_context<'a>(
 fn push_context<'a>(
     fa: &'a FileAnalysis<'a>,
     scope: &Scope,
-    bodies: &'a BodyIndex<'a>,
-    call: &Expr,
     callback: &Arg,
     inferred: Vec<Type>,
     out: &mut Vec<CallbackContext<'a>>,
@@ -422,17 +243,16 @@ fn push_context<'a>(
     ) {
         return;
     }
-    let Some(body) = resolve_callback_body(fa, scope, bodies, &callback.value) else {
+    let Some(body) = resolve_callback_body(fa, scope, &callback.value) else {
         return;
     };
+    if body.source_kind != SourceKind::Analyzed || body.path.is_none() {
+        return;
+    }
     if !context_changes_params(body.params(), &inferred) {
         return;
     }
-    out.push(CallbackContext {
-        call_key: span_key(call),
-        body,
-        inferred,
-    });
+    out.push(CallbackContext { inferred, body });
 }
 
 fn builtin_callback_seed<'a>(
@@ -537,32 +357,27 @@ fn collection_callback_seed<'a>(
 fn resolve_callback_body<'a>(
     fa: &'a FileAnalysis<'a>,
     scope: &Scope,
-    bodies: &'a BodyIndex<'a>,
     e: &Expr,
 ) -> Option<CallbackBody<'a>> {
     match &peel_paren(e).kind {
         ExprKind::Str(bytes) => literal_str(bytes)
             .and_then(|name| function_fqn_from_text(fa, scope, &name))
-            .and_then(|fqn| bodies.function(&fqn))
-            .map(CallbackBody::Function),
+            .and_then(|fqn| function_callback_body(fa, &fqn)),
         ExprKind::Variable(_) => match fa.type_of(e) {
             Type::LiteralString(name) => function_fqn_from_text(fa, scope, &name)
-                .and_then(|fqn| bodies.function(&fqn))
-                .map(CallbackBody::Function),
-            ty => invokable_body(fa, bodies, &ty),
+                .and_then(|fqn| function_callback_body(fa, &fqn)),
+            ty => invokable_body(fa, &ty),
         },
-        ExprKind::Array { items, .. } => callable_array_body(fa, scope, bodies, items),
+        ExprKind::Array { items, .. } => callable_array_body(fa, scope, items),
         ExprKind::Call { callee, args } if is_first_class_callable(args) => {
             let ExprKind::Name(name) = &callee.kind else {
                 return None;
             };
-            function_from_name(fa, scope, name)
-                .and_then(|f| bodies.function(&f.fqn))
-                .map(CallbackBody::Function)
+            function_from_name(fa, scope, name).and_then(|f| function_callback_body(fa, &f.fqn))
         }
         ExprKind::MethodCall {
             recv, method, args, ..
-        } if is_first_class_callable(args) => method_body_from_receiver(fa, bodies, recv, method),
+        } if is_first_class_callable(args) => method_body_from_receiver(fa, recv, method),
         ExprKind::StaticCall {
             class,
             method,
@@ -572,16 +387,15 @@ fn resolve_callback_body<'a>(
             let MemberName::Ident(sym) = method else {
                 return None;
             };
-            method_body_from_class_name(fa, bodies, &class, fa.interner.resolve(*sym))
+            method_body_from_class_name(fa, &class, fa.interner.resolve(*sym))
         }
-        _ => invokable_body(fa, bodies, &fa.type_of(e)),
+        _ => invokable_body(fa, &fa.type_of(e)),
     }
 }
 
 fn callable_array_body<'a>(
     fa: &'a FileAnalysis<'a>,
     scope: &Scope,
-    bodies: &'a BodyIndex<'a>,
     items: &[php_ast::ArrayItem],
 ) -> Option<CallbackBody<'a>> {
     let [target, method] = items else {
@@ -593,26 +407,24 @@ fn callable_array_body<'a>(
     let target = target.value.as_ref()?;
     let method_name = method.value.as_ref().and_then(literal_string_expr)?;
     if let Some(class) = class_fqn_from_callable_array_target(fa, scope, target) {
-        return method_body_from_class_name(fa, bodies, &class, &method_name);
+        return method_body_from_class_name(fa, &class, &method_name);
     }
-    method_body_from_receiver_name(fa, bodies, target, &method_name)
+    method_body_from_receiver_name(fa, target, &method_name)
 }
 
 fn method_body_from_receiver<'a>(
     fa: &'a FileAnalysis<'a>,
-    bodies: &'a BodyIndex<'a>,
     recv: &Expr,
     method: &MemberName,
 ) -> Option<CallbackBody<'a>> {
     let MemberName::Ident(sym) = method else {
         return None;
     };
-    method_body_from_receiver_name(fa, bodies, recv, fa.interner.resolve(*sym))
+    method_body_from_receiver_name(fa, recv, fa.interner.resolve(*sym))
 }
 
 fn method_body_from_receiver_name<'a>(
     fa: &'a FileAnalysis<'a>,
-    bodies: &'a BodyIndex<'a>,
     recv: &Expr,
     method: &str,
 ) -> Option<CallbackBody<'a>> {
@@ -623,33 +435,61 @@ fn method_body_from_receiver_name<'a>(
         .or_else(|| {
             members::sole_class(&recv_ty).and_then(|fqn| fa.reflection.find_method(&fqn, method))
         })?;
-    bodies
-        .method(&found.declaring_class, &found.member.name)
-        .map(CallbackBody::Method)
+    method_callback_body(fa, found)
 }
 
 fn method_body_from_class_name<'a>(
     fa: &'a FileAnalysis<'a>,
-    bodies: &'a BodyIndex<'a>,
     class: &str,
     method: &str,
 ) -> Option<CallbackBody<'a>> {
     let found = fa.reflection.find_method(class, method)?;
-    bodies
-        .method(&found.declaring_class, &found.member.name)
-        .map(CallbackBody::Method)
+    method_callback_body(fa, found)
 }
 
-fn invokable_body<'a>(
-    fa: &'a FileAnalysis<'a>,
-    bodies: &'a BodyIndex<'a>,
-    ty: &Type,
-) -> Option<CallbackBody<'a>> {
+fn invokable_body<'a>(fa: &'a FileAnalysis<'a>, ty: &Type) -> Option<CallbackBody<'a>> {
     let fqn = members::sole_class(ty)?;
     let found = fa.reflection.find_method(&fqn, "__invoke")?;
-    bodies
-        .method(&found.declaring_class, &found.member.name)
-        .map(CallbackBody::Method)
+    method_callback_body(fa, found)
+}
+
+fn function_callback_body<'a>(fa: &'a FileAnalysis<'a>, fqn: &str) -> Option<CallbackBody<'a>> {
+    let refl = fa.reflection.function(fqn)?;
+    let meta = fa.reflection.function_body_meta(&refl.fqn)?;
+    Some(CallbackBody {
+        body: meta.body,
+        scope: meta.scope,
+        path: meta.path,
+        source_kind: meta.source_kind,
+        class_fqn: None,
+        params: refl.params.clone(),
+        return_type: refl.return_type.clone(),
+        native_return: refl.native_return.clone(),
+        label: format!("function {}()", refl.fqn),
+    })
+}
+
+fn method_callback_body<'a>(
+    fa: &'a FileAnalysis<'a>,
+    found: php_reflect::Found<MethodReflection>,
+) -> Option<CallbackBody<'a>> {
+    let meta = fa
+        .reflection
+        .method_body_meta(&found.declaring_class, &found.member.name)?;
+    let class_fqn = found.declaring_class;
+    let method = found.member;
+    let method_name = method.name;
+    Some(CallbackBody {
+        body: meta.body,
+        scope: meta.scope,
+        path: meta.path,
+        source_kind: meta.source_kind,
+        class_fqn: Some(class_fqn.clone()),
+        params: method.params,
+        return_type: method.return_type,
+        native_return: method.native_return,
+        label: format!("{class_fqn}::{method_name}()"),
+    })
 }
 
 fn check_method_not_found(overlay: &Overlay, body: &[Stmt], out: &mut Vec<Diagnostic>) {
@@ -834,7 +674,7 @@ fn check_method_call_args(
     }
 }
 
-fn check_return_type(overlay: &Overlay, body: CallbackBody, out: &mut Vec<Diagnostic>) {
+fn check_return_type(overlay: &Overlay, body: &CallbackBody, out: &mut Vec<Diagnostic>) {
     let (declared, native_declared, label) = body.return_type();
     if skip_return(declared) {
         return;
@@ -864,7 +704,7 @@ fn check_return_type(overlay: &Overlay, body: CallbackBody, out: &mut Vec<Diagno
         {
             return;
         }
-        function_like::push_return_type_error(out, expr, &label, declared, &actual);
+        function_like::push_return_type_error(out, expr, label, declared, &actual);
     });
 }
 
@@ -874,10 +714,10 @@ fn for_each_body_expr(body: &[Stmt], mut f: impl FnMut(&Expr)) {
     }
 }
 
-fn dedupe_from(out: &mut Vec<Diagnostic>, seen: &mut HashSet<DedupeKey>, call_key: SpanKey) {
+fn dedupe_from(out: &mut Vec<Diagnostic>, seen: &mut HashSet<DedupeKey>, path: Option<&str>) {
     out.retain(|d| {
         let key = (
-            call_key,
+            path.map(str::to_string),
             span_key_raw(d.primary),
             d.code.unwrap_or(""),
             d.message.clone(),
@@ -1173,10 +1013,6 @@ fn last_segment(name: &str) -> &str {
         .unwrap_or(name)
 }
 
-fn fqn_key(fqn: &str) -> String {
-    fqn.trim_start_matches('\\').to_ascii_lowercase()
-}
-
 fn span_key(e: &Expr) -> (u32, u32) {
     span_key_raw(e.span)
 }
@@ -1196,7 +1032,7 @@ fn skip_return(t: &Type) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::codes;
+    use crate::testutil::located_codes;
 
     #[test]
     fn method_not_found_inside_named_function_array_map_callback_is_flagged() {
@@ -1210,7 +1046,7 @@ mod tests {
                 $u->missing();
             }
         "#;
-        assert_eq!(codes(src, run_member), ["method.notFound"]);
+        assert_eq!(located_codes(src, run_member), ["method.notFound"]);
     }
 
     #[test]
@@ -1227,7 +1063,7 @@ mod tests {
                 }
             }
         "#;
-        assert_eq!(codes(src, run_member), ["property.notFound"]);
+        assert_eq!(located_codes(src, run_member), ["property.notFound"]);
     }
 
     #[test]
@@ -1244,7 +1080,7 @@ mod tests {
                 return true;
             }
         "#;
-        assert_eq!(codes(src, run_argument), ["argument.type"]);
+        assert_eq!(located_codes(src, run_argument), ["argument.type"]);
     }
 
     #[test]
@@ -1259,7 +1095,7 @@ mod tests {
                 return $u;
             }
         "#;
-        assert_eq!(codes(src, run_return), ["return.type"]);
+        assert_eq!(located_codes(src, run_return), ["return.type"]);
     }
 
     #[test]
@@ -1283,7 +1119,7 @@ mod tests {
                 }
             }
         "#;
-        assert_eq!(codes(src, run_member), ["method.notFound"]);
+        assert_eq!(located_codes(src, run_member), ["method.notFound"]);
     }
 
     #[test]
@@ -1298,8 +1134,8 @@ mod tests {
                 strlen($u);
             }
         "#;
-        assert!(codes(src, run_argument).is_empty());
-        assert!(codes(src, run_member).is_empty());
+        assert!(located_codes(src, run_argument).is_empty());
+        assert!(located_codes(src, run_member).is_empty());
     }
 
     #[test]
@@ -1314,7 +1150,7 @@ mod tests {
                 $u->missing();
             }
         "#;
-        assert!(codes(src, run_member).is_empty());
+        assert!(located_codes(src, run_member).is_empty());
     }
 
     #[test]
@@ -1326,6 +1162,6 @@ mod tests {
                 array_map(fn($u) => $u->missing(), $users);
             }
         "#;
-        assert!(codes(src, run_member).is_empty());
+        assert!(located_codes(src, run_member).is_empty());
     }
 }

@@ -19,7 +19,7 @@
 //! extension-development API) and **Ignore** (phpstan's own ignore-comment
 //! handling — we do suppression in `php-cli`).
 
-use crate::{FileAnalysis, RuleEntry};
+use crate::{FileAnalysis, LocatedRuleEntry, RuleEntry};
 use php_types::Type;
 
 mod arrays;
@@ -55,7 +55,6 @@ mod whitespace;
 /// Every category's rule slice. The registry flattens this and filters by level.
 pub(crate) static CATEGORY_RULES: &[&[RuleEntry]] = &[
     arrays::RULES,
-    callback_context::RULES,
     cast::RULES,
     classes::RULES,
     comparison::RULES,
@@ -84,6 +83,10 @@ pub(crate) static CATEGORY_RULES: &[&[RuleEntry]] = &[
     variables::RULES,
     whitespace::RULES,
 ];
+
+/// Rules whose diagnostics may target a different analyzed file than the current
+/// file being walked.
+pub(crate) static LOCATED_CATEGORY_RULES: &[&[LocatedRuleEntry]] = &[callback_context::RULES];
 
 pub(crate) fn type_contains_null(t: &Type) -> bool {
     match t {

@@ -26,7 +26,8 @@ pub use php_infer::{
 };
 pub use php_types::PhpVersion;
 pub use registry::{
-    analyze_file, rule_manifest, rules_for_level, FileAnalysis, RuleEntry, RuleManifestEntry,
+    analyze_file, analyze_file_located, rule_manifest, rules_for_level, FileAnalysis,
+    LocatedDiagnostic, LocatedRuleEntry, RuleEntry, RuleManifestEntry,
 };
 pub use return_type::return_type_errors;
 

@@ -1,6 +1,6 @@
 //! Test-only helpers for exercising a single rule against a PHP snippet.
 
-use crate::{FileAnalysis, PhpVersion};
+use crate::{FileAnalysis, LocatedDiagnostic, PhpVersion};
 use php_diagnostics::Diagnostic;
 use php_index::ProjectIndex;
 use php_infer::type_map;
@@ -24,7 +24,58 @@ pub(crate) fn run_version(
     let mut project = ProjectIndex::with_builtins();
     project.add_file("test.php", &index_file(&r.program, &r.interner));
     let mut reflection = ReflectionIndex::with_builtins_for(php_version);
-    reflection.add_file(&r.program, &r.interner);
+    reflection.add_file_labeled_as(
+        Some("test.php"),
+        &r.program,
+        &r.interner,
+        php_reflect::SourceKind::Analyzed,
+    );
+    let refs = resolve_references(&r.program, &r.interner);
+    let types = type_map(&reflection, &r.program, &r.interner);
+    let native_types = php_infer::native_type_map(&reflection, &r.program, &r.interner);
+    let fa = FileAnalysis {
+        path: "test.php",
+        source: src,
+        program: &r.program,
+        interner: &r.interner,
+        project: &project,
+        reflection: &reflection,
+        resolved_refs: &refs,
+        types: &types,
+        native_types: &native_types,
+        php_version,
+        treat_phpdoc_types_as_certain: true,
+        report_maybes: true,
+        check_nullables: true,
+        check_explicit_mixed: true,
+        check_implicit_mixed: true,
+    };
+    rule(&fa)
+}
+
+pub(crate) fn run_located(
+    src: &str,
+    rule: fn(&FileAnalysis) -> Vec<LocatedDiagnostic>,
+) -> Vec<LocatedDiagnostic> {
+    run_located_version(src, rule, PhpVersion::default())
+}
+
+pub(crate) fn run_located_version(
+    src: &str,
+    rule: fn(&FileAnalysis) -> Vec<LocatedDiagnostic>,
+    php_version: PhpVersion,
+) -> Vec<LocatedDiagnostic> {
+    let r = php_parser::parse(src);
+    assert!(!r.has_errors(), "parse errors in test source: {src}");
+    let mut project = ProjectIndex::with_builtins();
+    project.add_file("test.php", &index_file(&r.program, &r.interner));
+    let mut reflection = ReflectionIndex::with_builtins_for(php_version);
+    reflection.add_file_labeled_as(
+        Some("test.php"),
+        &r.program,
+        &r.interner,
+        php_reflect::SourceKind::Analyzed,
+    );
     let refs = resolve_references(&r.program, &r.interner);
     let types = type_map(&reflection, &r.program, &r.interner);
     let native_types = php_infer::native_type_map(&reflection, &r.program, &r.interner);
@@ -53,6 +104,16 @@ pub(crate) fn codes(src: &str, rule: fn(&FileAnalysis) -> Vec<Diagnostic>) -> Ve
     run(src, rule)
         .into_iter()
         .map(|d| d.code.unwrap_or(""))
+        .collect()
+}
+
+pub(crate) fn located_codes(
+    src: &str,
+    rule: fn(&FileAnalysis) -> Vec<LocatedDiagnostic>,
+) -> Vec<&'static str> {
+    run_located(src, rule)
+        .into_iter()
+        .map(|d| d.diagnostic.code.unwrap_or(""))
         .collect()
 }
 
