@@ -22,6 +22,11 @@ pub fn apply(
     report_unmatched: bool,
     sources: &HashMap<&str, &str>,
 ) -> Report {
+    let Report {
+        findings,
+        files_analyzed,
+        timings,
+    } = report;
     let mut matchers: Vec<Matcher> = ignore.iter().filter_map(Matcher::compile).collect();
     // Precompute inline-ignore maps per file (keys borrow `sources`, which
     // outlives this loop — so findings can be moved into `kept`).
@@ -31,7 +36,7 @@ pub fn apply(
         .collect();
 
     let mut kept = Vec::new();
-    for f in report.findings {
+    for f in findings {
         // Inline ignore?
         if let Some(inline) = inline.get(f.path.as_str()) {
             if suppressed_inline(&inline.map, &f) {
@@ -93,7 +98,8 @@ pub fn apply(
 
     Report {
         findings: kept,
-        files_analyzed: report.files_analyzed,
+        files_analyzed,
+        timings,
     }
 }
 
@@ -485,6 +491,7 @@ mod tests {
         Report {
             findings,
             files_analyzed: 1,
+            timings: None,
         }
     }
 

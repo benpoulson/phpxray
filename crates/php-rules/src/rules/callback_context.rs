@@ -12,11 +12,11 @@ use crate::{
     members::{self, MemberAccessResolver, ResolveStatus},
     walk, FileAnalysis, LocatedDiagnostic, LocatedRuleEntry,
 };
-use php_ast::{Arg, Expr, ExprKind, MemberName, Name, Program, Stmt};
+use php_ast::{Arg, Expr, ExprKind, MemberName, Name, Stmt};
 use php_diagnostics::Diagnostic;
 use php_infer::{arrays, contextual_body_type_map, TypeMap};
 use php_reflect::{FunctionReflection, MethodReflection, ParamReflection, SourceKind};
-use php_resolve::{for_each_region, Resolution, Scope};
+use php_resolve::{Resolution, Scope};
 use php_types::Type;
 use std::collections::HashSet;
 
@@ -196,38 +196,21 @@ impl<'a> CallbackBody<'a> {
 
 fn callback_contexts<'a>(fa: &'a FileAnalysis<'a>) -> Vec<CallbackContext<'a>> {
     let mut out = Vec::new();
-    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
-        let program = Program {
-            stmts: region.to_vec(),
-        };
-        walk::for_each_expr(&program, &mut |e| {
-            collect_expr_context(fa, scope, e, &mut out);
-        });
-    });
-    out
-}
-
-fn collect_expr_context<'a>(
-    fa: &'a FileAnalysis<'a>,
-    scope: &Scope,
-    e: &Expr,
-    out: &mut Vec<CallbackContext<'a>>,
-) {
-    match &e.kind {
-        ExprKind::Call { callee, args } => {
-            if let Some((callback, inferred)) = builtin_callback_seed(fa, scope, callee, args) {
-                push_context(fa, scope, callback, inferred, out);
-            }
+    for call in fa.facts.scoped_function_calls() {
+        if let Some((callback, inferred)) =
+            builtin_callback_seed(fa, &call.scope, call.callee, call.args)
+        {
+            push_context(fa, &call.scope, callback, inferred, &mut out);
         }
-        ExprKind::MethodCall {
-            recv, method, args, ..
-        } => {
-            if let Some((callback, inferred)) = collection_callback_seed(fa, recv, method, args) {
-                push_context(fa, scope, callback, inferred, out);
-            }
-        }
-        _ => {}
     }
+    for call in fa.facts.scoped_method_calls() {
+        if let Some((callback, inferred)) =
+            collection_callback_seed(fa, call.recv, call.method, call.args)
+        {
+            push_context(fa, &call.scope, callback, inferred, &mut out);
+        }
+    }
+    out
 }
 
 fn push_context<'a>(

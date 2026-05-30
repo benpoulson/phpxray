@@ -1,6 +1,6 @@
 //! Test-only helpers for exercising a single rule against a PHP snippet.
 
-use crate::{FileAnalysis, LocatedDiagnostic, PhpVersion};
+use crate::{FileAnalysis, FileFacts, LocatedDiagnostic, PhpVersion};
 use php_diagnostics::Diagnostic;
 use php_index::ProjectIndex;
 use php_infer::type_map;
@@ -33,6 +33,7 @@ pub(crate) fn run_version(
     let refs = resolve_references(&r.program, &r.interner);
     let types = type_map(&reflection, &r.program, &r.interner);
     let native_types = php_infer::native_type_map(&reflection, &r.program, &r.interner);
+    let facts = FileFacts::new(&r.program, &r.interner);
     let fa = FileAnalysis {
         path: "test.php",
         source: src,
@@ -43,6 +44,7 @@ pub(crate) fn run_version(
         resolved_refs: &refs,
         types: &types,
         native_types: &native_types,
+        facts,
         php_version,
         treat_phpdoc_types_as_certain: true,
         report_maybes: true,
@@ -79,6 +81,7 @@ pub(crate) fn run_located_version(
     let refs = resolve_references(&r.program, &r.interner);
     let types = type_map(&reflection, &r.program, &r.interner);
     let native_types = php_infer::native_type_map(&reflection, &r.program, &r.interner);
+    let facts = FileFacts::new(&r.program, &r.interner);
     let fa = FileAnalysis {
         path: "test.php",
         source: src,
@@ -89,6 +92,7 @@ pub(crate) fn run_located_version(
         resolved_refs: &refs,
         types: &types,
         native_types: &native_types,
+        facts,
         php_version,
         treat_phpdoc_types_as_certain: true,
         report_maybes: true,

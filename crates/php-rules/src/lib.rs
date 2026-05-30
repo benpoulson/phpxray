@@ -11,6 +11,7 @@ use php_index::ProjectIndex;
 use php_resolve::{RefKind, Resolution, ResolvedRef};
 
 pub(crate) mod decls;
+mod facts;
 pub(crate) mod function_like;
 pub(crate) mod members;
 pub(crate) mod missing_type;
@@ -21,6 +22,7 @@ pub(crate) mod symbols;
 pub use php_ast::walk;
 #[cfg(test)]
 mod testutil;
+pub use facts::FileFacts;
 pub use php_infer::{
     is_assignable, is_castable_to_string, native_type_map, type_map, undefined_variables, TypeMap,
 };

@@ -12,13 +12,13 @@ use php_diagnostics::Severity;
 use php_index::{ProjectIndex, SourceKind as ProjectSourceKind};
 use php_reflect::{ReflectionIndex, SourceKind as ReflectSourceKind};
 use php_resolve::{index_file, resolve_references};
-use php_rules::{analyze_file_located, FileAnalysis};
+use php_rules::{analyze_file_located, FileAnalysis, FileFacts};
 use php_span::LineIndex;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
 pub mod baseline;
@@ -42,6 +42,8 @@ pub struct ParsedFile {
 pub struct RunOptions {
     /// Show transient progress indicators on stderr when stderr is a terminal.
     pub progress: bool,
+    /// Collect internal wall-clock timings in [`Report::timings`].
+    pub collect_timings: bool,
 }
 
 /// Parse `(path, source)` inputs into a single shared interner, returned alongside
@@ -105,6 +107,42 @@ pub struct Finding {
 pub struct Report {
     pub findings: Vec<Finding>,
     pub files_analyzed: usize,
+    pub timings: Option<AnalysisTimings>,
+}
+
+/// Internal timing breakdown for one analysis run. Durations are wall-clock and
+/// intended for coarse performance comparisons, not stable assertions.
+#[derive(Debug, Clone, Default)]
+pub struct AnalysisTimings {
+    pub discovery: Duration,
+    pub read: Duration,
+    pub parse: Duration,
+    pub index: Duration,
+    pub analyze: Duration,
+    pub resolve: Duration,
+    pub facts: Duration,
+    pub type_map: Duration,
+    pub native_type_map: Duration,
+    pub rules: Duration,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct FileTimings {
+    resolve: Duration,
+    facts: Duration,
+    type_map: Duration,
+    native_type_map: Duration,
+    rules: Duration,
+}
+
+impl AnalysisTimings {
+    fn add_file(&mut self, file: FileTimings) {
+        self.resolve += file.resolve;
+        self.facts += file.facts;
+        self.type_map += file.type_map;
+        self.native_type_map += file.native_type_map;
+        self.rules += file.rules;
+    }
 }
 
 impl Report {
@@ -129,10 +167,16 @@ pub fn run(config: &Config, root: &Path) -> Report {
 
 /// Run analysis with CLI/UI options such as progress reporting.
 pub fn run_with_options(config: &Config, root: &Path, options: RunOptions) -> Report {
+    let mut timings = options.collect_timings.then(AnalysisTimings::default);
     let progress = Progress::new(options.progress);
+    let started = Instant::now();
     let discovery = progress.spinner("Discovering files");
     let files = discover_inputs(config, root);
     discovery.finish();
+    if let Some(t) = &mut timings {
+        t.discovery = started.elapsed();
+    }
+    let started = Instant::now();
     let read = progress.counter(files.len(), "Reading files");
     let inputs: Vec<(String, String, bool)> = files
         .iter()
@@ -147,22 +191,34 @@ pub fn run_with_options(config: &Config, root: &Path, options: RunOptions) -> Re
         })
         .collect();
     read.finish();
+    if let Some(t) = &mut timings {
+        t.read = started.elapsed();
+    }
+    let started = Instant::now();
     let (parsed, interner) = parse_files_with_mode_progress(inputs, &progress);
+    if let Some(t) = &mut timings {
+        t.parse = started.elapsed();
+    }
     let php_version = config
         .php_version
         .as_deref()
         .and_then(php_rules::PhpVersion::parse)
         .unwrap_or_default();
     let rule_options = config.level.rule_options();
-    let report = analyze_parsed_progress(
+    let analysis_options = AnalyzeParsedOptions {
+        level: config.level.value(),
+        php_version,
+        treat_phpdoc_types_as_certain: config.treat_phpdoc_types_as_certain,
+        rule_options,
+    };
+    let mut report = analyze_parsed_progress(
         &parsed,
         &interner,
-        config.level.value(),
-        php_version,
-        config.treat_phpdoc_types_as_certain,
-        rule_options,
+        analysis_options,
         &progress,
+        timings.as_mut(),
     );
+    report.timings = timings;
     let sources: HashMap<&str, &str> = parsed
         .iter()
         .map(|f| (f.path.as_str(), f.source.as_str()))
@@ -187,27 +243,37 @@ pub fn analyze_parsed(
     analyze_parsed_progress(
         parsed,
         interner,
-        level,
-        php_version,
-        treat_phpdoc_types_as_certain,
-        Level(level).rule_options(),
+        AnalyzeParsedOptions {
+            level,
+            php_version,
+            treat_phpdoc_types_as_certain,
+            rule_options: Level(level).rule_options(),
+        },
         &Progress::hidden(),
+        None,
     )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AnalyzeParsedOptions {
+    level: u8,
+    php_version: php_rules::PhpVersion,
+    treat_phpdoc_types_as_certain: bool,
+    rule_options: RuleOptions,
 }
 
 fn analyze_parsed_progress(
     parsed: &[ParsedFile],
     interner: &php_intern::Interner,
-    level: u8,
-    php_version: php_rules::PhpVersion,
-    treat_phpdoc_types_as_certain: bool,
-    rule_options: RuleOptions,
+    options: AnalyzeParsedOptions,
     progress: &Progress,
+    mut timings: Option<&mut AnalysisTimings>,
 ) -> Report {
     // Build the shared immutable indexes once, over the one shared interner.
+    let started = Instant::now();
     let indexing = progress.counter(parsed.len(), "Indexing files");
-    let mut project = ProjectIndex::with_builtins_for(php_version);
-    let mut reflection = ReflectionIndex::with_builtins_for(php_version);
+    let mut project = ProjectIndex::with_builtins_for(options.php_version);
+    let mut reflection = ReflectionIndex::with_builtins_for(options.php_version);
     for f in parsed {
         let project_kind = if f.analyze {
             ProjectSourceKind::Analyzed
@@ -224,6 +290,9 @@ fn analyze_parsed_progress(
         indexing.inc(1);
     }
     indexing.finish();
+    if let Some(t) = &mut timings {
+        t.index = started.elapsed();
+    }
 
     let analyzed_count = parsed.iter().filter(|f| f.analyze).count();
     let workers = rayon::current_num_threads();
@@ -233,10 +302,10 @@ fn analyze_parsed_progress(
     );
     let ctx = AnalysisContext {
         interner,
-        level,
-        php_version,
-        treat_phpdoc_types_as_certain,
-        rule_options,
+        level: options.level,
+        php_version: options.php_version,
+        treat_phpdoc_types_as_certain: options.treat_phpdoc_types_as_certain,
+        rule_options: options.rule_options,
         project: &project,
         reflection: &reflection,
         sources: parsed
@@ -245,25 +314,33 @@ fn analyze_parsed_progress(
             .map(|f| (f.path.as_str(), f.source.as_str()))
             .collect(),
     };
+    let started = Instant::now();
     let mut findings_by_file = parsed
         .par_iter()
         .enumerate()
         .filter(|(_, f)| f.analyze)
         .map(|(idx, f)| {
-            let findings = analyze_one_file(f, &ctx);
+            let (findings, file_timings) = analyze_one_file(f, &ctx);
             analyzing.inc(1);
-            (idx, findings)
+            (idx, findings, file_timings)
         })
         .collect::<Vec<_>>();
-    findings_by_file.sort_by_key(|(idx, _)| *idx);
+    findings_by_file.sort_by_key(|(idx, _, _)| *idx);
+    if let Some(t) = &mut timings {
+        t.analyze = started.elapsed();
+        for (_, _, file_timings) in &findings_by_file {
+            t.add_file(*file_timings);
+        }
+    }
     let findings = findings_by_file
         .into_iter()
-        .flat_map(|(_, findings)| findings)
+        .flat_map(|(_, findings, _)| findings)
         .collect();
     analyzing.finish();
     Report {
         findings,
         files_analyzed: analyzed_count,
+        timings: None,
     }
 }
 
@@ -278,8 +355,9 @@ struct AnalysisContext<'a> {
     sources: HashMap<&'a str, &'a str>,
 }
 
-fn analyze_one_file(f: &ParsedFile, ctx: &AnalysisContext<'_>) -> Vec<Finding> {
+fn analyze_one_file(f: &ParsedFile, ctx: &AnalysisContext<'_>) -> (Vec<Finding>, FileTimings) {
     let mut findings = Vec::new();
+    let mut timings = FileTimings::default();
     let line_index = LineIndex::new(&f.source);
     for d in &f.diagnostics {
         let lc = line_index.line_col(d.primary.start);
@@ -293,9 +371,18 @@ fn analyze_one_file(f: &ParsedFile, ctx: &AnalysisContext<'_>) -> Vec<Finding> {
         });
     }
 
+    let started = Instant::now();
     let refs = resolve_references(&f.program, ctx.interner);
+    timings.resolve = started.elapsed();
+    let started = Instant::now();
+    let facts = FileFacts::new(&f.program, ctx.interner);
+    timings.facts = started.elapsed();
+    let started = Instant::now();
     let types = php_rules::type_map(ctx.reflection, &f.program, ctx.interner);
+    timings.type_map = started.elapsed();
+    let started = Instant::now();
     let native_types = php_rules::native_type_map(ctx.reflection, &f.program, ctx.interner);
+    timings.native_type_map = started.elapsed();
     let fa = FileAnalysis {
         path: &f.path,
         source: &f.source,
@@ -306,6 +393,7 @@ fn analyze_one_file(f: &ParsedFile, ctx: &AnalysisContext<'_>) -> Vec<Finding> {
         resolved_refs: &refs,
         types: &types,
         native_types: &native_types,
+        facts,
         php_version: ctx.php_version,
         treat_phpdoc_types_as_certain: ctx.treat_phpdoc_types_as_certain,
         report_maybes: ctx.rule_options.report_maybes,
@@ -314,6 +402,7 @@ fn analyze_one_file(f: &ParsedFile, ctx: &AnalysisContext<'_>) -> Vec<Finding> {
         check_implicit_mixed: ctx.rule_options.check_implicit_mixed,
     };
     let mut target_line_indices: HashMap<String, LineIndex> = HashMap::new();
+    let started = Instant::now();
     for located in analyze_file_located(&fa, ctx.level) {
         let target_path = located.path.as_deref().unwrap_or(&f.path);
         let Some(target_source) = ctx.sources.get(target_path) else {
@@ -333,7 +422,8 @@ fn analyze_one_file(f: &ParsedFile, ctx: &AnalysisContext<'_>) -> Vec<Finding> {
             severity: d.severity,
         });
     }
-    findings
+    timings.rules = started.elapsed();
+    (findings, timings)
 }
 
 #[derive(Debug, Clone)]
@@ -920,6 +1010,27 @@ excludePaths:
             "{:?}",
             report.findings
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_with_options_collects_internal_timings() {
+        let root = temp_dir("timings");
+        write_file(&root, "src/ok.php", "<?php class User {}\n");
+        let config = Config::from_yaml("level: 0\npaths:\n  - src\n").unwrap();
+
+        let report = run_with_options(
+            &config,
+            &root,
+            RunOptions {
+                collect_timings: true,
+                ..RunOptions::default()
+            },
+        );
+
+        assert_eq!(report.files_analyzed, 1);
+        report.timings.as_ref().expect("timings should be present");
 
         let _ = fs::remove_dir_all(root);
     }

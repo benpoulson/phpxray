@@ -10,7 +10,9 @@ use php_resolve::{for_each_region, Scope};
 
 /// Visit every named class-like declaration with its namespace scope and FQN.
 pub(crate) fn for_each_class_like(fa: &FileAnalysis, mut f: impl FnMut(&Scope, &str, &ClassDecl)) {
-    for_each_class_like_in(fa.program, fa.interner, &mut f);
+    for fact in fa.facts.classes() {
+        f(&fact.scope, &fact.fqn, fact.decl);
+    }
 }
 
 /// Visit every named class-like declaration in `program`.
@@ -28,7 +30,9 @@ pub(crate) fn for_each_class_like_in(
 
 /// Visit every named function declaration with its namespace scope.
 pub(crate) fn for_each_named_function(fa: &FileAnalysis, mut f: impl FnMut(&Scope, &FunctionDecl)) {
-    for_each_named_function_in(fa.program, fa.interner, &mut f);
+    for fact in fa.facts.functions() {
+        f(&fact.scope, fact.decl);
+    }
 }
 
 /// Visit every named function declaration in `program`.
@@ -49,13 +53,9 @@ pub(crate) fn for_each_method(
     fa: &FileAnalysis,
     mut f: impl FnMut(&Scope, &str, &ClassDecl, &MethodDecl),
 ) {
-    for_each_class_like(fa, |scope, fqn, class| {
-        for member in &class.members {
-            if let Member::Method(method) = member {
-                f(scope, fqn, class, method);
-            }
-        }
-    });
+    for fact in fa.facts.methods() {
+        f(&fact.scope, &fact.class_fqn, fact.class, fact.decl);
+    }
 }
 
 /// Visit every property declaration.
@@ -63,13 +63,9 @@ pub(crate) fn for_each_property(
     fa: &FileAnalysis,
     mut f: impl FnMut(&str, &ClassDecl, &PropertyDecl),
 ) {
-    for_each_class_like(fa, |_scope, fqn, class| {
-        for member in &class.members {
-            if let Member::Property(property) = member {
-                f(fqn, class, property);
-            }
-        }
-    });
+    for fact in fa.facts.properties() {
+        f(&fact.class_fqn, fact.class, fact.decl);
+    }
 }
 
 /// Visit every property element.
@@ -77,11 +73,9 @@ pub(crate) fn for_each_property_elem(
     fa: &FileAnalysis,
     mut f: impl FnMut(&str, &ClassDecl, &PropertyDecl, &PropElem),
 ) {
-    for_each_property(fa, |fqn, class, property| {
-        for elem in &property.props {
-            f(fqn, class, property, elem);
-        }
-    });
+    for fact in fa.facts.property_elems() {
+        f(&fact.class_fqn, fact.class, fact.property, fact.elem);
+    }
 }
 
 /// Visit every return statement in `body`, descending control-flow statements

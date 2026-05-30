@@ -96,23 +96,39 @@ fn run_first_class_callable_version(fa: &FileAnalysis) -> Vec<Diagnostic> {
         return Vec::new();
     }
     let mut out = Vec::new();
-    crate::walk::for_each_expr(fa.program, &mut |e| {
-        let args = match &e.kind {
-            ExprKind::Call { args, .. }
-            | ExprKind::MethodCall { args, .. }
-            | ExprKind::StaticCall { args, .. } => args,
-            _ => return,
-        };
-        if args.iter().any(|a| a.placeholder) {
+    for call in fa.facts.function_calls() {
+        if call.args.iter().any(|a| a.placeholder) {
             out.push(
                 Diagnostic::error(
-                    e.span,
+                    call.expr.span,
                     "First-class callables are supported only on PHP 8.1 and later.".to_string(),
                 )
                 .with_code("callable.notSupported"),
             );
         }
-    });
+    }
+    for call in fa.facts.method_calls() {
+        if call.args.iter().any(|a| a.placeholder) {
+            out.push(
+                Diagnostic::error(
+                    call.expr.span,
+                    "First-class callables are supported only on PHP 8.1 and later.".to_string(),
+                )
+                .with_code("callable.notSupported"),
+            );
+        }
+    }
+    for call in fa.facts.static_calls() {
+        if call.args.iter().any(|a| a.placeholder) {
+            out.push(
+                Diagnostic::error(
+                    call.expr.span,
+                    "First-class callables are supported only on PHP 8.1 and later.".to_string(),
+                )
+                .with_code("callable.notSupported"),
+            );
+        }
+    }
     out
 }
 
@@ -512,9 +528,9 @@ fn inner_params(params: &[Param], out: &mut Vec<Diagnostic>) {
 /// `use` var that collides with a parameter name.
 fn run_invalid_lexical_use(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    crate::walk::for_each_expr(fa.program, &mut |e| {
+    for e in fa.facts.expressions() {
         let ExprKind::Closure(c) = &e.kind else {
-            return;
+            continue;
         };
         let param_names: HashSet<&str> = c
             .params
@@ -548,7 +564,7 @@ fn run_invalid_lexical_use(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 );
             }
         }
-    });
+    }
     out
 }
 

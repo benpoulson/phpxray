@@ -9,10 +9,10 @@
 use crate::*;
 
 /// Visit every statement and expression in `program` (crossing all scopes).
-pub fn walk<S, E>(program: &Program, on_stmt: &mut S, on_expr: &mut E)
+pub fn walk<'a, S, E>(program: &'a Program, on_stmt: &mut S, on_expr: &mut E)
 where
-    S: FnMut(&Stmt),
-    E: FnMut(&Expr),
+    S: FnMut(&'a Stmt),
+    E: FnMut(&'a Expr),
 {
     for s in &program.stmts {
         walk_stmt(s, on_stmt, on_expr, true);
@@ -20,25 +20,30 @@ where
 }
 
 /// Visit every expression in `program` (crossing all scopes).
-pub fn for_each_expr<E: FnMut(&Expr)>(program: &Program, f: &mut E) {
+pub fn for_each_expr<'a, E: FnMut(&'a Expr)>(program: &'a Program, f: &mut E) {
     walk(program, &mut |_| {}, f);
 }
 
 /// Visit every statement in `program` (crossing all scopes).
-pub fn for_each_stmt<S: FnMut(&Stmt)>(program: &Program, f: &mut S) {
+pub fn for_each_stmt<'a, S: FnMut(&'a Stmt)>(program: &'a Program, f: &mut S) {
     walk(program, f, &mut |_| {});
 }
 
 /// Visit every statement within a single `stmt` (crossing all scopes).
-pub fn for_each_stmt_in_stmt<S: FnMut(&Stmt)>(stmt: &Stmt, f: &mut S) {
+pub fn for_each_stmt_in_stmt<'a, S: FnMut(&'a Stmt)>(stmt: &'a Stmt, f: &mut S) {
     walk_stmt(stmt, f, &mut |_| {}, true);
+}
+
+/// Visit every expression within a single `stmt` (crossing all scopes).
+pub fn for_each_expr_in_stmt<'a, E: FnMut(&'a Expr)>(stmt: &'a Stmt, f: &mut E) {
+    walk_stmt(stmt, &mut |_| {}, f, true);
 }
 
 /// Visit the expressions of `stmt` that belong to its *own* scope — descends
 /// control flow but stops at nested function-like scopes (closures, arrow fns,
 /// anonymous classes, nested function/class declarations). The closure/anon-class
 /// node itself is visited; its body is not.
-pub fn for_each_expr_in_scope<E: FnMut(&Expr)>(stmt: &Stmt, f: &mut E) {
+pub fn for_each_expr_in_scope<'a, E: FnMut(&'a Expr)>(stmt: &'a Stmt, f: &mut E) {
     walk_stmt(stmt, &mut |_| {}, f, false);
 }
 
@@ -46,14 +51,14 @@ pub fn for_each_expr_in_scope<E: FnMut(&Expr)>(stmt: &Stmt, f: &mut E) {
 /// closures / arrow-fn bodies). Used by flow-sensitive passes to record the
 /// expressions at a single flow point (one statement's environment), without
 /// descending into child-statement blocks the caller handles separately.
-pub fn for_each_subexpr<E: FnMut(&Expr)>(e: &Expr, f: &mut E) {
+pub fn for_each_subexpr<'a, E: FnMut(&'a Expr)>(e: &'a Expr, f: &mut E) {
     walk_expr(e, &mut |_| {}, f, false);
 }
 
-fn walk_stmt<S, E>(s: &Stmt, on_s: &mut S, on_e: &mut E, cross: bool)
+fn walk_stmt<'a, S, E>(s: &'a Stmt, on_s: &mut S, on_e: &mut E, cross: bool)
 where
-    S: FnMut(&Stmt),
-    E: FnMut(&Expr),
+    S: FnMut(&'a Stmt),
+    E: FnMut(&'a Expr),
 {
     on_s(s);
     match &s.kind {
@@ -188,10 +193,10 @@ where
     }
 }
 
-fn walk_params<S, E>(params: &[Param], on_s: &mut S, on_e: &mut E)
+fn walk_params<'a, S, E>(params: &'a [Param], on_s: &mut S, on_e: &mut E)
 where
-    S: FnMut(&Stmt),
-    E: FnMut(&Expr),
+    S: FnMut(&'a Stmt),
+    E: FnMut(&'a Expr),
 {
     for p in params {
         if let Some(d) = &p.default {
@@ -201,10 +206,10 @@ where
     }
 }
 
-fn walk_attrs<S, E>(attrs: &[AttributeGroup], on_s: &mut S, on_e: &mut E)
+fn walk_attrs<'a, S, E>(attrs: &'a [AttributeGroup], on_s: &mut S, on_e: &mut E)
 where
-    S: FnMut(&Stmt),
-    E: FnMut(&Expr),
+    S: FnMut(&'a Stmt),
+    E: FnMut(&'a Expr),
 {
     for group in attrs {
         for attr in &group.attrs {
@@ -216,10 +221,10 @@ where
     }
 }
 
-fn walk_class<S, E>(c: &ClassDecl, on_s: &mut S, on_e: &mut E)
+fn walk_class<'a, S, E>(c: &'a ClassDecl, on_s: &mut S, on_e: &mut E)
 where
-    S: FnMut(&Stmt),
-    E: FnMut(&Expr),
+    S: FnMut(&'a Stmt),
+    E: FnMut(&'a Expr),
 {
     walk_attrs(&c.attrs, on_s, on_e);
     for m in &c.members {
@@ -256,10 +261,10 @@ where
     }
 }
 
-fn walk_hook<S, E>(h: &PropertyHook, on_s: &mut S, on_e: &mut E)
+fn walk_hook<'a, S, E>(h: &'a PropertyHook, on_s: &mut S, on_e: &mut E)
 where
-    S: FnMut(&Stmt),
-    E: FnMut(&Expr),
+    S: FnMut(&'a Stmt),
+    E: FnMut(&'a Expr),
 {
     if let Some(params) = &h.params {
         walk_params(params, on_s, on_e);
@@ -271,13 +276,13 @@ where
     }
 }
 
-fn walk_expr<S, E>(e: &Expr, on_s: &mut S, on_e: &mut E, cross: bool)
+fn walk_expr<'a, S, E>(e: &'a Expr, on_s: &mut S, on_e: &mut E, cross: bool)
 where
-    S: FnMut(&Stmt),
-    E: FnMut(&Expr),
+    S: FnMut(&'a Stmt),
+    E: FnMut(&'a Expr),
 {
     on_e(e);
-    let go = |x: &Expr, on_s: &mut S, on_e: &mut E| walk_expr(x, on_s, on_e, cross);
+    let go = |x: &'a Expr, on_s: &mut S, on_e: &mut E| walk_expr(x, on_s, on_e, cross);
     match &e.kind {
         ExprKind::Int(_)
         | ExprKind::Float(_)
@@ -418,19 +423,19 @@ where
     }
 }
 
-fn walk_args<S, E>(args: &[Arg], on_s: &mut S, on_e: &mut E, cross: bool)
+fn walk_args<'a, S, E>(args: &'a [Arg], on_s: &mut S, on_e: &mut E, cross: bool)
 where
-    S: FnMut(&Stmt),
-    E: FnMut(&Expr),
+    S: FnMut(&'a Stmt),
+    E: FnMut(&'a Expr),
 {
     args.iter()
         .for_each(|a| walk_expr(&a.value, on_s, on_e, cross));
 }
 
-fn walk_member<S, E>(m: &MemberName, on_s: &mut S, on_e: &mut E, cross: bool)
+fn walk_member<'a, S, E>(m: &'a MemberName, on_s: &mut S, on_e: &mut E, cross: bool)
 where
-    S: FnMut(&Stmt),
-    E: FnMut(&Expr),
+    S: FnMut(&'a Stmt),
+    E: FnMut(&'a Expr),
 {
     if let MemberName::Expr(e) = m {
         walk_expr(e, on_s, on_e, cross);

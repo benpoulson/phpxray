@@ -1264,35 +1264,30 @@ fn collect_expr<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
 /// deferred. Lenient: unknown receiver/arg/param types produce no diagnostic.
 fn run_method_argument_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    crate::walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::MethodCall {
-            recv, method, args, ..
-        } = &e.kind
-        else {
-            return;
+    for call in fa.facts.method_calls() {
+        let MemberName::Ident(name) = call.method else {
+            continue;
         };
-        let MemberName::Ident(name) = method else {
-            return;
-        };
-        if args
+        if call
+            .args
             .iter()
             .any(|a| a.spread || a.name.is_some() || a.placeholder)
         {
-            return;
+            continue;
         }
-        let Some(fqn) = named_fqn(&fa.type_of(recv)) else {
-            return;
+        let Some(fqn) = named_fqn(&fa.type_of(call.recv)) else {
+            continue;
         };
         let mname = fa.interner.resolve(*name);
         let Some(found) = fa.reflection.find_method(&fqn, mname) else {
-            return;
+            continue;
         };
         let mr = &found.member;
         if mr.magic {
-            return;
+            continue;
         }
         let short = fqn.trim_start_matches('\\');
-        for (i, arg) in args.iter().enumerate() {
+        for (i, arg) in call.args.iter().enumerate() {
             let Some(param) = mr.params.get(i) else { break };
             if param.variadic {
                 break;
@@ -1313,7 +1308,7 @@ fn run_method_argument_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 );
             }
         }
-    });
+    }
     out
 }
 

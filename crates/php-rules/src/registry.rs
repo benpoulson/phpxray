@@ -8,6 +8,7 @@
 //! and has no shared mutable state, the engine's per-file loop is trivially
 //! parallelizable later (Phase 2).
 
+use crate::facts::FileFacts;
 use php_ast::{Expr, Program};
 use php_diagnostics::Diagnostic;
 use php_index::ProjectIndex;
@@ -36,6 +37,9 @@ pub struct FileAnalysis<'a> {
     /// span — used by the type-compatibility rules when `treatPhpDocTypesAsCertain`
     /// is off, to suppress mismatches visible only at the PHPDoc-refined level.
     pub native_types: &'a TypeMap,
+    /// Shared whole-file AST facts collected once for rules that do not need
+    /// flow-sensitive local-scope traversal.
+    pub facts: FileFacts<'a>,
     /// Target PHP version of the analyzed project (gates version-dependent rules).
     pub php_version: PhpVersion,
     /// phpstan's `treatPhpDocTypesAsCertain` (default `true`). When `false`, the
@@ -332,6 +336,7 @@ mod tests {
         let refs = resolve_references(&r.program, &r.interner);
         let types = php_infer::type_map(&reflection, &r.program, &r.interner);
         let native_types = php_infer::native_type_map(&reflection, &r.program, &r.interner);
+        let facts = FileFacts::new(&r.program, &r.interner);
         let fa = FileAnalysis {
             path: "t.php",
             source: src,
@@ -342,6 +347,7 @@ mod tests {
             resolved_refs: &refs,
             types: &types,
             native_types: &native_types,
+            facts,
             php_version: PhpVersion::default(),
             treat_phpdoc_types_as_certain: true,
             report_maybes: true,

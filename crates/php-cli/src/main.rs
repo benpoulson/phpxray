@@ -33,6 +33,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let run_options = RunOptions {
         progress: !cli.no_progress,
+        ..RunOptions::default()
     };
 
     let ConfigResolution {

@@ -80,6 +80,7 @@ mod tests {
                 finding("b.php", 2, "unknown class `X`", "class.notFound"),
             ],
             files_analyzed: 2,
+            timings: None,
         };
         let es = entries(&report);
         // (a.php, "bad return") x2 and (b.php, ...) x1.
@@ -104,6 +105,7 @@ mod tests {
                 finding("src/B.php", 9, "unknown class `Foo`", "class.notFound"),
             ],
             files_analyzed: 2,
+            timings: None,
         };
         let yaml = to_yaml(&entries(&report));
         let cfg = Config::from_yaml(&yaml).unwrap();

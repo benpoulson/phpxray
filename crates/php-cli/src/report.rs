@@ -200,6 +200,7 @@ mod tests {
                 finding("src/A.php", 7, "unknown class `Foo`", "class.notFound"),
             ],
             files_analyzed: 2,
+            timings: None,
         };
         let out = render_table(&report);
         assert!(out.contains("src/A.php\n"));
@@ -212,6 +213,7 @@ mod tests {
         let report = Report {
             findings: vec![],
             files_analyzed: 5,
+            timings: None,
         };
         assert!(render_table(&report).contains("[OK] No errors (5 files analyzed)"));
     }
@@ -221,6 +223,7 @@ mod tests {
         let report = Report {
             findings: vec![finding("src/A.php", 4, "bad return", "return.type")],
             files_analyzed: 1,
+            timings: None,
         };
         let v: serde_json::Value = serde_json::from_str(&render_json(&report)).unwrap();
         assert_eq!(v["totals"]["file_errors"], 1);
@@ -241,6 +244,7 @@ mod tests {
         let report = Report {
             findings: vec![finding("src/A.php", 4, "bad return", "return.type")],
             files_analyzed: 1,
+            timings: None,
         };
         assert_eq!(
             render_github(&report).trim(),
@@ -256,6 +260,7 @@ mod tests {
         let report = Report {
             findings: vec![],
             files_analyzed: 0,
+            timings: None,
         };
         assert!(render(&report, "table").is_some());
         assert!(render(&report, "json").is_some());

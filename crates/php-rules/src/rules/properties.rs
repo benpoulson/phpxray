@@ -43,6 +43,7 @@
 
 use crate::{
     decls,
+    facts::AssignmentKind,
     members::{MemberAccessResolver, ResolveStatus},
     symbols, walk, FileAnalysis, RuleEntry,
 };
@@ -2695,38 +2696,36 @@ fn run_access_properties_general(fa: &FileAnalysis) -> Vec<Diagnostic> {
     // Property fetches that are assignment targets are checked (as writes) by
     // run_access_properties_in_assign — exclude them here so we don't
     // double-report (mirrors phpstan's `isInExpressionAssign` skip).
-    let assign_targets = assignment_target_spans(fa.program);
-    walk::for_each_expr(fa.program, &mut |e: &Expr| {
-        if let ExprKind::Prop {
-            base,
-            name,
-            nullsafe,
-        } = &e.kind
-        {
-            let r = e.span.range();
-            if assign_targets.contains(&(r.start as u32, r.end as u32)) {
-                return;
-            }
-            check_property_access(fa, e, base, name, *nullsafe, false, &mut out);
+    let assign_targets = assignment_target_spans_facts(fa);
+    for fetch in fa.facts.property_fetches() {
+        let r = fetch.expr.span.range();
+        if assign_targets.contains(&(r.start as u32, r.end as u32)) {
+            continue;
         }
-    });
+        check_property_access(
+            fa,
+            fetch.expr,
+            fetch.base,
+            fetch.name,
+            fetch.nullsafe,
+            false,
+            &mut out,
+        );
+    }
     out
 }
 
-/// Spans of every property fetch used as a plain assignment / assign-ref target
-/// (these are pure writes, checked by run_access_properties_in_assign). Compound
-/// assignments (`+=`) are reads too, so they are NOT excluded here.
-fn assignment_target_spans(program: &Program) -> Vec<(u32, u32)> {
+fn assignment_target_spans_facts(fa: &FileAnalysis) -> Vec<(u32, u32)> {
     let mut spans = Vec::new();
-    walk::for_each_expr(program, &mut |e: &Expr| {
-        let (ExprKind::Assign { target, .. } | ExprKind::AssignRef { target, .. }) = &e.kind else {
-            return;
-        };
-        if matches!(&target.kind, ExprKind::Prop { .. }) {
-            let r = target.span.range();
+    for assign in fa.facts.assignments() {
+        if !matches!(assign.kind, AssignmentKind::Plain | AssignmentKind::Ref) {
+            continue;
+        }
+        if matches!(&assign.target.kind, ExprKind::Prop { .. }) {
+            let r = assign.target.span.range();
             spans.push((r.start as u32, r.end as u32));
         }
-    });
+    }
     spans
 }
 
@@ -2739,23 +2738,24 @@ fn mark_property_subtree(expr: &Expr, spans: &mut Vec<(u32, u32)>) {
     });
 }
 
-fn undefined_allowed_property_spans(program: &Program) -> Vec<(u32, u32)> {
+fn undefined_allowed_property_spans_facts(fa: &FileAnalysis) -> Vec<(u32, u32)> {
     let mut spans = Vec::new();
-    walk::for_each_expr(program, &mut |e: &Expr| match &e.kind {
-        ExprKind::Isset(vars) => {
-            for v in vars {
-                mark_property_subtree(v, &mut spans);
-            }
+    for isset in fa.facts.issets() {
+        for v in isset.vars {
+            mark_property_subtree(v, &mut spans);
         }
-        ExprKind::Empty(inner) => mark_property_subtree(inner, &mut spans),
-        ExprKind::Coalesce { lhs, .. } => mark_property_subtree(lhs, &mut spans),
-        ExprKind::AssignOp {
-            op: php_ast::BinOp::Coalesce,
-            target,
-            ..
-        } => mark_property_subtree(target, &mut spans),
-        _ => {}
-    });
+    }
+    for empty in fa.facts.empties() {
+        mark_property_subtree(empty.inner, &mut spans);
+    }
+    for coalesce in fa.facts.coalesces() {
+        mark_property_subtree(coalesce.lhs, &mut spans);
+    }
+    for assign in fa.facts.assignments() {
+        if matches!(assign.kind, AssignmentKind::Op(php_ast::BinOp::Coalesce)) {
+            mark_property_subtree(assign.target, &mut spans);
+        }
+    }
     spans
 }
 
@@ -2764,36 +2764,30 @@ fn undefined_allowed_property_spans(program: &Program) -> Vec<(u32, u32)> {
 /// at level 8+ it reports `property.nonObject` for `$maybeC->p`. Undefined-
 /// probing contexts (`isset`, `empty`, `??`) stay silent like phpstan.
 fn run_nullable_property_access(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    let suppressed = undefined_allowed_property_spans(fa.program);
+    let suppressed = undefined_allowed_property_spans_facts(fa);
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e: &Expr| {
-        let ExprKind::Prop {
-            base,
-            name,
-            nullsafe,
-        } = &e.kind
-        else {
-            return;
-        };
-        if *nullsafe {
-            return;
+    for fetch in fa.facts.property_fetches() {
+        if fetch.nullsafe {
+            continue;
         }
-        let r = e.span.range();
+        let r = fetch.expr.span.range();
         if suppressed.contains(&(r.start as u32, r.end as u32)) {
-            return;
+            continue;
         }
-        let MemberName::Ident(p) = name else { return };
-        let base_ty = fa.type_of(base);
+        let MemberName::Ident(p) = fetch.name else {
+            continue;
+        };
+        let base_ty = fa.type_of(fetch.base);
         let Some(non_null) = super::non_null_part(&base_ty) else {
-            return;
+            continue;
         };
         if !super::known_objectish_type(fa, &non_null) {
-            return;
+            continue;
         }
         let prop = fa.interner.resolve(*p);
         out.push(
             Diagnostic::error(
-                e.span,
+                fetch.expr.span,
                 format!(
                     "Cannot access property ${prop} on {}.",
                     super::nullable_type_display(&base_ty)
@@ -2801,7 +2795,7 @@ fn run_nullable_property_access(fa: &FileAnalysis) -> Vec<Diagnostic> {
             )
             .with_code("property.nonObject"),
         );
-    });
+    }
     out
 }
 
@@ -2813,43 +2807,37 @@ fn run_union_property_access(fa: &FileAnalysis) -> Vec<Diagnostic> {
     if !fa.report_maybes {
         return Vec::new();
     }
-    let suppressed = undefined_allowed_property_spans(fa.program);
-    let assign_targets = assignment_target_spans(fa.program);
+    let suppressed = undefined_allowed_property_spans_facts(fa);
+    let assign_targets = assignment_target_spans_facts(fa);
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e: &Expr| {
-        let ExprKind::Prop {
-            base,
-            name,
-            nullsafe,
-        } = &e.kind
-        else {
-            return;
-        };
-        if *nullsafe {
-            return;
+    for fetch in fa.facts.property_fetches() {
+        if fetch.nullsafe {
+            continue;
         }
-        let r = e.span.range();
+        let r = fetch.expr.span.range();
         let span = (r.start as u32, r.end as u32);
         if suppressed.contains(&span) || assign_targets.contains(&span) {
-            return;
+            continue;
         }
-        let MemberName::Ident(p) = name else { return };
-        let base_ty = fa.type_of(base);
+        let MemberName::Ident(p) = fetch.name else {
+            continue;
+        };
+        let base_ty = fa.type_of(fetch.base);
         let prop = fa.interner.resolve(*p);
         let Some((has_prop, lacks_prop)) = union_property_status(fa, &base_ty, prop, false) else {
-            return;
+            continue;
         };
         if !(has_prop && lacks_prop) {
-            return;
+            continue;
         }
         out.push(
             Diagnostic::error(
-                e.span,
+                fetch.expr.span,
                 format!("Access to an undefined property {base_ty}::${prop}."),
             )
             .with_code("property.notFound"),
         );
-    });
+    }
     out
 }
 
@@ -2860,10 +2848,11 @@ fn run_union_property_access(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_access_properties_in_assign(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     // Walk every assignment whose target is a (non-`$this`) property fetch.
-    walk::for_each_expr(fa.program, &mut |e: &Expr| {
-        let (ExprKind::Assign { target, .. } | ExprKind::AssignRef { target, .. }) = &e.kind else {
-            return;
-        };
+    for assign in fa.facts.assignments() {
+        if !matches!(assign.kind, AssignmentKind::Plain | AssignmentKind::Ref) {
+            continue;
+        }
+        let target = assign.target;
         if let ExprKind::Prop {
             base,
             name,
@@ -2872,7 +2861,7 @@ fn run_access_properties_in_assign(fa: &FileAnalysis) -> Vec<Diagnostic> {
         {
             check_property_access(fa, target, base, name, *nullsafe, true, &mut out);
         }
-    });
+    }
     out
 }
 
@@ -2881,29 +2870,32 @@ fn run_union_property_access_in_assign(fa: &FileAnalysis) -> Vec<Diagnostic> {
         return Vec::new();
     }
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e: &Expr| {
-        let (ExprKind::Assign { target, .. } | ExprKind::AssignRef { target, .. }) = &e.kind else {
-            return;
-        };
+    for assign in fa.facts.assignments() {
+        if !matches!(assign.kind, AssignmentKind::Plain | AssignmentKind::Ref) {
+            continue;
+        }
+        let target = assign.target;
         let ExprKind::Prop {
             base,
             name,
             nullsafe,
         } = &target.kind
         else {
-            return;
+            continue;
         };
         if *nullsafe {
-            return;
+            continue;
         }
-        let MemberName::Ident(p) = name else { return };
+        let MemberName::Ident(p) = name else {
+            continue;
+        };
         let base_ty = fa.type_of(base);
         let prop = fa.interner.resolve(*p);
         let Some((has_prop, lacks_prop)) = union_property_status(fa, &base_ty, prop, true) else {
-            return;
+            continue;
         };
         if !(has_prop && lacks_prop) {
-            return;
+            continue;
         }
         out.push(
             Diagnostic::error(
@@ -2912,7 +2904,7 @@ fn run_union_property_access_in_assign(fa: &FileAnalysis) -> Vec<Diagnostic> {
             )
             .with_code("property.notFound"),
         );
-    });
+    }
     out
 }
 
@@ -3170,22 +3162,17 @@ fn walk_region_exprs(s: &Stmt, on_expr: &mut impl FnMut(&Expr)) {
 /// (`Type::Named`). Unknown/mixed/nullable/union receivers are left alone.
 fn run_nullsafe_property_fetch(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e: &Expr| {
-        let ExprKind::Prop {
-            base,
-            nullsafe: true,
-            ..
-        } = &e.kind
-        else {
-            return;
-        };
-        let recv = fa.type_of(base);
+    for fetch in fa.facts.property_fetches() {
+        if !fetch.nullsafe {
+            continue;
+        }
+        let recv = fa.type_of(fetch.base);
         // Only when we are SURE it's never null: a concrete named object type.
         if matches!(recv, Type::Named { .. }) {
             let desc = type_desc(&recv);
             out.push(
                 Diagnostic::error(
-                    e.span,
+                    fetch.expr.span,
                     format!(
                         "Using nullsafe property access on non-nullable type {desc}. Use -> instead."
                     ),
@@ -3193,7 +3180,7 @@ fn run_nullsafe_property_fetch(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 .with_code("nullsafe.neverNull"),
             );
         }
-    });
+    }
     out
 }
 
@@ -3214,37 +3201,28 @@ fn run_reading_write_only(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     // Collect spans of property fetches that are assignment *targets* (writes),
     // so we can exclude them from the read check.
-    let mut write_targets: Vec<(u32, u32)> = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e: &Expr| {
-        if let ExprKind::Assign { target, .. } | ExprKind::AssignRef { target, .. } = &e.kind {
-            if matches!(&target.kind, ExprKind::Prop { .. }) {
-                let r = target.span.range();
-                write_targets.push((r.start as u32, r.end as u32));
-            }
-        }
-    });
+    let write_targets = assignment_target_spans_facts(fa);
 
-    walk::for_each_expr(fa.program, &mut |e: &Expr| {
-        let ExprKind::Prop { base, name, .. } = &e.kind else {
-            return;
+    for fetch in fa.facts.property_fetches() {
+        let MemberName::Ident(p) = fetch.name else {
+            continue;
         };
-        let MemberName::Ident(p) = name else { return };
-        let r = e.span.range();
+        let r = fetch.expr.span.range();
         if write_targets.contains(&(r.start as u32, r.end as u32)) {
-            return; // it's a write, not a read.
+            continue; // it's a write, not a read.
         }
-        let Some(class) = receiver_class(fa, base) else {
-            return;
+        let Some(class) = receiver_class(fa, fetch.base) else {
+            continue;
         };
         if !symbols::class_tree_fully_known(fa, &class) {
-            return;
+            continue;
         }
         let prop = fa.interner.resolve(*p);
         if let Some(found) = fa.reflection.find_property(&class, prop) {
             if found.member.magic && found.member.access == PropertyAccess::WriteOnly {
                 out.push(
                     Diagnostic::error(
-                        e.span,
+                        fetch.expr.span,
                         format!(
                             "Property {}::${prop} is not readable.",
                             found.declaring_class.trim_start_matches('\\')
@@ -3254,7 +3232,7 @@ fn run_reading_write_only(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 );
             }
         }
-    });
+    }
     out
 }
 
@@ -3266,19 +3244,22 @@ fn run_reading_write_only(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// `readonly` properties — those are `ReadOnlyPropertyAssignRule`.)
 fn run_writing_to_read_only(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e: &Expr| {
-        let (ExprKind::Assign { target, .. } | ExprKind::AssignOp { target, .. }) = &e.kind else {
-            return;
-        };
+    for assign in fa.facts.assignments() {
+        if !matches!(assign.kind, AssignmentKind::Plain | AssignmentKind::Op(_)) {
+            continue;
+        }
+        let target = assign.target;
         let ExprKind::Prop { base, name, .. } = &target.kind else {
-            return;
+            continue;
         };
-        let MemberName::Ident(p) = name else { return };
+        let MemberName::Ident(p) = name else {
+            continue;
+        };
         let Some(class) = receiver_class(fa, base) else {
-            return;
+            continue;
         };
         if !symbols::class_tree_fully_known(fa, &class) {
-            return;
+            continue;
         }
         let prop = fa.interner.resolve(*p);
         if let Some(found) = fa.reflection.find_property(&class, prop) {
@@ -3295,7 +3276,7 @@ fn run_writing_to_read_only(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 );
             }
         }
-    });
+    }
     out
 }
 
