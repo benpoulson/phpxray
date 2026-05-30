@@ -23,6 +23,7 @@ use crate::{FileAnalysis, RuleEntry};
 use php_types::Type;
 
 mod arrays;
+mod callback_context;
 mod cast;
 mod classes;
 mod comparison;
@@ -54,6 +55,7 @@ mod whitespace;
 /// Every category's rule slice. The registry flattens this and filters by level.
 pub(crate) static CATEGORY_RULES: &[&[RuleEntry]] = &[
     arrays::RULES,
+    callback_context::RULES,
     cast::RULES,
     classes::RULES,
     comparison::RULES,

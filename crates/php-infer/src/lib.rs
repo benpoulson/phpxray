@@ -28,7 +28,7 @@ pub use assign::{
 pub use const_eval::{eval_const, ConstVal};
 pub use definedness::{undefined_variables, UndefVar};
 pub use refine::{strip_false, strip_falsy, strip_null_lenient, strip_null_strict};
-pub use type_map::{native_type_map, type_map, TypeMap};
+pub use type_map::{contextual_body_type_map, native_type_map, type_map, TypeMap};
 
 use php_ast::{
     Arg, ArrowFn, BinOp, CastKind, ClosureExpr, Expr, ExprKind, MemberName, Name, Param, UnOp,

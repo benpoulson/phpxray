@@ -13,7 +13,7 @@
 use crate::TypeCtx;
 use php_ast::{walk, Member, Program, StmtKind};
 use php_intern::Interner;
-use php_reflect::{reflect_class, reflect_function, ReflectionIndex};
+use php_reflect::{reflect_class, reflect_function, ParamReflection, ReflectionIndex};
 use php_resolve::{for_each_region, Scope};
 use php_types::Type;
 use std::collections::HashMap;
@@ -41,6 +41,28 @@ pub fn native_type_map(
     interner: &Interner,
 ) -> TypeMap {
     build(reflection, program, interner, true)
+}
+
+/// Build a contextual type map for a single function-like body under callback
+/// parameter seeds. This is intentionally additive: it does not mutate or
+/// replace the file-level [`TypeMap`].
+#[allow(clippy::too_many_arguments)]
+pub fn contextual_body_type_map(
+    reflection: &ReflectionIndex,
+    scope: &Scope,
+    interner: &Interner,
+    class: Option<String>,
+    params: &[ParamReflection],
+    inferred_params: &[Type],
+    native: bool,
+    body: &[php_ast::Stmt],
+) -> TypeMap {
+    let vars = contextual_param_vars(params, inferred_params, native);
+    let mut map = TypeMap::new();
+    record_scope(
+        reflection, scope, interner, class, vars, native, body, &mut map,
+    );
+    map
 }
 
 fn build(
@@ -83,6 +105,42 @@ fn seed_type(p: &php_reflect::ParamReflection, native: bool) -> Type {
         Type::Array(None)
     } else {
         p.native_ty.clone()
+    }
+}
+
+fn contextual_param_vars(
+    params: &[ParamReflection],
+    inferred_params: &[Type],
+    native: bool,
+) -> HashMap<String, Type> {
+    let mut vars = HashMap::new();
+    for (i, p) in params.iter().enumerate() {
+        let inferred = &inferred_params[i.min(inferred_params.len())..];
+        vars.insert(p.name.clone(), contextual_param_type(p, inferred, native));
+    }
+    vars
+}
+
+fn contextual_param_type(p: &ParamReflection, inferred: &[Type], native: bool) -> Type {
+    if p.explicit {
+        return seed_type(p, native);
+    }
+    if native {
+        return if p.variadic {
+            Type::Array(None)
+        } else {
+            inferred.first().cloned().unwrap_or(Type::Mixed)
+        };
+    }
+    if p.variadic {
+        let item = if inferred.is_empty() {
+            Type::Mixed
+        } else {
+            Type::union(inferred.to_vec())
+        };
+        Type::List(Box::new(item))
+    } else {
+        inferred.first().cloned().unwrap_or(Type::Mixed)
     }
 }
 
@@ -909,6 +967,60 @@ mod tests {
         }
         "#;
         assert_eq!(ty_of_last_method(src, "label"), "mixed");
+    }
+
+    #[test]
+    fn contextual_body_type_map_seeds_untyped_callback_param() {
+        let src = r#"<?php
+        class User { public function label(): string {} }
+        function cb($u): void {
+            $u->label();
+        }
+        "#;
+        let r = php_parser::parse(src);
+        assert!(!r.has_errors(), "parse errors: {src}");
+        let mut reflection = ReflectionIndex::with_builtins();
+        reflection.add_file(&r.program, &r.interner);
+        let mut found = None;
+        for_each_region(&r.program.stmts, &r.interner, |scope, region| {
+            for st in region {
+                let StmtKind::Function(f) = &st.kind else {
+                    continue;
+                };
+                if r.interner.resolve(f.name) == "cb" {
+                    found = Some((scope.clone(), f));
+                }
+            }
+        });
+        let (scope, cb) = found.expect("cb function");
+        let refl = reflect_function(&scope, &r.interner, cb);
+        let map = contextual_body_type_map(
+            &reflection,
+            &scope,
+            &r.interner,
+            None,
+            &refl.params,
+            &[Type::Named {
+                fqn: "User".into(),
+                args: vec![],
+            }],
+            false,
+            &cb.body,
+        );
+        let mut found = None;
+        walk::for_each_expr(&r.program, &mut |e| {
+            let ExprKind::MethodCall {
+                method: php_ast::MemberName::Ident(sym),
+                ..
+            } = &e.kind
+            else {
+                return;
+            };
+            if r.interner.resolve(*sym) == "label" {
+                found = map.get(&key(e.span)).map(ToString::to_string);
+            }
+        });
+        assert_eq!(found.as_deref(), Some("string"));
     }
 
     #[test]
