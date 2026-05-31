@@ -198,6 +198,30 @@ pub struct LocatedRuleEntry {
     pub run: fn(&FileAnalysis) -> Vec<LocatedDiagnostic>,
 }
 
+/// Coarse input families used by the internal rule scheduler. V2 keeps rule
+/// execution order stable, but recording the input shape makes the next
+/// node-dispatch/caching step mechanical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RuleInputKind {
+    Declarations,
+    Expressions,
+    ScopedCalls,
+    TypeMapSensitive,
+    LocalBodyFlow,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ScheduledRule {
+    pub(crate) input: RuleInputKind,
+    pub(crate) rule: &'static RuleEntry,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ScheduledLocatedRule {
+    pub(crate) input: RuleInputKind,
+    pub(crate) rule: &'static LocatedRuleEntry,
+}
+
 /// Machine-readable rule metadata exported for docs/tooling. Keep this as a
 /// pure projection of the runtime registry so generated catalogs don't grow a
 /// second source of truth for analyzer coverage.
@@ -248,6 +272,77 @@ pub fn located_rules_for_level(level: u8) -> impl Iterator<Item = &'static Locat
         .filter(move |r| r.level <= level)
 }
 
+/// Scheduled ordinary rules, preserving the registry's diagnostic order.
+pub(crate) fn scheduled_rules_for_level(level: u8) -> Vec<ScheduledRule> {
+    rules_for_level(level)
+        .map(|rule| ScheduledRule {
+            input: classify_rule_input(rule.name),
+            rule,
+        })
+        .collect()
+}
+
+/// Scheduled located rules, preserving the located registry's diagnostic order.
+pub(crate) fn scheduled_located_rules_for_level(level: u8) -> Vec<ScheduledLocatedRule> {
+    located_rules_for_level(level)
+        .map(|rule| ScheduledLocatedRule {
+            input: classify_located_rule_input(rule.name),
+            rule,
+        })
+        .collect()
+}
+
+fn classify_located_rule_input(_name: &str) -> RuleInputKind {
+    RuleInputKind::ScopedCalls
+}
+
+fn classify_rule_input(name: &str) -> RuleInputKind {
+    if name == "unknown-symbol"
+        || name.starts_with("class.")
+        || name.starts_with("method.")
+        || name.starts_with("property.")
+        || name.starts_with("constant.")
+        || name.starts_with("enumCase.")
+        || name.starts_with("trait.")
+        || name.starts_with("namespace.")
+        || name.starts_with("name.")
+        || name.starts_with("phpdoc.")
+        || name.starts_with("generics.")
+        || name.starts_with("missing.")
+        || name.starts_with("pure.")
+    {
+        return RuleInputKind::Declarations;
+    }
+
+    if name == "return-type"
+        || name.starts_with("deadCode.")
+        || name.starts_with("variables.defined")
+        || name.starts_with("variables.maybeUndefined")
+        || name.contains("paramOut")
+        || name.contains("tooWide")
+        || name.contains("missingReturn")
+    {
+        return RuleInputKind::LocalBodyFlow;
+    }
+
+    if name.contains("argument")
+        || name.contains("type")
+        || name.contains("Type")
+        || name.contains("nullable")
+        || name.contains("union")
+        || name.contains("assign")
+        || name.contains("access")
+        || name.contains("call")
+        || name.contains("clone")
+        || name.contains("iterable")
+        || name.contains("mixed")
+    {
+        return RuleInputKind::TypeMapSensitive;
+    }
+
+    RuleInputKind::Expressions
+}
+
 /// Run every rule active at `level` over one file and collect the diagnostics.
 /// Pure over `fa` + the borrowed indexes — the engine's parallelizable unit.
 pub fn analyze_file(fa: &FileAnalysis, level: u8) -> Vec<Diagnostic> {
@@ -261,11 +356,17 @@ pub fn analyze_file(fa: &FileAnalysis, level: u8) -> Vec<Diagnostic> {
 /// rules that can analyze context-specific bodies outside the current file.
 pub fn analyze_file_located(fa: &FileAnalysis, level: u8) -> Vec<LocatedDiagnostic> {
     let mut out = Vec::new();
-    for rule in rules_for_level(level) {
-        out.extend((rule.run)(fa).into_iter().map(LocatedDiagnostic::local));
+    for scheduled in scheduled_rules_for_level(level) {
+        let _input = scheduled.input;
+        out.extend(
+            (scheduled.rule.run)(fa)
+                .into_iter()
+                .map(LocatedDiagnostic::local),
+        );
     }
-    for rule in located_rules_for_level(level) {
-        out.extend((rule.run)(fa));
+    for scheduled in scheduled_located_rules_for_level(level) {
+        let _input = scheduled.input;
+        out.extend((scheduled.rule.run)(fa));
     }
     out
 }
@@ -319,6 +420,32 @@ mod tests {
         let mut sorted_manifest_names = manifest_names;
         sorted_manifest_names.sort();
         assert_eq!(sorted_manifest_names, registry_names);
+    }
+
+    #[test]
+    fn scheduler_preserves_order_and_records_input_kinds() {
+        let raw: Vec<_> = rules_for_level(10).map(|r| r.name).collect();
+        let scheduled = scheduled_rules_for_level(10);
+        let scheduled_names: Vec<_> = scheduled.iter().map(|r| r.rule.name).collect();
+        assert_eq!(scheduled_names, raw);
+        assert!(scheduled
+            .iter()
+            .any(|r| r.input == RuleInputKind::Declarations));
+        assert!(scheduled
+            .iter()
+            .any(|r| r.input == RuleInputKind::Expressions));
+        assert!(scheduled
+            .iter()
+            .any(|r| r.input == RuleInputKind::TypeMapSensitive));
+        assert!(scheduled
+            .iter()
+            .any(|r| r.input == RuleInputKind::LocalBodyFlow));
+
+        let located = scheduled_located_rules_for_level(10);
+        assert!(!located.is_empty());
+        assert!(located
+            .iter()
+            .all(|r| r.input == RuleInputKind::ScopedCalls));
     }
 
     #[test]

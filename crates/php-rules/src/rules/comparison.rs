@@ -153,7 +153,7 @@ fn diag(span: Span, msg: impl Into<String>, code: &'static str) -> Diagnostic {
 
 fn run_if_condition(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_stmt(fa.program, &mut |s| {
+    for s in fa.facts.statements() {
         if let StmtKind::If { cond, elseifs, .. } = &s.kind {
             if let Some(v) = const_bool(fa, cond) {
                 out.push(diag(
@@ -166,7 +166,7 @@ fn run_if_condition(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 push_elseif(fa, ei, &mut out);
             }
         }
-    });
+    }
     out
 }
 
@@ -190,7 +190,7 @@ fn push_elseif(fa: &FileAnalysis, ei: &ElseIf, out: &mut Vec<Diagnostic>) {
 
 fn run_ternary_condition(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
+    for e in fa.facts.expressions() {
         if let ExprKind::Ternary { cond, .. } = &e.kind {
             if let Some(v) = const_bool(fa, cond) {
                 out.push(diag(
@@ -204,7 +204,7 @@ fn run_ternary_condition(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 ));
             }
         }
-    });
+    }
     out
 }
 
@@ -216,7 +216,7 @@ fn run_ternary_condition(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// `WhileLoopAlwaysTrueConditionRule`.
 fn run_while_condition(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_stmt(fa.program, &mut |s| {
+    for s in fa.facts.statements() {
         if let StmtKind::While { cond, .. } = &s.kind {
             match const_bool(fa, cond) {
                 Some(false) => out.push(diag(
@@ -232,14 +232,14 @@ fn run_while_condition(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 _ => {}
             }
         }
-    });
+    }
     out
 }
 
 /// `DoWhileLoopConstantConditionRule`. Same exit-point caveat as `while`.
 fn run_do_while_condition(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_stmt(fa.program, &mut |s| {
+    for s in fa.facts.statements() {
         if let StmtKind::DoWhile { cond, .. } = &s.kind {
             match const_bool(fa, cond) {
                 Some(false) => out.push(diag(
@@ -255,7 +255,7 @@ fn run_do_while_condition(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 _ => {}
             }
         }
-    });
+    }
     out
 }
 
@@ -265,17 +265,13 @@ fn run_do_while_condition(fa: &FileAnalysis) -> Vec<Diagnostic> {
 
 fn run_boolean_not(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        if let ExprKind::Unary {
-            op: UnOp::Not,
-            expr,
-        } = &e.kind
-        {
-            if let Some(v) = const_bool(fa, expr) {
+    for unary in fa.facts.unaries() {
+        if matches!(unary.op, UnOp::Not) {
+            if let Some(v) = const_bool(fa, unary.inner) {
                 // `!` flips: a constantly-true operand makes the negation false.
                 let result = !v;
                 out.push(diag(
-                    expr.span,
+                    unary.inner.span,
                     format!("Negated boolean expression is always {result}."),
                     if result {
                         "booleanNot.alwaysTrue"
@@ -285,7 +281,7 @@ fn run_boolean_not(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 ));
             }
         }
-    });
+    }
     out
 }
 
@@ -302,28 +298,25 @@ fn binary_sides(
     sigil: &str,
     out: &mut Vec<Diagnostic>,
 ) {
-    walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Binary { op, lhs, rhs } = &e.kind else {
-            return;
-        };
-        if !matches_op(*op) {
-            return;
+    for binary in fa.facts.binaries() {
+        if !matches_op(binary.op) {
+            continue;
         }
-        if let Some(v) = const_bool(fa, lhs) {
+        if let Some(v) = const_bool(fa, binary.lhs) {
             out.push(diag(
-                lhs.span,
+                binary.lhs.span,
                 format!("Left side of {sigil} is always {v}."),
                 side_code(prefix, true, v),
             ));
         }
-        if let Some(v) = const_bool(fa, rhs) {
+        if let Some(v) = const_bool(fa, binary.rhs) {
             out.push(diag(
-                rhs.span,
+                binary.rhs.span,
                 format!("Right side of {sigil} is always {v}."),
                 side_code(prefix, false, v),
             ));
         }
-    });
+    }
 }
 
 /// Map (identifier prefix, is-left, value) → the static phpstan identifier.
@@ -457,22 +450,22 @@ fn run_impossible_instanceof(fa: &FileAnalysis) -> Vec<Diagnostic> {
         .map(|r| ((r.span.start, r.span.end), r))
         .collect();
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
+    for e in fa.facts.expressions() {
         let ExprKind::Instanceof { expr, class } = &e.kind else {
-            return;
+            continue;
         };
         let ExprKind::Name(n) = &class.kind else {
-            return;
+            continue;
         };
         let Some(r) = cmap.get(&(n.span.start, n.span.end)) else {
-            return;
+            continue;
         };
         // Only an explicitly-named, fully-known class (skip self/static/parent/builtin).
         let Resolution::Fqn(class_fqn) = &r.resolution else {
-            return;
+            continue;
         };
         if !fa.class_fully_known(class_fqn) {
-            return;
+            continue;
         }
         let vt = fa.type_of(expr);
         if let Some(result) = instanceof_result(fa, &vt, class_fqn) {
@@ -480,7 +473,7 @@ fn run_impossible_instanceof(fa: &FileAnalysis) -> Vec<Diagnostic> {
             // always-*true* report OFF (`checkAlwaysTrueInstanceof`) — defensive
             // `instanceof` that's redundant is usually intentional. Match that.
             if result {
-                return;
+                continue;
             }
             let (verb, code) = ("false", "instanceof.alwaysFalse");
             out.push(diag(
@@ -489,7 +482,7 @@ fn run_impossible_instanceof(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 code,
             ));
         }
-    });
+    }
     out
 }
 
@@ -532,46 +525,45 @@ fn run_impossible_check_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
         .map(|r| ((r.span.start, r.span.end), r))
         .collect();
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Call { callee, args } = &e.kind else {
-            return;
-        };
-        let ExprKind::Name(n) = &callee.kind else {
-            return;
+    for call in fa.facts.function_calls() {
+        let ExprKind::Name(n) = &call.callee.kind else {
+            continue;
         };
         let Some(r) = fmap.get(&(n.span.start, n.span.end)) else {
-            return;
+            continue;
         };
         let fname = match &r.resolution {
             Resolution::Fqn(f) => f.trim_start_matches('\\').to_ascii_lowercase(),
             Resolution::Fallback { global, .. } => {
                 global.trim_start_matches('\\').to_ascii_lowercase()
             }
-            _ => return,
+            _ => continue,
         };
         let Some(pred) = predicate_cat(&fname) else {
-            return;
+            continue;
         };
-        let Some(arg0) = args.first() else { return };
+        let Some(arg0) = call.args.first() else {
+            continue;
+        };
         if arg0.spread || arg0.placeholder || arg0.name.is_some() {
-            return;
+            continue;
         }
         let Some(vcat) = category(&fa.type_of(&arg0.value)) else {
-            return;
+            continue;
         };
         // Always-*true* type-check (`is_int($int)`) is OFF by default in phpstan
         // (`checkAlwaysTrueCheckTypeFunctionCall`) — it reports the resulting dead
         // code instead. Only report the impossible (always-false) case.
         if vcat == pred {
-            return;
+            continue;
         }
         let (verb, code) = ("false", "function.impossibleType");
         out.push(diag(
-            e.span,
+            call.expr.span,
             format!("Call to function {fname}() will always evaluate to {verb}."),
             code,
         ));
-    });
+    }
     out
 }
 
@@ -676,44 +668,35 @@ fn run_impossible_check_type_method_call(fa: &FileAnalysis) -> Vec<Diagnostic> {
     }
     let assertions = assertion_methods(fa);
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::MethodCall {
-            recv,
-            nullsafe,
-            method,
-            args,
-        } = &e.kind
-        else {
-            return;
-        };
-        if *nullsafe {
-            return;
+    for call in fa.facts.method_calls() {
+        if call.nullsafe {
+            continue;
         }
-        let Some(method_name) = member_ident(fa, method) else {
-            return;
+        let Some(method_name) = member_ident(fa, call.method) else {
+            continue;
         };
-        let Some(receiver_fqn) = receiver_class(fa, recv) else {
-            return;
+        let Some(receiver_fqn) = receiver_class(fa, call.recv) else {
+            continue;
         };
         if !fa.class_fully_known(&receiver_fqn) {
-            return;
+            continue;
         }
         let Some(found) = fa.reflection.find_method(&receiver_fqn, &method_name) else {
-            return;
+            continue;
         };
         if found.member.magic || found.member.is_static {
-            return;
+            continue;
         }
         let Some(assertion) = assertions.get(&(
             symbols::fqn_key(&found.declaring_class),
             found.member.name.to_ascii_lowercase(),
             false,
         )) else {
-            return;
+            continue;
         };
-        if assertion_call_is_false(fa, &assertion.target, assertion.param_index, args) {
+        if assertion_call_is_false(fa, &assertion.target, assertion.param_index, call.args) {
             out.push(diag(
-                e.span,
+                call.expr.span,
                 format!(
                     "Call to method {}::{}() will always evaluate to false.",
                     found.declaring_class.trim_start_matches('\\'),
@@ -722,7 +705,7 @@ fn run_impossible_check_type_method_call(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 "method.impossibleType",
             ));
         }
-    });
+    }
     out
 }
 
@@ -738,40 +721,32 @@ fn run_impossible_check_type_static_method_call(fa: &FileAnalysis) -> Vec<Diagno
         .map(|r| ((r.span.start, r.span.end), r))
         .collect();
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::StaticCall {
-            class,
-            method,
-            args,
-        } = &e.kind
-        else {
-            return;
+    for call in fa.facts.static_calls() {
+        let Some(method_name) = member_ident(fa, call.method) else {
+            continue;
         };
-        let Some(method_name) = member_ident(fa, method) else {
-            return;
-        };
-        let Some(target_fqn) = static_call_class(fa, &cmap, class) else {
-            return;
+        let Some(target_fqn) = static_call_class(fa, &cmap, call.class) else {
+            continue;
         };
         if !fa.class_fully_known(&target_fqn) {
-            return;
+            continue;
         }
         let Some(found) = fa.reflection.find_method(&target_fqn, &method_name) else {
-            return;
+            continue;
         };
         if found.member.magic || !found.member.is_static {
-            return;
+            continue;
         }
         let Some(assertion) = assertions.get(&(
             symbols::fqn_key(&found.declaring_class),
             found.member.name.to_ascii_lowercase(),
             true,
         )) else {
-            return;
+            continue;
         };
-        if assertion_call_is_false(fa, &assertion.target, assertion.param_index, args) {
+        if assertion_call_is_false(fa, &assertion.target, assertion.param_index, call.args) {
             out.push(diag(
-                e.span,
+                call.expr.span,
                 format!(
                     "Call to static method {}::{}() will always evaluate to false.",
                     found.declaring_class.trim_start_matches('\\'),
@@ -780,7 +755,7 @@ fn run_impossible_check_type_static_method_call(fa: &FileAnalysis) -> Vec<Diagno
                 "staticMethod.impossibleType",
             ));
         }
-    });
+    }
     out
 }
 
@@ -918,17 +893,14 @@ fn methods(c: &ClassDecl) -> impl Iterator<Item = &MethodDecl> {
 
 fn run_strict_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Binary { op, lhs, rhs } = &e.kind else {
-            return;
-        };
-        let (sigil, always_false) = match op {
+    for binary in fa.facts.binaries() {
+        let (sigil, always_false) = match binary.op {
             BinOp::Identical => ("===", true),
             BinOp::NotIdentical => ("!==", false),
-            _ => return,
+            _ => continue,
         };
-        let lt = fa.type_of(lhs);
-        let rt = fa.type_of(rhs);
+        let lt = fa.type_of(binary.lhs);
+        let rt = fa.type_of(binary.rhs);
         // 1. Disjoint *types* — provably never/always equal, even for non-constant
         //    typed operands (`int $a === string $b`). `===` on disjoint types is
         //    always false (reported); `!==` is always true — and phpstan defaults
@@ -936,29 +908,31 @@ fn run_strict_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
         //    (`checkAlwaysTrueStrictComparison`), so we only report the false case.
         if disjoint(&lt, &rt) {
             if !always_false {
-                return;
+                continue;
             }
             let (verb, code) = ("false", "identical.alwaysFalse");
             out.push(diag(
-                e.span,
+                binary.expr.span,
                 format!("Strict comparison using {sigil} between {lt} and {rt} will always evaluate to {verb}."),
                 code,
             ));
-            return;
+            continue;
         }
         // 2. Same-category but constant-foldable (`1 === 1`, `1 === 2`).
-        if let (Some(ConstVal::Bool(result)), Some(l), Some(r)) =
-            (eval_const(e), eval_const(lhs), eval_const(rhs))
-        {
-            let code = match (op, result) {
+        if let (Some(ConstVal::Bool(result)), Some(l), Some(r)) = (
+            eval_const(binary.expr),
+            eval_const(binary.lhs),
+            eval_const(binary.rhs),
+        ) {
+            let code = match (binary.op, result) {
                 (BinOp::Identical, true) => "identical.alwaysTrue",
                 (BinOp::Identical, false) => "identical.alwaysFalse",
                 (BinOp::NotIdentical, true) => "notIdentical.alwaysTrue",
                 (BinOp::NotIdentical, false) => "notIdentical.alwaysFalse",
-                _ => return,
+                _ => continue,
             };
             out.push(diag(
-                e.span,
+                binary.expr.span,
                 format!(
                     "Strict comparison using {sigil} between {} and {} will always evaluate to {result}.",
                     l.describe(),
@@ -967,7 +941,7 @@ fn run_strict_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 code,
             ));
         }
-    });
+    }
     out
 }
 
@@ -978,24 +952,23 @@ fn run_strict_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
 
 fn run_constant_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Binary { op, lhs, rhs } = &e.kind else {
-            return;
-        };
+    for binary in fa.facts.binaries() {
         // (sigil, node-type for `<` family, loose flag)
-        let (sigil, ntype, loose) = match op {
+        let (sigil, ntype, loose) = match binary.op {
             BinOp::Eq => ("==", "equal", true),
             BinOp::NotEq => ("!=", "notEqual", true),
             BinOp::Lt => ("<", "smaller", false),
             BinOp::Gt => (">", "greater", false),
             BinOp::LtEq => ("<=", "smallerOrEqual", false),
             BinOp::GtEq => (">=", "greaterOrEqual", false),
-            _ => return,
+            _ => continue,
         };
-        let (Some(ConstVal::Bool(result)), Some(l), Some(r)) =
-            (eval_const(e), eval_const(lhs), eval_const(rhs))
-        else {
-            return;
+        let (Some(ConstVal::Bool(result)), Some(l), Some(r)) = (
+            eval_const(binary.expr),
+            eval_const(binary.lhs),
+            eval_const(binary.rhs),
+        ) else {
+            continue;
         };
         // The registry needs a `&'static str` code; enumerate the variants.
         let code = match (ntype, result) {
@@ -1011,7 +984,7 @@ fn run_constant_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
             ("smallerOrEqual", false) => "smallerOrEqual.alwaysFalse",
             ("greaterOrEqual", true) => "greaterOrEqual.alwaysTrue",
             ("greaterOrEqual", false) => "greaterOrEqual.alwaysFalse",
-            _ => return,
+            _ => continue,
         };
         let msg = if loose {
             format!(
@@ -1026,8 +999,8 @@ fn run_constant_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 r.describe()
             )
         };
-        out.push(diag(e.span, msg, code));
-    });
+        out.push(diag(binary.expr.span, msg, code));
+    }
     out
 }
 
@@ -1044,26 +1017,36 @@ fn run_constant_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// flag anything whose runtime value we can't prove.
 fn run_match_arms(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
+    for e in fa.facts.expressions() {
         let ExprKind::Match { subject, arms } = &e.kind else {
-            return;
+            continue;
         };
         let Some(subj) = eval_const(subject) else {
-            return;
+            continue;
         };
 
         // Every condition must fold to a constant; otherwise we can't reason about
         // any arm safely (a non-constant arm could match the subject).
         let mut folded: Vec<Vec<(Span, ConstVal)>> = Vec::with_capacity(arms.len());
+        let mut all_folded = true;
         for arm in arms {
             let mut arm_vals = Vec::new();
             if let Some(arm_conds) = &arm.conds {
                 for c in arm_conds {
-                    let Some(v) = eval_const(c) else { return };
+                    let Some(v) = eval_const(c) else {
+                        all_folded = false;
+                        break;
+                    };
                     arm_vals.push((c.span, v));
                 }
             }
+            if !all_folded {
+                break;
+            }
             folded.push(arm_vals);
+        }
+        if !all_folded {
+            continue;
         }
 
         let arms_count = arms.len();
@@ -1105,7 +1088,7 @@ fn run_match_arms(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 }
             }
         }
-    });
+    }
     out
 }
 
@@ -1120,21 +1103,21 @@ fn run_void_match(fa: &FileAnalysis) -> Vec<Diagnostic> {
     // Spans of `match` expressions that ARE a bare statement (first-level) — those
     // are allowed to be void.
     let mut statement_matches = std::collections::HashSet::new();
-    walk::for_each_stmt(fa.program, &mut |s| {
+    for s in fa.facts.statements() {
         if let StmtKind::Expr(e) = &s.kind {
             if matches!(e.kind, ExprKind::Match { .. }) {
                 statement_matches.insert((e.span.start, e.span.end));
             }
         }
-    });
+    }
 
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
+    for e in fa.facts.expressions() {
         if !matches!(e.kind, ExprKind::Match { .. }) {
-            return;
+            continue;
         }
         if statement_matches.contains(&(e.span.start, e.span.end)) {
-            return; // bare statement — its void result isn't "used"
+            continue; // bare statement — its void result isn't "used"
         }
         if matches!(fa.type_of(e), Type::Void) {
             out.push(diag(
@@ -1143,7 +1126,7 @@ fn run_void_match(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 "match.void",
             ));
         }
-    });
+    }
     out
 }
 

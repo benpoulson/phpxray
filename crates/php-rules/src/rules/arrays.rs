@@ -51,8 +51,8 @@
 //!   here intentionally skip unions, maybe-empty arrays, and object-specific
 //!   offset key contracts unless they are explicit in `ArrayAccess<_, _>`.
 
-use crate::{walk, FileAnalysis, RuleEntry};
-use php_ast::{ArrayItem, Expr, ExprKind, StmtKind};
+use crate::{facts::AssignmentKind, walk, FileAnalysis, RuleEntry};
+use php_ast::{ArrayItem, Expr, ExprKind};
 use php_diagnostics::Diagnostic;
 use php_span::Span;
 use php_types::Type;
@@ -111,11 +111,13 @@ fn export_key(k: &KeyVal) -> String {
 /// single array literal, report constant keys that appear more than once.
 fn run_duplicate_keys(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        if let ExprKind::Array { items, .. } = &e.kind {
-            out.extend(duplicate_keys_in_one_array(items, fa.source, e.span));
-        }
-    });
+    for array in fa.facts.arrays() {
+        out.extend(duplicate_keys_in_one_array(
+            array.items,
+            fa.source,
+            array.expr.span,
+        ));
+    }
     out
 }
 
@@ -214,35 +216,26 @@ fn run_offset_access_no_dim(fa: &FileAnalysis) -> Vec<Diagnostic> {
     // (assignment) position — those are the allowed `$a[] = …` appends.
     let mut allowed: HashSet<(u32, u32)> = HashSet::new();
 
-    walk::for_each_expr(fa.program, &mut |e| match &e.kind {
-        ExprKind::Assign { target, .. }
-        | ExprKind::AssignRef { target, .. }
-        | ExprKind::AssignOp { target, .. } => {
-            mark_write_targets(target, &mut allowed);
-        }
-        _ => {}
-    });
+    for assign in fa.facts.assignments() {
+        mark_write_targets(assign.target, &mut allowed);
+    }
     // `foreach (... as $a[])` — the value (and key) are write targets.
-    walk::for_each_stmt(fa.program, &mut |s| {
-        if let StmtKind::Foreach { key, value, .. } = &s.kind {
-            if let Some(k) = key {
-                mark_write_targets(k, &mut allowed);
-            }
-            mark_write_targets(value, &mut allowed);
+    for foreach in fa.facts.foreaches() {
+        if let Some(k) = foreach.key {
+            mark_write_targets(k, &mut allowed);
         }
-    });
+        mark_write_targets(foreach.value, &mut allowed);
+    }
 
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        if let ExprKind::Index { index: None, .. } = &e.kind {
-            if !allowed.contains(&span_key(e.span)) {
-                out.push(
-                    Diagnostic::error(e.span, "Cannot use [] for reading.")
-                        .with_code("offsetAccess.noDim"),
-                );
-            }
+    for index in fa.facts.indexes() {
+        if index.index.is_none() && !allowed.contains(&span_key(index.expr.span)) {
+            out.push(
+                Diagnostic::error(index.expr.span, "Cannot use [] for reading.")
+                    .with_code("offsetAccess.noDim"),
+            );
         }
-    });
+    }
     out
 }
 
@@ -614,40 +607,36 @@ fn mark_index_subtree(expr: &Expr, spans: &mut HashSet<(u32, u32)>) {
 
 fn write_index_spans(fa: &FileAnalysis) -> HashSet<(u32, u32)> {
     let mut spans = HashSet::new();
-    walk::for_each_expr(fa.program, &mut |e| match &e.kind {
-        ExprKind::Assign { target, .. }
-        | ExprKind::AssignRef { target, .. }
-        | ExprKind::AssignOp { target, .. } => mark_index_subtree(target, &mut spans),
-        _ => {}
-    });
-    walk::for_each_stmt(fa.program, &mut |s| {
-        if let StmtKind::Foreach { key, value, .. } = &s.kind {
-            if let Some(key) = key {
-                mark_index_subtree(key, &mut spans);
-            }
-            mark_index_subtree(value, &mut spans);
+    for assign in fa.facts.assignments() {
+        mark_index_subtree(assign.target, &mut spans);
+    }
+    for foreach in fa.facts.foreaches() {
+        if let Some(key) = foreach.key {
+            mark_index_subtree(key, &mut spans);
         }
-    });
+        mark_index_subtree(foreach.value, &mut spans);
+    }
     spans
 }
 
 fn undefined_allowed_index_spans(fa: &FileAnalysis) -> HashSet<(u32, u32)> {
     let mut spans = HashSet::new();
-    walk::for_each_expr(fa.program, &mut |e| match &e.kind {
-        ExprKind::Isset(vars) => {
-            for v in vars {
-                mark_index_subtree(v, &mut spans);
-            }
+    for isset in fa.facts.issets() {
+        for v in isset.vars {
+            mark_index_subtree(v, &mut spans);
         }
-        ExprKind::Empty(inner) => mark_index_subtree(inner, &mut spans),
-        ExprKind::Coalesce { lhs, .. } => mark_index_subtree(lhs, &mut spans),
-        ExprKind::AssignOp {
-            op: php_ast::BinOp::Coalesce,
-            target,
-            ..
-        } => mark_index_subtree(target, &mut spans),
-        _ => {}
-    });
+    }
+    for empty in fa.facts.empties() {
+        mark_index_subtree(empty.inner, &mut spans);
+    }
+    for coalesce in fa.facts.coalesces() {
+        mark_index_subtree(coalesce.lhs, &mut spans);
+    }
+    for assign in fa.facts.assignments() {
+        if matches!(assign.kind, AssignmentKind::Op(php_ast::BinOp::Coalesce)) {
+            mark_index_subtree(assign.target, &mut spans);
+        }
+    }
     spans
 }
 
@@ -656,22 +645,20 @@ fn undefined_allowed_index_spans(fa: &FileAnalysis) -> HashSet<(u32, u32)> {
 /// definitely non-iterable (see [`definitely_not_iterable`]).
 fn run_iterable_in_foreach(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_stmt(fa.program, &mut |s| {
-        if let StmtKind::Foreach { subject, .. } = &s.kind {
-            let ty = fa.type_of(subject);
-            if definitely_not_iterable(fa, &ty) {
-                out.push(
-                    Diagnostic::error(
-                        subject.span,
-                        format!(
-                            "Argument of an invalid type {ty} supplied for foreach, only iterables are supported.",
-                        ),
-                    )
-                    .with_code("foreach.nonIterable"),
-                );
-            }
+    for foreach in fa.facts.foreaches() {
+        let ty = fa.type_of(foreach.subject);
+        if definitely_not_iterable(fa, &ty) {
+            out.push(
+                Diagnostic::error(
+                    foreach.subject.span,
+                    format!(
+                        "Argument of an invalid type {ty} supplied for foreach, only iterables are supported.",
+                    ),
+                )
+                .with_code("foreach.nonIterable"),
+            );
         }
-    });
+    }
     out
 }
 
@@ -679,11 +666,8 @@ fn run_iterable_in_foreach(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// element `[...$x]` requires `$x` to be iterable.
 fn run_unpack_iterable_in_array(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Array { items, .. } = &e.kind else {
-            return;
-        };
-        for it in items {
+    for array in fa.facts.arrays() {
+        for it in array.items {
             if !it.spread {
                 continue;
             }
@@ -699,7 +683,7 @@ fn run_unpack_iterable_in_array(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 );
             }
         }
-    });
+    }
     out
 }
 
@@ -713,11 +697,8 @@ fn run_array_unpacking_string_offset(fa: &FileAnalysis) -> Vec<Diagnostic> {
     }
 
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Array { items, .. } = &e.kind else {
-            return;
-        };
-        for it in items {
+    for array in fa.facts.arrays() {
+        for it in array.items {
             if !it.spread {
                 continue;
             }
@@ -742,7 +723,7 @@ fn run_array_unpacking_string_offset(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 .with_code("arrayUnpacking.stringOffset"),
             );
         }
-    });
+    }
     out
 }
 
@@ -751,22 +732,25 @@ fn run_array_unpacking_string_offset(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// be an array or `ArrayAccess`.
 fn run_array_destructuring(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Assign { target, rhs } = &e.kind else {
-            return;
-        };
-        // Only a list/array destructuring target triggers this rule.
-        if !matches!(target.kind, ExprKind::Array { .. }) {
-            return;
+    for assign in fa.facts.assignments() {
+        if !matches!(assign.kind, AssignmentKind::Plain) {
+            continue;
         }
-        let ty = fa.type_of(rhs);
+        // Only a list/array destructuring target triggers this rule.
+        if !matches!(assign.target.kind, ExprKind::Array { .. }) {
+            continue;
+        }
+        let ty = fa.type_of(assign.rhs);
         if definitely_not_array_destructurable(fa, &ty) {
             out.push(
-                Diagnostic::error(rhs.span, format!("Cannot use array destructuring on {ty}."))
-                    .with_code("offsetAccess.nonArray"),
+                Diagnostic::error(
+                    assign.rhs.span,
+                    format!("Cannot use array destructuring on {ty}."),
+                )
+                .with_code("offsetAccess.nonArray"),
             );
         }
-    });
+    }
     out
 }
 
@@ -776,11 +760,8 @@ fn run_array_destructuring(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// (array/object/resource).
 fn run_invalid_key_in_array_item(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Array { items, .. } = &e.kind else {
-            return;
-        };
-        for it in items {
+    for array in fa.facts.arrays() {
+        for it in array.items {
             let Some(key) = &it.key else { continue };
             let ty = fa.type_of(key);
             if definitely_invalid_key(&ty) {
@@ -790,7 +771,7 @@ fn run_invalid_key_in_array_item(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 );
             }
         }
-    });
+    }
     out
 }
 
@@ -800,16 +781,12 @@ fn run_invalid_key_in_array_item(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// misfire on string offsets (`$s[$i]`) or `ArrayAccess` objects.
 fn run_invalid_key_in_dim_fetch(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Index {
-            base,
-            index: Some(dim),
-        } = &e.kind
-        else {
-            return;
+    for index in fa.facts.indexes() {
+        let Some(dim) = index.index else {
+            continue;
         };
-        if !definitely_array(&fa.type_of(base)) {
-            return;
+        if !definitely_array(&fa.type_of(index.base)) {
+            continue;
         }
         let ty = fa.type_of(dim);
         if definitely_invalid_key(&ty) {
@@ -818,7 +795,7 @@ fn run_invalid_key_in_dim_fetch(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     .with_code("offsetAccess.invalidOffset"),
             );
         }
-    });
+    }
     out
 }
 
@@ -829,30 +806,25 @@ fn run_invalid_key_in_dim_fetch(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// array-shape mutations, and maybe cases are left alone.
 fn run_offset_access_assignment(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        let target = match &e.kind {
-            ExprKind::Assign { target, .. }
-            | ExprKind::AssignRef { target, .. }
-            | ExprKind::AssignOp { target, .. } => target,
-            _ => return,
-        };
+    for assign in fa.facts.assignments() {
+        let target = assign.target;
         let ExprKind::Index { base, index } = &target.kind else {
-            return;
+            continue;
         };
         let base_ty = fa.type_of(base);
         if !definitely_string_offset_base(&base_ty) {
-            return;
+            continue;
         }
         let dim_ty = index.as_ref().map(|dim| fa.type_of(dim));
         if !definitely_invalid_string_write_offset(dim_ty.as_ref()) {
-            return;
+            continue;
         }
         let msg = match &dim_ty {
             None => format!("Cannot assign new offset to {base_ty}."),
             Some(dim_ty) => format!("Cannot assign offset {dim_ty} to {base_ty}."),
         };
         out.push(Diagnostic::error(target.span, msg).with_code("offsetAssign.dimType"));
-    });
+    }
     out
 }
 
@@ -862,33 +834,30 @@ fn run_offset_access_assignment(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// accepts, so this under-reports by design.
 fn run_offset_access_value_assignment(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        let (target, assigned_ty) = match &e.kind {
-            ExprKind::Assign { target, rhs } | ExprKind::AssignRef { target, rhs } => {
-                (target, fa.type_of(rhs))
-            }
-            ExprKind::AssignOp { target, .. } => (target, fa.type_of(e)),
-            _ => return,
+    for assign in fa.facts.assignments() {
+        let assigned_ty = match assign.kind {
+            AssignmentKind::Plain | AssignmentKind::Ref => fa.type_of(assign.rhs),
+            AssignmentKind::Op(_) => fa.type_of(assign.expr),
         };
-        let ExprKind::Index { base, .. } = &target.kind else {
-            return;
+        let ExprKind::Index { base, .. } = &assign.target.kind else {
+            continue;
         };
         let base_ty = fa.type_of(base);
         let Some(accepted_ty) = array_access_value_type(fa, &base_ty) else {
-            return;
+            continue;
         };
         let checked_value = fa.lenient_src(assigned_ty.clone());
         if crate::is_assignable(fa.reflection, &checked_value, &accepted_ty) {
-            return;
+            continue;
         }
         out.push(
             Diagnostic::error(
-                target.span,
+                assign.target.span,
                 format!("{base_ty} does not accept {assigned_ty}."),
             )
             .with_code("offsetAssign.valueType"),
         );
-    });
+    }
     out
 }
 
@@ -901,37 +870,33 @@ fn run_nonexistent_offset_in_array_dim_fetch(fa: &FileAnalysis) -> Vec<Diagnosti
     let write_spans = write_index_spans(fa);
     let undefined_allowed = undefined_allowed_index_spans(fa);
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Index {
-            base,
-            index: Some(dim),
-        } = &e.kind
-        else {
-            return;
+    for index in fa.facts.indexes() {
+        let Some(dim) = index.index else {
+            continue;
         };
-        let key = span_key(e.span);
+        let key = span_key(index.expr.span);
         if write_spans.contains(&key) || undefined_allowed.contains(&key) {
-            return;
+            continue;
         }
         let Some(shape_key) = const_shape_key(dim) else {
-            return;
+            continue;
         };
-        let base_ty = fa.type_of(base);
+        let base_ty = fa.type_of(index.base);
         if !matches!(
             shape_offset_status(&base_ty, &shape_key),
             Some(ShapeOffsetStatus::Missing)
         ) {
-            return;
+            continue;
         }
         let dim_ty = fa.type_of(dim);
         out.push(
             Diagnostic::error(
-                e.span,
+                index.expr.span,
                 format!("Offset {dim_ty} does not exist on {base_ty}."),
             )
             .with_code("offsetAccess.notFound"),
         );
-    });
+    }
     out
 }
 
@@ -942,34 +907,30 @@ fn run_maybe_nonexistent_offset_in_array_dim_fetch(fa: &FileAnalysis) -> Vec<Dia
     let write_spans = write_index_spans(fa);
     let undefined_allowed = undefined_allowed_index_spans(fa);
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Index {
-            base,
-            index: Some(dim),
-        } = &e.kind
-        else {
-            return;
+    for index in fa.facts.indexes() {
+        let Some(dim) = index.index else {
+            continue;
         };
-        let key = span_key(e.span);
+        let key = span_key(index.expr.span);
         if write_spans.contains(&key) || undefined_allowed.contains(&key) {
-            return;
+            continue;
         }
         let Some(shape_key) = const_shape_key(dim) else {
-            return;
+            continue;
         };
-        let base_ty = fa.type_of(base);
+        let base_ty = fa.type_of(index.base);
         if !shape_offset_maybe_reportable(&base_ty, &shape_key) {
-            return;
+            continue;
         }
         let dim_ty = fa.type_of(dim);
         out.push(
             Diagnostic::error(
-                e.span,
+                index.expr.span,
                 format!("Offset {dim_ty} might not exist on {base_ty}."),
             )
             .with_code("offsetAccess.notFound"),
         );
-    });
+    }
     out
 }
 
@@ -981,22 +942,19 @@ fn run_nullable_offset_access(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let write_spans = write_index_spans(fa);
     let undefined_allowed = undefined_allowed_index_spans(fa);
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Index { base, index } = &e.kind else {
-            return;
-        };
-        let key = span_key(e.span);
+    for index in fa.facts.indexes() {
+        let key = span_key(index.expr.span);
         if write_spans.contains(&key) || undefined_allowed.contains(&key) {
-            return;
+            continue;
         }
-        let base_ty = fa.type_of(base);
+        let base_ty = fa.type_of(index.base);
         let Some(non_null) = super::non_null_part(&base_ty) else {
-            return;
+            continue;
         };
         if !definitely_offset_accessible(fa, &non_null) {
-            return;
+            continue;
         }
-        let message = if let Some(dim) = index {
+        let message = if let Some(dim) = index.index {
             let dim_ty = fa.type_of(dim);
             format!(
                 "Cannot access offset {dim_ty} on {}.",
@@ -1008,8 +966,11 @@ fn run_nullable_offset_access(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 super::nullable_type_display(&base_ty)
             )
         };
-        out.push(Diagnostic::error(e.span, message).with_code("offsetAccess.nonOffsetAccessible"));
-    });
+        out.push(
+            Diagnostic::error(index.expr.span, message)
+                .with_code("offsetAccess.nonOffsetAccessible"),
+        );
+    }
     out
 }
 
@@ -1022,29 +983,29 @@ fn run_union_offset_access(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let write_spans = write_index_spans(fa);
     let undefined_allowed = undefined_allowed_index_spans(fa);
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Index { base, index } = &e.kind else {
-            return;
-        };
-        let key = span_key(e.span);
+    for index in fa.facts.indexes() {
+        let key = span_key(index.expr.span);
         if write_spans.contains(&key) || undefined_allowed.contains(&key) {
-            return;
+            continue;
         }
-        let base_ty = fa.type_of(base);
+        let base_ty = fa.type_of(index.base);
         let Some((accessible, inaccessible)) = union_offset_status(fa, &base_ty) else {
-            return;
+            continue;
         };
         if !(accessible && inaccessible) {
-            return;
+            continue;
         }
-        let message = if let Some(dim) = index {
+        let message = if let Some(dim) = index.index {
             let dim_ty = fa.type_of(dim);
             format!("Cannot access offset {dim_ty} on {base_ty}.")
         } else {
             format!("Cannot access an offset on {base_ty}.")
         };
-        out.push(Diagnostic::error(e.span, message).with_code("offsetAccess.nonOffsetAccessible"));
-    });
+        out.push(
+            Diagnostic::error(index.expr.span, message)
+                .with_code("offsetAccess.nonOffsetAccessible"),
+        );
+    }
     out
 }
 
@@ -1074,16 +1035,14 @@ fn union_offset_status(fa: &FileAnalysis, ty: &Type) -> Option<(bool, bool)> {
 /// only for the literal `[]` and empty sealed shapes.
 fn run_dead_foreach(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_stmt(fa.program, &mut |s| {
-        if let StmtKind::Foreach { subject, .. } = &s.kind {
-            if definitely_empty_iterable_expr(fa, subject) {
-                out.push(
-                    Diagnostic::error(subject.span, "Empty array passed to foreach.")
-                        .with_code("foreach.emptyArray"),
-                );
-            }
+    for foreach in fa.facts.foreaches() {
+        if definitely_empty_iterable_expr(fa, foreach.subject) {
+            out.push(
+                Diagnostic::error(foreach.subject.span, "Empty array passed to foreach.")
+                    .with_code("foreach.emptyArray"),
+            );
         }
-    });
+    }
     out
 }
 

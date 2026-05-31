@@ -5,6 +5,7 @@
 //!                       and report counts. The TDD Tier-C smoke check.
 //!   phpt-extract FILE   Print the `--FILE--` body of a single `.phpt`.
 //!   rule-manifest       Print analyzer rules/options for generated docs.
+//!   rule-timings        Run analyzer timing instrumentation over a path/config.
 //!   gen-tokens          (M1) Generate golden token fixtures via PHP. Requires PHP.
 
 use std::collections::BTreeMap;
@@ -54,6 +55,7 @@ fn main() -> ExitCode {
         }
         Some("phpt-extract") => cmd_phpt_extract(args.get(1).map(PathBuf::from)),
         Some("rule-manifest") => cmd_rule_manifest(),
+        Some("rule-timings") => cmd_rule_timings(&args[1..]),
         Some("gen-tokens") => cmd_gen_tokens(),
         Some("gen-stubs") => cmd_gen_stubs(),
         Some(other) => {
@@ -78,6 +80,8 @@ fn usage() {
          \x20                     diff our tokens vs PHP token_get_all over the corpus (requires PHP)\n\
          \x20 phpt-extract FILE   print the --FILE-- body of a .phpt\n\
          \x20 rule-manifest       print analyzer rule/strictness manifest for docs\n\
+         \x20 rule-timings [--path PATH]\n\
+         \x20                     run analyzer timing instrumentation over a path/config\n\
          \x20 gen-tokens          generate golden token fixtures (requires PHP; M1)"
     );
 }
@@ -111,6 +115,96 @@ fn cmd_rule_manifest() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+fn cmd_rule_timings(args: &[String]) -> ExitCode {
+    let mut path: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--path" => {
+                let Some(value) = it.next() else {
+                    eprintln!("error: --path requires a value");
+                    return ExitCode::FAILURE;
+                };
+                path = Some(value.clone());
+            }
+            other => {
+                path = Some(other.to_string());
+            }
+        }
+    }
+
+    let workspace = workspace_root();
+    let (mut config, root) = if let Some(path) = path {
+        (
+            php_config::Config {
+                level: php_config::Level::MAX,
+                paths: vec![path],
+                ..php_config::Config::default()
+            },
+            workspace,
+        )
+    } else if let Some(config_path) = php_config::Config::discover(&workspace) {
+        match php_config::Config::load(&config_path) {
+            Ok(config) => {
+                let root = config_path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| workspace.clone());
+                (config, root)
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        (
+            php_config::Config {
+                level: php_config::Level::MAX,
+                paths: vec![".".to_string()],
+                ..php_config::Config::default()
+            },
+            workspace,
+        )
+    };
+
+    if config.paths.is_empty() {
+        config.paths.push(".".to_string());
+    }
+
+    let report = php_cli::run_with_options(
+        &config,
+        &root,
+        php_cli::RunOptions {
+            progress: false,
+            collect_timings: true,
+        },
+    );
+    let Some(t) = report.timings else {
+        eprintln!("error: timing collection did not produce timings");
+        return ExitCode::FAILURE;
+    };
+
+    println!("files_analyzed\t{}", report.files_analyzed);
+    println!("findings\t{}", report.findings.len());
+    print_duration("discovery_ms", t.discovery);
+    print_duration("read_ms", t.read);
+    print_duration("parse_ms", t.parse);
+    print_duration("index_ms", t.index);
+    print_duration("analyze_ms", t.analyze);
+    print_duration("resolve_ms", t.resolve);
+    print_duration("facts_ms", t.facts);
+    print_duration("type_map_ms", t.type_map);
+    print_duration("native_type_map_ms", t.native_type_map);
+    print_duration("rules_ms", t.rules);
+    ExitCode::SUCCESS
+}
+
+fn print_duration(label: &str, duration: std::time::Duration) {
+    println!("{label}\t{:.3}", duration.as_secs_f64() * 1000.0);
 }
 
 /// Differential token check: lex every corpus `--FILE--` with both our lexer and

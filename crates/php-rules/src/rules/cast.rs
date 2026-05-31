@@ -22,7 +22,7 @@
 //! - `encapsedStringPart.nonString` (`InvalidPartOfEncapsedStringRule`) — an
 //!   interpolated expression that can never be cast to string (`"{$arr}"`).
 //!
-use crate::{walk, FileAnalysis, RuleEntry};
+use crate::{FileAnalysis, RuleEntry};
 use php_ast::{CastKind, ExprKind, StmtKind};
 use php_diagnostics::Diagnostic;
 use php_types::Type;
@@ -37,29 +37,28 @@ fn run_deprecated_cast(fa: &FileAnalysis) -> Vec<Diagnostic> {
     }
 
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
+    for cast in fa.facts.casts() {
         if !matches!(
-            e.kind,
-            ExprKind::Cast {
-                kind: CastKind::Int | CastKind::Bool | CastKind::Float | CastKind::String,
-                ..
-            }
+            cast.kind,
+            CastKind::Int | CastKind::Bool | CastKind::Float | CastKind::String
         ) {
-            return;
+            continue;
         }
-        let Some((spelling, replacement)) = deprecated_cast_spelling(e.span.text(fa.source)) else {
-            return;
+        let Some((spelling, replacement)) =
+            deprecated_cast_spelling(cast.expr.span.text(fa.source))
+        else {
+            continue;
         };
         out.push(
             Diagnostic::error(
-                e.span,
+                cast.expr.span,
                 format!(
                     "Non-standard ({spelling}) cast is deprecated in PHP 8.5. Use ({replacement}) instead."
                 ),
             )
             .with_code("cast.deprecated"),
         );
-    });
+    }
     out
 }
 
@@ -83,21 +82,17 @@ fn deprecated_cast_spelling(expr_src: &str) -> Option<(&'static str, &'static st
 /// `(unset)` cast — no longer supported since PHP 8.0.
 fn run_unset_cast(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        if let ExprKind::Cast {
-            kind: CastKind::Unset,
-            ..
-        } = &e.kind
-        {
+    for cast in fa.facts.casts() {
+        if matches!(cast.kind, CastKind::Unset) {
             out.push(
                 Diagnostic::error(
-                    e.span,
+                    cast.expr.span,
                     "The (unset) cast is no longer supported in PHP 8.0 and later.",
                 )
                 .with_code("cast.unset"),
             );
         }
-    });
+    }
     out
 }
 
@@ -106,7 +101,7 @@ fn run_unset_cast(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_void_cast(fa: &FileAnalysis) -> Vec<Diagnostic> {
     // Collect void casts that ARE a statement expression (the allowed position).
     let mut allowed: HashSet<(u32, u32)> = HashSet::new();
-    walk::for_each_stmt(fa.program, &mut |s| {
+    for s in fa.facts.statements() {
         if let StmtKind::Expr(e) = &s.kind {
             if let ExprKind::Cast {
                 kind: CastKind::Void,
@@ -117,27 +112,23 @@ fn run_void_cast(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 allowed.insert((r.start as u32, r.end as u32));
             }
         }
-    });
+    }
 
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        if let ExprKind::Cast {
-            kind: CastKind::Void,
-            ..
-        } = &e.kind
-        {
-            let r = e.span.range();
+    for cast in fa.facts.casts() {
+        if matches!(cast.kind, CastKind::Void) {
+            let r = cast.expr.span.range();
             if !allowed.contains(&(r.start as u32, r.end as u32)) {
                 out.push(
                     Diagnostic::error(
-                        e.span,
+                        cast.expr.span,
                         "The (void) cast cannot be used within an expression.",
                     )
                     .with_code("cast.void"),
                 );
             }
         }
-    });
+    }
     out
 }
 
@@ -200,24 +191,22 @@ fn never_number(t: &Type) -> bool {
 /// PHP, and `(array)`/`(object)` wrap any value.
 fn run_invalid_cast(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Cast { kind, expr } = &e.kind else {
-            return;
-        };
+    for cast in fa.facts.casts() {
         // (name shown in phpstan's message, identifier suffix, coercibility test)
-        let (name, ident, bad): (&str, &'static str, fn(&Type) -> bool) = match kind {
+        let (name, ident, bad): (&str, &'static str, fn(&Type) -> bool) = match cast.kind {
             CastKind::Int => ("int", "cast.int", never_number),
             CastKind::Float => ("float", "cast.double", never_number),
             CastKind::String => ("string", "cast.string", never_string),
-            _ => return,
+            _ => continue,
         };
-        let t = fa.type_of(expr);
+        let t = fa.type_of(cast.inner);
         if bad(&t) {
             out.push(
-                Diagnostic::error(e.span, format!("Cannot cast {t} to {name}.")).with_code(ident),
+                Diagnostic::error(cast.expr.span, format!("Cannot cast {t} to {name}."))
+                    .with_code(ident),
             );
         }
-    });
+    }
     out
 }
 
@@ -225,11 +214,8 @@ fn run_invalid_cast(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// string.
 fn run_echo(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_stmt(fa.program, &mut |s| {
-        let StmtKind::Echo(exprs) = &s.kind else {
-            return;
-        };
-        for (i, ex) in exprs.iter().enumerate() {
+    for echo in fa.facts.echoes() {
+        for (i, ex) in echo.exprs.iter().enumerate() {
             let t = fa.type_of(ex);
             if never_string(&t) {
                 out.push(
@@ -244,7 +230,7 @@ fn run_echo(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 );
             }
         }
-    });
+    }
     out
 }
 
@@ -252,21 +238,18 @@ fn run_echo(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// string.
 fn run_print(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Print(inner) = &e.kind else {
-            return;
-        };
-        let t = fa.type_of(inner);
+    for print in fa.facts.prints() {
+        let t = fa.type_of(print.inner);
         if never_string(&t) {
             out.push(
                 Diagnostic::error(
-                    inner.span,
+                    print.inner.span,
                     format!("Parameter {t} of print cannot be converted to string."),
                 )
                 .with_code("print.nonString"),
             );
         }
-    });
+    }
     out
 }
 
@@ -275,10 +258,10 @@ fn run_print(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// parts) are skipped — only the embedded *expressions* are checked.
 fn run_invalid_encapsed_part(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
+    for e in fa.facts.expressions() {
         let parts = match &e.kind {
             ExprKind::Interpolated(parts) | ExprKind::ShellExec(parts) => parts,
-            _ => return,
+            _ => continue,
         };
         for part in parts {
             // Literal text runs are `Str`; they are always valid string parts.
@@ -300,7 +283,7 @@ fn run_invalid_encapsed_part(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 );
             }
         }
-    });
+    }
     out
 }
 

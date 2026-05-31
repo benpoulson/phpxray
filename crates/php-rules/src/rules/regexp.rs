@@ -98,42 +98,41 @@ fn is_global_preg(fa: &FileAnalysis, r: &ResolvedRef, tail: &str) -> bool {
 fn run_pattern(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let fmap = function_refs(fa.resolved_refs);
     let mut out = Vec::new();
-    crate::walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Call { callee, args } = &e.kind else {
-            return;
-        };
-        let Some(r) = resolved_callee(callee, &fmap) else {
-            return;
+    for call in fa.facts.function_calls() {
+        let Some(r) = resolved_callee(call.callee, &fmap) else {
+            continue;
         };
         let Some(tail) = global_tail_lower(r) else {
-            return;
+            continue;
         };
         // Every preg_* function takes the pattern as the first argument. Match
         // any `preg_`-prefixed global function (phpstan does the same), but only
         // the ones whose first arg is the pattern string. `preg_quote` /
         // `preg_last_error*` do NOT take a pattern first — exclude them.
         if !tail.starts_with("preg_") {
-            return;
+            continue;
         }
         if matches!(
             tail.as_str(),
             "preg_quote" | "preg_last_error" | "preg_last_error_msg"
         ) {
-            return;
+            continue;
         }
         if !is_global_preg(fa, r, &tail) {
-            return;
+            continue;
         }
         // First positional argument (skip spread/named/first-class-callable forms
         // where the pattern position is indeterminate).
-        let Some(arg0) = args.first() else { return };
+        let Some(arg0) = call.args.first() else {
+            continue;
+        };
         if arg0.spread || arg0.placeholder || arg0.name.is_some() {
-            return;
+            continue;
         }
         // Fold the pattern to a constant string. Only a constant string can be
         // validated; anything dynamic is left alone.
         let Some(ConstVal::Str(bytes)) = eval_const(&arg0.value) else {
-            return;
+            continue;
         };
         if let Some(msg) = invalid_pattern_reason(&bytes) {
             out.push(
@@ -141,7 +140,7 @@ fn run_pattern(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     .with_code("regexp.pattern"),
             );
         }
-    });
+    }
     out
 }
 
@@ -151,35 +150,32 @@ fn run_pattern(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_quoting(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let fmap = function_refs(fa.resolved_refs);
     let mut out = Vec::new();
-    crate::walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Call { callee, args } = &e.kind else {
-            return;
-        };
-        let Some(r) = resolved_callee(callee, &fmap) else {
-            return;
+    for call in fa.facts.function_calls() {
+        let Some(r) = resolved_callee(call.callee, &fmap) else {
+            continue;
         };
         let Some(tail) = global_tail_lower(r) else {
-            return;
+            continue;
         };
         if !is_regex_pattern_function(&tail) || !is_global_preg(fa, r, &tail) {
-            return;
+            continue;
         }
 
-        let Some(pattern) = pattern_arg(args, fa.interner, &tail) else {
-            return;
+        let Some(pattern) = pattern_arg(call.args, fa.interner, &tail) else {
+            continue;
         };
         if !is_concat(pattern) {
-            return;
+            continue;
         }
 
         let mut pattern_delimiters = pattern_delimiters_from_concat(fa, pattern);
         pattern_delimiters = remove_default_escaped(pattern_delimiters);
         if pattern_delimiters.is_empty() {
-            return;
+            continue;
         }
 
         validate_quote_delimiters(fa, &fmap, pattern, &pattern_delimiters, &mut out);
-    });
+    }
     out
 }
 

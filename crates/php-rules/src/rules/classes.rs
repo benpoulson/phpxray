@@ -237,16 +237,17 @@ fn collect_exprs_in_stmt(st: &Stmt, f: &mut impl FnMut(&Expr)) {
 /// Mirrors phpstan's `InstantiationCallableRule`.
 fn run_instantiation_callable(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        if let ExprKind::New { args, .. } = &e.kind {
-            if args.iter().any(|a| a.placeholder) {
-                out.push(
-                    Diagnostic::error(e.span, "Cannot create callable from the new operator.")
-                        .with_code("callable.notSupported"),
-                );
-            }
+    for new_expr in fa.facts.news() {
+        if new_expr.args.iter().any(|a| a.placeholder) {
+            out.push(
+                Diagnostic::error(
+                    new_expr.expr.span,
+                    "Cannot create callable from the new operator.",
+                )
+                .with_code("callable.notSupported"),
+            );
         }
-    });
+    }
     out
 }
 

@@ -200,31 +200,29 @@ fn is_this_variable(kind: &ExprKind, fa: &FileAnalysis) -> bool {
 /// positives.
 fn run_variable_cloning(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Clone(inner) = &e.kind else {
-            return;
-        };
+    for clone in fa.facts.clones() {
+        let inner = clone.inner;
         let ty = fa.type_of(inner);
         if !is_definitely_non_object(&ty) {
-            return;
+            continue;
         }
         // Match phpstan's two message shapes (variable vs. arbitrary expression).
         if let ExprKind::Variable(s) = &inner.kind {
             let name = fa.interner.resolve(*s);
             out.push(
                 Diagnostic::error(
-                    e.span,
+                    clone.expr.span,
                     format!("Cannot clone non-object variable ${name} of type {ty}."),
                 )
                 .with_code("clone.nonObject"),
             );
         } else {
             out.push(
-                Diagnostic::error(e.span, format!("Cannot clone {ty}."))
+                Diagnostic::error(clone.expr.span, format!("Cannot clone {ty}."))
                     .with_code("clone.nonObject"),
             );
         }
-    });
+    }
     out
 }
 

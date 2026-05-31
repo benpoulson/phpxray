@@ -36,7 +36,7 @@
 //! - DEFERRED: `PipeOperatorRule` (`pipe.byRef`) — needs the callable type of the
 //!   right operand (whether its first parameter is by-reference).
 
-use crate::{walk, FileAnalysis, RuleEntry};
+use crate::{facts::AssignmentKind, FileAnalysis, RuleEntry};
 use php_ast::{BinOp, Expr, ExprKind, UnOp};
 use php_diagnostics::Diagnostic;
 use php_resolve::{RefKind, Resolution, ResolvedRef};
@@ -98,47 +98,46 @@ fn contains_non_assignable(e: &Expr) -> bool {
 /// assignment (nor the right side of an assignment by reference).
 fn run_invalid_assign_var(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        let (target, byref_rhs) = match &e.kind {
-            ExprKind::Assign { target, .. } | ExprKind::AssignOp { target, .. } => (target, None),
-            ExprKind::AssignRef { target, rhs } => (target, Some(rhs)),
-            _ => return,
+    for assign in fa.facts.assignments() {
+        let byref_rhs = match assign.kind {
+            AssignmentKind::Ref => Some(assign.rhs),
+            _ => None,
         };
 
-        if contains_nullsafe(target) {
+        if contains_nullsafe(assign.target) {
             out.push(
                 Diagnostic::error(
-                    e.span,
+                    assign.expr.span,
                     "Nullsafe operator cannot be on left side of assignment.",
                 )
                 .with_code("nullsafe.assign"),
             );
-            return;
+            continue;
         }
 
         if let Some(rhs) = byref_rhs {
             if contains_nullsafe(rhs) {
                 out.push(
                     Diagnostic::error(
-                        e.span,
+                        assign.expr.span,
                         "Nullsafe operator cannot be on right side of assignment by reference.",
                     )
                     .with_code("nullsafe.byRef"),
                 );
-                return;
+                continue;
             }
         }
 
-        if contains_non_assignable(target) {
+        if contains_non_assignable(assign.target) {
             out.push(
                 Diagnostic::error(
-                    e.span,
+                    assign.expr.span,
                     "Expression on left side of assignment is not assignable.",
                 )
                 .with_code("assign.invalidExpr"),
             );
         }
-    });
+    }
     out
 }
 
@@ -160,13 +159,13 @@ fn is_inc_dec_variable(e: &Expr) -> bool {
 /// the operator to an invalid *type* — needs the type system and is deferred.)
 fn run_invalid_inc_dec(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
+    for e in fa.facts.expressions() {
         let (var, op_str, ident) = match &e.kind {
             ExprKind::PreInc(v) => (v, "++", "preInc.expr"),
             ExprKind::PostInc(v) => (v, "++", "postInc.expr"),
             ExprKind::PreDec(v) => (v, "--", "preDec.expr"),
             ExprKind::PostDec(v) => (v, "--", "postDec.expr"),
-            _ => return,
+            _ => continue,
         };
         if !is_inc_dec_variable(var) {
             out.push(
@@ -174,7 +173,7 @@ fn run_invalid_inc_dec(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     .with_code(ident),
             );
         }
-    });
+    }
     out
 }
 
@@ -183,7 +182,7 @@ fn run_invalid_inc_dec(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// fires; use a `shell_exec()` call instead.
 fn run_backtick(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
+    for e in fa.facts.expressions() {
         if let ExprKind::ShellExec(_) = &e.kind {
             out.push(
                 Diagnostic::error(
@@ -193,7 +192,7 @@ fn run_backtick(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 .with_code("backtick.deprecated"),
             );
         }
-    });
+    }
     out
 }
 
@@ -306,12 +305,12 @@ fn is_definitely_object_or_array(t: &Type) -> bool {
 /// unions are silently allowed (zero false positives).
 fn run_invalid_binary(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
+    for e in fa.facts.expressions() {
         // Both `a OP b` and `a OP= b` share the operand-coercion check.
         let (op, lhs, rhs, ident) = match &e.kind {
             ExprKind::Binary { op, lhs, rhs } => (*op, lhs, rhs, "binaryOp.invalid"),
             ExprKind::AssignOp { op, target, rhs } => (*op, target, rhs, "assignOp.invalid"),
-            _ => return,
+            _ => continue,
         };
 
         // Pick the per-operator operand predicate + sigil. `Plus` allows arrays
@@ -331,7 +330,7 @@ fn run_invalid_binary(fa: &FileAnalysis) -> Vec<Diagnostic> {
             BinOp::Shl => ("<<", never_number),
             BinOp::Shr => (">>", never_number),
             // Add (`+`), comparisons, logical, coalesce, pipe, spaceship: not here.
-            _ => return,
+            _ => continue,
         };
 
         let lt = fa.type_of(lhs);
@@ -347,7 +346,7 @@ fn run_invalid_binary(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 .with_code(ident),
             );
         }
-    });
+    }
     out
 }
 
@@ -356,27 +355,24 @@ fn run_invalid_binary(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// int/float/string). `!` is always valid (any value is boolean-coercible).
 fn run_invalid_unary(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Unary { op, expr } = &e.kind else {
-            return;
-        };
-        let (sigil, bad): (&str, fn(&Type) -> bool) = match op {
+    for unary in fa.facts.unaries() {
+        let (sigil, bad): (&str, fn(&Type) -> bool) = match unary.op {
             UnOp::Plus => ("+", never_number),
             UnOp::Minus => ("-", never_number),
             UnOp::BitNot => ("~", never_bitnot_operand),
-            UnOp::Not => return,
+            UnOp::Not => continue,
         };
-        let t = fa.type_of(expr);
+        let t = fa.type_of(unary.inner);
         if bad(&t) {
             out.push(
                 Diagnostic::error(
-                    e.span,
+                    unary.expr.span,
                     format!("Unary operation \"{sigil}\" on {t} results in an error."),
                 )
                 .with_code("unaryOp.invalid"),
             );
         }
-    });
+    }
     out
 }
 
@@ -386,11 +382,8 @@ fn run_invalid_unary(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// object/array" shape is flagged.
 fn run_invalid_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Binary { op, lhs, rhs } = &e.kind else {
-            return;
-        };
-        let (sigil, ident) = match op {
+    for binary in fa.facts.binaries() {
+        let (sigil, ident) = match binary.op {
             BinOp::Eq => ("==", "equal.invalid"),
             BinOp::NotEq => ("!=", "notEqual.invalid"),
             BinOp::Lt => ("<", "smaller.invalid"),
@@ -398,23 +391,23 @@ fn run_invalid_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
             BinOp::Gt => (">", "greater.invalid"),
             BinOp::GtEq => (">=", "greaterOrEqual.invalid"),
             BinOp::Spaceship => ("<=>", "spaceship.invalid"),
-            _ => return,
+            _ => continue,
         };
-        let lt = fa.type_of(lhs);
-        let rt = fa.type_of(rhs);
+        let lt = fa.type_of(binary.lhs);
+        let rt = fa.type_of(binary.rhs);
         // Exactly one side a number, the other an object/array → invalid.
         let mismatch = (is_definitely_number(&lt) && is_definitely_object_or_array(&rt))
             || (is_definitely_number(&rt) && is_definitely_object_or_array(&lt));
         if mismatch {
             out.push(
                 Diagnostic::error(
-                    e.span,
+                    binary.expr.span,
                     format!("Comparison operation \"{sigil}\" between {lt} and {rt} results in an error."),
                 )
                 .with_code(ident),
             );
         }
-    });
+    }
     out
 }
 
@@ -435,16 +428,11 @@ fn run_pipe_byref(fa: &FileAnalysis) -> Vec<Diagnostic> {
         .map(|r| ((r.span.start, r.span.end), r))
         .collect();
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::Binary {
-            op: BinOp::Pipe,
-            rhs,
-            ..
-        } = &e.kind
-        else {
-            return;
-        };
-        if let Some((true, name)) = callable_first_param(fa, rhs, &fmap) {
+    for binary in fa.facts.binaries() {
+        if !matches!(binary.op, BinOp::Pipe) {
+            continue;
+        }
+        if let Some((true, name)) = callable_first_param(fa, binary.rhs, &fmap) {
             let suffix = if name.is_empty() {
                 String::new()
             } else {
@@ -452,7 +440,7 @@ fn run_pipe_byref(fa: &FileAnalysis) -> Vec<Diagnostic> {
             };
             out.push(
                 Diagnostic::error(
-                    rhs.span,
+                    binary.rhs.span,
                     format!(
                         "Parameter #1{suffix} of callable on the right side of pipe operator is passed by reference."
                     ),
@@ -460,7 +448,7 @@ fn run_pipe_byref(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 .with_code("pipe.byRef"),
             );
         }
-    });
+    }
     out
 }
 

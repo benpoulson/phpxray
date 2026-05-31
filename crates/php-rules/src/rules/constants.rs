@@ -838,18 +838,15 @@ fn find_prototype(
 /// our target supports dynamic fetch.)
 fn run_dynamic_class_constant_fetch(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    walk::for_each_expr(fa.program, &mut |e| {
-        let ExprKind::ClassConst { name, .. } = &e.kind else {
-            return;
-        };
-        let MemberName::Expr(name_expr) = name else {
-            return;
+    for class_const in fa.facts.class_consts() {
+        let MemberName::Expr(name_expr) = class_const.name else {
+            continue;
         };
         let t = fa.type_of(name_expr);
         if never_string(&t) {
             out.push(
                 Diagnostic::error(
-                    e.span,
+                    class_const.expr.span,
                     format!(
                         "Class constant name in dynamic fetch can only be a string, {t} given."
                     ),
@@ -857,7 +854,7 @@ fn run_dynamic_class_constant_fetch(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 .with_code("classConstant.nameType"),
             );
         }
-    });
+    }
     out
 }
 
