@@ -18,7 +18,7 @@
 //!   flags `preg_quote()` calls inside a concatenated regex pattern when the
 //!   quote delimiter is missing or contradicts the pattern delimiter.
 
-use crate::{FileAnalysis, RuleEntry};
+use crate::{facts::CallFact, FactKind, FactRuleEntry, FactRuleHandler, FileAnalysis, RuleEntry};
 use php_ast::{Arg, BinOp, Expr, ExprKind};
 use php_diagnostics::Diagnostic;
 use php_infer::{eval_const, ConstVal};
@@ -37,6 +37,21 @@ pub(crate) static RULES: &[RuleEntry] = &[
         level: 5,
         run: run_quoting,
     },
+];
+
+pub(crate) static FACT_RULES: &[FactRuleEntry] = &[
+    FactRuleEntry::new(
+        "regexp.pattern",
+        0,
+        FactKind::FunctionCall,
+        FactRuleHandler::FunctionCall(check_pattern_call),
+    ),
+    FactRuleEntry::new(
+        "argument.invalidPregQuote",
+        5,
+        FactKind::FunctionCall,
+        FactRuleHandler::FunctionCall(check_quoting_call),
+    ),
 ];
 
 /// Build a span→resolution map for function references (callee names).
@@ -99,49 +114,63 @@ fn run_pattern(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let fmap = function_refs(fa.resolved_refs);
     let mut out = Vec::new();
     for call in fa.facts.function_calls() {
-        let Some(r) = resolved_callee(call.callee, &fmap) else {
-            continue;
-        };
-        let Some(tail) = global_tail_lower(r) else {
-            continue;
-        };
-        // Every preg_* function takes the pattern as the first argument. Match
-        // any `preg_`-prefixed global function (phpstan does the same), but only
-        // the ones whose first arg is the pattern string. `preg_quote` /
-        // `preg_last_error*` do NOT take a pattern first — exclude them.
-        if !tail.starts_with("preg_") {
-            continue;
-        }
-        if matches!(
-            tail.as_str(),
-            "preg_quote" | "preg_last_error" | "preg_last_error_msg"
-        ) {
-            continue;
-        }
-        if !is_global_preg(fa, r, &tail) {
-            continue;
-        }
-        // First positional argument (skip spread/named/first-class-callable forms
-        // where the pattern position is indeterminate).
-        let Some(arg0) = call.args.first() else {
-            continue;
-        };
-        if arg0.spread || arg0.placeholder || arg0.name.is_some() {
-            continue;
-        }
-        // Fold the pattern to a constant string. Only a constant string can be
-        // validated; anything dynamic is left alone.
-        let Some(ConstVal::Str(bytes)) = eval_const(&arg0.value) else {
-            continue;
-        };
-        if let Some(msg) = invalid_pattern_reason(&bytes) {
-            out.push(
-                Diagnostic::error(arg0.value.span, format!("Regex pattern is invalid: {msg}"))
-                    .with_code("regexp.pattern"),
-            );
-        }
+        check_pattern_call_with_refs(fa, call, &fmap, &mut out);
     }
     out
+}
+
+fn check_pattern_call(fa: &FileAnalysis, call: &CallFact, out: &mut Vec<Diagnostic>) {
+    let fmap = function_refs(fa.resolved_refs);
+    check_pattern_call_with_refs(fa, call, &fmap, out);
+}
+
+fn check_pattern_call_with_refs(
+    fa: &FileAnalysis,
+    call: &CallFact,
+    fmap: &HashMap<(u32, u32), &ResolvedRef>,
+    out: &mut Vec<Diagnostic>,
+) {
+    let Some(r) = resolved_callee(call.callee, fmap) else {
+        return;
+    };
+    let Some(tail) = global_tail_lower(r) else {
+        return;
+    };
+    // Every preg_* function takes the pattern as the first argument. Match
+    // any `preg_`-prefixed global function (phpstan does the same), but only
+    // the ones whose first arg is the pattern string. `preg_quote` /
+    // `preg_last_error*` do NOT take a pattern first — exclude them.
+    if !tail.starts_with("preg_") {
+        return;
+    }
+    if matches!(
+        tail.as_str(),
+        "preg_quote" | "preg_last_error" | "preg_last_error_msg"
+    ) {
+        return;
+    }
+    if !is_global_preg(fa, r, &tail) {
+        return;
+    }
+    // First positional argument (skip spread/named/first-class-callable forms
+    // where the pattern position is indeterminate).
+    let Some(arg0) = call.args.first() else {
+        return;
+    };
+    if arg0.spread || arg0.placeholder || arg0.name.is_some() {
+        return;
+    }
+    // Fold the pattern to a constant string. Only a constant string can be
+    // validated; anything dynamic is left alone.
+    let Some(ConstVal::Str(bytes)) = eval_const(&arg0.value) else {
+        return;
+    };
+    if let Some(msg) = invalid_pattern_reason(&bytes) {
+        out.push(
+            Diagnostic::error(arg0.value.span, format!("Regex pattern is invalid: {msg}"))
+                .with_code("regexp.pattern"),
+        );
+    }
 }
 
 /// `RegularExpressionQuotingRule` (`argument.invalidPregQuote`). phpstan only
@@ -151,32 +180,46 @@ fn run_quoting(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let fmap = function_refs(fa.resolved_refs);
     let mut out = Vec::new();
     for call in fa.facts.function_calls() {
-        let Some(r) = resolved_callee(call.callee, &fmap) else {
-            continue;
-        };
-        let Some(tail) = global_tail_lower(r) else {
-            continue;
-        };
-        if !is_regex_pattern_function(&tail) || !is_global_preg(fa, r, &tail) {
-            continue;
-        }
-
-        let Some(pattern) = pattern_arg(call.args, fa.interner, &tail) else {
-            continue;
-        };
-        if !is_concat(pattern) {
-            continue;
-        }
-
-        let mut pattern_delimiters = pattern_delimiters_from_concat(fa, pattern);
-        pattern_delimiters = remove_default_escaped(pattern_delimiters);
-        if pattern_delimiters.is_empty() {
-            continue;
-        }
-
-        validate_quote_delimiters(fa, &fmap, pattern, &pattern_delimiters, &mut out);
+        check_quoting_call_with_refs(fa, call, &fmap, &mut out);
     }
     out
+}
+
+fn check_quoting_call(fa: &FileAnalysis, call: &CallFact, out: &mut Vec<Diagnostic>) {
+    let fmap = function_refs(fa.resolved_refs);
+    check_quoting_call_with_refs(fa, call, &fmap, out);
+}
+
+fn check_quoting_call_with_refs(
+    fa: &FileAnalysis,
+    call: &CallFact,
+    fmap: &HashMap<(u32, u32), &ResolvedRef>,
+    out: &mut Vec<Diagnostic>,
+) {
+    let Some(r) = resolved_callee(call.callee, fmap) else {
+        return;
+    };
+    let Some(tail) = global_tail_lower(r) else {
+        return;
+    };
+    if !is_regex_pattern_function(&tail) || !is_global_preg(fa, r, &tail) {
+        return;
+    }
+
+    let Some(pattern) = pattern_arg(call.args, fa.interner, &tail) else {
+        return;
+    };
+    if !is_concat(pattern) {
+        return;
+    }
+
+    let mut pattern_delimiters = pattern_delimiters_from_concat(fa, pattern);
+    pattern_delimiters = remove_default_escaped(pattern_delimiters);
+    if pattern_delimiters.is_empty() {
+        return;
+    }
+
+    validate_quote_delimiters(fa, fmap, pattern, &pattern_delimiters, out);
 }
 
 fn is_regex_pattern_function(tail: &str) -> bool {

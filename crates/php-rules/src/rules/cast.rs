@@ -22,8 +22,11 @@
 //! - `encapsedStringPart.nonString` (`InvalidPartOfEncapsedStringRule`) — an
 //!   interpolated expression that can never be cast to string (`"{$arr}"`).
 //!
-use crate::{FileAnalysis, RuleEntry};
-use php_ast::{CastKind, ExprKind, StmtKind};
+use crate::{
+    facts::{CastFact, EchoFact, PrintFact},
+    FactKind, FactRuleEntry, FactRuleHandler, FileAnalysis, RuleEntry,
+};
+use php_ast::{CastKind, Expr, ExprKind, StmtKind};
 use php_diagnostics::Diagnostic;
 use php_types::Type;
 use std::collections::HashSet;
@@ -38,28 +41,34 @@ fn run_deprecated_cast(fa: &FileAnalysis) -> Vec<Diagnostic> {
 
     let mut out = Vec::new();
     for cast in fa.facts.casts() {
-        if !matches!(
-            cast.kind,
-            CastKind::Int | CastKind::Bool | CastKind::Float | CastKind::String
-        ) {
-            continue;
-        }
-        let Some((spelling, replacement)) =
-            deprecated_cast_spelling(cast.expr.span.text(fa.source))
-        else {
-            continue;
-        };
-        out.push(
-            Diagnostic::error(
-                cast.expr.span,
-                format!(
-                    "Non-standard ({spelling}) cast is deprecated in PHP 8.5. Use ({replacement}) instead."
-                ),
-            )
-            .with_code("cast.deprecated"),
-        );
+        check_deprecated_cast(fa, cast, &mut out);
     }
     out
+}
+
+fn check_deprecated_cast(fa: &FileAnalysis, cast: &CastFact, out: &mut Vec<Diagnostic>) {
+    if !fa.php_version.at_least(80500) {
+        return;
+    }
+    if !matches!(
+        cast.kind,
+        CastKind::Int | CastKind::Bool | CastKind::Float | CastKind::String
+    ) {
+        return;
+    }
+    let Some((spelling, replacement)) = deprecated_cast_spelling(cast.expr.span.text(fa.source))
+    else {
+        return;
+    };
+    out.push(
+        Diagnostic::error(
+            cast.expr.span,
+            format!(
+                "Non-standard ({spelling}) cast is deprecated in PHP 8.5. Use ({replacement}) instead."
+            ),
+        )
+        .with_code("cast.deprecated"),
+    );
 }
 
 fn deprecated_cast_spelling(expr_src: &str) -> Option<(&'static str, &'static str)> {
@@ -83,17 +92,21 @@ fn deprecated_cast_spelling(expr_src: &str) -> Option<(&'static str, &'static st
 fn run_unset_cast(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for cast in fa.facts.casts() {
-        if matches!(cast.kind, CastKind::Unset) {
-            out.push(
-                Diagnostic::error(
-                    cast.expr.span,
-                    "The (unset) cast is no longer supported in PHP 8.0 and later.",
-                )
-                .with_code("cast.unset"),
-            );
-        }
+        check_unset_cast(fa, cast, &mut out);
     }
     out
+}
+
+fn check_unset_cast(_fa: &FileAnalysis, cast: &CastFact, out: &mut Vec<Diagnostic>) {
+    if matches!(cast.kind, CastKind::Unset) {
+        out.push(
+            Diagnostic::error(
+                cast.expr.span,
+                "The (unset) cast is no longer supported in PHP 8.0 and later.",
+            )
+            .with_code("cast.unset"),
+        );
+    }
 }
 
 /// `(void)` cast used within an expression. A `(void)` cast is only valid as a
@@ -192,22 +205,26 @@ fn never_number(t: &Type) -> bool {
 fn run_invalid_cast(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for cast in fa.facts.casts() {
-        // (name shown in phpstan's message, identifier suffix, coercibility test)
-        let (name, ident, bad): (&str, &'static str, fn(&Type) -> bool) = match cast.kind {
-            CastKind::Int => ("int", "cast.int", never_number),
-            CastKind::Float => ("float", "cast.double", never_number),
-            CastKind::String => ("string", "cast.string", never_string),
-            _ => continue,
-        };
-        let t = fa.type_of(cast.inner);
-        if bad(&t) {
-            out.push(
-                Diagnostic::error(cast.expr.span, format!("Cannot cast {t} to {name}."))
-                    .with_code(ident),
-            );
-        }
+        check_invalid_cast(fa, cast, &mut out);
     }
     out
+}
+
+fn check_invalid_cast(fa: &FileAnalysis, cast: &CastFact, out: &mut Vec<Diagnostic>) {
+    // (name shown in phpstan's message, identifier suffix, coercibility test)
+    let (name, ident, bad): (&str, &'static str, fn(&Type) -> bool) = match cast.kind {
+        CastKind::Int => ("int", "cast.int", never_number),
+        CastKind::Float => ("float", "cast.double", never_number),
+        CastKind::String => ("string", "cast.string", never_string),
+        _ => return,
+    };
+    let t = fa.type_of(cast.inner);
+    if bad(&t) {
+        out.push(
+            Diagnostic::error(cast.expr.span, format!("Cannot cast {t} to {name}."))
+                .with_code(ident),
+        );
+    }
 }
 
 /// `EchoRule` (level 2): an `echo` argument that can never be converted to a
@@ -215,23 +232,27 @@ fn run_invalid_cast(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_echo(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for echo in fa.facts.echoes() {
-        for (i, ex) in echo.exprs.iter().enumerate() {
-            let t = fa.type_of(ex);
-            if never_string(&t) {
-                out.push(
-                    Diagnostic::error(
-                        ex.span,
-                        format!(
-                            "Parameter #{} ({t}) of echo cannot be converted to string.",
-                            i + 1
-                        ),
-                    )
-                    .with_code("echo.nonString"),
-                );
-            }
-        }
+        check_echo(fa, echo, &mut out);
     }
     out
+}
+
+fn check_echo(fa: &FileAnalysis, echo: &EchoFact, out: &mut Vec<Diagnostic>) {
+    for (i, ex) in echo.exprs.iter().enumerate() {
+        let t = fa.type_of(ex);
+        if never_string(&t) {
+            out.push(
+                Diagnostic::error(
+                    ex.span,
+                    format!(
+                        "Parameter #{} ({t}) of echo cannot be converted to string.",
+                        i + 1
+                    ),
+                )
+                .with_code("echo.nonString"),
+            );
+        }
+    }
 }
 
 /// `PrintRule` (level 2): a `print` operand that can never be converted to a
@@ -239,18 +260,22 @@ fn run_echo(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_print(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for print in fa.facts.prints() {
-        let t = fa.type_of(print.inner);
-        if never_string(&t) {
-            out.push(
-                Diagnostic::error(
-                    print.inner.span,
-                    format!("Parameter {t} of print cannot be converted to string."),
-                )
-                .with_code("print.nonString"),
-            );
-        }
+        check_print(fa, print, &mut out);
     }
     out
+}
+
+fn check_print(fa: &FileAnalysis, print: &PrintFact, out: &mut Vec<Diagnostic>) {
+    let t = fa.type_of(print.inner);
+    if never_string(&t) {
+        out.push(
+            Diagnostic::error(
+                print.inner.span,
+                format!("Parameter {t} of print cannot be converted to string."),
+            )
+            .with_code("print.nonString"),
+        );
+    }
 }
 
 /// `InvalidPartOfEncapsedStringRule` (level 2): an interpolated expression that
@@ -259,32 +284,34 @@ fn run_print(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_invalid_encapsed_part(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for e in fa.facts.expressions() {
-        let parts = match &e.kind {
-            ExprKind::Interpolated(parts) | ExprKind::ShellExec(parts) => parts,
-            _ => continue,
-        };
-        for part in parts {
-            // Literal text runs are `Str`; they are always valid string parts.
-            if matches!(part.kind, ExprKind::Str(_)) {
-                continue;
-            }
-            let t = fa.type_of(part);
-            if never_string(&t) {
-                out.push(
-                    Diagnostic::error(
-                        part.span,
-                        // phpstan prints the pretty-printed part expression; we
-                        // approximate with a placeholder (our AST has no printer).
-                        format!(
-                            "Part expression ({t}) of encapsed string cannot be cast to string."
-                        ),
-                    )
-                    .with_code("encapsedStringPart.nonString"),
-                );
-            }
-        }
+        check_invalid_encapsed_part(fa, e, &mut out);
     }
     out
+}
+
+fn check_invalid_encapsed_part(fa: &FileAnalysis, e: &Expr, out: &mut Vec<Diagnostic>) {
+    let parts = match &e.kind {
+        ExprKind::Interpolated(parts) | ExprKind::ShellExec(parts) => parts,
+        _ => return,
+    };
+    for part in parts {
+        // Literal text runs are `Str`; they are always valid string parts.
+        if matches!(part.kind, ExprKind::Str(_)) {
+            continue;
+        }
+        let t = fa.type_of(part);
+        if never_string(&t) {
+            out.push(
+                Diagnostic::error(
+                    part.span,
+                    // phpstan prints the pretty-printed part expression; we
+                    // approximate with a placeholder (our AST has no printer).
+                    format!("Part expression ({t}) of encapsed string cannot be cast to string."),
+                )
+                .with_code("encapsedStringPart.nonString"),
+            );
+        }
+    }
 }
 
 pub(crate) static RULES: &[RuleEntry] = &[
@@ -323,6 +350,45 @@ pub(crate) static RULES: &[RuleEntry] = &[
         level: 2,
         run: run_invalid_encapsed_part,
     },
+];
+
+pub(crate) static FACT_RULES: &[FactRuleEntry] = &[
+    FactRuleEntry::new(
+        "cast.deprecated",
+        0,
+        FactKind::Cast,
+        FactRuleHandler::Cast(check_deprecated_cast),
+    ),
+    FactRuleEntry::new(
+        "cast.unset",
+        0,
+        FactKind::Cast,
+        FactRuleHandler::Cast(check_unset_cast),
+    ),
+    FactRuleEntry::new(
+        "cast.invalid",
+        2,
+        FactKind::Cast,
+        FactRuleHandler::Cast(check_invalid_cast),
+    ),
+    FactRuleEntry::new(
+        "cast.echo",
+        2,
+        FactKind::Echo,
+        FactRuleHandler::Echo(check_echo),
+    ),
+    FactRuleEntry::new(
+        "cast.print",
+        2,
+        FactKind::Print,
+        FactRuleHandler::Print(check_print),
+    ),
+    FactRuleEntry::new(
+        "cast.encapsedPart",
+        2,
+        FactKind::Expression,
+        FactRuleHandler::Expression(check_invalid_encapsed_part),
+    ),
 ];
 
 #[cfg(test)]

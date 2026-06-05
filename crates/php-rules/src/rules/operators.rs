@@ -36,7 +36,11 @@
 //! - DEFERRED: `PipeOperatorRule` (`pipe.byRef`) — needs the callable type of the
 //!   right operand (whether its first parameter is by-reference).
 
-use crate::{facts::AssignmentKind, FileAnalysis, RuleEntry};
+use crate::facts::AssignmentKind;
+use crate::{
+    facts::{AssignmentFact, BinaryFact, UnaryFact},
+    FactKind, FactRuleEntry, FactRuleHandler, FileAnalysis, RuleEntry,
+};
 use php_ast::{BinOp, Expr, ExprKind, UnOp};
 use php_diagnostics::Diagnostic;
 use php_resolve::{RefKind, Resolution, ResolvedRef};
@@ -99,46 +103,54 @@ fn contains_non_assignable(e: &Expr) -> bool {
 fn run_invalid_assign_var(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for assign in fa.facts.assignments() {
-        let byref_rhs = match assign.kind {
-            AssignmentKind::Ref => Some(assign.rhs),
-            _ => None,
-        };
-
-        if contains_nullsafe(assign.target) {
-            out.push(
-                Diagnostic::error(
-                    assign.expr.span,
-                    "Nullsafe operator cannot be on left side of assignment.",
-                )
-                .with_code("nullsafe.assign"),
-            );
-            continue;
-        }
-
-        if let Some(rhs) = byref_rhs {
-            if contains_nullsafe(rhs) {
-                out.push(
-                    Diagnostic::error(
-                        assign.expr.span,
-                        "Nullsafe operator cannot be on right side of assignment by reference.",
-                    )
-                    .with_code("nullsafe.byRef"),
-                );
-                continue;
-            }
-        }
-
-        if contains_non_assignable(assign.target) {
-            out.push(
-                Diagnostic::error(
-                    assign.expr.span,
-                    "Expression on left side of assignment is not assignable.",
-                )
-                .with_code("assign.invalidExpr"),
-            );
-        }
+        check_invalid_assign_var(fa, assign, &mut out);
     }
     out
+}
+
+fn check_invalid_assign_var(
+    _fa: &FileAnalysis,
+    assign: &AssignmentFact,
+    out: &mut Vec<Diagnostic>,
+) {
+    let byref_rhs = match assign.kind {
+        AssignmentKind::Ref => Some(assign.rhs),
+        _ => None,
+    };
+
+    if contains_nullsafe(assign.target) {
+        out.push(
+            Diagnostic::error(
+                assign.expr.span,
+                "Nullsafe operator cannot be on left side of assignment.",
+            )
+            .with_code("nullsafe.assign"),
+        );
+        return;
+    }
+
+    if let Some(rhs) = byref_rhs {
+        if contains_nullsafe(rhs) {
+            out.push(
+                Diagnostic::error(
+                    assign.expr.span,
+                    "Nullsafe operator cannot be on right side of assignment by reference.",
+                )
+                .with_code("nullsafe.byRef"),
+            );
+            return;
+        }
+    }
+
+    if contains_non_assignable(assign.target) {
+        out.push(
+            Diagnostic::error(
+                assign.expr.span,
+                "Expression on left side of assignment is not assignable.",
+            )
+            .with_code("assign.invalidExpr"),
+        );
+    }
 }
 
 /// Is `target` a valid `++`/`--` operand (a variable-like expression)?
@@ -160,21 +172,25 @@ fn is_inc_dec_variable(e: &Expr) -> bool {
 fn run_invalid_inc_dec(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for e in fa.facts.expressions() {
-        let (var, op_str, ident) = match &e.kind {
-            ExprKind::PreInc(v) => (v, "++", "preInc.expr"),
-            ExprKind::PostInc(v) => (v, "++", "postInc.expr"),
-            ExprKind::PreDec(v) => (v, "--", "preDec.expr"),
-            ExprKind::PostDec(v) => (v, "--", "postDec.expr"),
-            _ => continue,
-        };
-        if !is_inc_dec_variable(var) {
-            out.push(
-                Diagnostic::error(var.span, format!("Cannot use {op_str} on a non-variable."))
-                    .with_code(ident),
-            );
-        }
+        check_invalid_inc_dec(fa, e, &mut out);
     }
     out
+}
+
+fn check_invalid_inc_dec(_fa: &FileAnalysis, e: &Expr, out: &mut Vec<Diagnostic>) {
+    let (var, op_str, ident) = match &e.kind {
+        ExprKind::PreInc(v) => (v, "++", "preInc.expr"),
+        ExprKind::PostInc(v) => (v, "++", "postInc.expr"),
+        ExprKind::PreDec(v) => (v, "--", "preDec.expr"),
+        ExprKind::PostDec(v) => (v, "--", "postDec.expr"),
+        _ => return,
+    };
+    if !is_inc_dec_variable(var) {
+        out.push(
+            Diagnostic::error(var.span, format!("Cannot use {op_str} on a non-variable."))
+                .with_code(ident),
+        );
+    }
 }
 
 /// `BacktickRule` (level 0): the backtick shell-exec operator `` `…` `` is
@@ -183,17 +199,21 @@ fn run_invalid_inc_dec(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_backtick(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for e in fa.facts.expressions() {
-        if let ExprKind::ShellExec(_) = &e.kind {
-            out.push(
-                Diagnostic::error(
-                    e.span,
-                    "Backtick operator is deprecated in PHP 8.5. Use shell_exec() function call instead.",
-                )
-                .with_code("backtick.deprecated"),
-            );
-        }
+        check_backtick(fa, e, &mut out);
     }
     out
+}
+
+fn check_backtick(_fa: &FileAnalysis, e: &Expr, out: &mut Vec<Diagnostic>) {
+    if let ExprKind::ShellExec(_) = &e.kind {
+        out.push(
+            Diagnostic::error(
+                e.span,
+                "Backtick operator is deprecated in PHP 8.5. Use shell_exec() function call instead.",
+            )
+            .with_code("backtick.deprecated"),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -306,48 +326,50 @@ fn is_definitely_object_or_array(t: &Type) -> bool {
 fn run_invalid_binary(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for e in fa.facts.expressions() {
-        // Both `a OP b` and `a OP= b` share the operand-coercion check.
-        let (op, lhs, rhs, ident) = match &e.kind {
-            ExprKind::Binary { op, lhs, rhs } => (*op, lhs, rhs, "binaryOp.invalid"),
-            ExprKind::AssignOp { op, target, rhs } => (*op, target, rhs, "assignOp.invalid"),
-            _ => continue,
-        };
-
-        // Pick the per-operator operand predicate + sigil. `Plus` allows arrays
-        // (array + array is the union operator), so it is excluded from the
-        // numeric check entirely (deciding `array + int` needs array-aware
-        // logic we don't model — defer to avoid false positives).
-        let (sigil, bad): (&str, fn(&Type) -> bool) = match op {
-            BinOp::Concat => (".", never_string),
-            BinOp::Sub => ("-", never_number),
-            BinOp::Mul => ("*", never_number),
-            BinOp::Div => ("/", never_number),
-            BinOp::Mod => ("%", never_number),
-            BinOp::Pow => ("**", never_number),
-            BinOp::BitOr => ("|", never_number),
-            BinOp::BitAnd => ("&", never_number),
-            BinOp::BitXor => ("^", never_number),
-            BinOp::Shl => ("<<", never_number),
-            BinOp::Shr => (">>", never_number),
-            // Add (`+`), comparisons, logical, coalesce, pipe, spaceship: not here.
-            _ => continue,
-        };
-
-        let lt = fa.type_of(lhs);
-        let rt = fa.type_of(rhs);
-        if bad(&lt) || bad(&rt) {
-            out.push(
-                Diagnostic::error(
-                    e.span,
-                    format!(
-                        "Binary operation \"{sigil}\" between {lt} and {rt} results in an error."
-                    ),
-                )
-                .with_code(ident),
-            );
-        }
+        check_invalid_binary(fa, e, &mut out);
     }
     out
+}
+
+fn check_invalid_binary(fa: &FileAnalysis, e: &Expr, out: &mut Vec<Diagnostic>) {
+    // Both `a OP b` and `a OP= b` share the operand-coercion check.
+    let (op, lhs, rhs, ident) = match &e.kind {
+        ExprKind::Binary { op, lhs, rhs } => (*op, lhs, rhs, "binaryOp.invalid"),
+        ExprKind::AssignOp { op, target, rhs } => (*op, target, rhs, "assignOp.invalid"),
+        _ => return,
+    };
+
+    // Pick the per-operator operand predicate + sigil. `Plus` allows arrays
+    // (array + array is the union operator), so it is excluded from the
+    // numeric check entirely (deciding `array + int` needs array-aware
+    // logic we don't model — defer to avoid false positives).
+    let (sigil, bad): (&str, fn(&Type) -> bool) = match op {
+        BinOp::Concat => (".", never_string),
+        BinOp::Sub => ("-", never_number),
+        BinOp::Mul => ("*", never_number),
+        BinOp::Div => ("/", never_number),
+        BinOp::Mod => ("%", never_number),
+        BinOp::Pow => ("**", never_number),
+        BinOp::BitOr => ("|", never_number),
+        BinOp::BitAnd => ("&", never_number),
+        BinOp::BitXor => ("^", never_number),
+        BinOp::Shl => ("<<", never_number),
+        BinOp::Shr => (">>", never_number),
+        // Add (`+`), comparisons, logical, coalesce, pipe, spaceship: not here.
+        _ => return,
+    };
+
+    let lt = fa.type_of(lhs);
+    let rt = fa.type_of(rhs);
+    if bad(&lt) || bad(&rt) {
+        out.push(
+            Diagnostic::error(
+                e.span,
+                format!("Binary operation \"{sigil}\" between {lt} and {rt} results in an error."),
+            )
+            .with_code(ident),
+        );
+    }
 }
 
 /// `InvalidUnaryOperationRule` (level 2): `+`/`-`/`~` on an operand that can
@@ -356,24 +378,28 @@ fn run_invalid_binary(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_invalid_unary(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for unary in fa.facts.unaries() {
-        let (sigil, bad): (&str, fn(&Type) -> bool) = match unary.op {
-            UnOp::Plus => ("+", never_number),
-            UnOp::Minus => ("-", never_number),
-            UnOp::BitNot => ("~", never_bitnot_operand),
-            UnOp::Not => continue,
-        };
-        let t = fa.type_of(unary.inner);
-        if bad(&t) {
-            out.push(
-                Diagnostic::error(
-                    unary.expr.span,
-                    format!("Unary operation \"{sigil}\" on {t} results in an error."),
-                )
-                .with_code("unaryOp.invalid"),
-            );
-        }
+        check_invalid_unary(fa, unary, &mut out);
     }
     out
+}
+
+fn check_invalid_unary(fa: &FileAnalysis, unary: &UnaryFact, out: &mut Vec<Diagnostic>) {
+    let (sigil, bad): (&str, fn(&Type) -> bool) = match unary.op {
+        UnOp::Plus => ("+", never_number),
+        UnOp::Minus => ("-", never_number),
+        UnOp::BitNot => ("~", never_bitnot_operand),
+        UnOp::Not => return,
+    };
+    let t = fa.type_of(unary.inner);
+    if bad(&t) {
+        out.push(
+            Diagnostic::error(
+                unary.expr.span,
+                format!("Unary operation \"{sigil}\" on {t} results in an error."),
+            )
+            .with_code("unaryOp.invalid"),
+        );
+    }
 }
 
 /// `InvalidComparisonOperationRule` (level 2): comparing a value that is
@@ -383,32 +409,38 @@ fn run_invalid_unary(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_invalid_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for binary in fa.facts.binaries() {
-        let (sigil, ident) = match binary.op {
-            BinOp::Eq => ("==", "equal.invalid"),
-            BinOp::NotEq => ("!=", "notEqual.invalid"),
-            BinOp::Lt => ("<", "smaller.invalid"),
-            BinOp::LtEq => ("<=", "smallerOrEqual.invalid"),
-            BinOp::Gt => (">", "greater.invalid"),
-            BinOp::GtEq => (">=", "greaterOrEqual.invalid"),
-            BinOp::Spaceship => ("<=>", "spaceship.invalid"),
-            _ => continue,
-        };
-        let lt = fa.type_of(binary.lhs);
-        let rt = fa.type_of(binary.rhs);
-        // Exactly one side a number, the other an object/array → invalid.
-        let mismatch = (is_definitely_number(&lt) && is_definitely_object_or_array(&rt))
-            || (is_definitely_number(&rt) && is_definitely_object_or_array(&lt));
-        if mismatch {
-            out.push(
-                Diagnostic::error(
-                    binary.expr.span,
-                    format!("Comparison operation \"{sigil}\" between {lt} and {rt} results in an error."),
-                )
-                .with_code(ident),
-            );
-        }
+        check_invalid_comparison(fa, binary, &mut out);
     }
     out
+}
+
+fn check_invalid_comparison(fa: &FileAnalysis, binary: &BinaryFact, out: &mut Vec<Diagnostic>) {
+    let (sigil, ident) = match binary.op {
+        BinOp::Eq => ("==", "equal.invalid"),
+        BinOp::NotEq => ("!=", "notEqual.invalid"),
+        BinOp::Lt => ("<", "smaller.invalid"),
+        BinOp::LtEq => ("<=", "smallerOrEqual.invalid"),
+        BinOp::Gt => (">", "greater.invalid"),
+        BinOp::GtEq => (">=", "greaterOrEqual.invalid"),
+        BinOp::Spaceship => ("<=>", "spaceship.invalid"),
+        _ => return,
+    };
+    let lt = fa.type_of(binary.lhs);
+    let rt = fa.type_of(binary.rhs);
+    // Exactly one side a number, the other an object/array → invalid.
+    let mismatch = (is_definitely_number(&lt) && is_definitely_object_or_array(&rt))
+        || (is_definitely_number(&rt) && is_definitely_object_or_array(&lt));
+    if mismatch {
+        out.push(
+            Diagnostic::error(
+                binary.expr.span,
+                format!(
+                    "Comparison operation \"{sigil}\" between {lt} and {rt} results in an error."
+                ),
+            )
+            .with_code(ident),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -429,27 +461,46 @@ fn run_pipe_byref(fa: &FileAnalysis) -> Vec<Diagnostic> {
         .collect();
     let mut out = Vec::new();
     for binary in fa.facts.binaries() {
-        if !matches!(binary.op, BinOp::Pipe) {
-            continue;
-        }
-        if let Some((true, name)) = callable_first_param(fa, binary.rhs, &fmap) {
-            let suffix = if name.is_empty() {
-                String::new()
-            } else {
-                format!(" ${name}")
-            };
-            out.push(
-                Diagnostic::error(
-                    binary.rhs.span,
-                    format!(
-                        "Parameter #1{suffix} of callable on the right side of pipe operator is passed by reference."
-                    ),
-                )
-                .with_code("pipe.byRef"),
-            );
-        }
+        check_pipe_byref_with_refs(fa, binary, &fmap, &mut out);
     }
     out
+}
+
+fn check_pipe_byref(fa: &FileAnalysis, binary: &BinaryFact, out: &mut Vec<Diagnostic>) {
+    let fmap: HashMap<(u32, u32), &ResolvedRef> = fa
+        .resolved_refs
+        .iter()
+        .filter(|r| r.kind == RefKind::Function)
+        .map(|r| ((r.span.start, r.span.end), r))
+        .collect();
+    check_pipe_byref_with_refs(fa, binary, &fmap, out);
+}
+
+fn check_pipe_byref_with_refs(
+    fa: &FileAnalysis,
+    binary: &BinaryFact,
+    fmap: &HashMap<(u32, u32), &ResolvedRef>,
+    out: &mut Vec<Diagnostic>,
+) {
+    if !matches!(binary.op, BinOp::Pipe) {
+        return;
+    }
+    if let Some((true, name)) = callable_first_param(fa, binary.rhs, fmap) {
+        let suffix = if name.is_empty() {
+            String::new()
+        } else {
+            format!(" ${name}")
+        };
+        out.push(
+            Diagnostic::error(
+                binary.rhs.span,
+                format!(
+                    "Parameter #1{suffix} of callable on the right side of pipe operator is passed by reference."
+                ),
+            )
+            .with_code("pipe.byRef"),
+        );
+    }
 }
 
 /// Resolve a callable expression to `(first_param_is_by_ref, first_param_name)`.
@@ -533,6 +584,51 @@ pub(crate) static RULES: &[RuleEntry] = &[
         level: 2,
         run: run_invalid_comparison,
     },
+];
+
+pub(crate) static FACT_RULES: &[FactRuleEntry] = &[
+    FactRuleEntry::new(
+        "operators.invalidAssignVar",
+        0,
+        FactKind::Assignment,
+        FactRuleHandler::Assignment(check_invalid_assign_var),
+    ),
+    FactRuleEntry::new(
+        "operators.invalidIncDec",
+        0,
+        FactKind::Expression,
+        FactRuleHandler::Expression(check_invalid_inc_dec),
+    ),
+    FactRuleEntry::new(
+        "operators.backtick",
+        0,
+        FactKind::Expression,
+        FactRuleHandler::Expression(check_backtick),
+    ),
+    FactRuleEntry::new(
+        "operators.pipeByRef",
+        0,
+        FactKind::Binary,
+        FactRuleHandler::Binary(check_pipe_byref),
+    ),
+    FactRuleEntry::new(
+        "operators.invalidBinary",
+        2,
+        FactKind::Expression,
+        FactRuleHandler::Expression(check_invalid_binary),
+    ),
+    FactRuleEntry::new(
+        "operators.invalidUnary",
+        2,
+        FactKind::Unary,
+        FactRuleHandler::Unary(check_invalid_unary),
+    ),
+    FactRuleEntry::new(
+        "operators.invalidComparison",
+        2,
+        FactKind::Binary,
+        FactRuleHandler::Binary(check_invalid_comparison),
+    ),
 ];
 
 #[cfg(test)]

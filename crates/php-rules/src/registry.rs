@@ -8,7 +8,10 @@
 //! and has no shared mutable state, the engine's per-file loop is trivially
 //! parallelizable later (Phase 2).
 
-use crate::facts::FileFacts;
+use crate::facts::{
+    ArrayFact, AssignmentFact, BinaryFact, CallFact, CastFact, EchoFact, FileFacts, ForeachFact,
+    IndexFact, MethodCallFact, PrintFact, StaticCallFact, UnaryFact,
+};
 use php_ast::{Expr, Program};
 use php_diagnostics::Diagnostic;
 use php_index::ProjectIndex;
@@ -222,6 +225,87 @@ pub(crate) struct ScheduledLocatedRule {
     pub(crate) rule: &'static LocatedRuleEntry,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum FactKind {
+    FunctionCall,
+    MethodCall,
+    StaticCall,
+    Binary,
+    Unary,
+    Cast,
+    Array,
+    Index,
+    Assignment,
+    Foreach,
+    Echo,
+    Print,
+    Expression,
+    Statement,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum FactRuleHandler {
+    FunctionCall(fn(&FileAnalysis, &CallFact, &mut Vec<Diagnostic>)),
+    MethodCall(fn(&FileAnalysis, &MethodCallFact, &mut Vec<Diagnostic>)),
+    StaticCall(fn(&FileAnalysis, &StaticCallFact, &mut Vec<Diagnostic>)),
+    Binary(fn(&FileAnalysis, &BinaryFact, &mut Vec<Diagnostic>)),
+    Unary(fn(&FileAnalysis, &UnaryFact, &mut Vec<Diagnostic>)),
+    Cast(fn(&FileAnalysis, &CastFact, &mut Vec<Diagnostic>)),
+    Array(fn(&FileAnalysis, &ArrayFact, &mut Vec<Diagnostic>)),
+    Index(fn(&FileAnalysis, &IndexFact, &mut Vec<Diagnostic>)),
+    Assignment(fn(&FileAnalysis, &AssignmentFact, &mut Vec<Diagnostic>)),
+    Foreach(fn(&FileAnalysis, &ForeachFact, &mut Vec<Diagnostic>)),
+    Echo(fn(&FileAnalysis, &EchoFact, &mut Vec<Diagnostic>)),
+    Print(fn(&FileAnalysis, &PrintFact, &mut Vec<Diagnostic>)),
+    Expression(fn(&FileAnalysis, &Expr, &mut Vec<Diagnostic>)),
+    #[allow(dead_code)]
+    Statement(fn(&FileAnalysis, &php_ast::Stmt, &mut Vec<Diagnostic>)),
+}
+
+impl FactRuleHandler {
+    fn kind(self) -> FactKind {
+        match self {
+            FactRuleHandler::FunctionCall(_) => FactKind::FunctionCall,
+            FactRuleHandler::MethodCall(_) => FactKind::MethodCall,
+            FactRuleHandler::StaticCall(_) => FactKind::StaticCall,
+            FactRuleHandler::Binary(_) => FactKind::Binary,
+            FactRuleHandler::Unary(_) => FactKind::Unary,
+            FactRuleHandler::Cast(_) => FactKind::Cast,
+            FactRuleHandler::Array(_) => FactKind::Array,
+            FactRuleHandler::Index(_) => FactKind::Index,
+            FactRuleHandler::Assignment(_) => FactKind::Assignment,
+            FactRuleHandler::Foreach(_) => FactKind::Foreach,
+            FactRuleHandler::Echo(_) => FactKind::Echo,
+            FactRuleHandler::Print(_) => FactKind::Print,
+            FactRuleHandler::Expression(_) => FactKind::Expression,
+            FactRuleHandler::Statement(_) => FactKind::Statement,
+        }
+    }
+}
+
+pub(crate) struct FactRuleEntry {
+    pub(crate) name: &'static str,
+    pub(crate) level: u8,
+    pub(crate) kind: FactKind,
+    pub(crate) handler: FactRuleHandler,
+}
+
+impl FactRuleEntry {
+    pub(crate) const fn new(
+        name: &'static str,
+        level: u8,
+        kind: FactKind,
+        handler: FactRuleHandler,
+    ) -> Self {
+        Self {
+            name,
+            level,
+            kind,
+            handler,
+        }
+    }
+}
+
 /// Machine-readable rule metadata exported for docs/tooling. Keep this as a
 /// pure projection of the runtime registry so generated catalogs don't grow a
 /// second source of truth for analyzer coverage.
@@ -270,6 +354,13 @@ pub fn located_rules_for_level(level: u8) -> impl Iterator<Item = &'static Locat
         .iter()
         .flat_map(|cat| cat.iter())
         .filter(move |r| r.level <= level)
+}
+
+fn fact_rule_for_name(name: &str, level: u8) -> Option<&'static FactRuleEntry> {
+    crate::rules::FACT_CATEGORY_RULES
+        .iter()
+        .flat_map(|cat| cat.iter())
+        .find(|r| r.name == name && r.level <= level)
 }
 
 /// Scheduled ordinary rules, preserving the registry's diagnostic order.
@@ -355,15 +446,27 @@ pub fn analyze_file(fa: &FileAnalysis, level: u8) -> Vec<Diagnostic> {
 /// Run every rule active at `level`, preserving path-aware diagnostics for the
 /// rules that can analyze context-specific bodies outside the current file.
 pub fn analyze_file_located(fa: &FileAnalysis, level: u8) -> Vec<LocatedDiagnostic> {
-    let mut out = Vec::new();
-    for scheduled in scheduled_rules_for_level(level) {
-        let _input = scheduled.input;
-        out.extend(
-            (scheduled.rule.run)(fa)
-                .into_iter()
-                .map(LocatedDiagnostic::local),
-        );
+    let scheduled = scheduled_rules_for_level(level);
+    let mut slots: Vec<Vec<Diagnostic>> = vec![Vec::new(); scheduled.len()];
+    let mut fact_rules: Vec<(usize, &'static FactRuleEntry)> = Vec::new();
+
+    for (idx, scheduled) in scheduled.iter().enumerate() {
+        if let Some(fact_rule) = fact_rule_for_name(scheduled.rule.name, level) {
+            debug_assert_eq!(fact_rule.kind, fact_rule.handler.kind());
+            fact_rules.push((idx, fact_rule));
+        } else {
+            let _input = scheduled.input;
+            slots[idx].extend((scheduled.rule.run)(fa));
+        }
     }
+
+    dispatch_fact_rules(fa, &fact_rules, &mut slots);
+
+    let mut out: Vec<LocatedDiagnostic> = slots
+        .into_iter()
+        .flatten()
+        .map(LocatedDiagnostic::local)
+        .collect();
     for scheduled in scheduled_located_rules_for_level(level) {
         let _input = scheduled.input;
         out.extend((scheduled.rule.run)(fa));
@@ -371,9 +474,193 @@ pub fn analyze_file_located(fa: &FileAnalysis, level: u8) -> Vec<LocatedDiagnost
     out
 }
 
+fn dispatch_fact_rules(
+    fa: &FileAnalysis,
+    fact_rules: &[(usize, &'static FactRuleEntry)],
+    slots: &mut [Vec<Diagnostic>],
+) {
+    for kind in [
+        FactKind::FunctionCall,
+        FactKind::MethodCall,
+        FactKind::StaticCall,
+        FactKind::Binary,
+        FactKind::Unary,
+        FactKind::Cast,
+        FactKind::Array,
+        FactKind::Index,
+        FactKind::Assignment,
+        FactKind::Foreach,
+        FactKind::Echo,
+        FactKind::Print,
+        FactKind::Expression,
+        FactKind::Statement,
+    ] {
+        let active: Vec<_> = fact_rules
+            .iter()
+            .copied()
+            .filter(|(_, rule)| rule.kind == kind)
+            .collect();
+        if active.is_empty() {
+            continue;
+        }
+        dispatch_fact_kind(fa, kind, &active, slots);
+    }
+}
+
+fn dispatch_fact_kind(
+    fa: &FileAnalysis,
+    kind: FactKind,
+    active: &[(usize, &'static FactRuleEntry)],
+    slots: &mut [Vec<Diagnostic>],
+) {
+    match kind {
+        FactKind::FunctionCall => {
+            for fact in fa.facts.function_calls() {
+                for (slot, rule) in active {
+                    let FactRuleHandler::FunctionCall(handler) = rule.handler else {
+                        continue;
+                    };
+                    handler(fa, fact, &mut slots[*slot]);
+                }
+            }
+        }
+        FactKind::MethodCall => {
+            for fact in fa.facts.method_calls() {
+                for (slot, rule) in active {
+                    let FactRuleHandler::MethodCall(handler) = rule.handler else {
+                        continue;
+                    };
+                    handler(fa, fact, &mut slots[*slot]);
+                }
+            }
+        }
+        FactKind::StaticCall => {
+            for fact in fa.facts.static_calls() {
+                for (slot, rule) in active {
+                    let FactRuleHandler::StaticCall(handler) = rule.handler else {
+                        continue;
+                    };
+                    handler(fa, fact, &mut slots[*slot]);
+                }
+            }
+        }
+        FactKind::Binary => {
+            for fact in fa.facts.binaries() {
+                for (slot, rule) in active {
+                    let FactRuleHandler::Binary(handler) = rule.handler else {
+                        continue;
+                    };
+                    handler(fa, fact, &mut slots[*slot]);
+                }
+            }
+        }
+        FactKind::Unary => {
+            for fact in fa.facts.unaries() {
+                for (slot, rule) in active {
+                    let FactRuleHandler::Unary(handler) = rule.handler else {
+                        continue;
+                    };
+                    handler(fa, fact, &mut slots[*slot]);
+                }
+            }
+        }
+        FactKind::Cast => {
+            for fact in fa.facts.casts() {
+                for (slot, rule) in active {
+                    let FactRuleHandler::Cast(handler) = rule.handler else {
+                        continue;
+                    };
+                    handler(fa, fact, &mut slots[*slot]);
+                }
+            }
+        }
+        FactKind::Array => {
+            for fact in fa.facts.arrays() {
+                for (slot, rule) in active {
+                    let FactRuleHandler::Array(handler) = rule.handler else {
+                        continue;
+                    };
+                    handler(fa, fact, &mut slots[*slot]);
+                }
+            }
+        }
+        FactKind::Index => {
+            for fact in fa.facts.indexes() {
+                for (slot, rule) in active {
+                    let FactRuleHandler::Index(handler) = rule.handler else {
+                        continue;
+                    };
+                    handler(fa, fact, &mut slots[*slot]);
+                }
+            }
+        }
+        FactKind::Assignment => {
+            for fact in fa.facts.assignments() {
+                for (slot, rule) in active {
+                    let FactRuleHandler::Assignment(handler) = rule.handler else {
+                        continue;
+                    };
+                    handler(fa, fact, &mut slots[*slot]);
+                }
+            }
+        }
+        FactKind::Foreach => {
+            for fact in fa.facts.foreaches() {
+                for (slot, rule) in active {
+                    let FactRuleHandler::Foreach(handler) = rule.handler else {
+                        continue;
+                    };
+                    handler(fa, fact, &mut slots[*slot]);
+                }
+            }
+        }
+        FactKind::Echo => {
+            for fact in fa.facts.echoes() {
+                for (slot, rule) in active {
+                    let FactRuleHandler::Echo(handler) = rule.handler else {
+                        continue;
+                    };
+                    handler(fa, fact, &mut slots[*slot]);
+                }
+            }
+        }
+        FactKind::Print => {
+            for fact in fa.facts.prints() {
+                for (slot, rule) in active {
+                    let FactRuleHandler::Print(handler) = rule.handler else {
+                        continue;
+                    };
+                    handler(fa, fact, &mut slots[*slot]);
+                }
+            }
+        }
+        FactKind::Expression => {
+            for fact in fa.facts.expressions() {
+                for (slot, rule) in active {
+                    let FactRuleHandler::Expression(handler) = rule.handler else {
+                        continue;
+                    };
+                    handler(fa, fact, &mut slots[*slot]);
+                }
+            }
+        }
+        FactKind::Statement => {
+            for fact in fa.facts.statements() {
+                for (slot, rule) in active {
+                    let FactRuleHandler::Statement(handler) = rule.handler else {
+                        continue;
+                    };
+                    handler(fa, fact, &mut slots[*slot]);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{codes, located_codes};
     use php_index::ProjectIndex;
     use php_reflect::ReflectionIndex;
     use php_resolve::{index_file, resolve_references};
@@ -446,6 +733,80 @@ mod tests {
         assert!(located
             .iter()
             .all(|r| r.input == RuleInputKind::ScopedCalls));
+    }
+
+    #[test]
+    fn fact_rules_are_registry_compatible_and_scheduled_in_registry_order() {
+        let registry: Vec<_> = rules_for_level(10).map(|r| r.name).collect();
+        for fact_rule in crate::rules::FACT_CATEGORY_RULES
+            .iter()
+            .flat_map(|cat| cat.iter())
+        {
+            assert!(
+                registry.contains(&fact_rule.name),
+                "fact rule {} must have a matching RuleEntry",
+                fact_rule.name
+            );
+            assert_eq!(fact_rule.kind, fact_rule.handler.kind());
+        }
+
+        let scheduled = scheduled_rules_for_level(10);
+        let dispatched_names: Vec<_> = scheduled
+            .iter()
+            .filter(|scheduled| fact_rule_for_name(scheduled.rule.name, 10).is_some())
+            .map(|scheduled| scheduled.rule.name)
+            .collect();
+        let registry_filtered: Vec<_> = registry
+            .into_iter()
+            .filter(|name| fact_rule_for_name(name, 10).is_some())
+            .collect();
+        assert_eq!(dispatched_names, registry_filtered);
+    }
+
+    fn analyze_level_4(fa: &FileAnalysis) -> Vec<Diagnostic> {
+        analyze_file(fa, 4)
+    }
+
+    fn analyze_located_level_4(fa: &FileAnalysis) -> Vec<LocatedDiagnostic> {
+        analyze_file_located(fa, 4)
+    }
+
+    #[test]
+    fn dispatched_and_whole_file_diagnostics_flatten_in_registry_order() {
+        let src = r#"<?php
+            $a = [1 => 'first', 1 => 'second'];
+            $b = (unset) $a;
+            $c = (void) $a;
+            $d = 1 === '1';
+        "#;
+        assert_eq!(
+            codes(src, analyze_level_4),
+            [
+                "array.duplicateKey",
+                "cast.unset",
+                "cast.void",
+                "identical.alwaysFalse",
+            ]
+        );
+    }
+
+    #[test]
+    fn located_callback_context_still_runs_after_local_diagnostics() {
+        let src = r#"<?php
+            class User {}
+            $a = [1 => 'first', 1 => 'second'];
+            /** @param list<User> $users */
+            function run(array $users): void {
+                $mapped = array_map('cb', $users);
+            }
+            function cb($u): void {
+                $u->missing();
+            }
+        "#;
+        assert_eq!(
+            located_codes(src, analyze_located_level_4),
+            ["array.duplicateKey", "method.notFound"]
+        );
     }
 
     #[test]

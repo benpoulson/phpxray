@@ -51,7 +51,10 @@
 //!   here intentionally skip unions, maybe-empty arrays, and object-specific
 //!   offset key contracts unless they are explicit in `ArrayAccess<_, _>`.
 
-use crate::{facts::AssignmentKind, walk, FileAnalysis, RuleEntry};
+use crate::{
+    facts::{ArrayFact, AssignmentFact, AssignmentKind, ForeachFact, IndexFact},
+    walk, FactKind, FactRuleEntry, FactRuleHandler, FileAnalysis, RuleEntry,
+};
 use php_ast::{ArrayItem, Expr, ExprKind};
 use php_diagnostics::Diagnostic;
 use php_span::Span;
@@ -112,13 +115,17 @@ fn export_key(k: &KeyVal) -> String {
 fn run_duplicate_keys(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for array in fa.facts.arrays() {
-        out.extend(duplicate_keys_in_one_array(
-            array.items,
-            fa.source,
-            array.expr.span,
-        ));
+        check_duplicate_keys(fa, array, &mut out);
     }
     out
+}
+
+fn check_duplicate_keys(fa: &FileAnalysis, array: &ArrayFact, out: &mut Vec<Diagnostic>) {
+    out.extend(duplicate_keys_in_one_array(
+        array.items,
+        fa.source,
+        array.expr.span,
+    ));
 }
 
 fn duplicate_keys_in_one_array(
@@ -646,20 +653,24 @@ fn undefined_allowed_index_spans(fa: &FileAnalysis) -> HashSet<(u32, u32)> {
 fn run_iterable_in_foreach(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for foreach in fa.facts.foreaches() {
-        let ty = fa.type_of(foreach.subject);
-        if definitely_not_iterable(fa, &ty) {
-            out.push(
-                Diagnostic::error(
-                    foreach.subject.span,
-                    format!(
-                        "Argument of an invalid type {ty} supplied for foreach, only iterables are supported.",
-                    ),
-                )
-                .with_code("foreach.nonIterable"),
-            );
-        }
+        check_iterable_in_foreach(fa, foreach, &mut out);
     }
     out
+}
+
+fn check_iterable_in_foreach(fa: &FileAnalysis, foreach: &ForeachFact, out: &mut Vec<Diagnostic>) {
+    let ty = fa.type_of(foreach.subject);
+    if definitely_not_iterable(fa, &ty) {
+        out.push(
+            Diagnostic::error(
+                foreach.subject.span,
+                format!(
+                    "Argument of an invalid type {ty} supplied for foreach, only iterables are supported.",
+                ),
+            )
+            .with_code("foreach.nonIterable"),
+        );
+    }
 }
 
 /// `UnpackIterableInArrayRule` (`arrayUnpacking.nonIterable`, level 3): a spread
@@ -667,24 +678,28 @@ fn run_iterable_in_foreach(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_unpack_iterable_in_array(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for array in fa.facts.arrays() {
-        for it in array.items {
-            if !it.spread {
-                continue;
-            }
-            let Some(value) = &it.value else { continue };
-            let ty = fa.type_of(value);
-            if definitely_not_iterable(fa, &ty) {
-                out.push(
-                    Diagnostic::error(
-                        value.span,
-                        format!("Only iterables can be unpacked, {ty} given."),
-                    )
-                    .with_code("arrayUnpacking.nonIterable"),
-                );
-            }
-        }
+        check_unpack_iterable_in_array(fa, array, &mut out);
     }
     out
+}
+
+fn check_unpack_iterable_in_array(fa: &FileAnalysis, array: &ArrayFact, out: &mut Vec<Diagnostic>) {
+    for it in array.items {
+        if !it.spread {
+            continue;
+        }
+        let Some(value) = &it.value else { continue };
+        let ty = fa.type_of(value);
+        if definitely_not_iterable(fa, &ty) {
+            out.push(
+                Diagnostic::error(
+                    value.span,
+                    format!("Only iterables can be unpacked, {ty} given."),
+                )
+                .with_code("arrayUnpacking.nonIterable"),
+            );
+        }
+    }
 }
 
 /// `ArrayUnpackingRule` (`arrayUnpacking.stringOffset`, level 3): before PHP
@@ -698,33 +713,44 @@ fn run_array_unpacking_string_offset(fa: &FileAnalysis) -> Vec<Diagnostic> {
 
     let mut out = Vec::new();
     for array in fa.facts.arrays() {
-        for it in array.items {
-            if !it.spread {
-                continue;
-            }
-            let Some(value) = &it.value else { continue };
-            let ty = fa.type_of(value);
-            let status = string_key_status(&ty);
-            if status == StringKeyStatus::No {
-                continue;
-            }
-            let potential = if status == StringKeyStatus::Potential {
-                "potential "
-            } else {
-                ""
-            };
-            out.push(
-                Diagnostic::error(
-                    value.span,
-                    format!(
-                        "Array unpacking cannot be used on an array with {potential}string keys: {ty}",
-                    ),
-                )
-                .with_code("arrayUnpacking.stringOffset"),
-            );
-        }
+        check_array_unpacking_string_offset(fa, array, &mut out);
     }
     out
+}
+
+fn check_array_unpacking_string_offset(
+    fa: &FileAnalysis,
+    array: &ArrayFact,
+    out: &mut Vec<Diagnostic>,
+) {
+    if fa.php_version.at_least(80100) {
+        return;
+    }
+    for it in array.items {
+        if !it.spread {
+            continue;
+        }
+        let Some(value) = &it.value else { continue };
+        let ty = fa.type_of(value);
+        let status = string_key_status(&ty);
+        if status == StringKeyStatus::No {
+            continue;
+        }
+        let potential = if status == StringKeyStatus::Potential {
+            "potential "
+        } else {
+            ""
+        };
+        out.push(
+            Diagnostic::error(
+                value.span,
+                format!(
+                    "Array unpacking cannot be used on an array with {potential}string keys: {ty}",
+                ),
+            )
+            .with_code("arrayUnpacking.stringOffset"),
+        );
+    }
 }
 
 /// `ArrayDestructuringRule` (`offsetAccess.nonArray`, level 3): the right side of
@@ -733,25 +759,33 @@ fn run_array_unpacking_string_offset(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_array_destructuring(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for assign in fa.facts.assignments() {
-        if !matches!(assign.kind, AssignmentKind::Plain) {
-            continue;
-        }
-        // Only a list/array destructuring target triggers this rule.
-        if !matches!(assign.target.kind, ExprKind::Array { .. }) {
-            continue;
-        }
-        let ty = fa.type_of(assign.rhs);
-        if definitely_not_array_destructurable(fa, &ty) {
-            out.push(
-                Diagnostic::error(
-                    assign.rhs.span,
-                    format!("Cannot use array destructuring on {ty}."),
-                )
-                .with_code("offsetAccess.nonArray"),
-            );
-        }
+        check_array_destructuring(fa, assign, &mut out);
     }
     out
+}
+
+fn check_array_destructuring(
+    fa: &FileAnalysis,
+    assign: &AssignmentFact,
+    out: &mut Vec<Diagnostic>,
+) {
+    if !matches!(assign.kind, AssignmentKind::Plain) {
+        return;
+    }
+    // Only a list/array destructuring target triggers this rule.
+    if !matches!(assign.target.kind, ExprKind::Array { .. }) {
+        return;
+    }
+    let ty = fa.type_of(assign.rhs);
+    if definitely_not_array_destructurable(fa, &ty) {
+        out.push(
+            Diagnostic::error(
+                assign.rhs.span,
+                format!("Cannot use array destructuring on {ty}."),
+            )
+            .with_code("offsetAccess.nonArray"),
+        );
+    }
 }
 
 /// `InvalidKeyInArrayItemRule` (`array.invalidKey`, level 3): a key in an array
@@ -761,18 +795,26 @@ fn run_array_destructuring(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_invalid_key_in_array_item(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for array in fa.facts.arrays() {
-        for it in array.items {
-            let Some(key) = &it.key else { continue };
-            let ty = fa.type_of(key);
-            if definitely_invalid_key(&ty) {
-                out.push(
-                    Diagnostic::error(key.span, format!("Invalid array key type {ty}."))
-                        .with_code("array.invalidKey"),
-                );
-            }
-        }
+        check_invalid_key_in_array_item(fa, array, &mut out);
     }
     out
+}
+
+fn check_invalid_key_in_array_item(
+    fa: &FileAnalysis,
+    array: &ArrayFact,
+    out: &mut Vec<Diagnostic>,
+) {
+    for it in array.items {
+        let Some(key) = &it.key else { continue };
+        let ty = fa.type_of(key);
+        if definitely_invalid_key(&ty) {
+            out.push(
+                Diagnostic::error(key.span, format!("Invalid array key type {ty}."))
+                    .with_code("array.invalidKey"),
+            );
+        }
+    }
 }
 
 /// `InvalidKeyInArrayDimFetchRule` (`offsetAccess.invalidOffset`, level 3): an
@@ -782,21 +824,25 @@ fn run_invalid_key_in_array_item(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_invalid_key_in_dim_fetch(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for index in fa.facts.indexes() {
-        let Some(dim) = index.index else {
-            continue;
-        };
-        if !definitely_array(&fa.type_of(index.base)) {
-            continue;
-        }
-        let ty = fa.type_of(dim);
-        if definitely_invalid_key(&ty) {
-            out.push(
-                Diagnostic::error(dim.span, format!("Invalid array key type {ty}."))
-                    .with_code("offsetAccess.invalidOffset"),
-            );
-        }
+        check_invalid_key_in_dim_fetch(fa, index, &mut out);
     }
     out
+}
+
+fn check_invalid_key_in_dim_fetch(fa: &FileAnalysis, index: &IndexFact, out: &mut Vec<Diagnostic>) {
+    let Some(dim) = index.index else {
+        return;
+    };
+    if !definitely_array(&fa.type_of(index.base)) {
+        return;
+    }
+    let ty = fa.type_of(dim);
+    if definitely_invalid_key(&ty) {
+        out.push(
+            Diagnostic::error(dim.span, format!("Invalid array key type {ty}."))
+                .with_code("offsetAccess.invalidOffset"),
+        );
+    }
 }
 
 /// `OffsetAccessAssignmentRule` / `OffsetAccessAssignOpRule`
@@ -807,25 +853,33 @@ fn run_invalid_key_in_dim_fetch(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_offset_access_assignment(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for assign in fa.facts.assignments() {
-        let target = assign.target;
-        let ExprKind::Index { base, index } = &target.kind else {
-            continue;
-        };
-        let base_ty = fa.type_of(base);
-        if !definitely_string_offset_base(&base_ty) {
-            continue;
-        }
-        let dim_ty = index.as_ref().map(|dim| fa.type_of(dim));
-        if !definitely_invalid_string_write_offset(dim_ty.as_ref()) {
-            continue;
-        }
-        let msg = match &dim_ty {
-            None => format!("Cannot assign new offset to {base_ty}."),
-            Some(dim_ty) => format!("Cannot assign offset {dim_ty} to {base_ty}."),
-        };
-        out.push(Diagnostic::error(target.span, msg).with_code("offsetAssign.dimType"));
+        check_offset_access_assignment(fa, assign, &mut out);
     }
     out
+}
+
+fn check_offset_access_assignment(
+    fa: &FileAnalysis,
+    assign: &AssignmentFact,
+    out: &mut Vec<Diagnostic>,
+) {
+    let target = assign.target;
+    let ExprKind::Index { base, index } = &target.kind else {
+        return;
+    };
+    let base_ty = fa.type_of(base);
+    if !definitely_string_offset_base(&base_ty) {
+        return;
+    }
+    let dim_ty = index.as_ref().map(|dim| fa.type_of(dim));
+    if !definitely_invalid_string_write_offset(dim_ty.as_ref()) {
+        return;
+    }
+    let msg = match &dim_ty {
+        None => format!("Cannot assign new offset to {base_ty}."),
+        Some(dim_ty) => format!("Cannot assign offset {dim_ty} to {base_ty}."),
+    };
+    out.push(Diagnostic::error(target.span, msg).with_code("offsetAssign.dimType"));
 }
 
 /// `OffsetAccessValueAssignmentRule` (`offsetAssign.valueType`, level 3):
@@ -835,30 +889,38 @@ fn run_offset_access_assignment(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_offset_access_value_assignment(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for assign in fa.facts.assignments() {
-        let assigned_ty = match assign.kind {
-            AssignmentKind::Plain | AssignmentKind::Ref => fa.type_of(assign.rhs),
-            AssignmentKind::Op(_) => fa.type_of(assign.expr),
-        };
-        let ExprKind::Index { base, .. } = &assign.target.kind else {
-            continue;
-        };
-        let base_ty = fa.type_of(base);
-        let Some(accepted_ty) = array_access_value_type(fa, &base_ty) else {
-            continue;
-        };
-        let checked_value = fa.lenient_src(assigned_ty.clone());
-        if crate::is_assignable(fa.reflection, &checked_value, &accepted_ty) {
-            continue;
-        }
-        out.push(
-            Diagnostic::error(
-                assign.target.span,
-                format!("{base_ty} does not accept {assigned_ty}."),
-            )
-            .with_code("offsetAssign.valueType"),
-        );
+        check_offset_access_value_assignment(fa, assign, &mut out);
     }
     out
+}
+
+fn check_offset_access_value_assignment(
+    fa: &FileAnalysis,
+    assign: &AssignmentFact,
+    out: &mut Vec<Diagnostic>,
+) {
+    let assigned_ty = match assign.kind {
+        AssignmentKind::Plain | AssignmentKind::Ref => fa.type_of(assign.rhs),
+        AssignmentKind::Op(_) => fa.type_of(assign.expr),
+    };
+    let ExprKind::Index { base, .. } = &assign.target.kind else {
+        return;
+    };
+    let base_ty = fa.type_of(base);
+    let Some(accepted_ty) = array_access_value_type(fa, &base_ty) else {
+        return;
+    };
+    let checked_value = fa.lenient_src(assigned_ty.clone());
+    if crate::is_assignable(fa.reflection, &checked_value, &accepted_ty) {
+        return;
+    }
+    out.push(
+        Diagnostic::error(
+            assign.target.span,
+            format!("{base_ty} does not accept {assigned_ty}."),
+        )
+        .with_code("offsetAssign.valueType"),
+    );
 }
 
 /// `NonexistentOffsetInArrayDimFetchRule` / `NonexistentOffsetInArrayDimFetchCheck`
@@ -1036,14 +1098,18 @@ fn union_offset_status(fa: &FileAnalysis, ty: &Type) -> Option<(bool, bool)> {
 fn run_dead_foreach(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for foreach in fa.facts.foreaches() {
-        if definitely_empty_iterable_expr(fa, foreach.subject) {
-            out.push(
-                Diagnostic::error(foreach.subject.span, "Empty array passed to foreach.")
-                    .with_code("foreach.emptyArray"),
-            );
-        }
+        check_dead_foreach(fa, foreach, &mut out);
     }
     out
+}
+
+fn check_dead_foreach(fa: &FileAnalysis, foreach: &ForeachFact, out: &mut Vec<Diagnostic>) {
+    if definitely_empty_iterable_expr(fa, foreach.subject) {
+        out.push(
+            Diagnostic::error(foreach.subject.span, "Empty array passed to foreach.")
+                .with_code("foreach.emptyArray"),
+        );
+    }
 }
 
 pub(crate) static RULES: &[RuleEntry] = &[
@@ -1122,6 +1188,69 @@ pub(crate) static RULES: &[RuleEntry] = &[
         level: 4,
         run: run_dead_foreach,
     },
+];
+
+pub(crate) static FACT_RULES: &[FactRuleEntry] = &[
+    FactRuleEntry::new(
+        "array.duplicateKey",
+        0,
+        FactKind::Array,
+        FactRuleHandler::Array(check_duplicate_keys),
+    ),
+    FactRuleEntry::new(
+        "foreach.nonIterable",
+        3,
+        FactKind::Foreach,
+        FactRuleHandler::Foreach(check_iterable_in_foreach),
+    ),
+    FactRuleEntry::new(
+        "arrayUnpacking.nonIterable",
+        3,
+        FactKind::Array,
+        FactRuleHandler::Array(check_unpack_iterable_in_array),
+    ),
+    FactRuleEntry::new(
+        "arrayUnpacking.stringOffset",
+        3,
+        FactKind::Array,
+        FactRuleHandler::Array(check_array_unpacking_string_offset),
+    ),
+    FactRuleEntry::new(
+        "offsetAccess.nonArray",
+        3,
+        FactKind::Assignment,
+        FactRuleHandler::Assignment(check_array_destructuring),
+    ),
+    FactRuleEntry::new(
+        "array.invalidKey",
+        3,
+        FactKind::Array,
+        FactRuleHandler::Array(check_invalid_key_in_array_item),
+    ),
+    FactRuleEntry::new(
+        "offsetAccess.invalidOffset",
+        3,
+        FactKind::Index,
+        FactRuleHandler::Index(check_invalid_key_in_dim_fetch),
+    ),
+    FactRuleEntry::new(
+        "offsetAssign.dimType",
+        3,
+        FactKind::Assignment,
+        FactRuleHandler::Assignment(check_offset_access_assignment),
+    ),
+    FactRuleEntry::new(
+        "offsetAssign.valueType",
+        3,
+        FactKind::Assignment,
+        FactRuleHandler::Assignment(check_offset_access_value_assignment),
+    ),
+    FactRuleEntry::new(
+        "foreach.emptyArray",
+        4,
+        FactKind::Foreach,
+        FactRuleHandler::Foreach(check_dead_foreach),
+    ),
 ];
 
 #[cfg(test)]

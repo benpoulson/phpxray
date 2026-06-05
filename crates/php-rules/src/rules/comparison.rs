@@ -58,7 +58,10 @@
 //!   phpstan's last-condition marker to avoid reports it suppresses.
 //! - `ConstantConditionInTraitRule` — trait-instantiation aware; out of scope.
 
-use crate::{symbols, walk, FileAnalysis, RuleEntry};
+use crate::{
+    facts::{BinaryFact, CallFact, MethodCallFact, StaticCallFact, UnaryFact},
+    symbols, walk, FactKind, FactRuleEntry, FactRuleHandler, FileAnalysis, RuleEntry,
+};
 use php_ast::{
     BinOp, ClassDecl, ClassKind, ElseIf, Expr, ExprKind, Member, MemberName, MethodDecl, Stmt,
     StmtKind, UnOp,
@@ -266,23 +269,28 @@ fn run_do_while_condition(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_boolean_not(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for unary in fa.facts.unaries() {
-        if matches!(unary.op, UnOp::Not) {
-            if let Some(v) = const_bool(fa, unary.inner) {
-                // `!` flips: a constantly-true operand makes the negation false.
-                let result = !v;
-                out.push(diag(
-                    unary.inner.span,
-                    format!("Negated boolean expression is always {result}."),
-                    if result {
-                        "booleanNot.alwaysTrue"
-                    } else {
-                        "booleanNot.alwaysFalse"
-                    },
-                ));
-            }
-        }
+        check_boolean_not(fa, unary, &mut out);
     }
     out
+}
+
+fn check_boolean_not(fa: &FileAnalysis, unary: &UnaryFact, out: &mut Vec<Diagnostic>) {
+    if !matches!(unary.op, UnOp::Not) {
+        return;
+    }
+    if let Some(v) = const_bool(fa, unary.inner) {
+        // `!` flips: a constantly-true operand makes the negation false.
+        let result = !v;
+        out.push(diag(
+            unary.inner.span,
+            format!("Negated boolean expression is always {result}."),
+            if result {
+                "booleanNot.alwaysTrue"
+            } else {
+                "booleanNot.alwaysFalse"
+            },
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +396,26 @@ fn run_logical_xor(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
+fn check_logical_xor(fa: &FileAnalysis, binary: &BinaryFact, out: &mut Vec<Diagnostic>) {
+    if !matches!(binary.op, BinOp::LogicalXor) {
+        return;
+    }
+    if let Some(v) = const_bool(fa, binary.lhs) {
+        out.push(diag(
+            binary.lhs.span,
+            format!("Left side of xor is always {v}."),
+            side_code("logicalXor", true, v),
+        ));
+    }
+    if let Some(v) = const_bool(fa, binary.rhs) {
+        out.push(diag(
+            binary.rhs.span,
+            format!("Right side of xor is always {v}."),
+            side_code("logicalXor", false, v),
+        ));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Strict comparison of disjoint types  (StrictComparisonOfDifferentTypesRule)
 // ---------------------------------------------------------------------------
@@ -451,39 +479,61 @@ fn run_impossible_instanceof(fa: &FileAnalysis) -> Vec<Diagnostic> {
         .collect();
     let mut out = Vec::new();
     for e in fa.facts.expressions() {
-        let ExprKind::Instanceof { expr, class } = &e.kind else {
-            continue;
-        };
-        let ExprKind::Name(n) = &class.kind else {
-            continue;
-        };
-        let Some(r) = cmap.get(&(n.span.start, n.span.end)) else {
-            continue;
-        };
-        // Only an explicitly-named, fully-known class (skip self/static/parent/builtin).
-        let Resolution::Fqn(class_fqn) = &r.resolution else {
-            continue;
-        };
-        if !fa.class_fully_known(class_fqn) {
-            continue;
-        }
-        let vt = fa.type_of(expr);
-        if let Some(result) = instanceof_result(fa, &vt, class_fqn) {
-            // phpstan reports always-*false* instanceof by default but defaults the
-            // always-*true* report OFF (`checkAlwaysTrueInstanceof`) — defensive
-            // `instanceof` that's redundant is usually intentional. Match that.
-            if result {
-                continue;
-            }
-            let (verb, code) = ("false", "instanceof.alwaysFalse");
-            out.push(diag(
-                e.span,
-                format!("Instanceof between {vt} and {class_fqn} will always evaluate to {verb}."),
-                code,
-            ));
-        }
+        check_impossible_instanceof_with_refs(fa, e, &cmap, &mut out);
     }
     out
+}
+
+fn check_impossible_instanceof(fa: &FileAnalysis, e: &Expr, out: &mut Vec<Diagnostic>) {
+    if !fa.treat_phpdoc_types_as_certain {
+        return;
+    }
+    let cmap: HashMap<(u32, u32), &ResolvedRef> = fa
+        .resolved_refs
+        .iter()
+        .filter(|r| r.kind == RefKind::Class)
+        .map(|r| ((r.span.start, r.span.end), r))
+        .collect();
+    check_impossible_instanceof_with_refs(fa, e, &cmap, out);
+}
+
+fn check_impossible_instanceof_with_refs(
+    fa: &FileAnalysis,
+    e: &Expr,
+    cmap: &HashMap<(u32, u32), &ResolvedRef>,
+    out: &mut Vec<Diagnostic>,
+) {
+    let ExprKind::Instanceof { expr, class } = &e.kind else {
+        return;
+    };
+    let ExprKind::Name(n) = &class.kind else {
+        return;
+    };
+    let Some(r) = cmap.get(&(n.span.start, n.span.end)) else {
+        return;
+    };
+    // Only an explicitly-named, fully-known class (skip self/static/parent/builtin).
+    let Resolution::Fqn(class_fqn) = &r.resolution else {
+        return;
+    };
+    if !fa.class_fully_known(class_fqn) {
+        return;
+    }
+    let vt = fa.type_of(expr);
+    if let Some(result) = instanceof_result(fa, &vt, class_fqn) {
+        // phpstan reports always-*false* instanceof by default but defaults the
+        // always-*true* report OFF (`checkAlwaysTrueInstanceof`) — defensive
+        // `instanceof` that's redundant is usually intentional. Match that.
+        if result {
+            return;
+        }
+        let (verb, code) = ("false", "instanceof.alwaysFalse");
+        out.push(diag(
+            e.span,
+            format!("Instanceof between {vt} and {class_fqn} will always evaluate to {verb}."),
+            code,
+        ));
+    }
 }
 
 fn instanceof_result(fa: &FileAnalysis, value: &Type, target: &str) -> Option<bool> {
@@ -526,45 +576,65 @@ fn run_impossible_check_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
         .collect();
     let mut out = Vec::new();
     for call in fa.facts.function_calls() {
-        let ExprKind::Name(n) = &call.callee.kind else {
-            continue;
-        };
-        let Some(r) = fmap.get(&(n.span.start, n.span.end)) else {
-            continue;
-        };
-        let fname = match &r.resolution {
-            Resolution::Fqn(f) => f.trim_start_matches('\\').to_ascii_lowercase(),
-            Resolution::Fallback { global, .. } => {
-                global.trim_start_matches('\\').to_ascii_lowercase()
-            }
-            _ => continue,
-        };
-        let Some(pred) = predicate_cat(&fname) else {
-            continue;
-        };
-        let Some(arg0) = call.args.first() else {
-            continue;
-        };
-        if arg0.spread || arg0.placeholder || arg0.name.is_some() {
-            continue;
-        }
-        let Some(vcat) = category(&fa.type_of(&arg0.value)) else {
-            continue;
-        };
-        // Always-*true* type-check (`is_int($int)`) is OFF by default in phpstan
-        // (`checkAlwaysTrueCheckTypeFunctionCall`) — it reports the resulting dead
-        // code instead. Only report the impossible (always-false) case.
-        if vcat == pred {
-            continue;
-        }
-        let (verb, code) = ("false", "function.impossibleType");
-        out.push(diag(
-            call.expr.span,
-            format!("Call to function {fname}() will always evaluate to {verb}."),
-            code,
-        ));
+        check_impossible_check_type_with_refs(fa, call, &fmap, &mut out);
     }
     out
+}
+
+fn check_impossible_check_type(fa: &FileAnalysis, call: &CallFact, out: &mut Vec<Diagnostic>) {
+    if !fa.treat_phpdoc_types_as_certain {
+        return;
+    }
+    let fmap: HashMap<(u32, u32), &ResolvedRef> = fa
+        .resolved_refs
+        .iter()
+        .filter(|r| r.kind == RefKind::Function)
+        .map(|r| ((r.span.start, r.span.end), r))
+        .collect();
+    check_impossible_check_type_with_refs(fa, call, &fmap, out);
+}
+
+fn check_impossible_check_type_with_refs(
+    fa: &FileAnalysis,
+    call: &CallFact,
+    fmap: &HashMap<(u32, u32), &ResolvedRef>,
+    out: &mut Vec<Diagnostic>,
+) {
+    let ExprKind::Name(n) = &call.callee.kind else {
+        return;
+    };
+    let Some(r) = fmap.get(&(n.span.start, n.span.end)) else {
+        return;
+    };
+    let fname = match &r.resolution {
+        Resolution::Fqn(f) => f.trim_start_matches('\\').to_ascii_lowercase(),
+        Resolution::Fallback { global, .. } => global.trim_start_matches('\\').to_ascii_lowercase(),
+        _ => return,
+    };
+    let Some(pred) = predicate_cat(&fname) else {
+        return;
+    };
+    let Some(arg0) = call.args.first() else {
+        return;
+    };
+    if arg0.spread || arg0.placeholder || arg0.name.is_some() {
+        return;
+    }
+    let Some(vcat) = category(&fa.type_of(&arg0.value)) else {
+        return;
+    };
+    // Always-*true* type-check (`is_int($int)`) is OFF by default in phpstan
+    // (`checkAlwaysTrueCheckTypeFunctionCall`) — it reports the resulting dead
+    // code instead. Only report the impossible (always-false) case.
+    if vcat == pred {
+        return;
+    }
+    let (verb, code) = ("false", "function.impossibleType");
+    out.push(diag(
+        call.expr.span,
+        format!("Call to function {fname}() will always evaluate to {verb}."),
+        code,
+    ));
 }
 
 /// The category a scalar/null type-predicate built-in asserts (only those whose
@@ -669,44 +739,65 @@ fn run_impossible_check_type_method_call(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let assertions = assertion_methods(fa);
     let mut out = Vec::new();
     for call in fa.facts.method_calls() {
-        if call.nullsafe {
-            continue;
-        }
-        let Some(method_name) = member_ident(fa, call.method) else {
-            continue;
-        };
-        let Some(receiver_fqn) = receiver_class(fa, call.recv) else {
-            continue;
-        };
-        if !fa.class_fully_known(&receiver_fqn) {
-            continue;
-        }
-        let Some(found) = fa.reflection.find_method(&receiver_fqn, &method_name) else {
-            continue;
-        };
-        if found.member.magic || found.member.is_static {
-            continue;
-        }
-        let Some(assertion) = assertions.get(&(
-            symbols::fqn_key(&found.declaring_class),
-            found.member.name.to_ascii_lowercase(),
-            false,
-        )) else {
-            continue;
-        };
-        if assertion_call_is_false(fa, &assertion.target, assertion.param_index, call.args) {
-            out.push(diag(
-                call.expr.span,
-                format!(
-                    "Call to method {}::{}() will always evaluate to false.",
-                    found.declaring_class.trim_start_matches('\\'),
-                    found.member.name
-                ),
-                "method.impossibleType",
-            ));
-        }
+        check_impossible_check_type_method_call_with_assertions(fa, call, &assertions, &mut out);
     }
     out
+}
+
+fn check_impossible_check_type_method_call(
+    fa: &FileAnalysis,
+    call: &MethodCallFact,
+    out: &mut Vec<Diagnostic>,
+) {
+    if !fa.treat_phpdoc_types_as_certain {
+        return;
+    }
+    let assertions = assertion_methods(fa);
+    check_impossible_check_type_method_call_with_assertions(fa, call, &assertions, out);
+}
+
+fn check_impossible_check_type_method_call_with_assertions(
+    fa: &FileAnalysis,
+    call: &MethodCallFact,
+    assertions: &HashMap<(String, String, bool), AssertMethod>,
+    out: &mut Vec<Diagnostic>,
+) {
+    if call.nullsafe {
+        return;
+    }
+    let Some(method_name) = member_ident(fa, call.method) else {
+        return;
+    };
+    let Some(receiver_fqn) = receiver_class(fa, call.recv) else {
+        return;
+    };
+    if !fa.class_fully_known(&receiver_fqn) {
+        return;
+    }
+    let Some(found) = fa.reflection.find_method(&receiver_fqn, &method_name) else {
+        return;
+    };
+    if found.member.magic || found.member.is_static {
+        return;
+    }
+    let Some(assertion) = assertions.get(&(
+        symbols::fqn_key(&found.declaring_class),
+        found.member.name.to_ascii_lowercase(),
+        false,
+    )) else {
+        return;
+    };
+    if assertion_call_is_false(fa, &assertion.target, assertion.param_index, call.args) {
+        out.push(diag(
+            call.expr.span,
+            format!(
+                "Call to method {}::{}() will always evaluate to false.",
+                found.declaring_class.trim_start_matches('\\'),
+                found.member.name
+            ),
+            "method.impossibleType",
+        ));
+    }
 }
 
 fn run_impossible_check_type_static_method_call(fa: &FileAnalysis) -> Vec<Diagnostic> {
@@ -722,41 +813,75 @@ fn run_impossible_check_type_static_method_call(fa: &FileAnalysis) -> Vec<Diagno
         .collect();
     let mut out = Vec::new();
     for call in fa.facts.static_calls() {
-        let Some(method_name) = member_ident(fa, call.method) else {
-            continue;
-        };
-        let Some(target_fqn) = static_call_class(fa, &cmap, call.class) else {
-            continue;
-        };
-        if !fa.class_fully_known(&target_fqn) {
-            continue;
-        }
-        let Some(found) = fa.reflection.find_method(&target_fqn, &method_name) else {
-            continue;
-        };
-        if found.member.magic || !found.member.is_static {
-            continue;
-        }
-        let Some(assertion) = assertions.get(&(
-            symbols::fqn_key(&found.declaring_class),
-            found.member.name.to_ascii_lowercase(),
-            true,
-        )) else {
-            continue;
-        };
-        if assertion_call_is_false(fa, &assertion.target, assertion.param_index, call.args) {
-            out.push(diag(
-                call.expr.span,
-                format!(
-                    "Call to static method {}::{}() will always evaluate to false.",
-                    found.declaring_class.trim_start_matches('\\'),
-                    found.member.name
-                ),
-                "staticMethod.impossibleType",
-            ));
-        }
+        check_impossible_check_type_static_method_call_with_maps(
+            fa,
+            call,
+            &assertions,
+            &cmap,
+            &mut out,
+        );
     }
     out
+}
+
+fn check_impossible_check_type_static_method_call(
+    fa: &FileAnalysis,
+    call: &StaticCallFact,
+    out: &mut Vec<Diagnostic>,
+) {
+    if !fa.treat_phpdoc_types_as_certain {
+        return;
+    }
+    let assertions = assertion_methods(fa);
+    let cmap: HashMap<(u32, u32), &ResolvedRef> = fa
+        .resolved_refs
+        .iter()
+        .filter(|r| r.kind == RefKind::Class)
+        .map(|r| ((r.span.start, r.span.end), r))
+        .collect();
+    check_impossible_check_type_static_method_call_with_maps(fa, call, &assertions, &cmap, out);
+}
+
+fn check_impossible_check_type_static_method_call_with_maps(
+    fa: &FileAnalysis,
+    call: &StaticCallFact,
+    assertions: &HashMap<(String, String, bool), AssertMethod>,
+    cmap: &HashMap<(u32, u32), &ResolvedRef>,
+    out: &mut Vec<Diagnostic>,
+) {
+    let Some(method_name) = member_ident(fa, call.method) else {
+        return;
+    };
+    let Some(target_fqn) = static_call_class(fa, cmap, call.class) else {
+        return;
+    };
+    if !fa.class_fully_known(&target_fqn) {
+        return;
+    }
+    let Some(found) = fa.reflection.find_method(&target_fqn, &method_name) else {
+        return;
+    };
+    if found.member.magic || !found.member.is_static {
+        return;
+    }
+    let Some(assertion) = assertions.get(&(
+        symbols::fqn_key(&found.declaring_class),
+        found.member.name.to_ascii_lowercase(),
+        true,
+    )) else {
+        return;
+    };
+    if assertion_call_is_false(fa, &assertion.target, assertion.param_index, call.args) {
+        out.push(diag(
+            call.expr.span,
+            format!(
+                "Call to static method {}::{}() will always evaluate to false.",
+                found.declaring_class.trim_start_matches('\\'),
+                found.member.name
+            ),
+            "staticMethod.impossibleType",
+        ));
+    }
 }
 
 fn assertion_call_is_false(
@@ -894,55 +1019,60 @@ fn methods(c: &ClassDecl) -> impl Iterator<Item = &MethodDecl> {
 fn run_strict_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for binary in fa.facts.binaries() {
-        let (sigil, always_false) = match binary.op {
-            BinOp::Identical => ("===", true),
-            BinOp::NotIdentical => ("!==", false),
-            _ => continue,
-        };
-        let lt = fa.type_of(binary.lhs);
-        let rt = fa.type_of(binary.rhs);
-        // 1. Disjoint *types* — provably never/always equal, even for non-constant
-        //    typed operands (`int $a === string $b`). `===` on disjoint types is
-        //    always false (reported); `!==` is always true — and phpstan defaults
-        //    the always-*true* strict-comparison report OFF
-        //    (`checkAlwaysTrueStrictComparison`), so we only report the false case.
-        if disjoint(&lt, &rt) {
-            if !always_false {
-                continue;
-            }
-            let (verb, code) = ("false", "identical.alwaysFalse");
-            out.push(diag(
-                binary.expr.span,
-                format!("Strict comparison using {sigil} between {lt} and {rt} will always evaluate to {verb}."),
-                code,
-            ));
-            continue;
-        }
-        // 2. Same-category but constant-foldable (`1 === 1`, `1 === 2`).
-        if let (Some(ConstVal::Bool(result)), Some(l), Some(r)) = (
-            eval_const(binary.expr),
-            eval_const(binary.lhs),
-            eval_const(binary.rhs),
-        ) {
-            let code = match (binary.op, result) {
-                (BinOp::Identical, true) => "identical.alwaysTrue",
-                (BinOp::Identical, false) => "identical.alwaysFalse",
-                (BinOp::NotIdentical, true) => "notIdentical.alwaysTrue",
-                (BinOp::NotIdentical, false) => "notIdentical.alwaysFalse",
-                _ => continue,
-            };
-            out.push(diag(
-                binary.expr.span,
-                format!(
-                    "Strict comparison using {sigil} between {} and {} will always evaluate to {result}.",
-                    l.describe(),
-                    r.describe()
-                ),
-                code,
-            ));
-        }
+        check_strict_comparison(fa, binary, &mut out);
     }
     out
+}
+
+fn check_strict_comparison(fa: &FileAnalysis, binary: &BinaryFact, out: &mut Vec<Diagnostic>) {
+    let (sigil, always_false) = match binary.op {
+        BinOp::Identical => ("===", true),
+        BinOp::NotIdentical => ("!==", false),
+        _ => return,
+    };
+    let lt = fa.type_of(binary.lhs);
+    let rt = fa.type_of(binary.rhs);
+    // 1. Disjoint *types* — provably never/always equal, even for non-constant
+    //    typed operands (`int $a === string $b`). `===` on disjoint types is
+    //    always false (reported); `!==` is always true — and phpstan defaults
+    //    the always-*true* strict-comparison report OFF
+    //    (`checkAlwaysTrueStrictComparison`), so we only report the false case.
+    if disjoint(&lt, &rt) {
+        if !always_false {
+            return;
+        }
+        let (verb, code) = ("false", "identical.alwaysFalse");
+        out.push(diag(
+            binary.expr.span,
+            format!("Strict comparison using {sigil} between {lt} and {rt} will always evaluate to {verb}."),
+            code,
+        ));
+        return;
+    }
+    // 2. Same-category but constant-foldable (`1 === 1`, `1 === 2`).
+    let (Some(ConstVal::Bool(result)), Some(l), Some(r)) = (
+        eval_const(binary.expr),
+        eval_const(binary.lhs),
+        eval_const(binary.rhs),
+    ) else {
+        return;
+    };
+    let code = match (binary.op, result) {
+        (BinOp::Identical, true) => "identical.alwaysTrue",
+        (BinOp::Identical, false) => "identical.alwaysFalse",
+        (BinOp::NotIdentical, true) => "notIdentical.alwaysTrue",
+        (BinOp::NotIdentical, false) => "notIdentical.alwaysFalse",
+        _ => return,
+    };
+    out.push(diag(
+        binary.expr.span,
+        format!(
+            "Strict comparison using {sigil} between {} and {} will always evaluate to {result}.",
+            l.describe(),
+            r.describe()
+        ),
+        code,
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -953,55 +1083,59 @@ fn run_strict_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_constant_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for binary in fa.facts.binaries() {
-        // (sigil, node-type for `<` family, loose flag)
-        let (sigil, ntype, loose) = match binary.op {
-            BinOp::Eq => ("==", "equal", true),
-            BinOp::NotEq => ("!=", "notEqual", true),
-            BinOp::Lt => ("<", "smaller", false),
-            BinOp::Gt => (">", "greater", false),
-            BinOp::LtEq => ("<=", "smallerOrEqual", false),
-            BinOp::GtEq => (">=", "greaterOrEqual", false),
-            _ => continue,
-        };
-        let (Some(ConstVal::Bool(result)), Some(l), Some(r)) = (
-            eval_const(binary.expr),
-            eval_const(binary.lhs),
-            eval_const(binary.rhs),
-        ) else {
-            continue;
-        };
-        // The registry needs a `&'static str` code; enumerate the variants.
-        let code = match (ntype, result) {
-            ("equal", true) => "equal.alwaysTrue",
-            ("equal", false) => "equal.alwaysFalse",
-            ("notEqual", true) => "notEqual.alwaysTrue",
-            ("notEqual", false) => "notEqual.alwaysFalse",
-            ("smaller", true) => "smaller.alwaysTrue",
-            ("smaller", false) => "smaller.alwaysFalse",
-            ("greater", true) => "greater.alwaysTrue",
-            ("greater", false) => "greater.alwaysFalse",
-            ("smallerOrEqual", true) => "smallerOrEqual.alwaysTrue",
-            ("smallerOrEqual", false) => "smallerOrEqual.alwaysFalse",
-            ("greaterOrEqual", true) => "greaterOrEqual.alwaysTrue",
-            ("greaterOrEqual", false) => "greaterOrEqual.alwaysFalse",
-            _ => continue,
-        };
-        let msg = if loose {
-            format!(
-                "Loose comparison using {sigil} between {} and {} will always evaluate to {result}.",
-                l.describe(),
-                r.describe()
-            )
-        } else {
-            format!(
-                "Comparison operation \"{sigil}\" between {} and {} is always {result}.",
-                l.describe(),
-                r.describe()
-            )
-        };
-        out.push(diag(binary.expr.span, msg, code));
+        check_constant_comparison(fa, binary, &mut out);
     }
     out
+}
+
+fn check_constant_comparison(_fa: &FileAnalysis, binary: &BinaryFact, out: &mut Vec<Diagnostic>) {
+    // (sigil, node-type for `<` family, loose flag)
+    let (sigil, ntype, loose) = match binary.op {
+        BinOp::Eq => ("==", "equal", true),
+        BinOp::NotEq => ("!=", "notEqual", true),
+        BinOp::Lt => ("<", "smaller", false),
+        BinOp::Gt => (">", "greater", false),
+        BinOp::LtEq => ("<=", "smallerOrEqual", false),
+        BinOp::GtEq => (">=", "greaterOrEqual", false),
+        _ => return,
+    };
+    let (Some(ConstVal::Bool(result)), Some(l), Some(r)) = (
+        eval_const(binary.expr),
+        eval_const(binary.lhs),
+        eval_const(binary.rhs),
+    ) else {
+        return;
+    };
+    // The registry needs a `&'static str` code; enumerate the variants.
+    let code = match (ntype, result) {
+        ("equal", true) => "equal.alwaysTrue",
+        ("equal", false) => "equal.alwaysFalse",
+        ("notEqual", true) => "notEqual.alwaysTrue",
+        ("notEqual", false) => "notEqual.alwaysFalse",
+        ("smaller", true) => "smaller.alwaysTrue",
+        ("smaller", false) => "smaller.alwaysFalse",
+        ("greater", true) => "greater.alwaysTrue",
+        ("greater", false) => "greater.alwaysFalse",
+        ("smallerOrEqual", true) => "smallerOrEqual.alwaysTrue",
+        ("smallerOrEqual", false) => "smallerOrEqual.alwaysFalse",
+        ("greaterOrEqual", true) => "greaterOrEqual.alwaysTrue",
+        ("greaterOrEqual", false) => "greaterOrEqual.alwaysFalse",
+        _ => return,
+    };
+    let msg = if loose {
+        format!(
+            "Loose comparison using {sigil} between {} and {} will always evaluate to {result}.",
+            l.describe(),
+            r.describe()
+        )
+    } else {
+        format!(
+            "Comparison operation \"{sigil}\" between {} and {} is always {result}.",
+            l.describe(),
+            r.describe()
+        )
+    };
+    out.push(diag(binary.expr.span, msg, code));
 }
 
 // ---------------------------------------------------------------------------
@@ -1018,78 +1152,82 @@ fn run_constant_comparison(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_match_arms(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for e in fa.facts.expressions() {
-        let ExprKind::Match { subject, arms } = &e.kind else {
-            continue;
-        };
-        let Some(subj) = eval_const(subject) else {
-            continue;
-        };
+        check_match_arms(fa, e, &mut out);
+    }
+    out
+}
 
-        // Every condition must fold to a constant; otherwise we can't reason about
-        // any arm safely (a non-constant arm could match the subject).
-        let mut folded: Vec<Vec<(Span, ConstVal)>> = Vec::with_capacity(arms.len());
-        let mut all_folded = true;
-        for arm in arms {
-            let mut arm_vals = Vec::new();
-            if let Some(arm_conds) = &arm.conds {
-                for c in arm_conds {
-                    let Some(v) = eval_const(c) else {
-                        all_folded = false;
-                        break;
-                    };
-                    arm_vals.push((c.span, v));
-                }
+fn check_match_arms(_fa: &FileAnalysis, e: &Expr, out: &mut Vec<Diagnostic>) {
+    let ExprKind::Match { subject, arms } = &e.kind else {
+        return;
+    };
+    let Some(subj) = eval_const(subject) else {
+        return;
+    };
+
+    // Every condition must fold to a constant; otherwise we can't reason about
+    // any arm safely (a non-constant arm could match the subject).
+    let mut folded: Vec<Vec<(Span, ConstVal)>> = Vec::with_capacity(arms.len());
+    let mut all_folded = true;
+    for arm in arms {
+        let mut arm_vals = Vec::new();
+        if let Some(arm_conds) = &arm.conds {
+            for c in arm_conds {
+                let Some(v) = eval_const(c) else {
+                    all_folded = false;
+                    break;
+                };
+                arm_vals.push((c.span, v));
             }
-            if !all_folded {
-                break;
-            }
-            folded.push(arm_vals);
         }
         if !all_folded {
-            continue;
+            break;
         }
+        folded.push(arm_vals);
+    }
+    if !all_folded {
+        return;
+    }
 
-        let arms_count = arms.len();
-        let mut already_matched = false;
-        for (arm_idx, arm_vals) in folded.iter().enumerate() {
-            for (span, v) in arm_vals {
-                if already_matched {
-                    // A prior arm already always-matched → this arm is dead.
-                    // phpstan reports the always-true arm once, not every dead
-                    // arm that follows, so we don't emit here.
-                    continue;
-                }
-                // PHP `match` uses `===`; `ConstVal`'s structural equality matches
-                // strict-identity for these literal kinds (int ≠ float ≠ string).
-                if *v == subj {
-                    // Always-true: dead arms follow only if this isn't the last arm.
-                    if arm_idx != arms_count - 1 {
-                        out.push(diag(
-                            *span,
-                            format!(
-                                "Match arm comparison between {} and {} is always true.",
-                                subj.describe(),
-                                v.describe()
-                            ),
-                            "match.alwaysTrue",
-                        ));
-                    }
-                    already_matched = true;
-                } else {
+    let arms_count = arms.len();
+    let mut already_matched = false;
+    for (arm_idx, arm_vals) in folded.iter().enumerate() {
+        for (span, v) in arm_vals {
+            if already_matched {
+                // A prior arm already always-matched -> this arm is dead.
+                // phpstan reports the always-true arm once, not every dead
+                // arm that follows, so we don't emit here.
+                continue;
+            }
+            // PHP `match` uses `===`; `ConstVal`'s structural equality matches
+            // strict-identity for these literal kinds (int != float != string).
+            if *v == subj {
+                // Always-true: dead arms follow only if this isn't the last arm.
+                if arm_idx != arms_count - 1 {
                     out.push(diag(
                         *span,
                         format!(
-                            "Match arm comparison between {} and {} is always false.",
+                            "Match arm comparison between {} and {} is always true.",
                             subj.describe(),
                             v.describe()
                         ),
-                        "match.alwaysFalse",
+                        "match.alwaysTrue",
                     ));
                 }
+                already_matched = true;
+            } else {
+                out.push(diag(
+                    *span,
+                    format!(
+                        "Match arm comparison between {} and {} is always false.",
+                        subj.describe(),
+                        v.describe()
+                    ),
+                    "match.alwaysFalse",
+                ));
             }
         }
     }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2000,6 +2138,63 @@ pub(crate) static RULES: &[RuleEntry] = &[
         level: 4,
         run: run_constant_condition_in_trait,
     },
+];
+
+pub(crate) static FACT_RULES: &[FactRuleEntry] = &[
+    FactRuleEntry::new(
+        "comparison.booleanNot",
+        4,
+        FactKind::Unary,
+        FactRuleHandler::Unary(check_boolean_not),
+    ),
+    FactRuleEntry::new(
+        "comparison.logicalXor",
+        4,
+        FactKind::Binary,
+        FactRuleHandler::Binary(check_logical_xor),
+    ),
+    FactRuleEntry::new(
+        "comparison.strict",
+        4,
+        FactKind::Binary,
+        FactRuleHandler::Binary(check_strict_comparison),
+    ),
+    FactRuleEntry::new(
+        "comparison.constant",
+        4,
+        FactKind::Binary,
+        FactRuleHandler::Binary(check_constant_comparison),
+    ),
+    FactRuleEntry::new(
+        "comparison.impossibleInstanceof",
+        4,
+        FactKind::Expression,
+        FactRuleHandler::Expression(check_impossible_instanceof),
+    ),
+    FactRuleEntry::new(
+        "comparison.impossibleCheckType",
+        4,
+        FactKind::FunctionCall,
+        FactRuleHandler::FunctionCall(check_impossible_check_type),
+    ),
+    FactRuleEntry::new(
+        "comparison.impossibleCheckTypeMethodCall",
+        4,
+        FactKind::MethodCall,
+        FactRuleHandler::MethodCall(check_impossible_check_type_method_call),
+    ),
+    FactRuleEntry::new(
+        "comparison.impossibleCheckTypeStaticMethodCall",
+        4,
+        FactKind::StaticCall,
+        FactRuleHandler::StaticCall(check_impossible_check_type_static_method_call),
+    ),
+    FactRuleEntry::new(
+        "comparison.matchArms",
+        4,
+        FactKind::Expression,
+        FactRuleHandler::Expression(check_match_arms),
+    ),
 ];
 
 #[cfg(test)]

@@ -19,7 +19,7 @@
 //! extension-development API) and **Ignore** (phpstan's own ignore-comment
 //! handling — we do suppression in `php-cli`).
 
-use crate::{FileAnalysis, LocatedRuleEntry, RuleEntry};
+use crate::{FactRuleEntry, FileAnalysis, LocatedRuleEntry, RuleEntry};
 use php_types::Type;
 
 mod arrays;
@@ -82,6 +82,14 @@ pub(crate) static CATEGORY_RULES: &[&[RuleEntry]] = &[
     types::RULES,
     variables::RULES,
     whitespace::RULES,
+];
+
+pub(crate) static FACT_CATEGORY_RULES: &[&[FactRuleEntry]] = &[
+    arrays::FACT_RULES,
+    cast::FACT_RULES,
+    comparison::FACT_RULES,
+    operators::FACT_RULES,
+    regexp::FACT_RULES,
 ];
 
 /// Rules whose diagnostics may target a different analyzed file than the current
