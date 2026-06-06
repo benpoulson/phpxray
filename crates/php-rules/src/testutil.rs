@@ -13,11 +13,28 @@ pub(crate) fn run(src: &str, rule: fn(&FileAnalysis) -> Vec<Diagnostic>) -> Vec<
     run_version(src, rule, PhpVersion::default())
 }
 
+pub(crate) fn run_with(
+    src: &str,
+    rule: fn(&FileAnalysis) -> Vec<Diagnostic>,
+    configure: impl FnOnce(&mut FileAnalysis),
+) -> Vec<Diagnostic> {
+    run_version_with(src, rule, PhpVersion::default(), configure)
+}
+
 /// Like [`run`] but with an explicit target PHP version (for version-gated rules).
 pub(crate) fn run_version(
     src: &str,
     rule: fn(&FileAnalysis) -> Vec<Diagnostic>,
     php_version: PhpVersion,
+) -> Vec<Diagnostic> {
+    run_version_with(src, rule, php_version, |_| {})
+}
+
+pub(crate) fn run_version_with(
+    src: &str,
+    rule: fn(&FileAnalysis) -> Vec<Diagnostic>,
+    php_version: PhpVersion,
+    configure: impl FnOnce(&mut FileAnalysis),
 ) -> Vec<Diagnostic> {
     let r = php_parser::parse(src);
     assert!(!r.has_errors(), "parse errors in test source: {src}");
@@ -34,7 +51,7 @@ pub(crate) fn run_version(
     let types = type_map(&reflection, &r.program, &r.interner);
     let native_types = php_infer::native_type_map(&reflection, &r.program, &r.interner);
     let facts = FileFacts::new(&r.program, &r.interner);
-    let fa = FileAnalysis {
+    let mut fa = FileAnalysis {
         path: "test.php",
         source: src,
         program: &r.program,
@@ -52,6 +69,7 @@ pub(crate) fn run_version(
         check_explicit_mixed: true,
         check_implicit_mixed: true,
     };
+    configure(&mut fa);
     rule(&fa)
 }
 
@@ -106,6 +124,17 @@ pub(crate) fn run_located_version(
 /// Run `rule` and return the error identifiers (`Diagnostic::code`) it emits.
 pub(crate) fn codes(src: &str, rule: fn(&FileAnalysis) -> Vec<Diagnostic>) -> Vec<&'static str> {
     run(src, rule)
+        .into_iter()
+        .map(|d| d.code.unwrap_or(""))
+        .collect()
+}
+
+pub(crate) fn codes_with(
+    src: &str,
+    rule: fn(&FileAnalysis) -> Vec<Diagnostic>,
+    configure: impl FnOnce(&mut FileAnalysis),
+) -> Vec<&'static str> {
+    run_with(src, rule, configure)
         .into_iter()
         .map(|d| d.code.unwrap_or(""))
         .collect()

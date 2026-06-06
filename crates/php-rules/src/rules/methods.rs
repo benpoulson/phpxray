@@ -74,7 +74,7 @@
 //!   the `consistentConstructor` *attribute* requires a custom PHPDoc tag we don't model).
 
 use crate::{
-    decls,
+    compat, decls,
     members::{MemberAccessResolver, ResolveStatus},
     symbols, FileAnalysis, RuleEntry,
 };
@@ -584,7 +584,7 @@ fn run_overriding_method(fa: &FileAnalysis) -> Vec<Diagnostic> {
         let Some(class) = fa.reflection.class(fqn) else {
             return;
         };
-        for m in &class.methods {
+        for (md, m) in zip_methods(fa.interner, c, class) {
             if m.magic {
                 continue;
             }
@@ -643,12 +643,90 @@ fn run_overriding_method(fa: &FileAnalysis) -> Vec<Diagnostic> {
                             "{lead} method {here}::{mname}() overriding {pvis} method {there}::{mname}() should {want}."
                         ),
                     )
-                    .with_code("method.visibility"),
+                        .with_code("method.visibility"),
                 );
             }
+            check_overriding_method_signature(fa, c, md, m, &parent, &mut out);
         }
     });
     out
+}
+
+fn check_overriding_method_signature(
+    fa: &FileAnalysis,
+    c: &ClassDecl,
+    md: &MethodDecl,
+    method: &MethodReflection,
+    parent: &Found<MethodReflection>,
+    out: &mut Vec<Diagnostic>,
+) {
+    let pm = &parent.member;
+    let here = display(fa, c);
+    let there = parent.declaring_class.trim_start_matches('\\');
+    let mname = &method.name;
+
+    if compat::declaration_mismatch(
+        fa,
+        &method.return_type,
+        &method.native_return,
+        &pm.return_type,
+        &pm.native_return,
+    ) {
+        out.push(
+            Diagnostic::error(
+                md.return_type
+                    .as_ref()
+                    .map(|t| t.span)
+                    .unwrap_or_else(|| method_span(md)),
+                format!(
+                    "Return type ({}) of method {here}::{mname}() should be compatible with return type ({}) of method {there}::{mname}()",
+                    method.return_type, pm.return_type
+                ),
+            )
+            .with_code("method.childReturnType"),
+        );
+    }
+
+    let count = method
+        .params
+        .len()
+        .min(pm.params.len())
+        .min(md.params.len());
+    for i in 0..count {
+        let child = &method.params[i];
+        let parent_param = &pm.params[i];
+        if child.variadic || parent_param.variadic {
+            continue;
+        }
+        if !compat::declaration_mismatch(
+            fa,
+            &parent_param.ty,
+            &parent_param.native_ty,
+            &child.ty,
+            &child.native_ty,
+        ) {
+            continue;
+        }
+        let span = md.params[i]
+            .ty
+            .as_ref()
+            .map(|t| t.span)
+            .unwrap_or(md.params[i].span);
+        out.push(
+            Diagnostic::error(
+                span,
+                format!(
+                    "Parameter #{} ${} ({}) of method {here}::{mname}() should be compatible with parameter ${} ({}) of method {there}::{mname}()",
+                    i + 1,
+                    child.name,
+                    child.ty,
+                    parent_param.name,
+                    parent_param.ty
+                ),
+            )
+            .with_code("method.childParameterType"),
+        );
+    }
 }
 
 fn vis_rank(v: Visibility) -> u8 {
@@ -2467,7 +2545,7 @@ fn run_incompatible_default_param(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 if matches!(given, Type::Array(_)) && is_array_or_iterable(&pr.ty) {
                     continue;
                 }
-                if crate::is_assignable(fa.reflection, &given, &pr.ty) {
+                if !compat::value_mismatch(fa, &given, Some(&given), &pr.ty, &pr.native_ty) {
                     continue;
                 }
                 out.push(
@@ -3221,7 +3299,7 @@ pub(crate) static RULES: &[RuleEntry] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{codes, codes_version};
+    use crate::testutil::{codes, codes_version, codes_with};
     use crate::PhpVersion;
 
     // --- missingType.iterableValue ---
@@ -3679,6 +3757,78 @@ mod tests {
             class Base { public function f(): void {} }
             class C extends Base { public function f(): void {} }";
         assert!(codes(src, run_overriding_method).is_empty());
+    }
+
+    #[test]
+    fn covariant_method_return_override_is_clean() {
+        let src = "<?php
+            class Base { public function f(): int|float { return 1; } }
+            class C extends Base { public function f(): int { return 1; } }";
+        assert!(codes(src, run_overriding_method).is_empty());
+    }
+
+    #[test]
+    fn incompatible_method_return_override_is_flagged() {
+        let src = "<?php
+            class Base { public function f(): int { return 1; } }
+            class C extends Base { public function f(): string { return 'x'; } }";
+        assert!(codes(src, run_overriding_method).contains(&"method.childReturnType"));
+    }
+
+    #[test]
+    fn contravariant_method_parameter_override_is_clean() {
+        let src = "<?php
+            class Base { public function f(int $x): void {} }
+            class C extends Base { public function f(int|float $x): void {} }";
+        assert!(codes(src, run_overriding_method).is_empty());
+    }
+
+    #[test]
+    fn narrowed_method_parameter_override_is_flagged() {
+        let src = "<?php
+            class Base { public function f(string $x): void {} }
+            class C extends Base { public function f(int $x): void {} }";
+        assert!(codes(src, run_overriding_method).contains(&"method.childParameterType"));
+    }
+
+    #[test]
+    fn maybe_method_parameter_override_waits_for_report_maybes() {
+        let src = "<?php
+            class Base { public function f(int|string $x): void {} }
+            class C extends Base { public function f(int $x): void {} }";
+        assert!(codes_with(src, run_overriding_method, |fa| {
+            fa.report_maybes = false;
+        })
+        .is_empty());
+        assert!(codes(src, run_overriding_method).contains(&"method.childParameterType"));
+    }
+
+    #[test]
+    fn explicit_mixed_method_return_override_waits_for_level_9() {
+        let src = "<?php
+            class Base { public function f(): int { return 1; } }
+            class C extends Base { public function f(): mixed { return 1; } }";
+        assert!(codes_with(src, run_overriding_method, |fa| {
+            fa.check_explicit_mixed = false;
+            fa.check_implicit_mixed = false;
+        })
+        .is_empty());
+        assert!(codes_with(src, run_overriding_method, |fa| {
+            fa.check_implicit_mixed = false;
+        })
+        .contains(&"method.childReturnType"));
+    }
+
+    #[test]
+    fn implicit_mixed_method_return_override_waits_for_max() {
+        let src = "<?php
+            class Base { public function f(): int { return 1; } }
+            class C extends Base { public function f() { return 1; } }";
+        assert!(codes_with(src, run_overriding_method, |fa| {
+            fa.check_implicit_mixed = false;
+        })
+        .is_empty());
+        assert!(codes(src, run_overriding_method).contains(&"method.childReturnType"));
     }
 
     #[test]

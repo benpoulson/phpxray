@@ -42,7 +42,7 @@
 //!   access receiver / value, or virtual-property hook semantics beyond the AST.
 
 use crate::{
-    decls,
+    compat, decls,
     facts::AssignmentKind,
     members::{MemberAccessResolver, ResolveStatus},
     symbols, walk, FileAnalysis, RuleEntry,
@@ -1193,40 +1193,40 @@ fn expr_is_this_property(e: &Expr, prop: &str, fa: &FileAnalysis) -> bool {
 /// ascends own-first, so we search each parent rather than the class itself).
 fn run_overriding_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    for_each_property(fa, &mut |class, pd| {
-        // Resolve the parent property (prototype) once per declaration name.
-        for elem in &pd.props {
-            let prop = fa.interner.resolve(elem.name).to_string();
-            let proto = class.extends.iter().find_map(|p| {
-                fa.reflection
-                    .find_property(p.text.trim_start_matches('\\'), &prop)
-            });
-            let has_override = has_override_attr(&pd.attrs);
-            let span = span_of(elem);
+    for_each_property_elem(fa, &mut |class_fqn, class, pd, elem| {
+        let prop = fa.interner.resolve(elem.name).to_string();
+        let proto = class.extends.iter().find_map(|p| {
+            fa.reflection
+                .find_property(p.text.trim_start_matches('\\'), &prop)
+        });
+        let has_override = has_override_attr(&pd.attrs);
+        let span = span_of(elem);
 
-            let Some(proto) = proto else {
+        let proto = match proto {
+            Some(proto) => proto,
+            None => {
                 if has_override {
                     out.push(
-                        Diagnostic::error(
-                            span,
-                            format!(
-                                "Property {}::${prop} has #[\\Override] attribute but does not override any property.",
-                                class_name(class, fa)
-                            ),
-                        )
-                        .with_code("property.override"),
-                    );
+                            Diagnostic::error(
+                                span,
+                                format!(
+                                    "Property {}::${prop} has #[\\Override] attribute but does not override any property.",
+                                    class_name(class, fa)
+                                ),
+                            )
+                            .with_code("property.override"),
+                        );
                 }
-                continue;
-            };
-            let parent = &proto.declaring_class;
+                return;
+            }
+        };
+        let parent = &proto.declaring_class;
 
-            // `#[\Override]` on a *property* only exists in PHP ≥ 8.5, so phpstan
-            // gates `property.missingOverride` on `supportsOverrideAttributeOnProperty()`
-            // (versionId ≥ 80500). Below that target it reports nothing.
-            if fa.php_version.at_least(80500) && has_override_should_be_present(class, has_override)
-            {
-                out.push(
+        // `#[\Override]` on a *property* only exists in PHP ≥ 8.5, so phpstan
+        // gates `property.missingOverride` on `supportsOverrideAttributeOnProperty()`
+        // (versionId ≥ 80500). Below that target it reports nothing.
+        if fa.php_version.at_least(80500) && has_override_should_be_present(class, has_override) {
+            out.push(
                     Diagnostic::error(
                         span,
                         format!(
@@ -1236,11 +1236,11 @@ fn run_overriding_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     )
                     .with_code("property.missingOverride"),
                 );
-            }
+        }
 
-            let m = &pd.modifiers;
-            if proto.member.is_static && !m.is_static {
-                out.push(
+        let m = &pd.modifiers;
+        if proto.member.is_static && !m.is_static {
+            out.push(
                     Diagnostic::error(
                         span,
                         format!(
@@ -1250,8 +1250,8 @@ fn run_overriding_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     )
                     .with_code("property.nonStatic"),
                 );
-            } else if !proto.member.is_static && m.is_static {
-                out.push(
+        } else if !proto.member.is_static && m.is_static {
+            out.push(
                     Diagnostic::error(
                         span,
                         format!(
@@ -1261,10 +1261,10 @@ fn run_overriding_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     )
                     .with_code("property.static"),
                 );
-            }
+        }
 
-            if proto.member.is_readonly && !m.is_readonly {
-                out.push(
+        if proto.member.is_readonly && !m.is_readonly {
+            out.push(
                     Diagnostic::error(
                         span,
                         format!(
@@ -1274,8 +1274,8 @@ fn run_overriding_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     )
                     .with_code("property.readWrite"),
                 );
-            } else if !proto.member.is_readonly && m.is_readonly {
-                out.push(
+        } else if !proto.member.is_readonly && m.is_readonly {
+            out.push(
                     Diagnostic::error(
                         span,
                         format!(
@@ -1285,17 +1285,36 @@ fn run_overriding_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     )
                     .with_code("property.readOnly"),
                 );
-            }
+        }
 
-            // Visibility may not be narrowed.
-            let own_vis = m.visibility.unwrap_or(Visibility::Public);
-            if proto.member.visibility == Visibility::Public && own_vis != Visibility::Public {
-                let kind = if own_vis == Visibility::Private {
-                    "Private"
-                } else {
-                    "Protected"
-                };
-                out.push(
+        let child = fa
+            .reflection
+            .class(class_fqn)
+            .and_then(|c| c.properties.iter().find(|p| p.name == prop));
+        if let Some(child) = child {
+            check_overriding_property_type(
+                fa,
+                PropertyOverrideType {
+                    class,
+                    pd,
+                    elem,
+                    prop: &prop,
+                    proto: &proto,
+                    child,
+                },
+                &mut out,
+            );
+        }
+
+        // Visibility may not be narrowed.
+        let own_vis = m.visibility.unwrap_or(Visibility::Public);
+        if proto.member.visibility == Visibility::Public && own_vis != Visibility::Public {
+            let kind = if own_vis == Visibility::Private {
+                "Private"
+            } else {
+                "Protected"
+            };
+            out.push(
                     Diagnostic::error(
                         span,
                         format!(
@@ -1305,10 +1324,9 @@ fn run_overriding_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     )
                     .with_code("property.visibility"),
                 );
-            } else if proto.member.visibility == Visibility::Protected
-                && own_vis == Visibility::Private
-            {
-                out.push(
+        } else if proto.member.visibility == Visibility::Protected && own_vis == Visibility::Private
+        {
+            out.push(
                     Diagnostic::error(
                         span,
                         format!(
@@ -1318,10 +1336,102 @@ fn run_overriding_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     )
                     .with_code("property.visibility"),
                 );
-            }
         }
     });
     out
+}
+
+fn has_native_decl(t: &Type) -> bool {
+    !matches!(t, Type::Mixed)
+}
+
+struct PropertyOverrideType<'a> {
+    class: &'a ClassDecl,
+    pd: &'a PropertyDecl,
+    elem: &'a PropElem,
+    prop: &'a str,
+    proto: &'a php_reflect::Found<php_reflect::PropertyReflection>,
+    child: &'a php_reflect::PropertyReflection,
+}
+
+fn check_overriding_property_type(
+    fa: &FileAnalysis,
+    ctx: PropertyOverrideType<'_>,
+    out: &mut Vec<Diagnostic>,
+) {
+    let PropertyOverrideType {
+        class,
+        pd,
+        elem,
+        prop,
+        proto,
+        child,
+    } = ctx;
+    let parent = &proto.declaring_class;
+    let span = pd
+        .ty
+        .as_ref()
+        .map(|t| t.span)
+        .unwrap_or_else(|| span_of(elem));
+    let child_has_native = has_native_decl(&child.native_ty);
+    let parent_has_native = has_native_decl(&proto.member.native_ty);
+    let child_name = class_name(class, fa);
+
+    if parent_has_native && !child_has_native {
+        out.push(
+            Diagnostic::error(
+                span,
+                format!(
+                    "Property {child_name}::${prop} overriding property {parent}::${prop} should have native type {}.",
+                    proto.member.native_ty
+                ),
+            )
+            .with_code("property.missingNativeType"),
+        );
+        return;
+    }
+
+    if !parent_has_native && child_has_native {
+        out.push(
+            Diagnostic::error(
+                span,
+                format!(
+                    "Property {child_name}::${prop} has native type {} but overrides property {parent}::${prop} with no native type.",
+                    child.native_ty
+                ),
+            )
+            .with_code("property.extraNativeType"),
+        );
+        return;
+    }
+
+    if child_has_native
+        && parent_has_native
+        && (compat::declaration_mismatch(
+            fa,
+            &child.native_ty,
+            &child.native_ty,
+            &proto.member.native_ty,
+            &proto.member.native_ty,
+        ) || compat::declaration_mismatch(
+            fa,
+            &proto.member.native_ty,
+            &proto.member.native_ty,
+            &child.native_ty,
+            &child.native_ty,
+        ))
+    {
+        out.push(
+            Diagnostic::error(
+                span,
+                format!(
+                    "Native type {} of property {child_name}::${prop} is not invariant with native type {} of overridden property {parent}::${prop}.",
+                    child.native_ty, proto.member.native_ty
+                ),
+            )
+            .with_code("property.nativeType"),
+        );
+    }
 }
 
 fn has_override_attr(attrs: &[AttributeGroup]) -> bool {
@@ -3404,13 +3514,18 @@ fn run_types_assigned_to_properties(fa: &FileAnalysis) -> Vec<Diagnostic> {
             return;
         }
         let pname = fa.interner.resolve(*psym);
-        let Some(found) = fa.reflection.find_property(&fqn, pname) else {
+        let Some(found) = fa
+            .reflection
+            .find_property_on_type(&recv, pname)
+            .or_else(|| fa.reflection.find_property(&fqn, pname))
+        else {
             return;
         };
         let decl = found.member.ty.clone();
         let native_decl = found.member.native_ty.clone();
         let val = fa.type_of(rhs);
-        if !fa.accepts(rhs, &decl, &native_decl) {
+        let native_val = fa.native_type_of(rhs);
+        if compat::value_mismatch(fa, &val, Some(&native_val), &decl, &native_decl) {
             out.push(
                 Diagnostic::error(
                     rhs.span,
@@ -3470,17 +3585,17 @@ fn check_property_defaults_stmt(
                     if pd.ty.is_none() && matches!(value, Type::Null) {
                         continue;
                     }
-                    if php_infer::is_assignable(
-                        fa.reflection,
-                        &fa.lenient_src(value.clone()),
+                    if is_empty_array_expr(default) && is_array_or_iterable_type(&prop.ty) {
+                        continue;
+                    }
+                    let native_value = native_ctx.infer(default);
+                    if !compat::value_mismatch(
+                        fa,
+                        &value,
+                        Some(&native_value),
                         &prop.ty,
-                    ) || (!fa.treat_phpdoc_types_as_certain
-                        && php_infer::is_assignable(
-                            fa.reflection,
-                            &fa.lenient_src(native_ctx.infer(default)),
-                            &prop.native_ty,
-                        ))
-                    {
+                        &prop.native_ty,
+                    ) {
                         continue;
                     }
                     let kind = if prop.is_static {
@@ -3552,6 +3667,18 @@ fn check_property_defaults_stmt(
                 .for_each(|s| check_property_defaults_stmt(fa, scope, s, out));
         }
         _ => {}
+    }
+}
+
+fn is_empty_array_expr(e: &Expr) -> bool {
+    matches!(&e.kind, ExprKind::Array { items, .. } if items.is_empty())
+}
+
+fn is_array_or_iterable_type(t: &Type) -> bool {
+    match t {
+        Type::Array(_) | Type::Iterable(_) | Type::List(_) | Type::Shape { .. } => true,
+        Type::Nullable(inner) => is_array_or_iterable_type(inner),
+        _ => false,
     }
 }
 
@@ -3721,7 +3848,7 @@ pub(crate) static RULES: &[RuleEntry] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::codes;
+    use crate::testutil::{codes, codes_with};
 
     // --- ReadOnlyByPhpDocPropertyRule -----------------------------------
 
@@ -3813,7 +3940,106 @@ mod tests {
     #[test]
     fn mixed_value_to_typed_property_clean() {
         let src = "<?php class C { public int $n; function f($x) { $this->n = $x; } }";
-        assert!(codes(src, run_types_assigned_to_properties).is_empty());
+        assert!(codes_with(src, run_types_assigned_to_properties, |fa| {
+            fa.check_implicit_mixed = false;
+        })
+        .is_empty());
+    }
+
+    #[test]
+    fn maybe_property_assignment_waits_for_report_maybes() {
+        let src = r#"<?php
+            class C { public int $n; }
+            /** @param int|string $x */
+            function f(C $c, $x) { $c->n = $x; }
+        "#;
+        assert!(codes_with(src, run_types_assigned_to_properties, |fa| {
+            fa.report_maybes = false;
+        })
+        .is_empty());
+        assert_eq!(
+            codes(src, run_types_assigned_to_properties),
+            ["assign.propertyType"]
+        );
+    }
+
+    #[test]
+    fn nullable_property_assignment_waits_for_check_nullables() {
+        let src = r#"<?php
+            class C { public int $n; }
+            /** @param int|null $x */
+            function f(C $c, $x) { $c->n = $x; }
+        "#;
+        assert!(codes_with(src, run_types_assigned_to_properties, |fa| {
+            fa.check_nullables = false;
+        })
+        .is_empty());
+        assert_eq!(
+            codes(src, run_types_assigned_to_properties),
+            ["assign.propertyType"]
+        );
+    }
+
+    #[test]
+    fn explicit_mixed_property_assignment_waits_for_level_9() {
+        let src = "<?php class C { public int $n; function f(mixed $x) { $this->n = $x; } }";
+        assert!(codes_with(src, run_types_assigned_to_properties, |fa| {
+            fa.check_explicit_mixed = false;
+            fa.check_implicit_mixed = false;
+        })
+        .is_empty());
+        assert_eq!(
+            codes_with(src, run_types_assigned_to_properties, |fa| {
+                fa.check_implicit_mixed = false;
+            }),
+            ["assign.propertyType"]
+        );
+    }
+
+    #[test]
+    fn implicit_mixed_property_assignment_waits_for_max() {
+        let src = "<?php class C { public int $n; function f($x) { $this->n = $x; } }";
+        assert!(codes_with(src, run_types_assigned_to_properties, |fa| {
+            fa.check_implicit_mixed = false;
+        })
+        .is_empty());
+        assert_eq!(
+            codes(src, run_types_assigned_to_properties),
+            ["assign.propertyType"]
+        );
+    }
+
+    #[test]
+    fn phpdoc_uncertain_suppresses_phpdoc_only_property_assignment() {
+        let src = r#"<?php
+            class C { public int $n; }
+            /** @param string $x */
+            function f(C $c, $x) { $c->n = $x; }
+        "#;
+        assert_eq!(
+            codes(src, run_types_assigned_to_properties),
+            ["assign.propertyType"]
+        );
+        assert!(codes_with(src, run_types_assigned_to_properties, |fa| {
+            fa.treat_phpdoc_types_as_certain = false;
+            fa.check_implicit_mixed = false;
+        })
+        .is_empty());
+    }
+
+    #[test]
+    fn generic_receiver_property_assignment_uses_instantiated_type() {
+        let src = r#"<?php
+            class User {}
+            /** @template T */
+            class Box { /** @var T */ public $value; }
+            /** @param Box<User> $box */
+            function f($box) { $box->value = 'no'; }
+        "#;
+        assert_eq!(
+            codes(src, run_types_assigned_to_properties),
+            ["assign.propertyType"]
+        );
     }
 
     #[test]
@@ -3857,6 +4083,18 @@ mod tests {
         assert_eq!(
             codes(src, run_default_value_types_assigned_to_properties),
             ["property.defaultValue"]
+        );
+    }
+
+    #[test]
+    fn phpdoc_uncertain_suppresses_phpdoc_only_property_default() {
+        let src = "<?php class C { /** @var int */ public $n = 'x'; }";
+        assert!(
+            codes_with(src, run_default_value_types_assigned_to_properties, |fa| {
+                fa.treat_phpdoc_types_as_certain = false;
+                fa.check_implicit_mixed = false;
+            })
+            .is_empty()
         );
     }
 
@@ -4211,6 +4449,36 @@ mod tests {
     fn non_overriding_property_is_clean() {
         let src = "<?php class C { public int $x = 0; }";
         assert!(codes(src, run_overriding_property).is_empty());
+    }
+
+    #[test]
+    fn override_missing_native_property_type_is_flagged() {
+        let src = "<?php class B { public int $x = 0; } class C extends B { public $x; }";
+        assert!(codes(src, run_overriding_property).contains(&"property.missingNativeType"));
+    }
+
+    #[test]
+    fn override_extra_native_property_type_is_flagged() {
+        let src = "<?php class B { public $x; } class C extends B { public int $x = 0; }";
+        assert!(codes(src, run_overriding_property).contains(&"property.extraNativeType"));
+    }
+
+    #[test]
+    fn override_incompatible_native_property_type_is_flagged() {
+        let src =
+            "<?php class B { public int $x = 0; } class C extends B { public string $x = ''; }";
+        assert!(codes(src, run_overriding_property).contains(&"property.nativeType"));
+    }
+
+    #[test]
+    fn maybe_property_native_override_waits_for_report_maybes() {
+        let src =
+            "<?php class B { public int|string $x = 0; } class C extends B { public int $x = 0; }";
+        assert!(codes_with(src, run_overriding_property, |fa| {
+            fa.report_maybes = false;
+        })
+        .is_empty());
+        assert!(codes(src, run_overriding_property).contains(&"property.nativeType"));
     }
 
     // --- AccessPropertiesRule -------------------------------------------

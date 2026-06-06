@@ -45,15 +45,15 @@
 //!   ConstantResolver config table we don't model.
 
 #![allow(unused_imports)]
-use crate::{walk, FileAnalysis, RuleEntry};
+use crate::{compat, walk, FileAnalysis, RuleEntry};
 use php_ast::{
     ClassConstDecl, ClassDecl, ClassKind, Expr, ExprKind, Member, MemberName, Name, Stmt, StmtKind,
     Visibility,
 };
 use php_diagnostics::Diagnostic;
-use php_infer::is_assignable;
 use php_intern::Interner;
 use php_resolve::{for_each_region, Resolution, Scope};
+use php_span::Span;
 use php_types::Type;
 
 // ---------------------------------------------------------------------------
@@ -791,10 +791,78 @@ fn run_overriding_constant(fa: &FileAnalysis) -> Vec<Diagnostic> {
                         .with_code("classConstant.visibility"),
                     );
                 }
+
+                check_overriding_constant_type(
+                    fa,
+                    display,
+                    name,
+                    ce.value.span,
+                    cd.ty.is_some(),
+                    &proto,
+                    &mut out,
+                );
             }
         }
     });
     out
+}
+
+fn has_native_const_type(t: &Type) -> bool {
+    !matches!(t, Type::Mixed)
+}
+
+fn check_overriding_constant_type(
+    fa: &FileAnalysis,
+    display: &str,
+    name: &str,
+    span: Span,
+    child_has_native: bool,
+    proto: &php_reflect::Found<php_reflect::ConstReflection>,
+    out: &mut Vec<Diagnostic>,
+) {
+    let parent_has_native = has_native_const_type(&proto.member.ty);
+    let proto_decl = proto.declaring_class.trim_start_matches('\\');
+    if parent_has_native && !child_has_native {
+        out.push(
+            Diagnostic::error(
+                span,
+                format!(
+                    "Constant {display}::{name} overriding constant {proto_decl}::{name} should have native type {}.",
+                    proto.member.ty
+                ),
+            )
+            .with_code("classConstant.missingNativeType"),
+        );
+        return;
+    }
+
+    if !parent_has_native || !child_has_native {
+        return;
+    }
+
+    let Some(child) = fa.reflection.find_constant(display, name) else {
+        return;
+    };
+    if !compat::declaration_mismatch(
+        fa,
+        &child.member.ty,
+        &child.member.ty,
+        &proto.member.ty,
+        &proto.member.ty,
+    ) {
+        return;
+    }
+
+    out.push(
+        Diagnostic::error(
+            span,
+            format!(
+                "Native type {} of constant {display}::{name} is not covariant with native type {} of overridden constant {proto_decl}::{name}.",
+                child.member.ty, proto.member.ty
+            ),
+        )
+        .with_code("classConstant.nativeType"),
+    );
 }
 
 /// phpstan's `findPrototype`: an immediate interface's constant wins; otherwise
@@ -910,7 +978,7 @@ fn run_value_assigned_to_class_constant(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 if !is_concrete(&value) {
                     continue;
                 }
-                if !is_assignable(fa.reflection, &value, target) {
+                if compat::value_mismatch(fa, &value, Some(&value), target, target) {
                     out.push(
                         Diagnostic::error(
                             ce.value.span,
@@ -1280,6 +1348,19 @@ mod tests {
     fn override_nonfinal_constant_is_ok() {
         let src = "<?php class A { const X = 1; } class B extends A { const X = 2; }";
         assert!(codes(src, run_overriding_constant).is_empty());
+    }
+
+    #[test]
+    fn override_missing_native_constant_type_is_flagged() {
+        let src =
+            "<?php class A { public const int X = 1; } class B extends A { public const X = 2; }";
+        assert!(codes(src, run_overriding_constant).contains(&"classConstant.missingNativeType"));
+    }
+
+    #[test]
+    fn override_incompatible_native_constant_type_is_flagged() {
+        let src = "<?php class A { public const int X = 1; } class B extends A { public const string X = 'x'; }";
+        assert!(codes(src, run_overriding_constant).contains(&"classConstant.nativeType"));
     }
 
     #[test]

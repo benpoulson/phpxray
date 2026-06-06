@@ -10,6 +10,7 @@ use php_diagnostics::Diagnostic;
 use php_index::ProjectIndex;
 use php_resolve::{RefKind, Resolution, ResolvedRef};
 
+pub(crate) mod compat;
 pub(crate) mod decls;
 mod facts;
 pub(crate) mod function_like;

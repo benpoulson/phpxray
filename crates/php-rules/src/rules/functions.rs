@@ -51,7 +51,7 @@
 //!   (latter handled by unknown-symbol resolution) — all need the type system.
 
 use crate::{
-    function_like,
+    compat, function_like,
     members::{self, CallResolver, ResolveStatus},
     return_type_errors, FileAnalysis, RuleEntry,
 };
@@ -3121,7 +3121,7 @@ fn run_incompatible_closure_default(fa: &FileAnalysis) -> Vec<Diagnostic> {
             if dty == php_types::Type::Null {
                 continue;
             }
-            if !crate::is_assignable(fa.reflection, &dty, &target) {
+            if compat::value_mismatch(fa, &dty, Some(&dty), &target, &target) {
                 out.push(
                     Diagnostic::error(
                         default.span,
@@ -3186,7 +3186,7 @@ fn run_incompatible_default_parameter(fa: &FileAnalysis) -> Vec<Diagnostic> {
             if matches!(dty, php_types::Type::Array(_)) && is_array_or_iterable(&param.ty) {
                 continue;
             }
-            if !crate::is_assignable(fa.reflection, &dty, &param.ty) {
+            if compat::value_mismatch(fa, &dty, Some(&dty), &param.ty, &param.native_ty) {
                 out.push(
                     Diagnostic::error(
                         default.span,
