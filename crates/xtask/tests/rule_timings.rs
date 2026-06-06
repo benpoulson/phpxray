@@ -26,6 +26,7 @@ fn rule_timings_command_prints_all_buckets() {
     for bucket in [
         "files_analyzed",
         "findings",
+        "cache_hit",
         "discovery_ms",
         "read_ms",
         "parse_ms",

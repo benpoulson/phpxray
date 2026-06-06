@@ -181,6 +181,7 @@ fn cmd_rule_timings(args: &[String]) -> ExitCode {
         php_cli::RunOptions {
             progress: false,
             collect_timings: true,
+            ..php_cli::RunOptions::default()
         },
     );
     let Some(t) = report.timings else {
@@ -190,6 +191,7 @@ fn cmd_rule_timings(args: &[String]) -> ExitCode {
 
     println!("files_analyzed\t{}", report.files_analyzed);
     println!("findings\t{}", report.findings.len());
+    println!("cache_hit\t{}", t.cache_hit);
     print_duration("discovery_ms", t.discovery);
     print_duration("read_ms", t.read);
     print_duration("parse_ms", t.parse);

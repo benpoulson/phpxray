@@ -23,6 +23,7 @@ use walkdir::WalkDir;
 
 pub mod baseline;
 pub mod report;
+mod result_cache;
 pub mod suppress;
 
 /// One parsed source file kept alive for analysis. The AST's symbols are interned
@@ -38,12 +39,27 @@ pub struct ParsedFile {
     pub diagnostics: Vec<php_diagnostics::Diagnostic>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone)]
 pub struct RunOptions {
     /// Show transient progress indicators on stderr when stderr is a terminal.
     pub progress: bool,
     /// Collect internal wall-clock timings in [`Report::timings`].
     pub collect_timings: bool,
+    /// Reuse final post-suppression reports for identical project reruns.
+    pub use_result_cache: bool,
+    /// Override the result cache directory. Defaults under the project root.
+    pub cache_dir: Option<PathBuf>,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self {
+            progress: false,
+            collect_timings: false,
+            use_result_cache: true,
+            cache_dir: None,
+        }
+    }
 }
 
 /// Parse `(path, source)` inputs into a single shared interner, returned alongside
@@ -114,6 +130,7 @@ pub struct Report {
 /// intended for coarse performance comparisons, not stable assertions.
 #[derive(Debug, Clone, Default)]
 pub struct AnalysisTimings {
+    pub cache_hit: bool,
     pub discovery: Duration,
     pub read: Duration,
     pub parse: Duration,
@@ -194,11 +211,6 @@ pub fn run_with_options(config: &Config, root: &Path, options: RunOptions) -> Re
     if let Some(t) = &mut timings {
         t.read = started.elapsed();
     }
-    let started = Instant::now();
-    let (parsed, interner) = parse_files_with_mode_progress(inputs, &progress);
-    if let Some(t) = &mut timings {
-        t.parse = started.elapsed();
-    }
     let php_version = config
         .php_version
         .as_deref()
@@ -211,6 +223,36 @@ pub fn run_with_options(config: &Config, root: &Path, options: RunOptions) -> Re
         treat_phpdoc_types_as_certain: config.treat_phpdoc_types_as_certain,
         rule_options,
     };
+    let cache = options.use_result_cache.then(|| {
+        let cache_dir = options
+            .cache_dir
+            .clone()
+            .unwrap_or_else(|| result_cache::default_cache_dir(root));
+        let cache_files: Vec<_> = inputs
+            .iter()
+            .map(|(path, source, analyze)| result_cache::CacheFileInput {
+                path,
+                source,
+                analyze: *analyze,
+            })
+            .collect();
+        let key = result_cache::key(config, root, php_version, rule_options, &cache_files);
+        (cache_dir, key)
+    });
+    if let Some((cache_dir, key)) = &cache {
+        if let Some(mut report) = result_cache::load(cache_dir, key) {
+            if let Some(mut t) = timings {
+                t.cache_hit = true;
+                report.timings = Some(t);
+            }
+            return report;
+        }
+    }
+    let started = Instant::now();
+    let (parsed, interner) = parse_files_with_mode_progress(inputs, &progress);
+    if let Some(t) = &mut timings {
+        t.parse = started.elapsed();
+    }
     let mut report = analyze_parsed_progress(
         &parsed,
         &interner,
@@ -223,12 +265,16 @@ pub fn run_with_options(config: &Config, root: &Path, options: RunOptions) -> Re
         .iter()
         .map(|f| (f.path.as_str(), f.source.as_str()))
         .collect();
-    suppress::apply(
+    let report = suppress::apply(
         report,
         &config.ignore,
         config.report_unmatched_ignored,
         &sources,
-    )
+    );
+    if let Some((cache_dir, key)) = &cache {
+        result_cache::store(cache_dir, key, &report);
+    }
+    report
 }
 
 /// Analyze already-parsed files at `level`. Pure over its inputs (no disk I/O) —
@@ -1033,6 +1079,191 @@ excludePaths:
         report.timings.as_ref().expect("timings should be present");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn result_cache_hits_identical_project_rerun() {
+        let root = temp_dir("cache-hit");
+        write_file(&root, "src/bad.php", "<?php new MissingCachedClass();\n");
+        let config = Config::from_yaml("level: 0\npaths:\n  - src\n").unwrap();
+        let cache_dir = root.join("cache");
+
+        let first = run_cached(&config, &root, &cache_dir);
+        assert!(!first.timings.unwrap().cache_hit);
+        assert_eq!(first.findings.len(), 1);
+
+        let second = run_cached(&config, &root, &cache_dir);
+        assert!(second.timings.unwrap().cache_hit);
+        assert_eq!(second.findings.len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn result_cache_source_content_change_misses() {
+        let root = temp_dir("cache-source-change");
+        write_file(&root, "src/bad.php", "<?php new MissingBeforeChange();\n");
+        let config = Config::from_yaml("level: 0\npaths:\n  - src\n").unwrap();
+        let cache_dir = root.join("cache");
+
+        assert!(
+            !run_cached(&config, &root, &cache_dir)
+                .timings
+                .unwrap()
+                .cache_hit
+        );
+        assert!(
+            run_cached(&config, &root, &cache_dir)
+                .timings
+                .unwrap()
+                .cache_hit
+        );
+
+        write_file(&root, "src/bad.php", "<?php class MissingBeforeChange {}\n");
+        let changed = run_cached(&config, &root, &cache_dir);
+        assert!(!changed.timings.as_ref().unwrap().cache_hit);
+        assert!(changed.findings.is_empty(), "{:?}", changed.findings);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn result_cache_rule_option_changes_miss() {
+        let root = temp_dir("cache-rule-options");
+        write_file(
+            &root,
+            "src/bad.php",
+            "<?php\n/** @param string|int $x */\nfunction f($x): string { return $x; }\n",
+        );
+        let cache_dir = root.join("cache");
+        let level6 = Config::from_yaml("level: 6\npaths:\n  - src\n").unwrap();
+        let level7 = Config::from_yaml("level: 7\npaths:\n  - src\n").unwrap();
+
+        assert!(
+            !run_cached(&level6, &root, &cache_dir)
+                .timings
+                .unwrap()
+                .cache_hit
+        );
+        assert!(
+            run_cached(&level6, &root, &cache_dir)
+                .timings
+                .unwrap()
+                .cache_hit
+        );
+
+        let l7 = run_cached(&level7, &root, &cache_dir);
+        assert!(!l7.timings.as_ref().unwrap().cache_hit);
+        assert!(l7
+            .findings
+            .iter()
+            .any(|f| f.identifier == Some("return.type")));
+
+        let phpdoc_uncertain =
+            Config::from_yaml("level: 7\ntreatPhpDocTypesAsCertain: false\npaths:\n  - src\n")
+                .unwrap();
+        let uncertain = run_cached(&phpdoc_uncertain, &root, &cache_dir);
+        assert!(!uncertain.timings.as_ref().unwrap().cache_hit);
+        assert!(uncertain
+            .findings
+            .iter()
+            .all(|f| f.identifier != Some("return.type")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn result_cache_ignore_and_baseline_changes_miss() {
+        let root = temp_dir("cache-ignore-baseline");
+        write_file(&root, "src/bad.php", "<?php new MissingIgnoredClass();\n");
+        write_file(
+            &root,
+            "baseline.yaml",
+            "ignore:\n  - identifier: class.notFound\n    path: src/bad.php\n",
+        );
+        let cache_dir = root.join("cache");
+        let base = Config::from_yaml("level: 0\npaths:\n  - src\n").unwrap();
+        let ignored = Config::from_yaml(
+            "level: 0\npaths:\n  - src\nignore:\n  - identifier: class.notFound\n",
+        )
+        .unwrap();
+        let mut baselined =
+            Config::from_yaml("level: 0\npaths:\n  - src\nbaseline: baseline.yaml\n").unwrap();
+        baselined.ignore = ignored.ignore.clone();
+
+        assert!(
+            !run_cached(&base, &root, &cache_dir)
+                .timings
+                .unwrap()
+                .cache_hit
+        );
+
+        let ignored_report = run_cached(&ignored, &root, &cache_dir);
+        assert!(!ignored_report.timings.as_ref().unwrap().cache_hit);
+        assert!(
+            ignored_report.findings.is_empty(),
+            "{:?}",
+            ignored_report.findings
+        );
+        assert!(
+            run_cached(&ignored, &root, &cache_dir)
+                .timings
+                .unwrap()
+                .cache_hit
+        );
+
+        let baseline_report = run_cached(&baselined, &root, &cache_dir);
+        assert!(!baseline_report.timings.as_ref().unwrap().cache_hit);
+        write_file(
+            &root,
+            "baseline.yaml",
+            "ignore:\n  - identifier: method.notFound\n    path: src/bad.php\n",
+        );
+        let changed_baseline = run_cached(&baselined, &root, &cache_dir);
+        assert!(!changed_baseline.timings.as_ref().unwrap().cache_hit);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn result_cache_analyze_vs_scan_mode_change_misses() {
+        let root = temp_dir("cache-scan-mode");
+        write_file(
+            &root,
+            "vendor/bad.php",
+            "<?php new MissingScanModeClass();\n",
+        );
+        let cache_dir = root.join("cache");
+        let scan_only =
+            Config::from_yaml("level: 0\npaths:\n  - src\nscanPaths:\n  - vendor\n").unwrap();
+        let analyze_vendor = Config::from_yaml("level: 0\npaths:\n  - vendor\n").unwrap();
+
+        let scan = run_cached(&scan_only, &root, &cache_dir);
+        assert!(!scan.timings.as_ref().unwrap().cache_hit);
+        assert_eq!(scan.files_analyzed, 0);
+        assert!(scan.findings.is_empty(), "{:?}", scan.findings);
+
+        let analyzed = run_cached(&analyze_vendor, &root, &cache_dir);
+        assert!(!analyzed.timings.as_ref().unwrap().cache_hit);
+        assert_eq!(analyzed.files_analyzed, 1);
+        assert!(analyzed
+            .findings
+            .iter()
+            .any(|f| f.identifier == Some("class.notFound")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn run_cached(config: &Config, root: &Path, cache_dir: &Path) -> Report {
+        run_with_options(
+            config,
+            root,
+            RunOptions {
+                collect_timings: true,
+                cache_dir: Some(cache_dir.to_path_buf()),
+                ..RunOptions::default()
+            },
+        )
     }
 
     fn write_file(root: &Path, path: &str, source: &str) {

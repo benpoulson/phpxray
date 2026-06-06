@@ -53,6 +53,13 @@ fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+fn cache_file_count(project: &TempProject) -> usize {
+    let cache = project.root.join(".php-analyzer/cache/results-v1");
+    fs::read_dir(cache)
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or(0)
+}
+
 fn write_config(root: &TempProject, yaml: &str) {
     root.write("phpanalyzer.yaml", yaml);
 }
@@ -158,4 +165,66 @@ fn cross_file_callback_diagnostics_point_at_target_file() {
     assert!(out.contains("src/Callback.php"), "{out}");
     assert!(out.contains("method.notFound"), "{out}");
     assert!(!out.contains("src/Use.php\n"), "{out}");
+}
+
+#[test]
+fn result_cache_creates_entry_and_cached_json_is_identical() {
+    let p = TempProject::new("result-cache-json");
+    write_config(&p, "level: 0\npaths:\n  - src\n");
+    p.write("src/bad.php", "<?php new MissingCachedJsonClass();\n");
+
+    let first = p.run(["--error-format", "json"]);
+    assert!(!first.status.success(), "{}", stdout(&first));
+    assert!(cache_file_count(&p) > 0);
+    let second = p.run(["--error-format", "json"]);
+    assert!(!second.status.success(), "{}", stdout(&second));
+    assert_eq!(stdout(&first), stdout(&second));
+}
+
+#[test]
+fn result_cache_source_change_updates_output() {
+    let p = TempProject::new("result-cache-change");
+    write_config(&p, "level: 0\npaths:\n  - src\n");
+    p.write("src/bad.php", "<?php new MissingBeforeCacheChange();\n");
+
+    let first = p.run(["--error-format", "json"]);
+    assert!(!first.status.success(), "{}", stdout(&first));
+    assert!(stdout(&first).contains("MissingBeforeCacheChange"));
+
+    p.write("src/bad.php", "<?php class MissingBeforeCacheChange {}\n");
+    let second = p.run(["--error-format", "json"]);
+    assert!(second.status.success(), "{}", stdout(&second));
+    assert!(!stdout(&second).contains("MissingBeforeCacheChange"));
+}
+
+#[test]
+fn result_cache_deleted_files_disappear() {
+    let p = TempProject::new("result-cache-delete");
+    write_config(&p, "level: 0\npaths:\n  - src\n");
+    p.write("src/one.php", "<?php new MissingOneForCache();\n");
+    p.write("src/two.php", "<?php new MissingTwoForCache();\n");
+
+    let first = p.run(["--error-format", "json"]);
+    assert!(!first.status.success(), "{}", stdout(&first));
+    assert!(stdout(&first).contains("src/one.php"));
+    assert!(stdout(&first).contains("src/two.php"));
+
+    fs::remove_file(p.root.join("src/two.php")).unwrap();
+    let second = p.run(["--error-format", "json"]);
+    assert!(!second.status.success(), "{}", stdout(&second));
+    let out = stdout(&second);
+    assert!(out.contains("src/one.php"), "{out}");
+    assert!(!out.contains("src/two.php"), "{out}");
+}
+
+#[test]
+fn result_cache_write_failure_is_nonfatal() {
+    let p = TempProject::new("result-cache-write-failure");
+    write_config(&p, "level: 0\npaths:\n  - src\n");
+    p.write("src/bad.php", "<?php new MissingCacheWriteClass();\n");
+    p.write(".php-analyzer", "not a directory");
+
+    let output = p.run([] as [&str; 0]);
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert!(stdout(&output).contains("class.notFound"));
 }
