@@ -4531,6 +4531,41 @@ mod tests {
     }
 
     #[test]
+    fn undefined_property_inside_arrayobject_foreach_is_flagged() {
+        let src = r#"<?php
+            class User {}
+            /** @param \ArrayObject<int, User> $users */
+            function f(\ArrayObject $users): void {
+                foreach ($users as $u) {
+                    $u->missing;
+                }
+            }
+        "#;
+        assert_eq!(
+            codes(src, run_access_properties_general),
+            ["property.notFound"]
+        );
+    }
+
+    #[test]
+    fn undefined_property_inside_iteratoraggregate_foreach_is_flagged() {
+        let src = r#"<?php
+            class User {}
+            /** @implements \IteratorAggregate<string, User> */
+            class Users implements \IteratorAggregate {}
+            function f(Users $users): void {
+                foreach ($users as $u) {
+                    $u->missing;
+                }
+            }
+        "#;
+        assert_eq!(
+            codes(src, run_access_properties_general),
+            ["property.notFound"]
+        );
+    }
+
+    #[test]
     fn undefined_property_inside_aliased_array_callback_is_flagged() {
         let src = r#"<?php
             class User {}

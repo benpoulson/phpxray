@@ -459,19 +459,22 @@ fn run_yield_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
         };
 
         if expected.key.is_some() || expected.value.is_some() {
-            yields_in_body(fs.body, &mut |e| {
-                let ExprKind::Yield { key, value } = &e.kind else {
-                    return;
-                };
-                check_yield_key_value(
-                    fa,
-                    fs.scope,
-                    e,
-                    key.as_deref(),
-                    value.as_deref(),
-                    &expected,
-                    &mut out,
-                );
+            yields_in_body(fs.body, &mut |e| match &e.kind {
+                ExprKind::Yield { key, value } => {
+                    check_yield_key_value(
+                        fa,
+                        fs.scope,
+                        e,
+                        key.as_deref(),
+                        value.as_deref(),
+                        &expected,
+                        &mut out,
+                    );
+                }
+                ExprKind::YieldFrom(inner) => {
+                    check_yield_from_key_value(fa, fs.scope, e, inner, &expected, &mut out);
+                }
+                _ => {}
             });
         }
 
@@ -500,6 +503,29 @@ fn check_yield_key_value(
     if let Some(expected_value) = &expected.value {
         let given = value.map_or(Type::Null, |e| yield_operand_type(fa, scope, e));
         check_yield_slot(fa, yield_expr, "value", expected_value, given, out);
+    }
+}
+
+fn check_yield_from_key_value(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    yield_expr: &Expr,
+    delegated: &Expr,
+    expected: &YieldExpectation,
+    out: &mut Vec<Diagnostic>,
+) {
+    let delegated = yield_operand_type(fa, scope, delegated);
+    let Some((given_key, given_value)) = fa.reflection.iterable_key_value_on_type(&delegated)
+    else {
+        return;
+    };
+
+    if let Some(expected_key) = &expected.key {
+        check_yield_slot(fa, yield_expr, "key", expected_key, given_key, out);
+    }
+
+    if let Some(expected_value) = &expected.value {
+        check_yield_slot(fa, yield_expr, "value", expected_value, given_value, out);
     }
 }
 
@@ -1159,6 +1185,39 @@ mod tests {
     #[test]
     fn bare_generator_return_type_has_no_generic_slots_to_check() {
         let src = "<?php function g(): \\Generator { yield 'k' => 'v'; }";
+        assert!(codes(src, run_yield_type).is_empty());
+    }
+
+    #[test]
+    fn yield_from_delegated_key_and_value_mismatch_are_flagged() {
+        let src = r#"<?php
+        class User {}
+        /** @return \Generator<string, User, void, void> */
+        function child(): \Generator { yield 'k' => new User(); }
+        /** @return \Generator<int, string, void, void> */
+        function parent_gen(): \Generator { yield from child(); }"#;
+        assert_eq!(
+            codes(src, run_yield_type),
+            ["generator.keyType", "generator.valueType"]
+        );
+    }
+
+    #[test]
+    fn yield_from_delegated_key_and_value_match_are_clean() {
+        let src = r#"<?php
+        class User {}
+        /** @return \Generator<int, User, void, void> */
+        function child(): \Generator { yield new User(); }
+        /** @return \Generator<int, User, void, void> */
+        function parent_gen(): \Generator { yield from child(); }"#;
+        assert!(codes(src, run_yield_type).is_empty());
+    }
+
+    #[test]
+    fn yield_from_unknown_iterable_slots_are_clean() {
+        let src = r#"<?php
+        /** @return \Generator<int, string, void, void> */
+        function parent_gen($x): \Generator { yield from $x; }"#;
         assert!(codes(src, run_yield_type).is_empty());
     }
 

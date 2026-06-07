@@ -100,6 +100,9 @@ pub struct TypeCtx<'a> {
     /// element types (native PHP `array` is untyped). Drives the native type map
     /// that backs `treatPhpDocTypesAsCertain: false` checking.
     pub native: bool,
+    /// Type received by a plain `yield` expression in this generator scope, when
+    /// the declared return type makes it precise enough to use.
+    pub(crate) generator_send: Option<Type>,
 }
 
 impl<'a> TypeCtx<'a> {
@@ -114,6 +117,7 @@ impl<'a> TypeCtx<'a> {
             callables: HashMap::new(),
             depth: 0,
             native: false,
+            generator_send: None,
         }
     }
 
@@ -209,7 +213,10 @@ impl<'a> TypeCtx<'a> {
                 args: vec![],
             },
             ExprKind::Throw(_) | ExprKind::Exit(_) => Type::Never,
-            ExprKind::Yield { .. } | ExprKind::YieldFrom(_) => Type::Mixed,
+            ExprKind::Yield { .. } => self.generator_send.clone().unwrap_or(Type::Mixed),
+            ExprKind::YieldFrom(inner) => {
+                yield_from_return_type(&self.infer(inner)).unwrap_or(Type::Mixed)
+            }
             ExprKind::Include { .. } | ExprKind::Eval(_) => Type::Mixed,
             ExprKind::Error => Type::Mixed,
         }
@@ -803,6 +810,9 @@ impl<'a> TypeCtx<'a> {
                 ..
             } => {
                 let mut child = self.child_with_env(class.clone(), vars.clone(), callables.clone());
+                child.generator_send = expr.return_type.as_ref().and_then(|t| {
+                    generator_send_type(&php_reflect::resolve_ast_type(self.scope, t))
+                });
                 child.seed_callback_params(&expr.params, inferred_params);
                 let mut returns = Vec::new();
                 returns::collect_returns(&mut child, &expr.body, &mut returns);
@@ -821,6 +831,9 @@ impl<'a> TypeCtx<'a> {
                 ..
             } => {
                 let mut child = self.child_with_env(class.clone(), vars.clone(), callables.clone());
+                child.generator_send = expr.return_type.as_ref().and_then(|t| {
+                    generator_send_type(&php_reflect::resolve_ast_type(self.scope, t))
+                });
                 child.seed_callback_params(&expr.params, inferred_params);
                 let body = child.infer(&expr.body);
                 self.prefer_precise_callback_return(body, expr.return_type.as_ref())
@@ -842,6 +855,10 @@ impl<'a> TypeCtx<'a> {
         child.class = (!c.is_static).then(|| self.class.clone()).flatten();
         child.depth = self.depth;
         child.native = self.native;
+        child.generator_send = c
+            .return_type
+            .as_ref()
+            .and_then(|t| generator_send_type(&php_reflect::resolve_ast_type(self.scope, t)));
         for u in &c.uses {
             let name = self.interner.resolve(u.name).to_string();
             let ty = self.vars.get(&name).cloned().unwrap_or(Type::Mixed);
@@ -859,6 +876,10 @@ impl<'a> TypeCtx<'a> {
         child.class = (!a.is_static).then(|| self.class.clone()).flatten();
         child.depth = self.depth;
         child.native = self.native;
+        child.generator_send = a
+            .return_type
+            .as_ref()
+            .and_then(|t| generator_send_type(&php_reflect::resolve_ast_type(self.scope, t)));
         child.vars = self.vars.clone();
         child.callables = self.callables.clone();
         if a.is_static {
@@ -880,6 +901,7 @@ impl<'a> TypeCtx<'a> {
         child.callables = callables;
         child.depth = self.depth;
         child.native = self.native;
+        child.generator_send = None;
         child
     }
 
@@ -1626,6 +1648,51 @@ fn template_observation_is_imprecise(t: &Type) -> bool {
         part
     });
     imprecise
+}
+
+pub(crate) fn generator_send_type(return_type: &Type) -> Option<Type> {
+    match return_type {
+        Type::Nullable(inner) => generator_send_type(inner),
+        Type::Union(parts) => {
+            if parts.is_empty() {
+                return None;
+            }
+            let sends: Option<Vec<Type>> = parts.iter().map(generator_send_type).collect();
+            sends.map(Type::union)
+        }
+        Type::Named { fqn, args }
+            if fqn
+                .trim_start_matches('\\')
+                .eq_ignore_ascii_case("Generator") =>
+        {
+            let send = args.get(2)?;
+            (!matches!(send, Type::Void) && !template_observation_is_imprecise(send))
+                .then(|| send.clone())
+        }
+        _ => None,
+    }
+}
+
+fn yield_from_return_type(delegated: &Type) -> Option<Type> {
+    match delegated {
+        Type::Nullable(inner) => yield_from_return_type(inner),
+        Type::Union(parts) => {
+            if parts.is_empty() {
+                return None;
+            }
+            let returns: Option<Vec<Type>> = parts.iter().map(yield_from_return_type).collect();
+            returns.map(Type::union)
+        }
+        Type::Named { fqn, args }
+            if fqn
+                .trim_start_matches('\\')
+                .eq_ignore_ascii_case("Generator") =>
+        {
+            let ret = args.get(3)?;
+            (!template_observation_is_imprecise(ret)).then(|| ret.clone())
+        }
+        _ => None,
+    }
 }
 
 fn strip_this_vars(vars: &mut HashMap<String, Type>) {

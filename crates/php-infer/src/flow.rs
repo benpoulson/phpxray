@@ -563,6 +563,14 @@ impl TypeCtx<'_> {
             }
             ExprKind::Closure(c) => self.rec_closure(c, &[], map),
             ExprKind::ArrowFn(a) => self.rec_arrow(a, &[], map),
+            ExprKind::Yield { key, value } => {
+                if let Some(key) = key {
+                    self.rec_here(key, map);
+                }
+                if let Some(value) = value {
+                    self.rec_here(value, map);
+                }
+            }
             // Leaves and yield-ish forms — nothing more to record at this scope
             // (`e` itself is already recorded above).
             _ => {}
@@ -582,7 +590,10 @@ impl TypeCtx<'_> {
         }
         self.seed_ast_params(&mut vars, &c.params, inferred_params);
         let class = (!c.is_static).then(|| self.class.clone()).flatten();
-        self.record_child_block(class, vars, callables, &c.body, map);
+        let generator_send = c.return_type.as_ref().and_then(|t| {
+            crate::generator_send_type(&php_reflect::resolve_ast_type(self.scope, t))
+        });
+        self.record_child_block(class, vars, callables, generator_send, &c.body, map);
     }
 
     fn rec_arrow(&self, a: &ArrowFn, inferred_params: &[Type], map: &mut RecMap) {
@@ -592,7 +603,17 @@ impl TypeCtx<'_> {
         }
         self.seed_ast_params(&mut vars, &a.params, inferred_params);
         let class = (!a.is_static).then(|| self.class.clone()).flatten();
-        self.record_child_expr(class, vars, self.callables.clone(), &a.body, map);
+        let generator_send = a.return_type.as_ref().and_then(|t| {
+            crate::generator_send_type(&php_reflect::resolve_ast_type(self.scope, t))
+        });
+        self.record_child_expr(
+            class,
+            vars,
+            self.callables.clone(),
+            generator_send,
+            &a.body,
+            map,
+        );
     }
 
     fn seed_ast_params(&self, vars: &mut Env, params: &[Param], inferred: &[Type]) {
@@ -756,7 +777,17 @@ impl TypeCtx<'_> {
             } => {
                 let mut vars = vars.clone();
                 self.seed_ast_params(&mut vars, &expr.params, inferred);
-                self.record_child_block(class.clone(), vars, callables.clone(), &expr.body, map);
+                let generator_send = expr.return_type.as_ref().and_then(|t| {
+                    crate::generator_send_type(&php_reflect::resolve_ast_type(self.scope, t))
+                });
+                self.record_child_block(
+                    class.clone(),
+                    vars,
+                    callables.clone(),
+                    generator_send,
+                    &expr.body,
+                    map,
+                );
             }
             CallableAlias::Arrow {
                 expr,
@@ -767,7 +798,17 @@ impl TypeCtx<'_> {
             } => {
                 let mut vars = vars.clone();
                 self.seed_ast_params(&mut vars, &expr.params, inferred);
-                self.record_child_expr(class.clone(), vars, callables.clone(), &expr.body, map);
+                let generator_send = expr.return_type.as_ref().and_then(|t| {
+                    crate::generator_send_type(&php_reflect::resolve_ast_type(self.scope, t))
+                });
+                self.record_child_expr(
+                    class.clone(),
+                    vars,
+                    callables.clone(),
+                    generator_send,
+                    &expr.body,
+                    map,
+                );
             }
         }
     }
@@ -785,6 +826,7 @@ impl TypeCtx<'_> {
         class: Option<String>,
         vars: Env,
         callables: CallableEnv,
+        generator_send: Option<Type>,
         body: &[Stmt],
         map: &mut RecMap,
     ) {
@@ -794,6 +836,7 @@ impl TypeCtx<'_> {
         child.callables = callables;
         child.depth = self.depth;
         child.native = self.native;
+        child.generator_send = generator_send;
         child.record_block(body, map);
     }
 
@@ -802,6 +845,7 @@ impl TypeCtx<'_> {
         class: Option<String>,
         vars: Env,
         callables: CallableEnv,
+        generator_send: Option<Type>,
         e: &Expr,
         map: &mut RecMap,
     ) {
@@ -811,6 +855,7 @@ impl TypeCtx<'_> {
         child.callables = callables;
         child.depth = self.depth;
         child.native = self.native;
+        child.generator_send = generator_send;
         child.rec_here(e, map);
     }
 
@@ -1151,7 +1196,10 @@ impl TypeCtx<'_> {
     ) {
         self.rec_here(subject, map);
         let subj_ty = self.apply_expr(subject);
-        let (k, v) = crate::arrays::iter_key_value(&subj_ty);
+        let (k, v) = self
+            .index
+            .iterable_key_value_on_type(&subj_ty)
+            .unwrap_or_else(|| crate::arrays::iter_key_value(&subj_ty));
         self.widen_loop_assignments(body);
         let base = self.flow_state();
         let mut current = base.clone();

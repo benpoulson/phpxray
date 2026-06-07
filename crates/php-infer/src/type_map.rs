@@ -60,7 +60,7 @@ pub fn contextual_body_type_map(
     let vars = contextual_param_vars(params, inferred_params, native);
     let mut map = TypeMap::new();
     record_scope(
-        reflection, scope, interner, class, vars, native, body, &mut map,
+        reflection, scope, interner, class, vars, native, None, body, &mut map,
     );
     map
 }
@@ -81,6 +81,7 @@ fn build(
             None,
             HashMap::new(),
             native,
+            None,
             region,
             &mut map,
         );
@@ -162,8 +163,21 @@ fn collect_scope(
                 .iter()
                 .map(|p| (p.name.clone(), seed_type(p, native)))
                 .collect();
+            let return_type = if native {
+                &refl.native_return
+            } else {
+                &refl.return_type
+            };
             record_scope(
-                reflection, scope, interner, None, vars, native, &f.body, map,
+                reflection,
+                scope,
+                interner,
+                None,
+                vars,
+                native,
+                crate::generator_send_type(return_type),
+                &f.body,
+                map,
             );
         }
         StmtKind::Class(c) => {
@@ -200,6 +214,11 @@ fn collect_scope(
                     Some(fqn.clone()),
                     vars,
                     native,
+                    crate::generator_send_type(if native {
+                        &mr.native_return
+                    } else {
+                        &mr.return_type
+                    }),
                     body,
                     map,
                 );
@@ -219,6 +238,7 @@ fn record_scope(
     class: Option<String>,
     init_vars: HashMap<String, Type>,
     native: bool,
+    generator_send: Option<Type>,
     body: &[php_ast::Stmt],
     map: &mut TypeMap,
 ) {
@@ -226,6 +246,7 @@ fn record_scope(
     ctx.class = class;
     ctx.vars = init_vars;
     ctx.native = native;
+    ctx.generator_send = generator_send;
     // The recording pass flows the environment statement-by-statement *and*
     // records each expression at its narrowed flow point, so expressions inside
     // `if`/`else`/loop branches are typed against the narrowed environment.
@@ -244,6 +265,15 @@ mod tests {
         let mut reflection = ReflectionIndex::with_builtins();
         reflection.add_file(&r.program, &r.interner);
         let map = type_map(&reflection, &r.program, &r.interner);
+        (map, r)
+    }
+
+    fn build_native(src: &str) -> (TypeMap, php_parser::ParseResult) {
+        let r = php_parser::parse(src);
+        assert!(!r.has_errors(), "parse errors: {src}");
+        let mut reflection = ReflectionIndex::with_builtins();
+        reflection.add_file(&r.program, &r.interner);
+        let map = native_type_map(&reflection, &r.program, &r.interner);
         (map, r)
     }
 
@@ -308,6 +338,15 @@ mod tests {
 
     fn ty_of_last_var(src: &str, name: &str) -> String {
         let (map, r) = build(src);
+        ty_of_last_var_in(&map, &r, name)
+    }
+
+    fn ty_of_last_var_native(src: &str, name: &str) -> String {
+        let (map, r) = build_native(src);
+        ty_of_last_var_in(&map, &r, name)
+    }
+
+    fn ty_of_last_var_in(map: &TypeMap, r: &php_parser::ParseResult, name: &str) -> String {
         let mut found: Option<String> = None;
         walk::for_each_expr(&r.program, &mut |e| {
             let ExprKind::Variable(sym) = &e.kind else {
@@ -1096,6 +1135,109 @@ mod tests {
         }
         "#;
         assert_eq!(ty_of_last_prop(src, "value"), "User");
+    }
+
+    #[test]
+    fn foreach_over_typed_generator_maps_key_and_value() {
+        let src = r#"<?php
+        class Child {}
+        class User { public function child(): Child {} }
+        /** @return \Generator<int, User, void, void> */
+        function users(): \Generator { yield new User(); }
+        function f(): void {
+            foreach (users() as $i => $u) {
+                $u->child();
+                $copy = $i;
+            }
+        }
+        "#;
+        assert_eq!(ty_of_last_var(src, "u"), "User");
+        assert_eq!(ty_of_last_var(src, "i"), "int");
+        assert_eq!(ty_of_last_method(src, "child"), "Child");
+    }
+
+    #[test]
+    fn foreach_over_generic_arrayobject_maps_key_and_value() {
+        let src = r#"<?php
+        class Child {}
+        class User { public function child(): Child {} }
+        /** @param \ArrayObject<int, User> $users */
+        function f(\ArrayObject $users): void {
+            foreach ($users as $i => $u) {
+                $u->child();
+                $copy = $i;
+            }
+        }
+        "#;
+        assert_eq!(ty_of_last_var(src, "u"), "User");
+        assert_eq!(ty_of_last_var(src, "i"), "int");
+        assert_eq!(ty_of_last_method(src, "child"), "Child");
+    }
+
+    #[test]
+    fn foreach_over_userland_iteratoraggregate_maps_key_and_value() {
+        let src = r#"<?php
+        class User { public function label(): string {} }
+        /** @implements \IteratorAggregate<string, User> */
+        class Users implements \IteratorAggregate {}
+        function f(Users $users): void {
+            foreach ($users as $name => $u) {
+                $u->label();
+                $copy = $name;
+            }
+        }
+        "#;
+        assert_eq!(ty_of_last_var(src, "u"), "User");
+        assert_eq!(ty_of_last_var(src, "name"), "string");
+        assert_eq!(ty_of_last_method(src, "label"), "string");
+    }
+
+    #[test]
+    fn yield_from_returns_delegated_generator_return_type() {
+        let src = r#"<?php
+        class User {}
+        class Result { public function ok(): bool {} }
+        /** @return \Generator<int, User, void, Result> */
+        function child(): \Generator {
+            yield new User();
+            return new Result();
+        }
+        /** @return \Generator<int, User, void, void> */
+        function parent_gen(): \Generator {
+            $result = yield from child();
+            $result->ok();
+        }
+        "#;
+        assert_eq!(ty_of_last_var(src, "result"), "Result");
+        assert_eq!(ty_of_last_method(src, "ok"), "bool");
+    }
+
+    #[test]
+    fn plain_yield_expression_uses_declared_send_type() {
+        let src = r#"<?php
+        /** @return \Generator<int, string, int, void> */
+        function g(): \Generator {
+            $sent = yield 'value';
+            $copy = $sent;
+        }
+        "#;
+        assert_eq!(ty_of_last_var(src, "sent"), "int");
+    }
+
+    #[test]
+    fn native_type_map_keeps_phpdoc_only_generator_foreach_broad() {
+        let src = r#"<?php
+        class User {}
+        /** @return \Generator<int, User, void, void> */
+        function users(): \Generator { yield new User(); }
+        function f(): void {
+            foreach (users() as $u) {
+                $copy = $u;
+            }
+        }
+        "#;
+        assert_eq!(ty_of_last_var(src, "u"), "User");
+        assert_eq!(ty_of_last_var_native(src, "u"), "mixed");
     }
 
     #[test]

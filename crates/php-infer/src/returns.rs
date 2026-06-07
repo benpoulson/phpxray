@@ -32,6 +32,7 @@ pub(crate) fn refine_return(
         callables: HashMap::new(),
         depth: caller.depth + 1,
         native: caller.native,
+        generator_send: None,
     };
     for (name, arg) in params.iter().zip(args) {
         sub.vars.insert(name.clone(), caller.infer(&arg.value));

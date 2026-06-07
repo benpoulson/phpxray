@@ -4057,6 +4057,21 @@ mod tests {
     }
 
     #[test]
+    fn undefined_method_inside_generator_foreach_is_flagged() {
+        let src = r#"<?php
+            class User {}
+            /** @return \Generator<int, User, void, void> */
+            function users(): \Generator { yield new User(); }
+            function f(): void {
+                foreach (users() as $u) {
+                    $u->missing();
+                }
+            }
+        "#;
+        assert!(codes(src, run_call_methods_typed).contains(&"method.notFound"));
+    }
+
+    #[test]
     fn undefined_method_on_array_map_result_is_flagged() {
         let src = r#"<?php
             class Child {}

@@ -4189,6 +4189,22 @@ mod tests {
     }
 
     #[test]
+    fn argument_type_from_generator_foreach_key_is_flagged() {
+        let src = r#"<?php
+        class User {}
+        function takes_string(string $x): void {}
+        /** @return \Generator<int, User, void, void> */
+        function users(): \Generator { yield new User(); }
+        function f(): void {
+            foreach (users() as $i => $u) {
+                takes_string($i);
+            }
+        }
+        "#;
+        assert_eq!(codes(src, run_argument_types), ["argument.type"]);
+    }
+
+    #[test]
     fn argument_type_inside_preg_replace_callback_is_flagged() {
         let src = r#"<?php
         function takes_string(string $x): void {}

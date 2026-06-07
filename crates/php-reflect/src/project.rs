@@ -308,6 +308,96 @@ impl ReflectionIndex {
         self.is_sub(&class_key(sub), &class_key(sup), &mut visited)
     }
 
+    /// Extract the key/value pair yielded by an iterable value, when reflection
+    /// has enough information to do so without guessing.
+    pub fn iterable_key_value_on_type(&self, ty: &Type) -> Option<(Type, Type)> {
+        let mut visited = Vec::new();
+        self.iterable_key_value(ty, &mut visited)
+    }
+
+    fn iterable_key_value(&self, ty: &Type, visited: &mut Vec<String>) -> Option<(Type, Type)> {
+        match ty {
+            Type::Array(Some(kv)) | Type::Iterable(Some(kv)) => Some((kv.0.clone(), kv.1.clone())),
+            Type::List(value) => Some((Type::Int, (**value).clone())),
+            Type::Shape { fields, sealed } => {
+                let mut keys: Vec<Type> = fields.iter().map(shape_field_key_type).collect();
+                let mut values: Vec<Type> = fields.iter().map(|f| f.ty.clone()).collect();
+                if !sealed {
+                    keys.push(Type::Mixed);
+                    values.push(Type::Mixed);
+                }
+                Some((Type::union(keys), Type::union(values)))
+            }
+            Type::Nullable(inner) => self.iterable_key_value(inner, visited),
+            Type::Union(parts) => {
+                if parts.is_empty() {
+                    return None;
+                }
+                let mut keys = Vec::new();
+                let mut values = Vec::new();
+                for part in parts {
+                    let mut branch_seen = visited.clone();
+                    let (k, v) = self.iterable_key_value(part, &mut branch_seen)?;
+                    keys.push(k);
+                    values.push(v);
+                }
+                Some((Type::union(keys), Type::union(values)))
+            }
+            Type::Intersection(parts) => parts.iter().find_map(|part| {
+                let mut branch_seen = visited.clone();
+                self.iterable_key_value(part, &mut branch_seen)
+            }),
+            Type::Named { fqn, args } => self.iterable_key_value_named(fqn, args, visited),
+            _ => None,
+        }
+    }
+
+    fn iterable_key_value_named(
+        &self,
+        fqn: &str,
+        args: &[Type],
+        visited: &mut Vec<String>,
+    ) -> Option<(Type, Type)> {
+        if let Some(kv) = direct_iterable_named_key_value(fqn, args) {
+            return Some(kv);
+        }
+
+        let key = class_key(fqn);
+        if visited.contains(&key) {
+            return None;
+        }
+        visited.push(key);
+
+        let class = self.classes.get(&class_key(fqn))?;
+        let subst = self.receiver_subst(fqn, args);
+        let parents = class
+            .traits
+            .iter()
+            .chain(&class.parents)
+            .chain(&class.interfaces)
+            .chain(&class.mixins);
+        for parent in parents {
+            let Type::Named {
+                fqn: parent_fqn,
+                args: parent_args,
+            } = parent
+            else {
+                continue;
+            };
+            let parent_args: Vec<Type> = parent_args
+                .iter()
+                .map(|arg| subst_type(arg, &subst))
+                .collect();
+            let mut branch_seen = visited.clone();
+            if let Some(kv) =
+                self.iterable_key_value_named(parent_fqn, &parent_args, &mut branch_seen)
+            {
+                return Some(kv);
+            }
+        }
+        None
+    }
+
     fn is_sub(&self, sub_key: &str, sup_key: &str, visited: &mut Vec<String>) -> bool {
         if sub_key == sup_key {
             return true; // reflexive
@@ -693,6 +783,61 @@ fn subst_type(ty: &Type, subst: &Subst) -> Type {
     })
 }
 
+fn direct_iterable_named_key_value(fqn: &str, args: &[Type]) -> Option<(Type, Type)> {
+    if !is_known_generic_iterable(fqn) {
+        return None;
+    }
+    match args {
+        [key, value, ..] => Some((key.clone(), value.clone())),
+        [value] => Some((Type::Mixed, value.clone())),
+        _ => None,
+    }
+}
+
+fn is_known_generic_iterable(fqn: &str) -> bool {
+    matches!(
+        fqn.trim_start_matches('\\').to_ascii_lowercase().as_str(),
+        "generator"
+            | "iterator"
+            | "seekableiterator"
+            | "traversable"
+            | "iteratoraggregate"
+            | "arrayobject"
+            | "splfixedarray"
+            | "weakmap"
+    )
+}
+
+fn shape_field_key_type(field: &php_types::ShapeField) -> Type {
+    match &field.key {
+        Some(key) if canonical_int_string(key.as_bytes()).is_some() => Type::Int,
+        Some(_) => Type::String,
+        None => Type::Int,
+    }
+}
+
+fn canonical_int_string(bytes: &[u8]) -> Option<i64> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let (neg, digits): (bool, &[u8]) = match bytes.first() {
+        Some(b'-') => (true, &bytes[1..]),
+        _ => (false, bytes),
+    };
+    if digits.is_empty() || !digits.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if digits.len() > 1 && digits[0] == b'0' {
+        return None;
+    }
+    let s = std::str::from_utf8(bytes).ok()?;
+    let n: i64 = s.parse().ok()?;
+    if neg && n == 0 {
+        return None;
+    }
+    Some(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -913,6 +1058,71 @@ mod tests {
         let receiver = generic("ArrayObject", vec![Type::Int, named("User")]);
         let found = idx.find_method_on_type(&receiver, "offsetGet").unwrap();
         assert_eq!(found.member.return_type.to_string(), "User|null");
+    }
+
+    #[test]
+    fn iterable_key_value_extracts_generator_family_args() {
+        let idx = ReflectionIndex::new();
+        let ty = generic(
+            "Generator",
+            vec![Type::Int, named("User"), Type::Void, named("Result")],
+        );
+        let (k, v) = idx.iterable_key_value_on_type(&ty).unwrap();
+        assert_eq!(k.to_string(), "int");
+        assert_eq!(v.to_string(), "User");
+    }
+
+    #[test]
+    fn iterable_key_value_extracts_builtin_iterable_classes() {
+        let idx = ReflectionIndex::new();
+        let array_object = generic("ArrayObject", vec![Type::Int, named("User")]);
+        let weak_map = generic("WeakMap", vec![Type::Object, named("User")]);
+
+        let (k, v) = idx.iterable_key_value_on_type(&array_object).unwrap();
+        assert_eq!(
+            (k.to_string(), v.to_string()),
+            ("int".to_string(), "User".to_string())
+        );
+
+        let (k, v) = idx.iterable_key_value_on_type(&weak_map).unwrap();
+        assert_eq!(
+            (k.to_string(), v.to_string()),
+            ("object".to_string(), "User".to_string())
+        );
+    }
+
+    #[test]
+    fn iterable_key_value_composes_through_userland_implements() {
+        let idx = index(
+            r#"<?php
+            class User {}
+            /** @implements \IteratorAggregate<string, User> */
+            class Users implements \IteratorAggregate {}
+            "#,
+        );
+        let (k, v) = idx
+            .iterable_key_value_on_type(&named("Users"))
+            .expect("iterable key/value");
+        assert_eq!(
+            (k.to_string(), v.to_string()),
+            ("string".to_string(), "User".to_string())
+        );
+    }
+
+    #[test]
+    fn iterable_key_value_unions_only_when_all_arms_are_extractable() {
+        let idx = ReflectionIndex::new();
+        let ok = Type::union(vec![
+            Type::List(Box::new(named("User"))),
+            generic("Generator", vec![Type::String, named("Admin")]),
+        ]);
+        let (k, v) = idx.iterable_key_value_on_type(&ok).unwrap();
+        assert_eq!(k.to_string(), "int|string");
+        assert_eq!(v.to_string(), "User|Admin");
+
+        let mixed = Type::union(vec![Type::List(Box::new(named("User"))), Type::Mixed]);
+        assert!(idx.iterable_key_value_on_type(&mixed).is_none());
+        assert!(idx.iterable_key_value_on_type(&Type::Mixed).is_none());
     }
 
     #[test]
