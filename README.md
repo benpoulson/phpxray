@@ -4,7 +4,7 @@ A fast PHP static analyzer written in Rust.
 
 `phpxray` parses PHP into a typed AST, resolves names and project symbols, reflects native and PHPDoc
 types, runs flow-sensitive inference, and reports phpstan-style diagnostics through the
-`php-analyzer` CLI.
+`phpxray` CLI.
 
 The project is young, but it is not a toy prototype: the parser is differential-tested against Zend's
 AST, the CLI can analyze real projects, and the rule engine already covers a broad set of PHPStan-like
@@ -32,54 +32,54 @@ Rust nightly is currently used for development.
 ```sh
 git clone https://github.com/benpoulson/phpxray.git
 cd phpxray
-cargo build -p php-cli --release
+cargo build -p phpxray --release
 ```
 
 The binary is built at:
 
 ```sh
-target/release/php-analyzer
+target/release/phpxray
 ```
 
-For local development, `cargo build -p php-cli` builds `target/debug/php-analyzer`.
+For local development, `cargo build -p phpxray` builds `target/debug/phpxray`.
 
 ## Quick Start
 
 Analyze explicit paths:
 
 ```sh
-php-analyzer -l 6 src tests
+phpxray -l 6 src tests
 ```
 
 Use an autodiscovered config file:
 
 ```sh
-php-analyzer
+phpxray
 ```
 
 Supported config names are:
 
-- `phpanalyzer.yaml`
-- `phpanalyzer.yml`
-- `phpanalyzer.dist.yaml`
+- `phpxray.yaml`
+- `phpxray.yml`
+- `phpxray.dist.yaml`
 
 JSON output:
 
 ```sh
-php-analyzer --error-format json
+phpxray --error-format json
 ```
 
 Generate a baseline for an existing codebase:
 
 ```sh
-php-analyzer --generate-baseline
+phpxray --generate-baseline
 ```
 
 Then reference the generated baseline from config.
 
 ## Configuration
 
-Example `phpanalyzer.yaml`:
+Example `phpxray.yaml`:
 
 ```yaml
 level: 8
@@ -97,7 +97,7 @@ phpVersion: "8.4"
 treatPhpDocTypesAsCertain: true
 reportUnmatchedIgnored: true
 
-baseline: phpanalyzer-baseline.yaml
+baseline: phpxray-baseline.yaml
 
 ignore:
   - identifier: method.notFound
@@ -131,7 +131,7 @@ $user->missingMethod();
 $user->missingMethod(); // @phpstan-ignore-line method.notFound
 ```
 
-`@php-analyzer-ignore` is also accepted as an alias.
+`@phpxray-ignore` is also accepted as an alias.
 
 ## Reporters
 
@@ -183,7 +183,7 @@ The workspace is split into small crates:
 - `php-phpdoc`, `php-types`, `php-reflect`: PHPDoc parsing, semantic types, reflection.
 - `php-infer`: expression inference, flow, narrowing, assignability.
 - `php-rules`: diagnostics and rule scheduling.
-- `php-config`, `php-cli`: configuration, suppression, baselines, reporters, and the CLI.
+- `php-config`, `phpxray`: configuration, suppression, baselines, reporters, and the CLI.
 - `xtask`: development and corpus tooling.
 
 Builtins are generated from JetBrains PHPStorm stubs and compiled into version-aware manifests.

@@ -561,7 +561,7 @@ dependencies = [
 
 [[package]]
 name = "php-ast"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "insta",
  "php-intern",
@@ -570,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "php-config"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "regex",
  "serde",
@@ -579,14 +579,14 @@ dependencies = [
 
 [[package]]
 name = "php-diagnostics"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "php-span",
 ]
 
 [[package]]
 name = "php-index"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "php-ast",
  "php-parser",
@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "php-infer"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "php-ast",
  "php-intern",
@@ -611,14 +611,14 @@ dependencies = [
 
 [[package]]
 name = "php-intern"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "lasso",
 ]
 
 [[package]]
 name = "php-lexer"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "php-diagnostics",
  "php-intern",
@@ -627,7 +627,7 @@ dependencies = [
 
 [[package]]
 name = "php-parser"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "insta",
  "php-ast",
@@ -639,14 +639,14 @@ dependencies = [
 
 [[package]]
 name = "php-phpdoc"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "php-span",
 ]
 
 [[package]]
 name = "php-reflect"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "php-ast",
  "php-index",
@@ -660,7 +660,7 @@ dependencies = [
 
 [[package]]
 name = "php-resolve"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "php-ast",
  "php-diagnostics",
@@ -671,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "php-rules"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "php-ast",
  "php-diagnostics",
@@ -688,15 +688,15 @@ dependencies = [
 
 [[package]]
 name = "php-span"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "php-types"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "phpxray"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "indicatif",
@@ -1335,7 +1335,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "php-ast",
  "php-config",
