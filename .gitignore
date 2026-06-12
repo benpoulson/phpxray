@@ -18,3 +18,10 @@
 
 # JetBrains IDE
 /.idea
+
+# macOS Finder metadata
+.DS_Store
+
+# phpxray's own on-disk caches (created in any analyzed project root, incl. this one)
+/.phpxray
+/.php-analyzer
