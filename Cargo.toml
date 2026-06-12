@@ -15,12 +15,12 @@ members = [
     "crates/php-reflect",
     "crates/php-infer",
     "crates/php-config",
-    "crates/php-cli",
+    "crates/phpxray",
     "crates/xtask",
 ]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/benpoulson/phpxray"
@@ -41,7 +41,7 @@ php-types = { path = "crates/php-types" }
 php-reflect = { path = "crates/php-reflect" }
 php-infer = { path = "crates/php-infer" }
 php-config = { path = "crates/php-config" }
-php-cli = { path = "crates/php-cli" }
+phpxray = { path = "crates/phpxray" }
 
 # Third-party
 insta = "1"
@@ -53,6 +53,10 @@ regex = "1"
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.18"
 rayon = "1"
+lasso = { version = "0.7", features = ["multi-threaded"] }
+notify = "8"
+notify-debouncer-full = "0.5"
+libc = "0.2"
 
 [profile.release]
 codegen-units = 1
@@ -65,3 +69,8 @@ opt-level = 2
 # Dependencies are compiled once and cached, so optimize them fully regardless.
 [profile.dev.package."*"]
 opt-level = 3
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

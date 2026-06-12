@@ -46,6 +46,11 @@ pub struct ParamReflection {
     /// The type from the *native* hint alone (`mixed` if none), ignoring PHPDoc —
     /// used for `treatPhpDocTypesAsCertain: false` native-level checking.
     pub native_ty: Type,
+    /// `ty` was synthesized by whole-project signature inference (from call-site
+    /// argument types), not declared. Treated as PHPDoc-grade: refines `ty` but
+    /// leaves `native_ty`/`explicit` untouched, so the native-level checking and the
+    /// missing-typehint rules are unaffected.
+    pub inferred: bool,
 }
 
 impl ParamReflection {
@@ -67,6 +72,14 @@ pub struct FunctionReflection {
     pub fqn: String,
     pub params: Vec<ParamReflection>,
     pub return_type: Type,
+    /// A return type was *explicitly* written (native hint or `@return`), even if
+    /// `mixed`. See [`ParamReflection::explicit`]. Distinguishes a real declaration
+    /// from a defaulted-to-`mixed` untyped function.
+    pub explicit_return: bool,
+    /// `return_type` was synthesized by whole-project signature inference (from the
+    /// body's `return` statements), not declared. PHPDoc-grade; see
+    /// [`ParamReflection::inferred`].
+    pub inferred_return: bool,
     /// Native-hint-only return type (`mixed` if none).
     pub native_return: Type,
     pub by_ref: bool,
@@ -99,6 +112,9 @@ pub struct MethodReflection {
     /// A return type was *explicitly* written (native hint or `@return`), even if
     /// `mixed`. See [`ParamReflection::explicit`].
     pub explicit_return: bool,
+    /// `return_type` was synthesized by whole-project signature inference, not
+    /// declared. PHPDoc-grade; see [`ParamReflection::inferred`].
+    pub inferred_return: bool,
     /// Native-hint-only return type (`mixed` if none). See [`ParamReflection::native_ty`].
     pub native_return: Type,
     /// `@template` names in scope (class templates plus the method's own).
@@ -296,6 +312,8 @@ pub fn reflect_function(
             f.return_type.as_ref(),
             doc.returns.as_ref(),
         ),
+        explicit_return: f.return_type.is_some() || doc.returns.is_some(),
+        inferred_return: false,
         native_return: native_type(scope, f.return_type.as_ref()),
         by_ref: f.by_ref,
         templates,
@@ -351,7 +369,7 @@ pub fn reflect_class(
                 name: interner.resolve(ec.name).to_string(),
                 visibility: Visibility::Public,
                 ty: Type::Named {
-                    fqn: fqn.to_string(),
+                    fqn: fqn.into(),
                     args: Vec::new(),
                 },
                 is_final: true,
@@ -480,6 +498,7 @@ fn synthetic_method(
         params,
         return_type: return_type.clone(),
         explicit_return: true,
+        inferred_return: false,
         native_return: return_type,
         templates: Vec::new(),
         deprecated: false,
@@ -499,6 +518,7 @@ fn synthetic_param(name: &str, ty: Type) -> ParamReflection {
         promoted: false,
         explicit: true,
         native_ty: ty,
+        inferred: false,
     }
 }
 
@@ -560,8 +580,9 @@ fn reflect_method(
             m.return_type.as_ref(),
             doc.returns.as_ref(),
         ),
-        native_return: native_type(scope, m.return_type.as_ref()),
         explicit_return: m.return_type.is_some() || doc.returns.is_some(),
+        inferred_return: false,
+        native_return: native_type(scope, m.return_type.as_ref()),
         templates,
         deprecated: doc.deprecated,
         pure: doc_is_pure(m.doc.as_deref()),
@@ -662,8 +683,9 @@ fn magic_method(
             .as_ref()
             .map(|t| resolve_doc_type(scope, &templates, t))
             .unwrap_or(Type::Mixed),
-        native_return: Type::Mixed,
         explicit_return: m.return_type.is_some(),
+        inferred_return: false,
+        native_return: Type::Mixed,
         templates,
         deprecated: false,
         pure: false,
@@ -686,6 +708,7 @@ fn magic_param(scope: &Scope, templates: &[String], p: &MethodParam) -> ParamRef
         promoted: false,
         explicit: p.ty.is_some(),
         native_ty: Type::Mixed,
+        inferred: false,
     }
 }
 
@@ -739,6 +762,7 @@ fn reflect_params(
                 optional: p.default.is_some() || p.variadic,
                 promoted: !p.modifiers.is_empty(),
                 explicit: p.ty.is_some() || doc_ty.is_some(),
+                inferred: false,
             }
         })
         .collect()
@@ -752,7 +776,7 @@ fn parents_with_generics(
     native: &[Name],
     doc_generics: &[DocType],
 ) -> Vec<Type> {
-    let doc_args: Vec<(String, Vec<Type>)> = doc_generics
+    let doc_args: Vec<(std::sync::Arc<str>, Vec<Type>)> = doc_generics
         .iter()
         .filter_map(|d| match resolve_doc_type(scope, templates, d) {
             Type::Named { fqn, args } => Some((fqn, args)),
@@ -762,7 +786,7 @@ fn parents_with_generics(
     native
         .iter()
         .filter_map(|n| {
-            let fqn = scope.resolve_class(n).fqn()?.to_string();
+            let fqn: std::sync::Arc<str> = scope.resolve_class(n).fqn()?.into();
             let args = doc_args
                 .iter()
                 .find(|(f, _)| *f == fqn)

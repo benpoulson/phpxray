@@ -223,13 +223,13 @@ pub fn assignable_trinary(index: &ReflectionIndex, value: &Type, target: &Type) 
     }
     // `?A` (value) ⊑ target iff both `A` and `null` are.
     if let Nullable(v) = value {
-        return assignable_trinary(index, &Union(vec![(**v).clone(), Null]), target);
+        return assignable_trinary(index, &Union(vec![(**v).clone(), Null].into()), target);
     }
 
     // A union/nullable target accepts the value if *any* arm does.
     match target {
         Nullable(t) => {
-            return assignable_trinary(index, value, &Union(vec![(**t).clone(), Null]));
+            return assignable_trinary(index, value, &Union(vec![(**t).clone(), Null].into()));
         }
         Union(parts) => {
             if parts
@@ -320,9 +320,18 @@ fn assignable_atom(index: &ReflectionIndex, value: &Type, target: &Type) -> bool
         // A coarse array (no per-field info) ⊑ shape: can't disprove → lenient.
         (Array(_) | List(_), Shape { .. }) => true,
         (Array(_) | List(_) | Iterable(_) | Shape { .. }, Iterable(None)) => true,
-        (Iterable(Some(a)), Iterable(Some(b))) => {
+        (Iterable(Some(a)) | Array(Some(a)), Iterable(Some(b))) => {
             is_assignable(index, &a.0, &b.0) && is_assignable(index, &a.1, &b.1)
         }
+        // list<V> ⊑ iterable<K,V>: int keys, covariant values.
+        (List(v), Iterable(Some(b))) => {
+            is_assignable(index, &Int, &b.0) && is_assignable(index, v, &b.1)
+        }
+        // shape ⊑ iterable<K,V>: like shape ⊑ array<K,V>.
+        (Shape { fields, .. }, Iterable(Some(kv))) => fields.iter().all(|f| {
+            is_assignable(index, &crate::arrays::shape_field_key_type(f), &kv.0)
+                && is_assignable(index, &f.ty, &kv.1)
+        }),
         // An object may be Traversable; we can't see builtins, so stay lenient.
         (Named { .. }, Iterable(_)) => true,
 
@@ -389,6 +398,31 @@ mod tests {
     }
 
     #[test]
+    fn typed_arrays_fit_typed_iterables() {
+        let it = |k: Type, v: Type| Type::Iterable(Some(Box::new((k, v))));
+        // list<int> ⊑ iterable<int, int>
+        assert!(ok(Type::List(Box::new(Type::Int)), it(Type::Int, Type::Int)));
+        // array<string, int> ⊑ iterable<string, int>
+        assert!(ok(
+            Type::Array(Some(Box::new((Type::String, Type::Int)))),
+            it(Type::String, Type::Int)
+        ));
+        // list<string> ⊄ iterable<int, int> (value type wrong)
+        assert!(!ok(
+            Type::List(Box::new(Type::String)),
+            it(Type::Int, Type::Int)
+        ));
+        // list<int> ⊑ iterable<TKey, TValue> — unbound templates stay lenient
+        assert!(ok(
+            Type::List(Box::new(Type::Int)),
+            it(
+                Type::TemplateVar("TKey".into()),
+                Type::TemplateVar("TValue".into())
+            )
+        ));
+    }
+
+    #[test]
     fn string_and_array_are_callable() {
         assert!(ok(Type::String, Type::Callable(None)));
         assert!(ok(Type::Array(None), Type::Callable(None)));
@@ -410,7 +444,7 @@ mod tests {
         assert!(ok(Type::Int, Type::Nullable(Box::new(Type::Int))));
         assert!(ok(Type::Null, Type::Nullable(Box::new(Type::Int))));
         assert!(!ok(Type::String, Type::Nullable(Box::new(Type::Int))));
-        let int_or_str = Type::Union(vec![Type::Int, Type::String]);
+        let int_or_str = Type::Union(vec![Type::Int, Type::String].into());
         assert!(ok(Type::Int, int_or_str.clone()));
         assert!(ok(Type::String, int_or_str.clone()));
         assert!(!ok(Type::Float, int_or_str));
@@ -507,9 +541,9 @@ mod tests {
 
     #[test]
     fn union_value_needs_all_members() {
-        let v = Type::Union(vec![Type::Int, Type::String]);
+        let v = Type::Union(vec![Type::Int, Type::String].into());
         assert!(!ok(v.clone(), Type::Int)); // string member fails
-        assert!(ok(v.clone(), Type::Union(vec![Type::Int, Type::String])));
+        assert!(ok(v.clone(), Type::Union(vec![Type::Int, Type::String].into())));
         assert!(ok(v, Type::Mixed));
     }
 

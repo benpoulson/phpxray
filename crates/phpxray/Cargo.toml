@@ -1,15 +1,18 @@
 [package]
-name = "php-cli"
+name = "phpxray"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/benpoulson/phpxray"
+description = "A fast PHP static analyzer written in Rust"
 
 [lib]
-name = "php_cli"
+name = "phpxray"
 path = "src/lib.rs"
 
 [[bin]]
-name = "php-analyzer"
+name = "phpxray"
 path = "src/main.rs"
 
 [dependencies]
@@ -21,6 +24,7 @@ php-parser.workspace = true
 php-resolve.workspace = true
 php-index.workspace = true
 php-reflect.workspace = true
+php-infer.workspace = true
 php-rules.workspace = true
 php-config.workspace = true
 walkdir.workspace = true
@@ -31,3 +35,9 @@ serde_yaml.workspace = true
 regex.workspace = true
 indicatif.workspace = true
 rayon.workspace = true
+notify.workspace = true
+notify-debouncer-full.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Local-time rendering for the watch header (localtime_r) without a date/time crate.
+libc.workspace = true

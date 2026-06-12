@@ -54,7 +54,6 @@ use php_ast::{
 use php_diagnostics::Diagnostic;
 use php_infer::TypeCtx;
 use php_phpdoc::PropertyAccess;
-use php_reflect::reflect_class;
 use php_resolve::{for_each_region, Scope};
 use php_span::Span;
 use php_types::Type;
@@ -70,15 +69,8 @@ fn has_hooks(p: &PropElem) -> bool {
 /// hook's short-body span, else a dummy span (PropElem has no span field; tests
 /// assert identifiers, and locations matter only for rendering).
 fn span_of(p: &PropElem) -> Span {
-    if let Some(d) = &p.default {
-        d.span
-    } else if let Some(HookBody::Short(e)) =
-        p.hooks.as_ref().and_then(|hs| hs.first()).map(|h| &h.body)
-    {
-        e.span
-    } else {
-        Span::DUMMY
-    }
+    // Point at the `$property` name token.
+    p.name_span
 }
 
 /// Walk every property declaration in the file together with the class it
@@ -210,7 +202,7 @@ fn property_decl_info(
 ) -> Option<PropertyDeclInfo> {
     let found = fa.reflection.find_property(receiver_class, prop)?;
     let mut info = PropertyDeclInfo {
-        declaring_class: found.declaring_class.clone(),
+        declaring_class: found.declaring_class.to_string(),
         visibility: found.member.visibility,
         is_static: found.member.is_static,
         is_native_readonly: found.member.is_readonly,
@@ -221,7 +213,7 @@ fn property_decl_info(
     };
 
     for_each_property_elem(fa, &mut |class_fqn, _class, pd, elem| {
-        if !symbols::same_fqn(class_fqn, &found.declaring_class) {
+        if !symbols::same_fqn(class_fqn, found.declaring_class) {
             return;
         }
         if fa.interner.resolve(elem.name) != prop {
@@ -660,7 +652,7 @@ fn check_set_property_hook_parameter_stmt(
                 .name
                 .map(|n| scope.qualify(fa.interner.resolve(n)))
                 .unwrap_or_else(|| "class@anonymous".to_string());
-            let reflected = reflect_class(scope, fa.interner, &fqn, c);
+            let reflected = fa.reflect_class(scope, &fqn, c);
             for m in &c.members {
                 let Member::Property(pd) = m else { continue };
                 for elem in &pd.props {
@@ -1005,11 +997,8 @@ fn hooked_property_is_definitely_backed(elem: &PropElem, prop: &str, fa: &FileAn
 }
 
 fn hook_span(hook: &PropertyHook) -> Span {
-    match &hook.body {
-        HookBody::Short(e) => e.span,
-        HookBody::Block(stmts) => stmts.first().map(|s| s.span).unwrap_or(Span::DUMMY),
-        HookBody::Abstract => Span::DUMMY,
-    }
+    // The hook-name token (`get` / `set`).
+    hook.name_span
 }
 
 fn hook_body_reads_this_property(body: &HookBody, prop: &str, fa: &FileAnalysis) -> bool {
@@ -1220,7 +1209,7 @@ fn run_overriding_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 return;
             }
         };
-        let parent = &proto.declaring_class;
+        let parent = proto.declaring_class;
 
         // `#[\Override]` on a *property* only exists in PHP ≥ 8.5, so phpstan
         // gates `property.missingOverride` on `supportsOverrideAttributeOnProperty()`
@@ -1350,7 +1339,7 @@ struct PropertyOverrideType<'a> {
     pd: &'a PropertyDecl,
     elem: &'a PropElem,
     prop: &'a str,
-    proto: &'a php_reflect::Found<php_reflect::PropertyReflection>,
+    proto: &'a php_reflect::Found<'a, php_reflect::PropertyReflection>,
     child: &'a php_reflect::PropertyReflection,
 }
 
@@ -1367,7 +1356,7 @@ fn check_overriding_property_type(
         proto,
         child,
     } = ctx;
-    let parent = &proto.declaring_class;
+    let parent = proto.declaring_class;
     let span = pd
         .ty
         .as_ref()
@@ -3032,7 +3021,7 @@ fn union_property_status(
     }
     let mut has_prop = false;
     let mut lacks_prop = false;
-    for part in parts {
+    for part in parts.iter() {
         let Type::Named { fqn, .. } = part else {
             return None;
         };
@@ -3567,7 +3556,7 @@ fn check_property_defaults_stmt(
                 .name
                 .map(|n| scope.qualify(fa.interner.resolve(n)))
                 .unwrap_or_else(|| "class@anonymous".to_string());
-            let class = reflect_class(scope, fa.interner, &fqn, c);
+            let class = fa.reflect_class(scope, &fqn, c);
             let ctx = TypeCtx::new(fa.reflection, scope, fa.interner);
             let mut native_ctx = TypeCtx::new(fa.reflection, scope, fa.interner);
             native_ctx.native = true;

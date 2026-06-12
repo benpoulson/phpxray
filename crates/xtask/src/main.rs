@@ -175,13 +175,13 @@ fn cmd_rule_timings(args: &[String]) -> ExitCode {
         config.paths.push(".".to_string());
     }
 
-    let report = php_cli::run_with_options(
+    let report = phpxray::run_with_options(
         &config,
         &root,
-        php_cli::RunOptions {
+        phpxray::RunOptions {
             progress: false,
             collect_timings: true,
-            ..php_cli::RunOptions::default()
+            ..phpxray::RunOptions::default()
         },
     );
     let Some(t) = report.timings else {
@@ -200,7 +200,6 @@ fn cmd_rule_timings(args: &[String]) -> ExitCode {
     print_duration("resolve_ms", t.resolve);
     print_duration("facts_ms", t.facts);
     print_duration("type_map_ms", t.type_map);
-    print_duration("native_type_map_ms", t.native_type_map);
     print_duration("rules_ms", t.rules);
     ExitCode::SUCCESS
 }
@@ -718,7 +717,7 @@ fn cmd_infer(dir: Option<PathBuf>) -> ExitCode {
     }
 }
 
-/// Product-driver corpus smoke: parse the Zend corpus through `php-cli`, build
+/// Product-driver corpus smoke: parse the Zend corpus through `phpxray`, build
 /// the shared project/reflection indexes, and run the analyzer at level max.
 /// Reports diagnostic counts and asserts 0 panics; over intentionally weird
 /// corpus code this is mostly a false-positive and stability gauge.
@@ -746,7 +745,7 @@ fn cmd_check_run(dir: Option<PathBuf>) -> ExitCode {
     let inputs = cases
         .iter()
         .map(|case| (case.label.clone(), case.source.clone()));
-    let (parsed, interner) = php_cli::parse_files(inputs);
+    let (parsed, interner) = phpxray::parse_files(inputs);
     let php_version = php_rules::PhpVersion::default();
     let level = 10;
     let pool = rayon::ThreadPoolBuilder::new()
@@ -755,7 +754,7 @@ fn cmd_check_run(dir: Option<PathBuf>) -> ExitCode {
         .build()
         .expect("build check thread pool");
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        pool.install(|| php_cli::analyze_parsed(&parsed, &interner, level, php_version, true))
+        pool.install(|| phpxray::analyze_parsed(&parsed, &interner, level, php_version, true))
     }));
     let (files, diags, panics, findings) = match outcome {
         Ok(report) => (
@@ -1367,7 +1366,7 @@ fn named_list(types: &[php_types::Type]) -> String {
     types
         .iter()
         .filter_map(|t| match t {
-            php_types::Type::Named { fqn, .. } => Some(fqn.as_str()),
+            php_types::Type::Named { fqn, .. } => Some(&**fqn),
             _ => None,
         })
         .collect::<Vec<_>>()

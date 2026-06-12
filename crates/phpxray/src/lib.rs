@@ -22,9 +22,11 @@ use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
 pub mod baseline;
+pub mod incremental;
 pub mod report;
 mod result_cache;
 pub mod suppress;
+pub mod watch;
 
 /// One parsed source file kept alive for analysis. The AST's symbols are interned
 /// into a **shared, project-wide** interner (see [`parse_files`]) so they resolve
@@ -62,6 +64,16 @@ impl Default for RunOptions {
     }
 }
 
+/// Read a source file, **lossily** decoding any non-UTF-8 bytes (legal in PHP
+/// source — string literals can carry arbitrary bytes) so the file is actually
+/// analyzed instead of being silently treated as empty. Returns an empty string
+/// only on a real I/O error (the file was already discovered, so this is rare).
+pub(crate) fn read_source_lossy(path: impl AsRef<std::path::Path>) -> String {
+    std::fs::read(path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default()
+}
+
 /// Parse `(path, source)` inputs into a single shared interner, returned alongside
 /// the parsed files. Every file's symbols live in this one interner, so a symbol
 /// from any file is resolvable while analyzing any other.
@@ -85,13 +97,17 @@ fn parse_files_with_mode_progress(
     inputs: impl IntoIterator<Item = (String, String, bool)>,
     progress: &Progress,
 ) -> (Vec<ParsedFile>, php_intern::Interner) {
-    let mut interner = php_intern::Interner::new();
+    // One shared, concurrent interner: every file parses into it (so symbols are
+    // global), but the interner takes `&self`, so files parse in parallel across
+    // rayon workers. `par_iter().map().collect()` preserves input order, keeping
+    // the downstream finding order deterministic.
+    let interner = php_intern::Interner::new();
     let inputs: Vec<_> = inputs.into_iter().collect();
     let counter = progress.counter(inputs.len(), "Parsing files");
     let parsed = inputs
-        .into_iter()
+        .into_par_iter()
         .map(|(path, source, analyze)| {
-            let (program, diagnostics) = php_parser::parse_into(&source, &mut interner);
+            let (program, diagnostics) = php_parser::parse_into(&source, &interner);
             counter.inc(1);
             ParsedFile {
                 path,
@@ -123,6 +139,8 @@ pub struct Finding {
 pub struct Report {
     pub findings: Vec<Finding>,
     pub files_analyzed: usize,
+    /// Scan-only files (indexed for symbols but not rule-checked), e.g. vendor.
+    pub files_scanned: usize,
     pub timings: Option<AnalysisTimings>,
 }
 
@@ -135,11 +153,11 @@ pub struct AnalysisTimings {
     pub read: Duration,
     pub parse: Duration,
     pub index: Duration,
+    pub infer_signatures: Duration,
     pub analyze: Duration,
     pub resolve: Duration,
     pub facts: Duration,
     pub type_map: Duration,
-    pub native_type_map: Duration,
     pub rules: Duration,
 }
 
@@ -148,7 +166,6 @@ struct FileTimings {
     resolve: Duration,
     facts: Duration,
     type_map: Duration,
-    native_type_map: Duration,
     rules: Duration,
 }
 
@@ -157,7 +174,6 @@ impl AnalysisTimings {
         self.resolve += file.resolve;
         self.facts += file.facts;
         self.type_map += file.type_map;
-        self.native_type_map += file.native_type_map;
         self.rules += file.rules;
     }
 }
@@ -200,7 +216,7 @@ pub fn run_with_options(config: &Config, root: &Path, options: RunOptions) -> Re
         .map(|f| {
             let input = (
                 rel_path(&f.path, root),
-                std::fs::read_to_string(&f.path).unwrap_or_default(),
+                read_source_lossy(&f.path),
                 f.analyze,
             );
             read.inc(1);
@@ -221,6 +237,7 @@ pub fn run_with_options(config: &Config, root: &Path, options: RunOptions) -> Re
         level: config.level.value(),
         php_version,
         treat_phpdoc_types_as_certain: config.treat_phpdoc_types_as_certain,
+        infer_untyped_signatures: config.infer_untyped_signatures,
         rule_options,
     };
     let cache = options.use_result_cache.then(|| {
@@ -293,6 +310,9 @@ pub fn analyze_parsed(
             level,
             php_version,
             treat_phpdoc_types_as_certain,
+            // Dev affordance (mirrors PHPXRAY_WATCH_FULL): `PHPXRAY_NO_INFER=1`
+            // disables untyped-signature inference for batch tooling / audits.
+            infer_untyped_signatures: std::env::var_os("PHPXRAY_NO_INFER").is_none(),
             rule_options: Level(level).rule_options(),
         },
         &Progress::hidden(),
@@ -305,6 +325,8 @@ struct AnalyzeParsedOptions {
     level: u8,
     php_version: php_rules::PhpVersion,
     treat_phpdoc_types_as_certain: bool,
+    /// Run whole-project signature inference for untyped functions before rules.
+    infer_untyped_signatures: bool,
     rule_options: RuleOptions,
 }
 
@@ -338,6 +360,27 @@ fn analyze_parsed_progress(
     indexing.finish();
     if let Some(t) = &mut timings {
         t.index = started.elapsed();
+    }
+
+    // Whole-project pre-pass: synthesize signatures for fully untyped
+    // functions/methods from their bodies and call sites, folding them into the
+    // shared reflection index so all downstream inference/rules see them. Runs
+    // sequentially before the parallel per-file analysis. Scan-only files
+    // contribute call sites and bodies too (they were reflected above).
+    if options.infer_untyped_signatures {
+        let started = Instant::now();
+        let inferring = progress.spinner("Inferring untyped signatures");
+        let programs: Vec<&php_ast::Program> = parsed.iter().map(|f| &f.program).collect();
+        php_infer::infer_and_apply(
+            &mut reflection,
+            &programs,
+            interner,
+            php_infer::InferOpts::default(),
+        );
+        inferring.finish();
+        if let Some(t) = &mut timings {
+            t.infer_signatures = started.elapsed();
+        }
     }
 
     let analyzed_count = parsed.iter().filter(|f| f.analyze).count();
@@ -386,6 +429,7 @@ fn analyze_parsed_progress(
     Report {
         findings,
         files_analyzed: analyzed_count,
+        files_scanned: parsed.len() - analyzed_count,
         timings: None,
     }
 }
@@ -424,11 +468,16 @@ fn analyze_one_file(f: &ParsedFile, ctx: &AnalysisContext<'_>) -> (Vec<Finding>,
     let facts = FileFacts::new(&f.program, ctx.interner);
     timings.facts = started.elapsed();
     let started = Instant::now();
-    let types = php_rules::type_map(ctx.reflection, &f.program, ctx.interner);
+    // One faceted inference pass. The native facet is computed only when
+    // `treatPhpDocTypesAsCertain` is off (otherwise nothing consults it), so the
+    // common case is a single pass.
+    let types = php_rules::type_map(
+        ctx.reflection,
+        &f.program,
+        ctx.interner,
+        !ctx.treat_phpdoc_types_as_certain,
+    );
     timings.type_map = started.elapsed();
-    let started = Instant::now();
-    let native_types = php_rules::native_type_map(ctx.reflection, &f.program, ctx.interner);
-    timings.native_type_map = started.elapsed();
     let fa = FileAnalysis {
         path: &f.path,
         source: &f.source,
@@ -438,7 +487,6 @@ fn analyze_one_file(f: &ParsedFile, ctx: &AnalysisContext<'_>) -> (Vec<Finding>,
         reflection: ctx.reflection,
         resolved_refs: &refs,
         types: &types,
-        native_types: &native_types,
         facts,
         php_version: ctx.php_version,
         treat_phpdoc_types_as_certain: ctx.treat_phpdoc_types_as_certain,
@@ -446,6 +494,7 @@ fn analyze_one_file(f: &ParsedFile, ctx: &AnalysisContext<'_>) -> (Vec<Finding>,
         check_nullables: ctx.rule_options.check_nullables,
         check_explicit_mixed: ctx.rule_options.check_explicit_mixed,
         check_implicit_mixed: ctx.rule_options.check_implicit_mixed,
+        reflect_cache: Default::default(),
     };
     let mut target_line_indices: HashMap<String, LineIndex> = HashMap::new();
     let started = Instant::now();
@@ -476,6 +525,16 @@ fn analyze_one_file(f: &ParsedFile, ctx: &AnalysisContext<'_>) -> (Vec<Finding>,
 struct DiscoveredFile {
     path: PathBuf,
     analyze: bool,
+}
+
+/// File discovery for external tooling (examples/benches). Returns
+/// `(root-relative path, absolute path, analyze)` triples in stable order.
+#[doc(hidden)]
+pub fn discover_files(config: &Config, root: &Path) -> Vec<(String, PathBuf, bool)> {
+    discover_inputs(config, root)
+        .into_iter()
+        .map(|f| (rel_path(&f.path, root), f.path.clone(), f.analyze))
+        .collect()
 }
 
 /// Collect analyzed and scan-only files. If a file is present in both sets, it
@@ -533,7 +592,11 @@ fn discover_paths(
         let base = root.join(entry_path);
         for found in WalkDir::new(&base)
             .into_iter()
-            .filter_entry(|entry| !hard_exclude.is_excluded(&rel_path(entry.path(), root)))
+            .filter_entry(|entry| {
+                let rel = rel_path(entry.path(), root);
+                !hard_exclude.is_excluded(&rel)
+                    && !(entry.file_type().is_dir() && is_nested_vendor_dir(&rel))
+            })
             .filter_map(Result::ok)
         {
             let p = found.path();
@@ -555,6 +618,19 @@ fn hard_exclude_matcher(config: &Config) -> ExcludeMatcher {
     let mut patterns = config.exclude.clone();
     patterns.extend(config.exclude_paths.analyse_and_scan.iter().cloned());
     ExcludeMatcher::new(&patterns)
+}
+
+/// Whether `rel` is a `vendor` directory nested inside another `vendor` tree
+/// (e.g. `vendor/rector/rector/vendor`). Composer never autoloads nested
+/// vendor dirs — packages that bundle their own dependencies (rector, some
+/// phars) ship *different versions* of libraries the project also uses
+/// directly, and indexing both makes the nested copy shadow the real one
+/// (symbol tables are last-wins). Pruning them matches runtime reality.
+fn is_nested_vendor_dir(rel: &str) -> bool {
+    let Some(prefix) = rel.strip_suffix("/vendor") else {
+        return false;
+    };
+    prefix.split('/').any(|c| c == "vendor")
 }
 
 /// `path` relative to `root` (forward slashes); falls back to the full path.
@@ -640,6 +716,42 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn nested_vendor_dirs_are_pruned_from_discovery() {
+        assert!(!is_nested_vendor_dir("vendor"));
+        assert!(!is_nested_vendor_dir("src/vendor"));
+        assert!(!is_nested_vendor_dir("vendor/nikic/php-parser"));
+        assert!(is_nested_vendor_dir("vendor/rector/rector/vendor"));
+        assert!(is_nested_vendor_dir("src/vendor/foo/vendor"));
+        // Only the nested `vendor` dir itself is the prune point.
+        assert!(!is_nested_vendor_dir("vendor/rector/rector/vendor/nikic"));
+
+        let dir = std::env::temp_dir().join(format!(
+            "phpxray-nested-vendor-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real = dir.join("vendor/pkg/lib");
+        let nested = dir.join("vendor/pkg/vendor/other/lib");
+        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(real.join("A.php"), "<?php class A {}\n").unwrap();
+        fs::write(nested.join("A.php"), "<?php class A { public function shadow(): void {} }\n")
+            .unwrap();
+
+        let config = Config::from_yaml("level: 0\npaths: []\nscanPaths:\n  - vendor\n").unwrap();
+        let files: Vec<String> = discover_inputs(&config, &dir)
+            .into_iter()
+            .map(|f| rel_path(&f.path, &dir))
+            .collect();
+        assert_eq!(files, ["vendor/pkg/lib/A.php"], "nested copy must be pruned");
+
+        let _ = fs::remove_dir_all(dir);
+    }
 
     /// Analyze `(path, src)` files at `level` over one shared interner.
     fn analyze(files: &[(&str, &str)], level: u8) -> Report {
@@ -1278,7 +1390,7 @@ excludePaths:
             .unwrap()
             .as_nanos();
         let dir =
-            std::env::temp_dir().join(format!("php-analyzer-{label}-{}-{now}", std::process::id()));
+            std::env::temp_dir().join(format!("phpxray-{label}-{}-{now}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }

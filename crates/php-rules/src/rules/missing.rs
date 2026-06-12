@@ -387,7 +387,7 @@ fn run_missing_return(fa: &FileAnalysis) -> Vec<Diagnostic> {
     walk::for_each_stmt(fa.program, &mut |s| match &s.kind {
         StmtKind::Function(f) => {
             let label = format!("Function {}()", interner.resolve(f.name));
-            check_body(fa, &label, s.span, &f.body, &f.return_type, &mut out);
+            check_body(fa, &label, f.name_span, &f.body, &f.return_type, &mut out);
         }
         StmtKind::Class(c) => check_class_methods(fa, c, interner, &mut out),
         _ => {}
@@ -429,13 +429,7 @@ fn check_class_methods(
         // Abstract/interface methods have no body — nothing to check.
         let Some(body) = &md.body else { continue };
         let label = format!("Method {}::{}()", class_name, interner.resolve(md.name));
-        // The AST `MethodDecl` carries no span of its own; point at the first body
-        // statement (best-effort), falling back to a zero span for empty bodies.
-        let span = body
-            .first()
-            .map(|s| s.span)
-            .unwrap_or_else(|| Span::new(0, 0));
-        check_body(fa, &label, span, body, &md.return_type, out);
+        check_body(fa, &label, md.name_span, body, &md.return_type, out);
     }
 }
 

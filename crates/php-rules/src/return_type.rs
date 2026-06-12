@@ -47,7 +47,6 @@ pub fn return_type_errors(
     program: &Program,
     interner: &Interner,
     types: &TypeMap,
-    native_types: &TypeMap,
     treat_phpdoc_certain: bool,
     check_nullables: bool,
     report_maybes: bool,
@@ -56,7 +55,6 @@ pub fn return_type_errors(
         index,
         interner,
         types,
-        native_types,
         treat_phpdoc_certain,
         check_nullables,
         report_maybes,
@@ -78,7 +76,6 @@ struct Cx<'a> {
     index: &'a ReflectionIndex,
     interner: &'a Interner,
     types: &'a TypeMap,
-    native_types: &'a TypeMap,
     treat_phpdoc_certain: bool,
     /// phpstan's `checkNullables` (level 8+). When `false`, `null` is stripped from
     /// the returned value's type before checking — a nullable value satisfies a
@@ -137,8 +134,12 @@ impl Cx<'_> {
     }
 
     fn check_return_expr(&self, e: &Expr, ret: &Ret, out: &mut Vec<Diagnostic>) {
-        // Unmapped (e.g. inside a closure the map leaves opaque) → `mixed` → lenient.
-        let actual = self.types.get(&key(e)).cloned().unwrap_or(Type::Mixed);
+        // Unmapped (rare) → `mixed` → lenient.
+        let actual = self
+            .types
+            .get(&key(e))
+            .map(|f| f.merged.clone())
+            .unwrap_or(Type::Mixed);
         // checkNullables gate (level < 8): strip `null` from the returned value.
         if !function_like::type_mismatch_reportable(
             self.index,
@@ -152,9 +153,9 @@ impl Cx<'_> {
         // treatPhpDocTypesAsCertain=false: suppress if the *native* types agree.
         if !self.treat_phpdoc_certain {
             let native = self
-                .native_types
+                .types
                 .get(&key(e))
-                .cloned()
+                .map(|f| f.native().clone())
                 .unwrap_or(Type::Mixed);
             if !function_like::type_mismatch_reportable(
                 self.index,
@@ -189,18 +190,8 @@ mod tests {
         assert!(!r.has_errors(), "parse errors in test source");
         let mut index = ReflectionIndex::new();
         index.add_file(&r.program, &r.interner);
-        let types = php_infer::type_map(&index, &r.program, &r.interner);
-        let native = php_infer::native_type_map(&index, &r.program, &r.interner);
-        return_type_errors(
-            &index,
-            &r.program,
-            &r.interner,
-            &types,
-            &native,
-            true,
-            true,
-            true,
-        )
+        let types = php_infer::type_map(&index, &r.program, &r.interner, true);
+        return_type_errors(&index, &r.program, &r.interner, &types, true, true, true)
         .into_iter()
         .map(|d| d.message)
         .collect()

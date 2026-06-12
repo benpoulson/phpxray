@@ -36,7 +36,7 @@ use php_ast::{
     MemberName, MethodDecl, Stmt, StmtKind,
 };
 use php_diagnostics::Diagnostic;
-use php_reflect::{reflect_class, reflect_function, resolve_ast_type};
+use php_reflect::resolve_ast_type;
 use php_resolve::{for_each_region, Scope};
 use php_types::Type;
 
@@ -114,7 +114,7 @@ fn maybe_iterable(t: &Type) -> bool {
     }
     let mut yes = false;
     let mut no = false;
-    for part in parts {
+    for part in parts.iter() {
         if definitely_iterable(part) {
             yes = true;
         } else if definitely_not_iterable(part) {
@@ -226,7 +226,7 @@ fn visit_function(
 fn visit_class(c: &ClassDecl, fa: &FileAnalysis, scope: &Scope, f: &mut impl FnMut(&FnScope)) {
     let reflected = c.name.map(|name| {
         let fqn = scope.qualify(fa.interner.resolve(name));
-        reflect_class(scope, fa.interner, &fqn, c)
+        fa.reflect_class(scope, &fqn, c)
     });
     let mut reflected_methods = reflected.as_ref().map(|r| r.methods.iter());
 
@@ -320,7 +320,7 @@ fn function_decl_return_type(fd: &FunctionDecl, fa: &FileAnalysis, scope: &Scope
     if fd.return_type.is_none() && !doc_has_return(fd.doc.as_deref()) {
         return None;
     }
-    Some(reflect_function(scope, fa.interner, fd).return_type)
+    Some(fa.reflect_function(scope, fd).return_type.clone())
 }
 
 fn doc_has_return(doc: Option<&str>) -> bool {

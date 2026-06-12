@@ -15,7 +15,7 @@ impl TempProject {
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "php-analyzer-{name}-{}-{unique}",
+            "phpxray-{name}-{}-{unique}",
             std::process::id()
         ));
         fs::create_dir_all(&root).unwrap();
@@ -35,7 +35,7 @@ impl TempProject {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        Command::new(env!("CARGO_BIN_EXE_php-analyzer"))
+        Command::new(env!("CARGO_BIN_EXE_phpxray"))
             .current_dir(&self.root)
             .args(args)
             .output()
@@ -54,14 +54,14 @@ fn stdout(output: &Output) -> String {
 }
 
 fn cache_file_count(project: &TempProject) -> usize {
-    let cache = project.root.join(".php-analyzer/cache/results-v1");
+    let cache = project.root.join(".phpxray/cache/results-v1");
     fs::read_dir(cache)
         .map(|entries| entries.filter_map(Result::ok).count())
         .unwrap_or(0)
 }
 
 fn write_config(root: &TempProject, yaml: &str) {
-    root.write("phpanalyzer.yaml", yaml);
+    root.write("phpxray.yaml", yaml);
 }
 
 #[test]
@@ -77,7 +77,7 @@ fn discovers_config_and_cli_paths_override_config_paths() {
     assert!(out.contains("src/bad.php"), "{out}");
     assert!(!out.contains("override/bad.php"), "{out}");
 
-    let overridden = p.run(["-c", "phpanalyzer.yaml", "override"]);
+    let overridden = p.run(["-c", "phpxray.yaml", "override"]);
     assert!(!overridden.status.success(), "{}", stdout(&overridden));
     let out = stdout(&overridden);
     assert!(out.contains("override/bad.php"), "{out}");
@@ -114,6 +114,66 @@ fn configured_baseline_suppresses_findings() {
     let output = p.run([] as [&str; 0]);
     assert!(output.status.success(), "{}", stdout(&output));
     assert!(stdout(&output).contains("[OK]"), "{}", stdout(&output));
+}
+
+#[test]
+fn stale_baseline_entries_do_not_nag() {
+    // A baseline entry whose finding has since been FIXED must not produce an
+    // ignore.unmatched error — going stale is the goal of a baseline. Explicit
+    // `ignore:` entries in the config keep following reportUnmatchedIgnored.
+    let p = TempProject::new("stale-baseline");
+    write_config(&p, "level: 0\npaths:\n  - src\nbaseline: baseline.yaml\n");
+    p.write(
+        "baseline.yaml",
+        "ignore:\n  - message: '#^unknown class `LongGoneClass`$#'\n    count: 1\n    path: src/ok.php\n",
+    );
+    p.write("src/ok.php", "<?php class Fine {}\n");
+
+    let output = p.run([] as [&str; 0]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    assert!(
+        !stdout(&output).contains("ignore.unmatched"),
+        "stale baseline entry must not nag: {}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn rules_check_inside_closure_and_arrow_bodies() {
+    // Closure/arrow-fn bodies are recorded in the file type map, so rules using
+    // `type_of` (here method.notFound) fire on a typed param inside them.
+    let p = TempProject::new("closure-bodies");
+    write_config(&p, "level: 6\npaths:\n  - src\n");
+    p.write("src/User.php", "<?php class User { public function name(): string { return \"\"; } }\n");
+    p.write(
+        "src/run.php",
+        "<?php\nfunction run(): void {\n  $f = function (User $u) { return $u->bogus(); };\n  $g = fn (User $u) => $u->alsoBogus();\n}\n",
+    );
+
+    let output = p.run([] as [&str; 0]);
+    let out = stdout(&output);
+    assert!(out.contains("User::bogus"), "closure body not checked: {out}");
+    assert!(out.contains("User::alsoBogus"), "arrow body not checked: {out}");
+}
+
+#[test]
+fn non_utf8_source_is_still_analyzed() {
+    // A PHP file with non-UTF-8 bytes (legal in PHP) must be analyzed, not
+    // silently treated as empty. We lossily decode invalid bytes.
+    let p = TempProject::new("non-utf8");
+    write_config(&p, "level: 0\npaths:\n  - src\n");
+    fs::create_dir_all(p.root.join("src")).unwrap();
+    // A real error, with a raw 0xFF/0xFE (invalid UTF-8) in a comment.
+    let bytes = b"<?php // \xFF\xFE latin1\nnew MissingNonUtf8Class();\n";
+    fs::write(p.root.join("src/bad.php"), bytes).unwrap();
+
+    let output = p.run([] as [&str; 0]);
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert!(
+        stdout(&output).contains("class.notFound"),
+        "non-UTF-8 file should still be analyzed: {}",
+        stdout(&output)
+    );
 }
 
 #[test]
@@ -222,9 +282,63 @@ fn result_cache_write_failure_is_nonfatal() {
     let p = TempProject::new("result-cache-write-failure");
     write_config(&p, "level: 0\npaths:\n  - src\n");
     p.write("src/bad.php", "<?php new MissingCacheWriteClass();\n");
-    p.write(".php-analyzer", "not a directory");
+    p.write(".phpxray", "not a directory");
 
     let output = p.run([] as [&str; 0]);
     assert!(!output.status.success(), "{}", stdout(&output));
     assert!(stdout(&output).contains("class.notFound"));
+}
+
+/// Whole-project signature inference: an untyped factory function in one file is
+/// inferred to return `User` from its body, so a bad method call on its result in
+/// another file is caught as `method.notFound` rather than swallowed as `mixed`.
+#[test]
+fn infers_untyped_return_across_files() {
+    let p = TempProject::new("infer-untyped-return");
+    write_config(&p, "level: 6\npaths:\n  - src\n");
+    p.write(
+        "src/user.php",
+        "<?php\nclass User { public function name(): string { return \"x\"; } }\nfunction getUser() { return new User(); }\n",
+    );
+    p.write(
+        "src/caller.php",
+        "<?php\nfunction run() { return getUser()->bogus(); }\n",
+    );
+
+    // On by default: the inferred return type makes the bad call concrete.
+    let on = p.run([] as [&str; 0]);
+    let out = stdout(&on);
+    assert!(out.contains("method.notFound"), "{out}");
+    assert!(out.contains("User::bogus"), "{out}");
+
+    // Disabled: getUser() stays `mixed`, so there is no method.notFound on User.
+    let off = p.run(["--no-infer-untyped"]);
+    let out = stdout(&off);
+    assert!(!out.contains("method.notFound"), "{out}");
+    assert!(!out.contains("User::bogus"), "{out}");
+}
+
+/// Call-site parameter inference: an untyped parameter is inferred from the
+/// argument types callers pass, flowing into the body so a member call on it
+/// resolves against the inferred class.
+#[test]
+fn infers_untyped_parameter_from_call_sites() {
+    let p = TempProject::new("infer-untyped-param");
+    write_config(&p, "level: 6\npaths:\n  - src\n");
+    p.write(
+        "src/code.php",
+        "<?php\nclass Widget { public function render(): string { return \"x\"; } }\n\
+         function show($w) { return $w->paint(); }\n\
+         function main() { return show(new Widget()); }\n",
+    );
+
+    let on = p.run([] as [&str; 0]);
+    let out = stdout(&on);
+    // $w inferred as Widget from the call site; Widget has no paint().
+    assert!(out.contains("method.notFound"), "{out}");
+    assert!(out.contains("Widget::paint"), "{out}");
+
+    let off = p.run(["--no-infer-untyped"]);
+    let out = stdout(&off);
+    assert!(!out.contains("Widget::paint"), "{out}");
 }

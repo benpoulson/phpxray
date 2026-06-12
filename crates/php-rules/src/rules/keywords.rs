@@ -639,7 +639,7 @@ mod tests {
 
     #[test]
     fn missing_absolute_require_path_is_flagged() {
-        let src = "<?php require '/definitely/missing/php-analyzer-test-file.php';";
+        let src = "<?php require '/definitely/missing/phpxray-test-file.php';";
         assert_eq!(
             codes(src, run_require_file_exists),
             ["require.fileNotFound"]
@@ -648,7 +648,7 @@ mod tests {
 
     #[test]
     fn missing_absolute_include_once_path_uses_specific_identifier() {
-        let src = "<?php include_once '/definitely/missing/php-analyzer-test-file.php';";
+        let src = "<?php include_once '/definitely/missing/phpxray-test-file.php';";
         assert_eq!(
             codes(src, run_require_file_exists),
             ["includeOnce.fileNotFound"]

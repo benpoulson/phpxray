@@ -55,7 +55,7 @@ use php_ast::{
 };
 use php_diagnostics::Diagnostic;
 use php_intern::Interner;
-use php_reflect::{reflect_class, reflect_function, Found, MethodReflection};
+use php_reflect::{Found, MethodReflection};
 use php_resolve::{for_each_region, Resolution, Scope};
 use php_types::Type;
 use std::collections::{HashMap, HashSet};
@@ -408,14 +408,9 @@ fn is_magic_method(lower: &str) -> bool {
     )
 }
 
-/// Best-effort span for a method (its body's first statement, else a zero span;
-/// `MethodDecl` carries no span of its own).
+/// The method-name token span.
 fn method_span(md: &MethodDecl) -> php_span::Span {
-    md.body
-        .as_ref()
-        .and_then(|b| b.first())
-        .map(|s| s.span)
-        .unwrap_or(php_span::Span::new(0, 0))
+    md.name_span
 }
 
 // ---------------------------------------------------------------------------
@@ -493,14 +488,12 @@ fn run_unused_private_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 } else {
                     "Property"
                 };
-                let span = pe
-                    .default
-                    .as_ref()
-                    .map(|d| d.span)
-                    .unwrap_or(php_span::Span::new(0, 0));
                 out.push(
-                    Diagnostic::error(span, format!("{kind} {display}::${name} is unused."))
-                        .with_code("property.unused"),
+                    Diagnostic::error(
+                        pe.name_span,
+                        format!("{kind} {display}::${name} is unused."),
+                    )
+                    .with_code("property.unused"),
                 );
             }
         }
@@ -808,7 +801,7 @@ fn collect_function_candidate(
     f: &FunctionDecl,
     out: &mut HashMap<CallableKey, PureCandidate>,
 ) {
-    let refl = reflect_function(scope, fa.interner, f);
+    let refl = fa.reflect_function(scope, f);
     if !refl.pure || callable_signature_disqualifies(&refl.params, f.doc.as_deref()) {
         return;
     }
@@ -817,7 +810,7 @@ fn collect_function_candidate(
         return;
     };
     out.insert(
-        CallableKey::Function(refl.fqn),
+        CallableKey::Function(refl.fqn.clone()),
         PureCandidate { deps, method: None },
     );
 }
@@ -830,7 +823,7 @@ fn collect_class_candidates(
 ) {
     let Some(name) = c.name else { return };
     let class_fqn = scope.qualify(fa.interner.resolve(name));
-    let class = reflect_class(scope, fa.interner, &class_fqn, c);
+    let class = fa.reflect_class(scope, &class_fqn, c);
     for m in &c.members {
         let Member::Method(md) = m else { continue };
         if !matches!(c.kind, ClassKind::Class | ClassKind::Enum) {
@@ -1079,14 +1072,14 @@ fn exact_method_call_key(
     if found.member.magic || found.member.is_static {
         return None;
     }
-    if !symbols::same_fqn(&found.declaring_class, &receiver_fqn) {
+    if !symbols::same_fqn(found.declaring_class, &receiver_fqn) {
         return None;
     }
     if !instance_dispatch_is_exact(fa, &receiver_fqn, &found) {
         return None;
     }
     Some(method_callable_key(
-        &found.declaring_class,
+        found.declaring_class,
         &found.member.name,
     ))
 }
@@ -1109,11 +1102,11 @@ fn exact_static_method_call_key(
     if found.member.magic || !found.member.is_static {
         return None;
     }
-    if !symbols::same_fqn(&found.declaring_class, &class_fqn) {
+    if !symbols::same_fqn(found.declaring_class, &class_fqn) {
         return None;
     }
     Some(method_callable_key(
-        &found.declaring_class,
+        found.declaring_class,
         &found.member.name,
     ))
 }
@@ -1140,7 +1133,7 @@ fn method_callable_key(class: &str, method: &str) -> CallableKey {
 
 fn named_type_fqn(t: &Type) -> Option<String> {
     match t {
-        Type::Named { fqn, .. } => Some(fqn.clone()),
+        Type::Named { fqn, .. } => Some(fqn.to_string()),
         Type::Nullable(inner) => named_type_fqn(inner),
         _ => None,
     }

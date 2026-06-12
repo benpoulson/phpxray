@@ -8,7 +8,7 @@ use crate::{decls, FileAnalysis, RuleEntry};
 use php_ast::{FunctionDecl, MethodDecl};
 use php_diagnostics::Diagnostic;
 use php_intern::Interner;
-use php_reflect::{reflect_class, reflect_function, FunctionReflection};
+use php_reflect::FunctionReflection;
 use php_resolve::Scope;
 use php_span::Span;
 use php_types::Type;
@@ -26,7 +26,7 @@ use php_types::Type;
 fn run_pure_function(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for_each_function(fa, |scope, f| {
-        let refl = reflect_function(scope, fa.interner, f);
+        let refl = fa.reflect_function(scope, f);
         if !is_marked_pure(f.doc.as_deref()) {
             return;
         }
@@ -59,7 +59,7 @@ fn run_pure_function(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_pure_method(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     decls::for_each_method(fa, |scope, fqn, c, m| {
-        let class = reflect_class(scope, fa.interner, fqn, c);
+        let class = fa.reflect_class(scope, fqn, c);
         let Some(refl) = class
             .methods
             .iter()
@@ -152,49 +152,11 @@ fn for_each_function(fa: &FileAnalysis, mut f: impl FnMut(&Scope, &FunctionDecl)
 }
 
 fn function_span(f: &FunctionDecl) -> Span {
-    for p in &f.params {
-        if let Some(t) = &p.ty {
-            return t.span;
-        }
-        if let Some(d) = &p.default {
-            return d.span;
-        }
-    }
-    if let Some(t) = &f.return_type {
-        return t.span;
-    }
-    if let Some(first) = f.body.first() {
-        return first.span;
-    }
-    f.attrs
-        .first()
-        .and_then(|g| g.attrs.first())
-        .map(|a| a.name.span)
-        .unwrap_or_else(|| Span::new(0, 0))
+    f.name_span
 }
 
 fn method_span(m: &MethodDecl) -> Span {
-    for p in &m.params {
-        if let Some(t) = &p.ty {
-            return t.span;
-        }
-        if let Some(d) = &p.default {
-            return d.span;
-        }
-    }
-    if let Some(t) = &m.return_type {
-        return t.span;
-    }
-    if let Some(body) = &m.body {
-        if let Some(first) = body.first() {
-            return first.span;
-        }
-    }
-    m.attrs
-        .first()
-        .and_then(|g| g.attrs.first())
-        .map(|a| a.name.span)
-        .unwrap_or_else(|| Span::new(0, 0))
+    m.name_span
 }
 
 pub(crate) static RULES: &[RuleEntry] = &[

@@ -16,7 +16,7 @@ pub(crate) struct CacheFileInput<'a> {
 }
 
 pub(crate) fn default_cache_dir(root: &Path) -> PathBuf {
-    root.join(".php-analyzer").join("cache").join("results-v1")
+    root.join(".phpxray").join("cache").join("results-v1")
 }
 
 pub(crate) fn key(
@@ -30,6 +30,18 @@ pub(crate) fn key(
     h.write_str("result-cache-v1");
     h.write_u64(SCHEMA_VERSION as u64);
     h.write_str(env!("CARGO_PKG_VERSION"));
+    // The package version never changes between dev builds, so also key on the
+    // running binary itself (size + mtime): an analyzer upgrade or rebuild must
+    // never serve results computed by older rule/inference code.
+    if let Ok(meta) = std::env::current_exe().and_then(std::fs::metadata) {
+        h.write_u64(meta.len());
+        if let Ok(d) = meta
+            .modified()
+            .map(|m| m.duration_since(std::time::UNIX_EPOCH).unwrap_or_default())
+        {
+            h.write_u64(d.as_secs());
+        }
+    }
     h.write_u64(php_version.id() as u64);
     h.write_u64(config.level.value() as u64);
     h.write_bool(rule_options.report_maybes);
@@ -37,6 +49,7 @@ pub(crate) fn key(
     h.write_bool(rule_options.check_explicit_mixed);
     h.write_bool(rule_options.check_implicit_mixed);
     h.write_bool(config.treat_phpdoc_types_as_certain);
+    h.write_bool(config.infer_untyped_signatures);
     h.write_bool(config.report_unmatched_ignored);
     write_config_paths(&mut h, config);
     write_ignore_entries(&mut h, &config.ignore);
@@ -59,6 +72,7 @@ pub(crate) fn load(cache_dir: &Path, key: &str) -> Option<Report> {
     Some(Report {
         findings: cached.findings.into_iter().map(Into::into).collect(),
         files_analyzed: cached.files_analyzed,
+        files_scanned: cached.files_scanned,
         timings: None,
     })
 }
@@ -127,6 +141,10 @@ fn write_baseline(h: &mut StableHasher, config: &Config, root: &Path) {
 struct CachedReport {
     schema_version: u32,
     files_analyzed: usize,
+    // Older cache entries predate this field; the binary-identity cache key
+    // makes that unreachable in practice, but stay lenient anyway.
+    #[serde(default)]
+    files_scanned: usize,
     findings: Vec<CachedFinding>,
 }
 
@@ -135,6 +153,7 @@ impl From<&Report> for CachedReport {
         Self {
             schema_version: SCHEMA_VERSION,
             files_analyzed: report.files_analyzed,
+            files_scanned: report.files_scanned,
             findings: report.findings.iter().map(CachedFinding::from).collect(),
         }
     }

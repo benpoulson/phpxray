@@ -99,7 +99,7 @@ pub enum Type {
     ClassString(Option<Box<Type>>),
     /// A class/interface/enum/trait, fully-qualified, with optional generic args.
     Named {
-        fqn: String,
+        fqn: std::sync::Arc<str>,
         args: Vec<Type>,
     },
     /// `self` / `static` / `parent` — resolved against the class context later.
@@ -107,11 +107,11 @@ pub enum Type {
     StaticType,
     Parent,
     /// A generic template variable (`T`).
-    TemplateVar(String),
+    TemplateVar(std::sync::Arc<str>),
     /// A literal-int type (`42`).
     LiteralInt(i64),
     /// A literal-string type (`'draft'`).
-    LiteralString(String),
+    LiteralString(std::sync::Arc<str>),
     /// An array shape `array{id: int, name?: string}` (or unsealed `…, ...`).
     Shape {
         fields: Vec<ShapeField>,
@@ -119,18 +119,18 @@ pub enum Type {
     },
     /// `T|null` shorthand.
     Nullable(Box<Type>),
-    Union(Vec<Type>),
-    Intersection(Vec<Type>),
+    Union(std::sync::Arc<[Type]>),
+    Intersection(std::sync::Arc<[Type]>),
     /// A conditional type `($subject is [not] target ? then : else)`.
     Conditional {
-        subject: String,
+        subject: std::sync::Arc<str>,
         negated: bool,
         target: Box<Type>,
         then: Box<Type>,
         els: Box<Type>,
     },
     /// A type we couldn't resolve or don't model; analysis treats it as `mixed`.
-    Unknown(String),
+    Unknown(std::sync::Arc<str>),
 }
 
 /// A callable signature.
@@ -232,7 +232,7 @@ impl Type {
         match flat.len() {
             0 => Type::Never,
             1 => flat.pop().unwrap(),
-            _ => Type::Union(flat),
+            _ => Type::Union(flat.into()),
         }
     }
 
@@ -251,14 +251,14 @@ impl Type {
         let mut flat = Vec::new();
         for p in parts {
             match p {
-                Type::Intersection(inner) => flat.extend(inner),
+                Type::Intersection(inner) => flat.extend(inner.iter().cloned()),
                 other => flat.push(other),
             }
         }
         dedup(&mut flat);
         match flat.len() {
             1 => flat.pop().unwrap(),
-            _ => Type::Intersection(flat),
+            _ => Type::Intersection(flat.into()),
         }
     }
 
@@ -271,9 +271,11 @@ impl Type {
     pub fn map(self, mapper: &mut impl FnMut(Type) -> Type) -> Type {
         let rebuilt = match self {
             Type::Nullable(inner) => Type::Nullable(Box::new(inner.map(mapper))),
-            Type::Union(parts) => Type::Union(parts.into_iter().map(|p| p.map(mapper)).collect()),
+            Type::Union(parts) => {
+                Type::Union(parts.iter().map(|p| p.clone().map(mapper)).collect())
+            }
             Type::Intersection(parts) => {
-                Type::Intersection(parts.into_iter().map(|p| p.map(mapper)).collect())
+                Type::Intersection(parts.iter().map(|p| p.clone().map(mapper)).collect())
             }
             Type::Array(Some(kv)) => {
                 let (k, v) = *kv;
@@ -328,8 +330,8 @@ impl Type {
 fn collect_union_members(t: Type, out: &mut Vec<Type>) {
     match t {
         Type::Union(inner) => inner
-            .into_iter()
-            .for_each(|q| collect_union_members(q, out)),
+            .iter()
+            .for_each(|q| collect_union_members(q.clone(), out)),
         Type::Nullable(inner) => {
             collect_union_members(*inner, out);
             out.push(Type::Null);
@@ -494,7 +496,7 @@ mod tests {
     fn display_composite() {
         assert_eq!(Type::Nullable(Box::new(Type::Int)).to_string(), "?int");
         assert_eq!(
-            Type::Union(vec![Type::Int, Type::String]).to_string(),
+            Type::Union(vec![Type::Int, Type::String].into()).to_string(),
             "int|string"
         );
         assert_eq!(
@@ -517,8 +519,8 @@ mod tests {
     fn smart_constructors_flatten_and_dedup() {
         assert_eq!(Type::union(vec![Type::Int]), Type::Int);
         assert_eq!(
-            Type::union(vec![Type::Int, Type::Union(vec![Type::String, Type::Int])]),
-            Type::Union(vec![Type::Int, Type::String])
+            Type::union(vec![Type::Int, Type::Union(vec![Type::String, Type::Int].into())]),
+            Type::Union(vec![Type::Int, Type::String].into())
         );
         assert_eq!(
             Type::Int.nullable().nullable(),

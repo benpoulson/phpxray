@@ -736,16 +736,16 @@ fn property_declared_type(
 
 fn collect_template_vars(ty: &Type, templates: &[String], out: &mut Vec<String>) {
     match ty {
-        Type::TemplateVar(name) if templates.iter().any(|t| t == name) => {
-            if !out.iter().any(|seen| seen == name) {
-                out.push(name.clone());
+        Type::TemplateVar(name) if templates.iter().any(|t| t.as_str() == &**name) => {
+            if !out.iter().any(|seen| seen.as_str() == &**name) {
+                out.push(name.to_string());
             }
         }
         Type::Nullable(inner) | Type::List(inner) | Type::ClassString(Some(inner)) => {
             collect_template_vars(inner, templates, out)
         }
         Type::Union(parts) | Type::Intersection(parts) => {
-            for part in parts {
+            for part in parts.iter() {
                 collect_template_vars(part, templates, out);
             }
         }
@@ -1236,12 +1236,8 @@ fn visit_stmts(stmts: &[Stmt], f: &mut impl FnMut(&Stmt)) {
     }
 }
 
-fn method_span(method: &php_ast::MethodDecl, fallback: Span) -> Span {
-    method
-        .body
-        .as_ref()
-        .and_then(|body| body.first().map(|st| st.span))
-        .unwrap_or(fallback)
+fn method_span(method: &php_ast::MethodDecl, _fallback: Span) -> Span {
+    method.name_span
 }
 
 #[cfg(test)]

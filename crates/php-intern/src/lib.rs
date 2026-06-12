@@ -10,11 +10,15 @@
 //! unbounded and rarely repeat, so they stay as `Span` + decoded value at the
 //! call site.
 //!
-//! The implementation is deliberately tiny and single-threaded. If profiling
-//! later demands a concurrent interner we can swap in `lasso`, but the public
-//! `Symbol`/`Interner` surface is meant to stay stable.
+//! The implementation is backed by `lasso::ThreadedRodeo`, a concurrent interner:
+//! [`Interner::intern`] takes `&self`, so many threads can intern into one shared
+//! interner at once (the parser parallelises file parsing over a single
+//! project-wide interner). Reads ([`Interner::resolve`]) are lock-free, keeping
+//! the analysis hot path — which only ever resolves — as cheap as before. The
+//! public `Symbol`/`Interner` surface is unchanged except that `intern` no longer
+//! needs `&mut`.
 
-use std::collections::HashMap;
+use lasso::{Key, Spur, ThreadedRodeo};
 
 /// An interned string, cheap to copy and compare.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -26,6 +30,18 @@ impl Symbol {
     pub fn as_u32(self) -> u32 {
         self.0
     }
+
+    #[inline]
+    fn from_spur(spur: Spur) -> Symbol {
+        // `Spur::into_usize` is the 0-based insertion index; it always fits u32
+        // (no PHP project has 4 billion distinct identifiers).
+        Symbol(spur.into_usize() as u32)
+    }
+
+    #[inline]
+    fn to_spur(self) -> Spur {
+        Spur::try_from_usize(self.0 as usize).expect("valid symbol index")
+    }
 }
 
 impl std::fmt::Debug for Symbol {
@@ -34,12 +50,11 @@ impl std::fmt::Debug for Symbol {
     }
 }
 
-/// An arena of interned strings. Resolve a [`Symbol`] back to its text with
-/// [`Interner::resolve`].
+/// A concurrent arena of interned strings. Resolve a [`Symbol`] back to its text
+/// with [`Interner::resolve`].
 #[derive(Default)]
 pub struct Interner {
-    map: HashMap<Box<str>, u32>,
-    strings: Vec<Box<str>>,
+    rodeo: ThreadedRodeo,
 }
 
 impl Interner {
@@ -48,32 +63,24 @@ impl Interner {
     }
 
     /// Intern `s`, returning a stable [`Symbol`]. Interning the same text twice
-    /// yields the same symbol.
-    pub fn intern(&mut self, s: &str) -> Symbol {
-        // `HashMap<Box<str>, _>` can be queried by `&str` since `Box<str>:
-        // Borrow<str>`, so the hot path allocates nothing on a cache hit.
-        if let Some(&id) = self.map.get(s) {
-            return Symbol(id);
-        }
-        let id = self.strings.len() as u32;
-        let boxed: Box<str> = s.into();
-        self.strings.push(boxed.clone());
-        self.map.insert(boxed, id);
-        Symbol(id)
+    /// — from any thread — yields the same symbol.
+    #[inline]
+    pub fn intern(&self, s: &str) -> Symbol {
+        Symbol::from_spur(self.rodeo.get_or_intern(s))
     }
 
     /// Resolve a symbol previously produced by this interner.
     #[inline]
     pub fn resolve(&self, sym: Symbol) -> &str {
-        &self.strings[sym.0 as usize]
+        self.rodeo.resolve(&sym.to_spur())
     }
 
     pub fn len(&self) -> usize {
-        self.strings.len()
+        self.rodeo.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.strings.is_empty()
+        self.rodeo.is_empty()
     }
 }
 
@@ -83,7 +90,7 @@ mod tests {
 
     #[test]
     fn interns_and_resolves() {
-        let mut i = Interner::new();
+        let i = Interner::new();
         let a = i.intern("array");
         let b = i.intern("array");
         let c = i.intern("string");

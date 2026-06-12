@@ -744,22 +744,13 @@ fn is_magic_method(lower: &str) -> bool {
 }
 
 fn ec_span(ec: &php_ast::EnumCaseDecl) -> php_span::Span {
-    // EnumCaseDecl has no span; if it has a value, point at the value, else fall
-    // back to a zero span (the diagnostic message still names the case).
-    ec.value
-        .as_ref()
-        .map(|v| v.span)
-        .unwrap_or(php_span::Span::new(0, 0))
+    // Point at the case-name token.
+    ec.name_span
 }
 
 fn enum_member_span(c: &ClassDecl) -> php_span::Span {
-    // Use the enum's name token span when available; otherwise the backing type;
-    // otherwise a zero span.
-    c.backing
-        .as_ref()
-        .map(|t| t.span)
-        .or_else(|| c.extends.first().map(|n| n.span))
-        .unwrap_or(php_span::Span::new(0, 0))
+    // The class-like's name token (the `class` keyword for anonymous classes).
+    c.name_span
 }
 
 // ---------------------------------------------------------------------------
@@ -821,15 +812,10 @@ fn run_duplicate_declaration(fa: &FileAnalysis) -> Vec<Diagnostic> {
             if let Member::Property(pd) = m {
                 for pe in &pd.props {
                     let name = fa.interner.resolve(pe.name).to_string();
-                    let span = pe
-                        .default
-                        .as_ref()
-                        .map(|d| d.span)
-                        .unwrap_or(enum_member_span(c));
                     if !props.insert(name.clone()) {
                         out.push(
                             Diagnostic::error(
-                                span,
+                                pe.name_span,
                                 format!("Cannot redeclare property {display}::${name}."),
                             )
                             .with_code(dup_code(c.kind, "Property")),
@@ -847,10 +833,7 @@ fn run_duplicate_declaration(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 if !props.insert(name.clone()) {
                     out.push(
                         Diagnostic::error(
-                            p.default
-                                .as_ref()
-                                .map(|d| d.span)
-                                .unwrap_or(enum_member_span(c)),
+                            p.span,
                             format!("Cannot redeclare property {display}::${name}."),
                         )
                         .with_code(dup_code(c.kind, "Property")),
@@ -868,7 +851,7 @@ fn run_duplicate_declaration(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 if !methods.insert(key) {
                     out.push(
                         Diagnostic::error(
-                            enum_member_span(c),
+                            md.name_span,
                             format!("Cannot redeclare method {display}::{raw}()."),
                         )
                         .with_code(dup_code(c.kind, "Method")),
@@ -1317,12 +1300,13 @@ fn check_promoted_params(
     }
 }
 
-/// A best-effort span for a promoted parameter list (params carry no span; use a
-/// default's span if present, else a zero span).
+/// The span of the first promoted parameter (else the first parameter).
 fn promoted_span(params: &[Param]) -> php_span::Span {
     params
         .iter()
-        .find_map(|p| p.default.as_ref().map(|d| d.span))
+        .find(|p| !p.modifiers.is_empty())
+        .or_else(|| params.first())
+        .map(|p| p.span)
         .unwrap_or(php_span::Span::new(0, 0))
 }
 
@@ -2559,7 +2543,7 @@ fn substitute_type(ty: &Type, subst: &HashMap<String, Type>) -> Type {
         return ty.clone();
     }
     match ty {
-        Type::TemplateVar(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
+        Type::TemplateVar(name) => subst.get(&**name).cloned().unwrap_or_else(|| ty.clone()),
         Type::Nullable(inner) => Type::Nullable(Box::new(substitute_type(inner, subst))),
         Type::Union(parts) => {
             Type::union(parts.iter().map(|p| substitute_type(p, subst)).collect())
@@ -2902,7 +2886,7 @@ fn collect_known_traits_in_type(
             }
         }
         Type::Union(parts) | Type::Intersection(parts) => {
-            for part in parts {
+            for part in parts.iter() {
                 collect_known_traits_in_type(fa, part, seen, out);
             }
         }
@@ -3249,10 +3233,10 @@ fn sealed_docs(fa: &FileAnalysis) -> HashMap<String, SealedDocs> {
 
 fn collect_allowed_exact_subtypes(t: &Type, out: &mut Vec<String>) {
     match t {
-        Type::Named { fqn, .. } => out.push(fqn.clone()),
+        Type::Named { fqn, .. } => out.push(fqn.to_string()),
         Type::Nullable(inner) => collect_allowed_exact_subtypes(inner, out),
         Type::Union(parts) => {
-            for part in parts {
+            for part in parts.iter() {
                 collect_allowed_exact_subtypes(part, out);
             }
         }
@@ -3378,7 +3362,7 @@ fn required_interface_target(fa: &FileAnalysis, required_ty: &Type) -> Option<Mi
         return None;
     }
     Some(MissingRequirement {
-        fqn: fqn.clone(),
+        fqn: fqn.to_string(),
         ty_display: required_ty.to_string(),
     })
 }
@@ -3391,10 +3375,10 @@ fn object_class_names(t: &Type) -> Vec<String> {
 
 fn collect_object_class_names(t: &Type, out: &mut Vec<String>) {
     match t {
-        Type::Named { fqn, .. } => out.push(fqn.clone()),
+        Type::Named { fqn, .. } => out.push(fqn.to_string()),
         Type::Nullable(inner) => collect_object_class_names(inner, out),
         Type::Union(parts) | Type::Intersection(parts) => {
-            for p in parts {
+            for p in parts.iter() {
                 collect_object_class_names(p, out);
             }
         }
@@ -3640,6 +3624,22 @@ mod tests {
         testutil::{codes, codes_version, run},
         PhpVersion,
     };
+
+    // A member-level diagnostic must point at the member's own name token, not the
+    // old `1:1` fallback (member nodes used to lack a name span).
+    #[test]
+    fn duplicate_member_diagnostic_points_at_member_name() {
+        let src = "<?php class C { function foo() {} function foo() {} }";
+        let diags = run(src, run_duplicate_declaration);
+        assert!(!diags.is_empty(), "expected a duplicate.declaration finding");
+        let span = diags[0].primary;
+        assert!(span.start > 0, "diagnostic must not sit at offset 0 (the 1:1 bug)");
+        assert_eq!(
+            &src[span.start as usize..span.end as usize],
+            "foo",
+            "diagnostic should span the member name token"
+        );
+    }
 
     // --- attribute usage (target / repeatable / not-an-attribute) --------
 

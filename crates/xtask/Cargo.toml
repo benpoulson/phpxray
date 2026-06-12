@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# Dev-only tooling — never shipped to users.
+[package.metadata.dist]
+dist = false
+
 [lib]
 name = "xtask"
 path = "src/lib.rs"
@@ -25,7 +29,7 @@ php-reflect.workspace = true
 php-types.workspace = true
 php-infer.workspace = true
 php-rules.workspace = true
-php-cli.workspace = true
+phpxray.workspace = true
 php-config.workspace = true
 rayon.workspace = true
 walkdir.workspace = true

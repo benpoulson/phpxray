@@ -18,8 +18,53 @@ use php_resolve::{for_each_region, Scope};
 use php_types::Type;
 use std::collections::HashMap;
 
-/// Inferred type of each expression, keyed by its span (start, end).
-pub type TypeMap = HashMap<(u32, u32), Type>;
+/// Per-node inferred type with both the **merged** (PHPDoc-refined) and
+/// **native-only** views. One inference pass produces both, so the hot path is
+/// walked once and there is structurally a single map (no separate `native_types`
+/// for a rule to double-report against). The `native` facet is `None` when not
+/// separately computed — the run treats PHPDoc types as certain, so nothing ever
+/// consults it (it is gated behind `treatPhpDocTypesAsCertain: false`), and
+/// callers fall back to the merged type.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Facets {
+    pub merged: Type,
+    /// Boxed: absent in the common (`treatPhpDocTypesAsCertain: true`) case, so
+    /// the map entry stays one `Type` + a pointer rather than two inline `Type`s.
+    pub native: Option<Box<Type>>,
+}
+
+impl Facets {
+    /// The native-only facet, falling back to the merged type when the native
+    /// facet was not separately computed (i.e. it is never consulted).
+    pub fn native(&self) -> &Type {
+        self.native.as_deref().unwrap_or(&self.merged)
+    }
+}
+
+/// Inferred [`Facets`] for each expression, keyed by its span (start, end).
+pub type TypeMap = HashMap<(u32, u32), Facets>;
+
+/// Internal single-facet recording map — what the flow recorder fills for one
+/// view. The public [`TypeMap`] is assembled from one or two of these.
+type RawMap = HashMap<(u32, u32), Type>;
+
+/// Assemble the public faceted map from the merged raw map plus an optional
+/// native raw map (present only when `treatPhpDocTypesAsCertain: false`).
+fn facet(merged: RawMap, native: Option<RawMap>) -> TypeMap {
+    match native {
+        None => merged
+            .into_iter()
+            .map(|(k, m)| (k, Facets { merged: m, native: None }))
+            .collect(),
+        Some(mut native) => merged
+            .into_iter()
+            .map(|(k, m)| {
+                let n = native.remove(&k).map(Box::new);
+                (k, Facets { merged: m, native: n })
+            })
+            .collect(),
+    }
+}
 
 #[cfg(test)]
 fn key(span: php_span::Span) -> (u32, u32) {
@@ -27,20 +72,19 @@ fn key(span: php_span::Span) -> (u32, u32) {
     (r.start as u32, r.end as u32)
 }
 
-/// Build the (merged native+PHPDoc) type map for one parsed file.
-pub fn type_map(reflection: &ReflectionIndex, program: &Program, interner: &Interner) -> TypeMap {
-    build(reflection, program, interner, false)
-}
-
-/// Build the **native**-only type map: types inferred ignoring PHPDoc (member
-/// accesses use `native_ty`/`native_return`, arrays are untyped). Backs the
-/// `treatPhpDocTypesAsCertain: false` native-level checking.
-pub fn native_type_map(
+/// Build the faceted type map for one parsed file. The merged (PHPDoc-refined)
+/// facet is always computed; the native-only facet is computed only when
+/// `want_native` (i.e. `treatPhpDocTypesAsCertain: false`) — otherwise it is never
+/// consulted, so this is a single inference pass for the common case.
+pub fn type_map(
     reflection: &ReflectionIndex,
     program: &Program,
     interner: &Interner,
+    want_native: bool,
 ) -> TypeMap {
-    build(reflection, program, interner, true)
+    let merged = build(reflection, program, interner, false);
+    let native = want_native.then(|| build(reflection, program, interner, true));
+    facet(merged, native)
 }
 
 /// Build a contextual type map for a single function-like body under callback
@@ -54,11 +98,33 @@ pub fn contextual_body_type_map(
     class: Option<String>,
     params: &[ParamReflection],
     inferred_params: &[Type],
-    native: bool,
+    want_native: bool,
     body: &[php_ast::Stmt],
 ) -> TypeMap {
+    let merged = contextual_raw(
+        reflection, scope, interner, class.clone(), params, inferred_params, false, body,
+    );
+    let native = want_native.then(|| {
+        contextual_raw(
+            reflection, scope, interner, class, params, inferred_params, true, body,
+        )
+    });
+    facet(merged, native)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn contextual_raw(
+    reflection: &ReflectionIndex,
+    scope: &Scope,
+    interner: &Interner,
+    class: Option<String>,
+    params: &[ParamReflection],
+    inferred_params: &[Type],
+    native: bool,
+    body: &[php_ast::Stmt],
+) -> RawMap {
     let vars = contextual_param_vars(params, inferred_params, native);
-    let mut map = TypeMap::new();
+    let mut map = RawMap::new();
     record_scope(
         reflection, scope, interner, class, vars, native, None, body, &mut map,
     );
@@ -70,8 +136,8 @@ fn build(
     program: &Program,
     interner: &Interner,
     native: bool,
-) -> TypeMap {
-    let mut map = TypeMap::new();
+) -> RawMap {
+    let mut map = RawMap::new();
     for_each_region(&program.stmts, interner, |scope, region| {
         // Global scope of this region.
         record_scope(
@@ -153,11 +219,23 @@ fn collect_scope(
     interner: &Interner,
     s: &php_ast::Stmt,
     native: bool,
-    map: &mut TypeMap,
+    map: &mut RawMap,
 ) {
     match &s.kind {
         StmtKind::Function(f) => {
-            let refl = reflect_function(scope, interner, f);
+            // Prefer the stored index reflection so whole-project signature
+            // inference (inferred parameter/return types) flows into the body. In
+            // native mode `seed_type` still reads `native_ty`, so inferred
+            // (PHPDoc-grade) params never leak into native-level checking.
+            let fqn = scope.qualify(interner.resolve(f.name));
+            let fresh;
+            let refl = match reflection.function(&fqn) {
+                Some(s) => s,
+                None => {
+                    fresh = reflect_function(scope, interner, f);
+                    &fresh
+                }
+            };
             let vars = refl
                 .params
                 .iter()
@@ -183,7 +261,15 @@ fn collect_scope(
         StmtKind::Class(c) => {
             let Some(name) = c.name else { return };
             let fqn = scope.qualify(interner.resolve(name));
-            let cls = reflect_class(scope, interner, &fqn, c);
+            // Prefer the stored index reflection (see the function arm above).
+            let fresh;
+            let cls = match reflection.class(&fqn) {
+                Some(s) => s,
+                None => {
+                    fresh = reflect_class(scope, interner, &fqn, c);
+                    &fresh
+                }
+            };
             for m in &c.members {
                 let Member::Method(md) = m else { continue };
                 let Some(body) = &md.body else { continue };
@@ -203,7 +289,7 @@ fn collect_scope(
                 vars.insert(
                     "this".to_string(),
                     Type::Named {
-                        fqn: fqn.clone(),
+                        fqn: fqn.as_str().into(),
                         args: Vec::new(),
                     },
                 );
@@ -240,7 +326,7 @@ fn record_scope(
     native: bool,
     generator_send: Option<Type>,
     body: &[php_ast::Stmt],
-    map: &mut TypeMap,
+    map: &mut RawMap,
 ) {
     let mut ctx = TypeCtx::new(reflection, scope, interner);
     ctx.class = class;
@@ -258,22 +344,29 @@ mod tests {
     use super::*;
     use php_ast::{Expr, ExprKind, StmtKind};
 
-    /// Build the type map for `src` (parsed + self-reflected).
-    fn build(src: &str) -> (TypeMap, php_parser::ParseResult) {
+    /// Build the merged type map for `src` (parsed + self-reflected), flattened to
+    /// a raw `span → Type` map so the per-test lookups stay simple.
+    fn build(src: &str) -> (RawMap, php_parser::ParseResult) {
         let r = php_parser::parse(src);
         assert!(!r.has_errors(), "parse errors: {src}");
         let mut reflection = ReflectionIndex::with_builtins();
         reflection.add_file(&r.program, &r.interner);
-        let map = type_map(&reflection, &r.program, &r.interner);
+        let map = type_map(&reflection, &r.program, &r.interner, false)
+            .into_iter()
+            .map(|(k, f)| (k, f.merged))
+            .collect();
         (map, r)
     }
 
-    fn build_native(src: &str) -> (TypeMap, php_parser::ParseResult) {
+    fn build_native(src: &str) -> (RawMap, php_parser::ParseResult) {
         let r = php_parser::parse(src);
         assert!(!r.has_errors(), "parse errors: {src}");
         let mut reflection = ReflectionIndex::with_builtins();
         reflection.add_file(&r.program, &r.interner);
-        let map = native_type_map(&reflection, &r.program, &r.interner);
+        let map = type_map(&reflection, &r.program, &r.interner, true)
+            .into_iter()
+            .map(|(k, f)| (k, f.native().clone()))
+            .collect();
         (map, r)
     }
 
@@ -346,7 +439,7 @@ mod tests {
         ty_of_last_var_in(&map, &r, name)
     }
 
-    fn ty_of_last_var_in(map: &TypeMap, r: &php_parser::ParseResult, name: &str) -> String {
+    fn ty_of_last_var_in(map: &RawMap, r: &php_parser::ParseResult, name: &str) -> String {
         let mut found: Option<String> = None;
         walk::for_each_expr(&r.program, &mut |e| {
             let ExprKind::Variable(sym) = &e.kind else {
@@ -1056,7 +1149,7 @@ mod tests {
                 return;
             };
             if r.interner.resolve(*sym) == "label" {
-                found = map.get(&key(e.span)).map(ToString::to_string);
+                found = map.get(&key(e.span)).map(|f| f.merged.to_string());
             }
         });
         assert_eq!(found.as_deref(), Some("string"));

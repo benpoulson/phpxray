@@ -49,9 +49,7 @@ use php_ast::{
 };
 use php_diagnostics::Diagnostic;
 use php_infer::TypeCtx;
-use php_reflect::{
-    reflect_class, reflect_function, resolve_ast_type, resolve_doc_type, ParamReflection,
-};
+use php_reflect::{resolve_ast_type, resolve_doc_type, ParamReflection};
 use php_resolve::{for_each_region, Resolution, Scope};
 use php_types::Type;
 use std::collections::HashMap;
@@ -139,7 +137,7 @@ fn flag_unused_members(
 fn flatten_type_atoms(ty: &Type, out: &mut Vec<Type>) {
     match ty {
         Type::Union(parts) => {
-            for p in parts {
+            for p in parts.iter() {
                 flatten_type_atoms(p, out);
             }
         }
@@ -512,7 +510,9 @@ fn check_closure(
 }
 
 /// A fresh inference context seeded with `params`' declared types (untyped →
-/// `mixed`). Used for closures/arrow-fns, which the file type map leaves opaque.
+/// `mixed`), used to collect a closure/arrow-fn's returned types while threading
+/// its own flow environment (the too-wide-return check needs the return set, not
+/// per-node lookups).
 fn local_ctx<'a>(fa: &'a FileAnalysis, scope: &'a Scope, params: &[Param]) -> TypeCtx<'a> {
     let mut ctx = TypeCtx::new(fa.reflection, scope, fa.interner);
     for p in params {
@@ -1112,7 +1112,7 @@ fn static_class_may_be_current(class: &Expr, class_fqn: &str, ctx: &TypeCtx<'_>)
 
 fn sole_class(ty: &Type) -> Option<String> {
     match ty {
-        Type::Named { fqn, .. } => Some(fqn.clone()),
+        Type::Named { fqn, .. } => Some(fqn.to_string()),
         Type::Nullable(inner) => sole_class(inner),
         _ => None,
     }
@@ -1200,7 +1200,7 @@ fn check_function_param_out(
     scope: &Scope,
     out: &mut Vec<Diagnostic>,
 ) {
-    let refl = reflect_function(scope, fa.interner, f);
+    let refl = fa.reflect_function(scope, f);
     let templates = doc_templates(f.doc.as_deref());
     let desc = format!("Function {}()", refl.fqn);
     check_param_out_too_wide_body(
@@ -1273,7 +1273,7 @@ fn check_class_param_out_methods(
         return;
     };
     let class_fqn = scope.qualify(fa.interner.resolve(class_name));
-    let class_refl = reflect_class(scope, fa.interner, &class_fqn, c);
+    let class_refl = fa.reflect_class(scope, &class_fqn, c);
     let class_templates = doc_templates(c.doc.as_deref());
     for member in &c.members {
         let Member::Method(md) = member else {

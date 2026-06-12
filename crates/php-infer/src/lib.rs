@@ -19,6 +19,7 @@ mod definedness;
 mod flow;
 pub mod refine;
 mod returns;
+pub mod signatures;
 mod type_map;
 
 pub use assign::{
@@ -28,7 +29,8 @@ pub use assign::{
 pub use const_eval::{eval_const, ConstVal};
 pub use definedness::{undefined_variables, UndefVar};
 pub use refine::{strip_false, strip_falsy, strip_null_lenient, strip_null_strict};
-pub use type_map::{contextual_body_type_map, native_type_map, type_map, TypeMap};
+pub use signatures::{infer_and_apply, InferOpts};
+pub use type_map::{contextual_body_type_map, type_map, Facets, TypeMap};
 
 use php_ast::{
     Arg, ArrowFn, BinOp, CastKind, ClosureExpr, Expr, ExprKind, MemberName, Name, Param, UnOp,
@@ -228,7 +230,7 @@ impl<'a> TypeCtx<'a> {
             return self
                 .class
                 .clone()
-                .map(|fqn| Type::Named { fqn, args: vec![] })
+                .map(|fqn| Type::Named { fqn: fqn.into(), args: vec![] })
                 .unwrap_or(Type::Mixed);
         }
         self.vars.get(name).cloned().unwrap_or(Type::Mixed)
@@ -414,12 +416,23 @@ impl<'a> TypeCtx<'a> {
             // `array_values(array<K,V>)` → `list<V>`.
             "array_values" => Some(Type::List(Box::new(self.array_value_type(args.first()?)?))),
             "array_column" => self.array_column_return(args),
-            // These keep the value type (keys may change, but value type holds);
-            // returning the input array type is correct and false-positive-safe.
-            "array_filter" | "array_reverse" | "array_unique" | "array_slice" | "array_splice"
-            | "array_pad" | "array_diff" | "array_intersect" => {
+            // These keep the value type AND re-index integer keys (default
+            // flags), so a list stays a list; returning the input type holds.
+            "array_reverse" | "array_slice" | "array_splice" | "array_pad" => {
                 match self.infer(&args.first()?.value) {
                     t @ (Type::Array(_) | Type::List(_)) => Some(t),
+                    _ => None,
+                }
+            }
+            // These keep the value type but *preserve keys while dropping
+            // entries* — a list comes out with holes, i.e. `array<int, V>`,
+            // NOT `list<V>` (phpstan models this; `arrayValues.list` relies
+            // on the distinction: `array_values(array_filter($list))` is a
+            // meaningful call).
+            "array_filter" | "array_unique" | "array_diff" | "array_intersect" => {
+                match self.infer(&args.first()?.value) {
+                    Type::List(v) => Some(Type::Array(Some(Box::new((Type::Int, *v))))),
+                    t @ Type::Array(_) => Some(t),
                     _ => None,
                 }
             }
@@ -476,7 +489,26 @@ impl<'a> TypeCtx<'a> {
             return None;
         }
         let ret = self.callback_return_type(callback, &inferred_params)?;
-        (!template_observation_is_imprecise(&ret)).then(|| Type::List(Box::new(ret)))
+        if template_observation_is_imprecise(&ret) {
+            return None;
+        }
+        // With multiple arrays PHP re-indexes sequentially (a list); with one
+        // array the input's KEYS are preserved, so the result is a list only
+        // when the input is one. `array_map($cb, array_filter($list))` keeps
+        // the filter's holes — claiming `list` here would false-flag the
+        // `array_values()` call that re-indexes it.
+        if args.len() > 2 {
+            return Some(Type::List(Box::new(ret)));
+        }
+        match self.infer(&args.get(1)?.value) {
+            Type::List(_) => Some(Type::List(Box::new(ret))),
+            input @ (Type::Array(_) | Type::Shape { .. } | Type::Iterable(_)) => {
+                let key = arrays::array_key_type(&input)
+                    .unwrap_or_else(|| Type::union(vec![Type::Int, Type::String]));
+                Some(Type::Array(Some(Box::new((key, ret)))))
+            }
+            _ => None,
+        }
     }
 
     fn array_column_return(&self, args: &[Arg]) -> Option<Type> {
@@ -588,7 +620,7 @@ impl<'a> TypeCtx<'a> {
         let (fqn, args) = receiver_named_parts(recv_ty)?;
         self.index.class(fqn)?;
         (!args.is_empty()).then(|| Type::Named {
-            fqn: fqn.to_string(),
+            fqn: fqn.into(),
             args: args.to_vec(),
         })
     }
@@ -604,7 +636,7 @@ impl<'a> TypeCtx<'a> {
         let mut args = args.to_vec();
         args[replace_at] = value;
         Some(Type::Named {
-            fqn: fqn.to_string(),
+            fqn: fqn.into(),
             args,
         })
     }
@@ -969,7 +1001,7 @@ impl<'a> TypeCtx<'a> {
                     self.bound_call_return(&found.member.params, &found.member.return_type, args);
                 let params: Vec<String> =
                     found.member.params.iter().map(|p| p.name.clone()).collect();
-                let body = self.index.method_body(&found.declaring_class, &name);
+                let body = self.index.method_body(found.declaring_class, &name);
                 let refined = self.refine_return(&declared, body, &params, args, Some(fqn.clone()));
                 self.bind_relative(refined, &fqn)
             }
@@ -1012,13 +1044,15 @@ impl<'a> TypeCtx<'a> {
                 .unwrap_or(Type::Callable(None));
         }
         match self.index.find_method(&fqn, &name) {
-            Some(found) if self.native => self.bind_relative(found.member.native_return, &fqn),
+            Some(found) if self.native => {
+                self.bind_relative(found.member.native_return.clone(), &fqn)
+            }
             Some(found) => {
                 let declared =
                     self.bound_call_return(&found.member.params, &found.member.return_type, args);
                 let params: Vec<String> =
                     found.member.params.iter().map(|p| p.name.clone()).collect();
-                let body = self.index.method_body(&found.declaring_class, &name);
+                let body = self.index.method_body(found.declaring_class, &name);
                 let refined = self.refine_return(&declared, body, &params, args, Some(fqn.clone()));
                 self.bind_relative(refined, &fqn)
             }
@@ -1036,8 +1070,8 @@ impl<'a> TypeCtx<'a> {
             return Type::Mixed;
         };
         let ty = match self.find_property_for_receiver(&base_ty, &fqn, &prop) {
-            Some(found) if self.native => found.member.native_ty,
-            Some(found) => found.member.ty,
+            Some(found) if self.native => found.member.native_ty.clone(),
+            Some(found) => found.member.ty.clone(),
             None => Type::Mixed,
         };
         if nullsafe {
@@ -1056,8 +1090,8 @@ impl<'a> TypeCtx<'a> {
             return Type::Mixed;
         };
         match self.index.find_property(&fqn, &prop) {
-            Some(found) if self.native => found.member.native_ty,
-            Some(found) => found.member.ty,
+            Some(found) if self.native => found.member.native_ty.clone(),
+            Some(found) => found.member.ty.clone(),
             None => Type::Mixed,
         }
     }
@@ -1076,7 +1110,7 @@ impl<'a> TypeCtx<'a> {
                     // comparisons against it (`$x === Foo::BAR`) can be decided.
                     return match found.member.int_value {
                         Some(v) => Type::LiteralInt(v),
-                        None => found.member.ty,
+                        None => found.member.ty.clone(),
                     };
                 }
             }
@@ -1196,7 +1230,7 @@ impl<'a> TypeCtx<'a> {
     fn class_type(&self, e: &Expr) -> Option<Type> {
         match &e.kind {
             ExprKind::Name(n) => Some(match self.scope.resolve_class(n) {
-                Resolution::Fqn(fqn) => Type::Named { fqn, args: vec![] },
+                Resolution::Fqn(fqn) => Type::Named { fqn: fqn.into(), args: vec![] },
                 Resolution::LateStatic(s) => match s.as_str() {
                     "self" => self.self_type()?,
                     "static" => Type::StaticType,
@@ -1214,7 +1248,7 @@ impl<'a> TypeCtx<'a> {
     fn self_type(&self) -> Option<Type> {
         self.class
             .clone()
-            .map(|fqn| Type::Named { fqn, args: vec![] })
+            .map(|fqn| Type::Named { fqn: fqn.into(), args: vec![] })
     }
 
     fn parent_type(&self) -> Option<Type> {
@@ -1228,7 +1262,7 @@ impl<'a> TypeCtx<'a> {
     fn bind_relative(&self, ty: Type, bound: &str) -> Type {
         ty.map(&mut |part| match part {
             Type::SelfType | Type::StaticType => Type::Named {
-                fqn: bound.to_string(),
+                fqn: bound.into(),
                 args: vec![],
             },
             Type::Parent => self
@@ -1250,7 +1284,7 @@ impl<'a> TypeCtx<'a> {
     /// The class FQN to query members on, given a value's type.
     fn type_class_fqn(&self, t: &Type) -> Option<String> {
         match t {
-            Type::Named { fqn, .. } => Some(fqn.clone()),
+            Type::Named { fqn, .. } => Some(fqn.to_string()),
             Type::SelfType | Type::StaticType => self.class.clone(),
             Type::Parent => self.parent_type().and_then(|p| self.type_class_fqn(&p)),
             Type::Nullable(inner) => self.type_class_fqn(inner),
@@ -1271,7 +1305,7 @@ impl<'a> TypeCtx<'a> {
         recv_ty: &Type,
         fqn: &str,
         name: &str,
-    ) -> Option<php_reflect::Found<php_reflect::MethodReflection>> {
+    ) -> Option<php_reflect::Found<'a, php_reflect::MethodReflection>> {
         if self.native {
             self.index.find_method(fqn, name)
         } else {
@@ -1286,7 +1320,7 @@ impl<'a> TypeCtx<'a> {
         recv_ty: &Type,
         fqn: &str,
         name: &str,
-    ) -> Option<php_reflect::Found<php_reflect::PropertyReflection>> {
+    ) -> Option<php_reflect::Found<'a, php_reflect::PropertyReflection>> {
         if self.native {
             self.index.find_property(fqn, name)
         } else {
@@ -1481,7 +1515,7 @@ fn collection_method(name: &str) -> Option<CollectionMethod> {
 
 fn receiver_named_parts(ty: &Type) -> Option<(&str, &[Type])> {
     match ty {
-        Type::Named { fqn, args } => Some((fqn.as_str(), args.as_slice())),
+        Type::Named { fqn, args } => Some((&**fqn, args.as_slice())),
         Type::Nullable(inner) => receiver_named_parts(inner),
         _ => None,
     }
@@ -1526,12 +1560,12 @@ fn bind_templates_from_types(param: &Type, arg: &Type, subst: &mut HashMap<Strin
     match param {
         Type::TemplateVar(name) => {
             if !template_observation_is_imprecise(arg) {
-                subst.entry(name.clone()).or_default().push(arg.clone());
+                subst.entry(name.to_string()).or_default().push(arg.clone());
             }
         }
         Type::Nullable(inner) => bind_templates_from_types(inner, arg, subst),
         Type::Union(parts) | Type::Intersection(parts) => {
-            for part in parts {
+            for part in parts.iter() {
                 bind_templates_from_types(part, arg, subst);
             }
         }
@@ -1623,15 +1657,15 @@ fn finalize_subst(raw: HashMap<String, Vec<Type>>) -> HashMap<String, Type> {
 
 fn subst_templates(ty: &Type, subst: &HashMap<String, Type>, unbound_to_mixed: bool) -> Type {
     ty.clone().map(&mut |part| match part {
-        Type::TemplateVar(name) => subst.get(&name).cloned().unwrap_or({
+        Type::TemplateVar(name) => subst.get(&*name).cloned().unwrap_or({
             if unbound_to_mixed {
                 Type::Mixed
             } else {
                 Type::TemplateVar(name)
             }
         }),
-        Type::Union(parts) => Type::union(parts),
-        Type::Intersection(parts) => Type::intersection(parts),
+        Type::Union(parts) => Type::union(parts.to_vec()),
+        Type::Intersection(parts) => Type::intersection(parts.to_vec()),
         other => other,
     })
 }
@@ -1716,7 +1750,7 @@ fn magic_constant(name: &str) -> Option<Type> {
 fn apply_sign(neg: bool, t: Type) -> Type {
     match t {
         Type::LiteralInt(n) => Type::LiteralInt(if neg { n.wrapping_neg() } else { n }),
-        Type::Union(parts) => Type::union(parts.into_iter().map(|p| apply_sign(neg, p)).collect()),
+        Type::Union(parts) => Type::union(parts.iter().map(|p| apply_sign(neg, p.clone())).collect()),
         other => numeric_unary(other),
     }
 }
@@ -1749,7 +1783,7 @@ fn instance_of(t: Type) -> Type {
     match t {
         Type::ClassString(Some(inner)) => *inner,
         Type::ClassString(None) | Type::String | Type::LiteralString(_) => Type::Object,
-        Type::Union(parts) => Type::union(parts.into_iter().map(instance_of).collect()),
+        Type::Union(parts) => Type::union(parts.iter().map(|p| instance_of(p.clone())).collect()),
         other => other,
     }
 }
@@ -1774,7 +1808,7 @@ fn literal_string(bytes: &[u8]) -> Type {
     const MAX: usize = 64;
     if bytes.len() <= MAX {
         if let Ok(s) = std::str::from_utf8(bytes) {
-            return Type::LiteralString(s.to_string());
+            return Type::LiteralString(s.into());
         }
     }
     Type::String

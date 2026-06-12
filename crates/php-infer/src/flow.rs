@@ -1285,7 +1285,7 @@ impl TypeCtx<'_> {
 
     fn name_class_type(&self, n: &Name) -> Option<Type> {
         match self.scope.resolve_class(n) {
-            php_resolve::Resolution::Fqn(fqn) => Some(Type::Named { fqn, args: vec![] }),
+            php_resolve::Resolution::Fqn(fqn) => Some(Type::Named { fqn: fqn.into(), args: vec![] }),
             php_resolve::Resolution::LateStatic(s) => match s.as_str() {
                 "self" => self.self_type(),
                 "static" => Some(Type::StaticType),

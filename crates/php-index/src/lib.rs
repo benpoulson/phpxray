@@ -8,7 +8,7 @@
 //! while preserving each symbol's canonical (declared) casing.
 
 use php_ast::ClassKind;
-use php_resolve::{display_fqn, FileIndex, SymbolKey, SymbolOrigin};
+use php_resolve::{depsrec, display_fqn, FileIndex, SymbolKey, SymbolOrigin};
 use php_types::{builtins, PhpVersion};
 use std::collections::HashMap;
 
@@ -170,14 +170,22 @@ impl ProjectIndex {
     }
 
     // --- lookups (respecting PHP case rules) ----------------------------
+    //
+    // Lookups record the consulted name for incremental dependency tracking
+    // (`php_resolve::depsrec`); a no-op outside recording brackets. Negative
+    // lookups are recorded too — "X does not exist" is invalidated when X
+    // appears.
 
     pub fn class(&self, fqn: &str) -> Option<&ClassEntry> {
+        depsrec::note_surface(fqn);
         self.classes.get(&SymbolKey::class_like(fqn).into_string())
     }
     pub fn function(&self, fqn: &str) -> Option<&SymbolEntry> {
+        depsrec::note_surface(fqn);
         self.functions.get(&SymbolKey::function(fqn).into_string())
     }
     pub fn constant(&self, fqn: &str) -> Option<&SymbolEntry> {
+        depsrec::note_surface(fqn);
         self.constants.get(&SymbolKey::constant(fqn).into_string())
     }
 
@@ -195,26 +203,32 @@ impl ProjectIndex {
         self.classes.len()
     }
     /// All indexed class-like symbols (classes, interfaces, traits, enums).
+    /// A whole-index scan: records a global dependency.
     pub fn classes(&self) -> impl Iterator<Item = &ClassEntry> {
+        depsrec::note_global();
         self.classes.values()
     }
     pub fn function_count(&self) -> usize {
         self.functions.len()
     }
-    /// All indexed functions.
+    /// All indexed functions. A whole-index scan: records a global dependency.
     pub fn functions(&self) -> impl Iterator<Item = &SymbolEntry> {
+        depsrec::note_global();
         self.functions.values()
     }
     pub fn constant_count(&self) -> usize {
         self.constants.len()
     }
-    /// All indexed constants.
+    /// All indexed constants. A whole-index scan: records a global dependency.
     pub fn constants(&self) -> impl Iterator<Item = &SymbolEntry> {
+        depsrec::note_global();
         self.constants.values()
     }
 
     /// Classes (and interfaces/traits/enums) declared in more than one file.
+    /// A whole-index scan: records a global dependency.
     pub fn duplicate_classes(&self) -> impl Iterator<Item = &ClassEntry> {
+        depsrec::note_global();
         self.classes.values().filter(|c| c.sources.len() > 1)
     }
 }

@@ -15,9 +15,11 @@ use crate::{
 };
 use php_ast::{ClassDecl, ClassKind, Member, Program, Stmt, StmtKind};
 use php_intern::Interner;
-use php_resolve::{for_each_region, Scope, SymbolKey, SymbolOrigin};
+use php_resolve::{depsrec, for_each_region, Scope, SymbolKey, SymbolOrigin};
 use php_types::{PhpVersion, Type};
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// A map from `@template` names to the types bound for them along a hierarchy walk.
 type Subst = HashMap<String, Type>;
@@ -27,11 +29,14 @@ pub type SourceKind = SymbolOrigin;
 
 /// A member found via hierarchy lookup, plus the class that declared it. Member
 /// types have generic template variables substituted for the query's bindings.
+/// The member is **borrowed from the index** when no substitution applies (the
+/// common case — lookups used to deep-clone every member) and owned only when
+/// generic substitution had to rewrite types.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Found<T> {
-    pub member: T,
+pub struct Found<'a, T: Clone> {
+    pub member: std::borrow::Cow<'a, T>,
     /// FQN of the class/interface/trait the member was declared on.
-    pub declaring_class: String,
+    pub declaring_class: &'a str,
 }
 
 /// Stored AST body metadata for a reflected function or method.
@@ -214,19 +219,67 @@ fn visit_reflectable_decls<'a>(
 }
 
 /// All reflected classes/functions across a set of files, keyed for lookup.
-#[derive(Debug, Default)]
+///
+/// Values are `Arc`-shared so per-file reflection artifacts (see
+/// [`reflect_artifact`]) can be cached across incremental re-analysis passes and
+/// merged back into a fresh index by reference-count bump instead of deep clone.
+/// `Clone` on the index itself is correspondingly cheap (map-of-`Arc` copies).
+#[derive(Debug, Default, Clone)]
 pub struct ReflectionIndex {
     /// Lowercased FQN → class reflection (class names are case-insensitive).
-    classes: HashMap<String, ClassReflection>,
+    classes: HashMap<String, Arc<ClassReflection>>,
     /// Lowercased FQN → function reflection.
-    functions: HashMap<String, FunctionReflection>,
+    functions: HashMap<String, Arc<FunctionReflection>>,
     /// Callable bodies + their declaring [`Scope`] for interprocedural per-call
     /// return inference and context diagnostics. Keyed by `key(fqn)` for free
     /// functions and `key(declaring_class)::name_lower` for methods. The scope is
     /// kept so the body's name references resolve in *their* namespace, not the
     /// caller's; this is sound only because all files share one interner (symbols
     /// are global).
-    bodies: HashMap<String, BodyRecord>,
+    bodies: HashMap<String, Arc<BodyRecord>>,
+}
+
+/// One function/method's inferred signature, produced by whole-project signature
+/// inference and applied to the stored reflections via
+/// [`ReflectionIndex::apply_inferred`]. Every entry is advisory: `None` means
+/// "leave the declared type", a `Some` only overwrites a slot that was *not*
+/// explicitly declared.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InferredSig {
+    /// Inferred type per parameter position. `None` = leave the parameter alone.
+    pub params: Vec<Option<Type>>,
+    /// Inferred return type, or `None` to leave the declared return.
+    pub ret: Option<Type>,
+}
+
+impl InferredSig {
+    /// A signature carrying only an inferred return type.
+    pub fn ret_only(ret: Type) -> Self {
+        InferredSig {
+            params: Vec::new(),
+            ret: Some(ret),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ret.is_none() && self.params.iter().all(Option::is_none)
+    }
+}
+
+/// The whole-project result of signature inference: synthesized signatures for
+/// fully untyped free functions (keyed by FQN) and methods (keyed by
+/// `(class_fqn, method_name)`). Built by `php_infer::signatures` and applied to a
+/// [`ReflectionIndex`] in place.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InferredSignatures {
+    pub fns: HashMap<String, InferredSig>,
+    pub methods: HashMap<(String, String), InferredSig>,
+}
+
+impl InferredSignatures {
+    pub fn is_empty(&self) -> bool {
+        self.fns.is_empty() && self.methods.is_empty()
+    }
 }
 
 impl ReflectionIndex {
@@ -246,10 +299,10 @@ impl ReflectionIndex {
     pub fn with_builtins_for(version: PhpVersion) -> Self {
         let mut idx = Self::new();
         for fr in crate::builtins::builtin_functions_for(version) {
-            idx.functions.insert(function_key(&fr.fqn), fr);
+            idx.functions.insert(function_key(&fr.fqn), Arc::new(fr));
         }
         for cr in crate::builtins::builtin_classes_for(version) {
-            idx.classes.insert(class_key(&cr.fqn), cr);
+            idx.classes.insert(class_key(&cr.fqn), Arc::new(cr));
         }
         idx
     }
@@ -276,21 +329,72 @@ impl ReflectionIndex {
         interner: &Interner,
         kind: SourceKind,
     ) {
-        for_each_region(&program.stmts, interner, |scope, region| {
-            for st in region {
-                self.collect_stmt(scope, interner, st, kind, path);
+        // One code path with incremental analysis: build the per-file artifact,
+        // then merge it — so cached artifacts replay the exact same inserts.
+        let artifact = reflect_artifact(path, program, interner, kind);
+        self.add_artifact(&artifact);
+    }
+
+    /// Merge a previously built per-file reflection artifact. Entries replay in
+    /// declaration order with the same scan-vs-builtin guards as
+    /// [`add_file_labeled_as`](Self::add_file_labeled_as); `Arc` values are
+    /// shared, not deep-cloned, so re-merging a whole project of cached
+    /// artifacts each incremental pass is cheap.
+    pub fn add_artifact(&mut self, artifact: &FileReflectionArtifact) {
+        let kind = artifact.kind;
+        for entry in &artifact.entries {
+            match entry {
+                ArtifactEntry::Function {
+                    key,
+                    reflection,
+                    body,
+                } => {
+                    // Scan-only files must not replace curated builtin stubs.
+                    if kind == SourceKind::Scan
+                        && self.functions.get(key).is_some_and(|f| f.builtin)
+                    {
+                        continue;
+                    }
+                    self.bodies.insert(key.clone(), Arc::clone(body));
+                    self.functions.insert(key.clone(), Arc::clone(reflection));
+                }
+                ArtifactEntry::Class {
+                    key,
+                    reflection,
+                    bodies,
+                } => {
+                    if kind == SourceKind::Scan && self.classes.get(key).is_some_and(|c| c.builtin)
+                    {
+                        continue;
+                    }
+                    for (body_key, body) in bodies {
+                        self.bodies.insert(body_key.clone(), Arc::clone(body));
+                    }
+                    self.classes.insert(key.clone(), Arc::clone(reflection));
+                }
             }
-        });
+        }
     }
 
     /// Look up a class by FQN (case-insensitive, leading `\` ignored).
     pub fn class(&self, fqn: &str) -> Option<&ClassReflection> {
-        self.classes.get(&class_key(fqn))
+        self.class_by_key_ref(fqn)
     }
 
     /// Look up a function by FQN (case-insensitive, leading `\` ignored).
     pub fn function(&self, fqn: &str) -> Option<&FunctionReflection> {
-        self.functions.get(&function_key(fqn))
+        depsrec::note_surface(fqn);
+        with_ci_key(fqn, |key| self.functions.get(key).map(Arc::as_ref))
+    }
+
+    /// The single choke point for class-map reads: records the consulted name for
+    /// incremental dependency tracking (a no-op outside recording brackets). The
+    /// canonical key is built in the reused scratch buffer (no per-lookup alloc).
+    fn class_by_key_ref(&self, fqn: &str) -> Option<&ClassReflection> {
+        with_ci_key(fqn, |key| {
+            depsrec::note_surface(key);
+            self.classes.get(key).map(Arc::as_ref)
+        })
     }
 
     /// Number of indexed classes.
@@ -304,8 +408,11 @@ impl ReflectionIndex {
     /// can't be established from the indexed classes — callers that must avoid
     /// false positives should treat an *unknown* class leniently themselves.
     pub fn is_subclass_of(&self, sub: &str, sup: &str) -> bool {
+        // `sup` is compared per level, so its canonical key is built once (owned);
+        // the per-level `sub` keys go through the scratch buffer inside `is_sub_fqn`.
+        let sup_key = class_key(sup);
         let mut visited = Vec::new();
-        self.is_sub(&class_key(sub), &class_key(sup), &mut visited)
+        self.is_sub_fqn(sub, &sup_key, &mut visited)
     }
 
     /// Extract the key/value pair yielded by an iterable value, when reflection
@@ -335,7 +442,7 @@ impl ReflectionIndex {
                 }
                 let mut keys = Vec::new();
                 let mut values = Vec::new();
-                for part in parts {
+                for part in parts.iter() {
                     let mut branch_seen = visited.clone();
                     let (k, v) = self.iterable_key_value(part, &mut branch_seen)?;
                     keys.push(k);
@@ -368,7 +475,7 @@ impl ReflectionIndex {
         }
         visited.push(key);
 
-        let class = self.classes.get(&class_key(fqn))?;
+        let class = self.class_by_key_ref(fqn)?;
         let subst = self.receiver_subst(fqn, args);
         let parents = class
             .traits
@@ -398,32 +505,33 @@ impl ReflectionIndex {
         None
     }
 
-    fn is_sub(&self, sub_key: &str, sup_key: &str, visited: &mut Vec<String>) -> bool {
-        if sub_key == sup_key {
-            return true; // reflexive
+    fn is_sub_fqn(&self, sub: &str, sup_key: &str, visited: &mut Vec<*const ClassReflection>) -> bool {
+        // Reflexive: compare canonical keys without allocating for `sub`.
+        if with_ci_key(sub, |sk| sk == sup_key) {
+            return true;
         }
-        if visited.iter().any(|v| v == sub_key) {
-            return false;
-        }
-        visited.push(sub_key.to_string());
-        let Some(c) = self.classes.get(sub_key) else {
+        let Some(c) = self.class_by_key_ref(sub) else {
             return false;
         };
+        let id = std::ptr::from_ref(c);
+        if visited.contains(&id) {
+            return false;
+        }
+        visited.push(id);
         c.parents
             .iter()
             .chain(&c.interfaces)
             .chain(&c.traits)
-            .filter_map(|p| match p {
-                Type::Named { fqn, .. } => Some(class_key(fqn)),
-                _ => None,
+            .any(|p| match p {
+                Type::Named { fqn, .. } => self.is_sub_fqn(fqn, sup_key, visited),
+                _ => false,
             })
-            .any(|pk| self.is_sub(&pk, sup_key, visited))
     }
 
     /// Resolve a method by name through `class_fqn`'s hierarchy (own members
     /// first, then traits, parent class, interfaces, mixins). Method names match
     /// case-insensitively. Returns the method with generic args substituted.
-    pub fn find_method(&self, class_fqn: &str, name: &str) -> Option<Found<MethodReflection>> {
+    pub fn find_method(&self, class_fqn: &str, name: &str) -> Option<Found<'_, MethodReflection>> {
         let mut visited = Vec::new();
         self.ascend(
             class_fqn,
@@ -436,7 +544,7 @@ impl ReflectionIndex {
                     .find(|m| m.name.eq_ignore_ascii_case(name))
                     .map(|m| Found {
                         member: subst_method(m, subst),
-                        declaring_class: class.fqn.clone(),
+                        declaring_class: &class.fqn,
                     })
             },
         )
@@ -448,7 +556,7 @@ impl ReflectionIndex {
         &self,
         receiver: &Type,
         name: &str,
-    ) -> Option<Found<MethodReflection>> {
+    ) -> Option<Found<'_, MethodReflection>> {
         let (fqn, subst) = self.receiver_named_subst(receiver)?;
         let mut visited = Vec::new();
         self.ascend(fqn, subst, &mut visited, &mut |class, subst| {
@@ -458,7 +566,7 @@ impl ReflectionIndex {
                 .find(|m| m.name.eq_ignore_ascii_case(name))
                 .map(|m| Found {
                     member: subst_method(m, subst),
-                    declaring_class: class.fqn.clone(),
+                    declaring_class: &class.fqn,
                 })
         })
     }
@@ -469,6 +577,9 @@ impl ReflectionIndex {
     /// hierarchy is closed by final leaf classes, a call may be valid even when
     /// the abstract parent does not declare the method.
     pub fn final_concrete_descendants_have_method(&self, class_fqn: &str, method: &str) -> bool {
+        // A whole-index scan: the answer can change when *any* class changes,
+        // so incremental invalidation must treat this as a global dependency.
+        depsrec::note_global();
         let Some(base) = self.class(class_fqn) else {
             return false;
         };
@@ -495,7 +606,11 @@ impl ReflectionIndex {
 
     /// Resolve a property by name (without `$`) through the hierarchy. Property
     /// names are case-sensitive.
-    pub fn find_property(&self, class_fqn: &str, name: &str) -> Option<Found<PropertyReflection>> {
+    pub fn find_property(
+        &self,
+        class_fqn: &str,
+        name: &str,
+    ) -> Option<Found<'_, PropertyReflection>> {
         let mut visited = Vec::new();
         self.ascend(
             class_fqn,
@@ -507,11 +622,8 @@ impl ReflectionIndex {
                     .iter()
                     .find(|p| p.name == name)
                     .map(|p| Found {
-                        member: PropertyReflection {
-                            ty: subst_type(&p.ty, subst),
-                            ..p.clone()
-                        },
-                        declaring_class: class.fqn.clone(),
+                        member: subst_property(p, subst),
+                        declaring_class: &class.fqn,
                     })
             },
         )
@@ -523,7 +635,7 @@ impl ReflectionIndex {
         &self,
         receiver: &Type,
         name: &str,
-    ) -> Option<Found<PropertyReflection>> {
+    ) -> Option<Found<'_, PropertyReflection>> {
         let (fqn, subst) = self.receiver_named_subst(receiver)?;
         let mut visited = Vec::new();
         self.ascend(fqn, subst, &mut visited, &mut |class, subst| {
@@ -532,18 +644,15 @@ impl ReflectionIndex {
                 .iter()
                 .find(|p| p.name == name)
                 .map(|p| Found {
-                    member: PropertyReflection {
-                        ty: subst_type(&p.ty, subst),
-                        ..p.clone()
-                    },
-                    declaring_class: class.fqn.clone(),
+                    member: subst_property(p, subst),
+                    declaring_class: &class.fqn,
                 })
         })
     }
 
     /// Resolve a class constant by name through the hierarchy. Constant names are
     /// case-sensitive.
-    pub fn find_constant(&self, class_fqn: &str, name: &str) -> Option<Found<ConstReflection>> {
+    pub fn find_constant(&self, class_fqn: &str, name: &str) -> Option<Found<'_, ConstReflection>> {
         let mut visited = Vec::new();
         self.ascend(
             class_fqn,
@@ -555,11 +664,8 @@ impl ReflectionIndex {
                     .iter()
                     .find(|c| c.name == name)
                     .map(|c| Found {
-                        member: ConstReflection {
-                            ty: subst_type(&c.ty, subst),
-                            ..c.clone()
-                        },
-                        declaring_class: class.fqn.clone(),
+                        member: subst_constant(c, subst),
+                        declaring_class: &class.fqn,
                     })
             },
         )
@@ -567,20 +673,21 @@ impl ReflectionIndex {
 
     /// Walk `fqn` and its ancestors in PHP member-resolution order, calling `f`
     /// with each class and the active template substitution; returns the first
-    /// `Some(f(...))`. `visited` (lowercased FQNs) breaks diamonds/cycles.
-    fn ascend<T>(
-        &self,
+    /// `Some(f(...))`. `visited` (resolved class identities — `Arc` pointers, so
+    /// no per-level key allocation) breaks diamonds/cycles.
+    fn ascend<'s, T>(
+        &'s self,
         fqn: &str,
         subst: Subst,
-        visited: &mut Vec<String>,
-        f: &mut impl FnMut(&ClassReflection, &Subst) -> Option<T>,
+        visited: &mut Vec<*const ClassReflection>,
+        f: &mut impl FnMut(&'s ClassReflection, &Subst) -> Option<T>,
     ) -> Option<T> {
-        let k = class_key(fqn);
-        if visited.contains(&k) {
+        let class = self.class_by_key_ref(fqn)?;
+        let id = std::ptr::from_ref(class);
+        if visited.contains(&id) {
             return None;
         }
-        visited.push(k);
-        let class = self.classes.get(&class_key(fqn))?;
+        visited.push(id);
         if let Some(found) = f(class, &subst) {
             return Some(found);
         }
@@ -607,7 +714,7 @@ impl ReflectionIndex {
     /// through the outer substitution so bindings compose down the chain).
     fn compose(&self, pf: &str, args: &[Type], outer: &Subst) -> Subst {
         let mut map = Subst::new();
-        if let Some(parent) = self.classes.get(&class_key(pf)) {
+        if let Some(parent) = self.class_by_key_ref(pf) {
             for (name, arg) in parent.templates.iter().zip(args) {
                 map.insert(name.clone(), subst_type(arg, outer));
             }
@@ -617,7 +724,7 @@ impl ReflectionIndex {
 
     fn receiver_named_subst<'a>(&self, receiver: &'a Type) -> Option<(&'a str, Subst)> {
         match receiver {
-            Type::Named { fqn, args } => Some((fqn.as_str(), self.receiver_subst(fqn, args))),
+            Type::Named { fqn, args } => Some((&**fqn, self.receiver_subst(fqn, args))),
             Type::Nullable(inner) => self.receiver_named_subst(inner),
             _ => None,
         }
@@ -625,7 +732,7 @@ impl ReflectionIndex {
 
     fn receiver_subst(&self, fqn: &str, args: &[Type]) -> Subst {
         let mut map = Subst::new();
-        if let Some(class) = self.classes.get(&class_key(fqn)) {
+        if let Some(class) = self.class_by_key_ref(fqn) {
             for (name, arg) in class.templates.iter().zip(args) {
                 map.insert(name.clone(), arg.clone());
             }
@@ -633,118 +740,258 @@ impl ReflectionIndex {
         map
     }
 
-    fn collect_stmt(
-        &mut self,
-        scope: &Scope,
-        interner: &Interner,
-        st: &php_ast::Stmt,
-        kind: SourceKind,
-        path: Option<&str>,
-    ) {
-        visit_reflectable_decls(scope, st, &mut |scope, decl| match decl {
-            ReflectableDecl::Class(c) => self.add_class(scope, interner, c, kind, path),
-            ReflectableDecl::Function(f) => {
-                let r = reflect_function(scope, interner, f);
-                if kind == SourceKind::Scan
-                    && self
-                        .functions
-                        .get(&function_key(&r.fqn))
-                        .is_some_and(|f| f.builtin)
-                {
-                    return;
-                }
-                self.bodies.insert(
-                    function_key(&r.fqn),
-                    BodyRecord {
-                        body: f.body.clone(),
-                        scope: scope.clone(),
-                        path: path.map(str::to_string),
-                        source_kind: kind,
-                    },
-                );
-                self.functions.insert(function_key(&r.fqn), r);
-            }
-        });
-    }
-
-    fn add_class(
-        &mut self,
-        scope: &Scope,
-        interner: &Interner,
-        c: &ClassDecl,
-        kind: SourceKind,
-        path: Option<&str>,
-    ) {
-        // Anonymous classes have no FQN.
-        let Some(name) = c.name else { return };
-        let fqn = scope.qualify(interner.resolve(name));
-        if kind == SourceKind::Scan
-            && self
-                .classes
-                .get(&class_key(&fqn))
-                .is_some_and(|c| c.builtin)
-        {
-            return;
-        }
-        let r = reflect_class(scope, interner, &fqn, c);
-        // Store method bodies (+ the class's scope) for interprocedural inference.
-        for m in &c.members {
-            if let Member::Method(md) = m {
-                if let Some(body) = &md.body {
-                    let mname = interner.resolve(md.name).to_ascii_lowercase();
-                    self.bodies.insert(
-                        format!("{}::{}", class_key(&fqn), mname),
-                        BodyRecord {
-                            body: body.clone(),
-                            scope: scope.clone(),
-                            path: path.map(str::to_string),
-                            source_kind: kind,
-                        },
-                    );
-                }
-            }
-        }
-        self.classes.insert(class_key(&fqn), r);
-    }
-
     /// The body + declaring scope of a free function, by FQN (for interprocedural
     /// return inference).
     pub fn function_body(&self, fqn: &str) -> Option<(&[Stmt], &Scope)> {
-        self.bodies
-            .get(&function_key(fqn))
+        depsrec::note_body(fqn);
+        with_ci_key(fqn, |key| self.bodies.get(key))
             .map(|r| (r.body.as_slice(), &r.scope))
     }
 
     /// Full body metadata for a free function, including source path/kind when
     /// it was added through [`add_file_labeled_as`](Self::add_file_labeled_as).
     pub fn function_body_meta(&self, fqn: &str) -> Option<BodyMetadata<'_>> {
-        self.bodies
-            .get(&function_key(fqn))
-            .map(BodyRecord::metadata)
+        depsrec::note_body(fqn);
+        with_ci_key(fqn, |key| self.bodies.get(key)).map(|r| r.metadata())
     }
 
     /// The body + declaring scope of a method on `declaring_class` (use the
     /// `declaring_class` from [`find_method`](Self::find_method), not the receiver).
     pub fn method_body(&self, declaring_class: &str, name: &str) -> Option<(&[Stmt], &Scope)> {
-        self.bodies
-            .get(&format!(
-                "{}::{}",
-                class_key(declaring_class),
-                name.to_ascii_lowercase()
-            ))
+        depsrec::note_body(declaring_class);
+        with_method_key(declaring_class, name, |key| self.bodies.get(key))
             .map(|r| (r.body.as_slice(), &r.scope))
     }
 
     /// Full body metadata for a method on `declaring_class`.
     pub fn method_body_meta(&self, declaring_class: &str, name: &str) -> Option<BodyMetadata<'_>> {
+        depsrec::note_body(declaring_class);
         self.bodies
             .get(&format!(
                 "{}::{}",
                 class_key(declaring_class),
                 name.to_ascii_lowercase()
             ))
-            .map(BodyRecord::metadata)
+            .map(|r| r.metadata())
     }
+
+    // --- Whole-project signature inference support ---------------------------
+    //
+    // These accessors and the apply step exist for `php_infer::signatures`, which
+    // synthesizes signatures for fully untyped functions/methods from their bodies
+    // and call sites, then folds them back into the stored reflections so all
+    // downstream inference/rules benefit. They deliberately do **not** record
+    // incremental dependencies (`depsrec`): the pre-pass runs before per-file
+    // analysis, outside any recording session.
+
+    /// Canonical FQNs of every free function in the index (built-ins included; the
+    /// caller filters on [`FunctionReflection::builtin`]).
+    pub fn function_fqns(&self) -> Vec<String> {
+        self.functions.values().map(|f| f.fqn.clone()).collect()
+    }
+
+    /// Canonical FQNs of every class-like in the index (built-ins included).
+    pub fn class_fqns(&self) -> Vec<String> {
+        self.classes.values().map(|c| c.fqn.clone()).collect()
+    }
+
+    /// Whether a free-function body is stored under this FQN (i.e. it was reflected
+    /// from project source, not a stub). Does not record a dependency.
+    pub fn has_function_body(&self, fqn: &str) -> bool {
+        with_ci_key(fqn, |key| self.bodies.contains_key(key))
+    }
+
+    /// Whether a method body is stored under `class_fqn::name` (the method is
+    /// declared — with a body — on this class, not inherited or magic).
+    pub fn has_method_body(&self, class_fqn: &str, name: &str) -> bool {
+        with_method_key(class_fqn, name, |key| self.bodies.contains_key(key))
+    }
+
+    /// Fold synthesized signatures into the stored reflections in place. Only slots
+    /// that were *not* explicitly declared are overwritten (and flagged
+    /// `inferred`/`inferred_return`); `native_*` and `explicit*` are never touched,
+    /// so inferred types behave exactly like PHPDoc types.
+    pub fn apply_inferred(&mut self, inf: &InferredSignatures) {
+        for (fqn, sig) in &inf.fns {
+            if sig.is_empty() {
+                continue;
+            }
+            if let Some(arc) = self.functions.get_mut(&function_key(fqn)) {
+                let f = Arc::make_mut(arc);
+                if f.builtin {
+                    continue;
+                }
+                apply_params(&mut f.params, &sig.params);
+                if let Some(ret) = &sig.ret {
+                    if !f.explicit_return {
+                        f.return_type = ret.clone();
+                        f.inferred_return = true;
+                    }
+                }
+            }
+        }
+        for ((class_fqn, method), sig) in &inf.methods {
+            if sig.is_empty() {
+                continue;
+            }
+            if let Some(arc) = self.classes.get_mut(&class_key(class_fqn)) {
+                let c = Arc::make_mut(arc);
+                if c.builtin {
+                    continue;
+                }
+                if let Some(m) = c
+                    .methods
+                    .iter_mut()
+                    .find(|m| m.name.eq_ignore_ascii_case(method))
+                {
+                    apply_params(&mut m.params, &sig.params);
+                    if let Some(ret) = &sig.ret {
+                        if !m.explicit_return {
+                            m.return_type = ret.clone();
+                            m.inferred_return = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Overwrite the inferred type of each non-explicit parameter position.
+fn apply_params(params: &mut [crate::ParamReflection], inferred: &[Option<Type>]) {
+    for (p, slot) in params.iter_mut().zip(inferred) {
+        if let Some(ty) = slot {
+            if !p.explicit {
+                p.ty = ty.clone();
+                p.inferred = true;
+            }
+        }
+    }
+}
+
+/// The cached, re-mergeable reflection output of one parsed file: every
+/// declared class/function reflection plus the callable bodies, in declaration
+/// order, with the file's [`SourceKind`] baked in. Built by [`reflect_artifact`]
+/// and merged via [`ReflectionIndex::add_artifact`]. Values are `Arc`-shared so
+/// caching an artifact and re-merging it every incremental pass costs reference
+/// bumps, not deep clones of statement bodies.
+#[derive(Debug, Clone)]
+pub struct FileReflectionArtifact {
+    kind: SourceKind,
+    entries: Vec<ArtifactEntry>,
+}
+
+#[derive(Debug, Clone)]
+enum ArtifactEntry {
+    Class {
+        key: String,
+        reflection: Arc<ClassReflection>,
+        /// Method bodies, keyed `class_key::method_lower`.
+        bodies: Vec<(String, Arc<BodyRecord>)>,
+    },
+    Function {
+        key: String,
+        reflection: Arc<FunctionReflection>,
+        body: Arc<BodyRecord>,
+    },
+}
+
+impl FileReflectionArtifact {
+    /// How the file participates in reflection (analyzed vs scan-only).
+    pub fn kind(&self) -> SourceKind {
+        self.kind
+    }
+
+    /// The normalized index keys of every symbol this file declares.
+    pub fn declared_keys(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|e| match e {
+            ArtifactEntry::Class { key, .. } | ArtifactEntry::Function { key, .. } => key.as_str(),
+        })
+    }
+
+    /// `(key, reflection)` for each declared class, in declaration order.
+    pub fn class_reflections(&self) -> impl Iterator<Item = (&str, &ClassReflection)> {
+        self.entries.iter().filter_map(|e| match e {
+            ArtifactEntry::Class {
+                key, reflection, ..
+            } => Some((key.as_str(), reflection.as_ref())),
+            ArtifactEntry::Function { .. } => None,
+        })
+    }
+
+    /// `(key, reflection)` for each declared function, in declaration order.
+    pub fn function_reflections(&self) -> impl Iterator<Item = (&str, &FunctionReflection)> {
+        self.entries.iter().filter_map(|e| match e {
+            ArtifactEntry::Function {
+                key, reflection, ..
+            } => Some((key.as_str(), reflection.as_ref())),
+            ArtifactEntry::Class { .. } => None,
+        })
+    }
+}
+
+/// Reflect one parsed file into a cacheable [`FileReflectionArtifact`]. This is
+/// the reflection half of [`ReflectionIndex::add_file_labeled_as`], split out so
+/// incremental analysis can cache the result per file and replay it with
+/// [`ReflectionIndex::add_artifact`] on every pass.
+pub fn reflect_artifact(
+    path: Option<&str>,
+    program: &Program,
+    interner: &Interner,
+    kind: SourceKind,
+) -> FileReflectionArtifact {
+    let mut entries = Vec::new();
+    for_each_region(&program.stmts, interner, |scope, region| {
+        for st in region {
+            visit_reflectable_decls(scope, st, &mut |scope, decl| match decl {
+                ReflectableDecl::Function(f) => {
+                    let r = reflect_function(scope, interner, f);
+                    let key = function_key(&r.fqn);
+                    entries.push(ArtifactEntry::Function {
+                        body: Arc::new(BodyRecord {
+                            body: f.body.clone(),
+                            scope: scope.clone(),
+                            path: path.map(str::to_string),
+                            source_kind: kind,
+                        }),
+                        key,
+                        reflection: Arc::new(r),
+                    });
+                }
+                ReflectableDecl::Class(c) => {
+                    // Anonymous classes have no FQN.
+                    let Some(name) = c.name else { return };
+                    let fqn = scope.qualify(interner.resolve(name));
+                    let key = class_key(&fqn);
+                    let r = reflect_class(scope, interner, &fqn, c);
+                    // Method bodies (+ the class's scope) for interprocedural inference.
+                    let mut bodies = Vec::new();
+                    for m in &c.members {
+                        if let Member::Method(md) = m {
+                            if let Some(body) = &md.body {
+                                let mname = interner.resolve(md.name).to_ascii_lowercase();
+                                bodies.push((
+                                    format!("{key}::{mname}"),
+                                    Arc::new(BodyRecord {
+                                        body: body.clone(),
+                                        scope: scope.clone(),
+                                        path: path.map(str::to_string),
+                                        source_kind: kind,
+                                    }),
+                                ));
+                            }
+                        }
+                    }
+                    entries.push(ArtifactEntry::Class {
+                        key,
+                        reflection: Arc::new(r),
+                        bodies,
+                    });
+                }
+            });
+        }
+    });
+    FileReflectionArtifact { kind, entries }
 }
 
 fn class_key(fqn: &str) -> String {
@@ -755,10 +1002,46 @@ fn function_key(fqn: &str) -> String {
     SymbolKey::function(fqn).into_string()
 }
 
+// Allocation-free lookup keys: read paths build the canonical (lowercased,
+// `\`-stripped) key in a reused thread-local buffer instead of allocating a
+// `String` per lookup — inference hammers these maps. Inserts keep the owned
+// `class_key`/`function_key` builders above. The buffer is *taken* out of the
+// cell for the closure's duration, so an (unexpected) re-entrant lookup falls
+// back to a fresh allocation instead of panicking.
+thread_local! {
+    static KEY_BUF: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Run `f` with the canonical class/function key for `fqn` (classes and
+/// functions share the same case-insensitive canonicalization).
+fn with_ci_key<R>(fqn: &str, f: impl FnOnce(&str) -> R) -> R {
+    KEY_BUF.with(|cell| {
+        let mut buf = cell.take();
+        php_resolve::write_ci_key(fqn, &mut buf);
+        let r = f(&buf);
+        cell.replace(buf);
+        r
+    })
+}
+
+/// Run `f` with the canonical `class::method` body key.
+fn with_method_key<R>(class: &str, name: &str, f: impl FnOnce(&str) -> R) -> R {
+    KEY_BUF.with(|cell| {
+        let mut buf = cell.take();
+        php_resolve::write_ci_key(class, &mut buf);
+        buf.push_str("::");
+        buf.push_str(name);
+        buf.make_ascii_lowercase();
+        let r = f(&buf);
+        cell.replace(buf);
+        r
+    })
+}
+
 /// Apply a template substitution to a method's parameter and return types.
-fn subst_method(m: &MethodReflection, subst: &Subst) -> MethodReflection {
+fn subst_method<'a>(m: &'a MethodReflection, subst: &Subst) -> Cow<'a, MethodReflection> {
     if subst.is_empty() {
-        return m.clone();
+        return Cow::Borrowed(m);
     }
     let mut out = m.clone();
     for p in &mut out.params {
@@ -767,7 +1050,31 @@ fn subst_method(m: &MethodReflection, subst: &Subst) -> MethodReflection {
     }
     out.return_type = subst_type(&out.return_type, subst);
     out.native_return = subst_type(&out.native_return, subst);
-    out
+    Cow::Owned(out)
+}
+
+/// Apply a template substitution to a property's type, borrowing when nothing
+/// needs rewriting.
+fn subst_property<'a>(p: &'a PropertyReflection, subst: &Subst) -> Cow<'a, PropertyReflection> {
+    if subst.is_empty() {
+        return Cow::Borrowed(p);
+    }
+    Cow::Owned(PropertyReflection {
+        ty: subst_type(&p.ty, subst),
+        ..p.clone()
+    })
+}
+
+/// Apply a template substitution to a constant's type, borrowing when nothing
+/// needs rewriting.
+fn subst_constant<'a>(c: &'a ConstReflection, subst: &Subst) -> Cow<'a, ConstReflection> {
+    if subst.is_empty() {
+        return Cow::Borrowed(c);
+    }
+    Cow::Owned(ConstReflection {
+        ty: subst_type(&c.ty, subst),
+        ..c.clone()
+    })
 }
 
 /// Recursively replace [`Type::TemplateVar`] occurrences using `subst`.
@@ -776,9 +1083,12 @@ fn subst_type(ty: &Type, subst: &Subst) -> Type {
         return ty.clone();
     }
     ty.clone().map(&mut |part| match part {
-        Type::TemplateVar(name) => subst.get(&name).cloned().unwrap_or(Type::TemplateVar(name)),
-        Type::Union(parts) => Type::union(parts),
-        Type::Intersection(parts) => Type::intersection(parts),
+        Type::TemplateVar(name) => subst
+            .get(&*name)
+            .cloned()
+            .unwrap_or(Type::TemplateVar(name)),
+        Type::Union(parts) => Type::union(parts.to_vec()),
+        Type::Intersection(parts) => Type::intersection(parts.to_vec()),
         other => other,
     })
 }

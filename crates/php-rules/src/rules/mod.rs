@@ -17,7 +17,7 @@
 //!
 //! Skipped (phpstan-internal, not user-code analysis): **Api** (phpstan
 //! extension-development API) and **Ignore** (phpstan's own ignore-comment
-//! handling — we do suppression in `php-cli`).
+//! handling — we do suppression in `phpxray`).
 
 use crate::{FactRuleEntry, FileAnalysis, LocatedRuleEntry, RuleEntry};
 use php_types::Type;
@@ -126,7 +126,7 @@ pub(crate) fn nullable_type_display(t: &Type) -> String {
             }
             Type::Union(parts) => {
                 let mut saw_null = false;
-                for part in parts {
+                for part in parts.iter() {
                     saw_null |= collect(part, shown);
                 }
                 saw_null

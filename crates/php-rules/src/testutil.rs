@@ -48,8 +48,7 @@ pub(crate) fn run_version_with(
         php_reflect::SourceKind::Analyzed,
     );
     let refs = resolve_references(&r.program, &r.interner);
-    let types = type_map(&reflection, &r.program, &r.interner);
-    let native_types = php_infer::native_type_map(&reflection, &r.program, &r.interner);
+    let types = type_map(&reflection, &r.program, &r.interner, true);
     let facts = FileFacts::new(&r.program, &r.interner);
     let mut fa = FileAnalysis {
         path: "test.php",
@@ -60,7 +59,6 @@ pub(crate) fn run_version_with(
         reflection: &reflection,
         resolved_refs: &refs,
         types: &types,
-        native_types: &native_types,
         facts,
         php_version,
         treat_phpdoc_types_as_certain: true,
@@ -68,6 +66,7 @@ pub(crate) fn run_version_with(
         check_nullables: true,
         check_explicit_mixed: true,
         check_implicit_mixed: true,
+        reflect_cache: Default::default(),
     };
     configure(&mut fa);
     rule(&fa)
@@ -97,8 +96,7 @@ pub(crate) fn run_located_version(
         php_reflect::SourceKind::Analyzed,
     );
     let refs = resolve_references(&r.program, &r.interner);
-    let types = type_map(&reflection, &r.program, &r.interner);
-    let native_types = php_infer::native_type_map(&reflection, &r.program, &r.interner);
+    let types = type_map(&reflection, &r.program, &r.interner, true);
     let facts = FileFacts::new(&r.program, &r.interner);
     let fa = FileAnalysis {
         path: "test.php",
@@ -109,7 +107,6 @@ pub(crate) fn run_located_version(
         reflection: &reflection,
         resolved_refs: &refs,
         types: &types,
-        native_types: &native_types,
         facts,
         php_version,
         treat_phpdoc_types_as_certain: true,
@@ -117,6 +114,7 @@ pub(crate) fn run_located_version(
         check_nullables: true,
         check_explicit_mixed: true,
         check_implicit_mixed: true,
+        reflect_cache: Default::default(),
     };
     rule(&fa)
 }

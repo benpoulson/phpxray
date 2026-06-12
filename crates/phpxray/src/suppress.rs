@@ -22,18 +22,93 @@ pub fn apply(
     report_unmatched: bool,
     sources: &HashMap<&str, &str>,
 ) -> Report {
-    let Report {
-        findings,
-        files_analyzed,
-        timings,
-    } = report;
-    let mut matchers: Vec<Matcher> = ignore.iter().filter_map(Matcher::compile).collect();
+    let compiled = CompiledIgnores::compile(ignore);
     // Precompute inline-ignore maps per file (keys borrow `sources`, which
-    // outlives this loop — so findings can be moved into `kept`).
+    // outlives this call — so findings can be moved into `kept`).
     let inline: HashMap<&str, InlineIgnores> = sources
         .iter()
         .map(|(path, src)| (*path, inline_ignores(src)))
         .collect();
+    let inline_refs: HashMap<&str, &InlineIgnores> =
+        inline.iter().map(|(p, i)| (*p, i)).collect();
+    apply_compiled(report, &compiled, report_unmatched, &inline_refs)
+}
+
+/// The compiled, reusable form of a config `ignore` set. Compiling 5k+ baseline
+/// entries means 5k+ regex + glob compilations (~1s on a big baseline), so
+/// incremental reruns compile once and reuse. Matchers whose path constraint is
+/// a glob-free multi-segment path are additionally bucketed by that path for
+/// O(path-depth) candidate lookup instead of a linear scan per finding.
+pub struct CompiledIgnores {
+    matchers: Vec<Matcher>,
+    /// Matcher indices keyed by their glob-free path prefix (trailing `/` trimmed).
+    by_path: HashMap<String, Vec<usize>>,
+    /// Matcher indices that must be consulted for every finding: no path
+    /// constraint, glob patterns, or single-segment paths (those match at any
+    /// depth per `ExcludeMatcher` semantics).
+    general: Vec<usize>,
+}
+
+impl CompiledIgnores {
+    pub fn compile(ignore: &[IgnoreEntry]) -> CompiledIgnores {
+        let matchers: Vec<Matcher> = ignore.iter().filter_map(Matcher::compile).collect();
+        let mut by_path: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut general = Vec::new();
+        for (i, m) in matchers.iter().enumerate() {
+            if m.bucket_paths.is_empty() {
+                general.push(i);
+            } else {
+                for key in &m.bucket_paths {
+                    by_path.entry(key.clone()).or_default().push(i);
+                }
+            }
+        }
+        CompiledIgnores {
+            matchers,
+            by_path,
+            general,
+        }
+    }
+
+    /// Matcher indices that could possibly match a finding at `path`, in
+    /// original entry order (so `count`-limited entries consume findings in the
+    /// same order as a full linear scan).
+    fn candidates(&self, path: &str) -> Vec<usize> {
+        let mut out = self.general.clone();
+        // Subtree semantics: a bucketed entry path P matches F iff F == P or F
+        // is under P/, so every '/'-prefix of F is a possible bucket key.
+        let normalized = path.replace('\\', "/");
+        for (i, b) in normalized.bytes().enumerate() {
+            if b == b'/' {
+                if let Some(v) = self.by_path.get(&normalized[..i]) {
+                    out.extend_from_slice(v);
+                }
+            }
+        }
+        if let Some(v) = self.by_path.get(normalized.as_str()) {
+            out.extend_from_slice(v);
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+}
+
+/// Apply suppressions using a pre-compiled ignore set and pre-scanned per-file
+/// inline-ignore maps. Match counting is per-call (the compiled set is shared).
+pub(crate) fn apply_compiled(
+    report: Report,
+    compiled: &CompiledIgnores,
+    report_unmatched: bool,
+    inline: &HashMap<&str, &InlineIgnores>,
+) -> Report {
+    let Report {
+        findings,
+        files_analyzed,
+        files_scanned,
+        timings,
+    } = report;
+    let mut matched = vec![0usize; compiled.matchers.len()];
 
     let mut kept = Vec::new();
     for f in findings {
@@ -44,14 +119,28 @@ pub fn apply(
             }
         }
         // Config ignore?
-        if matchers.iter_mut().any(|m| m.try_suppress(&f)) {
+        let suppressed = compiled.candidates(&f.path).into_iter().any(|i| {
+            let m = &compiled.matchers[i];
+            if !m.matches(&f) {
+                return false;
+            }
+            if m.count.is_some_and(|count| matched[i] >= count) {
+                return false;
+            }
+            matched[i] += 1;
+            true
+        });
+        if suppressed {
             continue;
         }
         kept.push(f);
     }
 
-    for (path, inline) in &inline {
-        for (line, message) in &inline.parse_errors {
+    // Deterministic order (the map's iteration order is not).
+    let mut error_paths: Vec<&&str> = inline.keys().collect();
+    error_paths.sort_unstable();
+    for path in error_paths {
+        for (line, message) in &inline[*path].parse_errors {
             kept.push(Finding {
                 path: (*path).to_string(),
                 line: *line,
@@ -64,8 +153,13 @@ pub fn apply(
     }
 
     if report_unmatched {
-        for m in &matchers {
-            if m.matched == 0 {
+        for (i, m) in compiled.matchers.iter().enumerate() {
+            // Per-entry opt-out (phpstan's `reportUnmatched: false`) —
+            // baseline-loaded entries carry it by default.
+            if m.report_unmatched == Some(false) {
+                continue;
+            }
+            if matched[i] == 0 {
                 kept.push(Finding {
                     path: "(ignore)".to_string(),
                     line: 0,
@@ -78,7 +172,7 @@ pub fn apply(
                     severity: Severity::Error,
                 });
             } else if let Some(expected) = m.count {
-                if m.matched < expected {
+                if matched[i] < expected {
                     kept.push(Finding {
                         path: "(ignore)".to_string(),
                         line: 0,
@@ -86,7 +180,7 @@ pub fn apply(
                         message: format!(
                             "Ignored pattern {} was expected to match {expected} times, but matched {} times",
                             m.describe(),
-                            m.matched
+                            matched[i]
                         ),
                         identifier: Some("ignore.unmatched"),
                         severity: Severity::Error,
@@ -99,6 +193,7 @@ pub fn apply(
     Report {
         findings: kept,
         files_analyzed,
+        files_scanned,
         timings,
     }
 }
@@ -111,7 +206,12 @@ struct Matcher {
     paths: Option<ExcludeMatcher>,
     /// Maximum number of findings this entry may suppress. `None` means unlimited.
     count: Option<usize>,
-    matched: usize,
+    /// When every path pattern is glob-free and multi-segment, the trimmed
+    /// patterns — usable as exact bucket keys for candidate prefiltering.
+    /// Empty = must be consulted for every finding.
+    bucket_paths: Vec<String>,
+    /// Per-entry `reportUnmatched` override; `None` follows the global flag.
+    report_unmatched: Option<bool>,
     desc: String,
 }
 
@@ -128,6 +228,19 @@ impl Matcher {
         });
         let path_patterns: Vec<String> = e.path.iter().chain(e.paths.iter()).cloned().collect();
         let paths = (!path_patterns.is_empty()).then(|| ExcludeMatcher::new(&path_patterns));
+        // Bucketable iff every pattern is glob-free and multi-segment (a bare
+        // single-segment name matches at any depth, so it can't be bucketed).
+        let bucket_paths: Vec<String> = if !path_patterns.is_empty()
+            && path_patterns.iter().all(|p| {
+                !p.contains(['*', '?']) && p.trim_end_matches('/').contains('/')
+            }) {
+            path_patterns
+                .iter()
+                .map(|p| p.trim_end_matches('/').replace('\\', "/"))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let desc = e
             .message
             .clone()
@@ -138,20 +251,10 @@ impl Matcher {
             identifier: e.identifier.clone(),
             paths,
             count: e.count,
-            matched: 0,
+            bucket_paths,
+            report_unmatched: e.report_unmatched,
             desc,
         })
-    }
-
-    fn try_suppress(&mut self, f: &Finding) -> bool {
-        if !self.matches(f) {
-            return false;
-        }
-        if self.count.is_some_and(|count| self.matched >= count) {
-            return false;
-        }
-        self.matched += 1;
-        true
     }
 
     fn matches(&self, f: &Finding) -> bool {
@@ -199,7 +302,10 @@ enum Spec {
     Ids(Vec<String>),
 }
 
-struct InlineIgnores {
+/// The inline-ignore markers found in one file, mapped target line → spec.
+/// Derived purely from the file's source, so incremental analysis caches one
+/// per file and rebuilds it only when the file changes.
+pub(crate) struct InlineIgnores {
     map: HashMap<u32, Spec>,
     parse_errors: Vec<(u32, String)>,
 }
@@ -216,7 +322,7 @@ fn suppressed_inline(map: &HashMap<u32, Spec>, f: &Finding) -> bool {
 }
 
 /// Scan source for inline ignore comments, mapping target line → what to ignore.
-fn inline_ignores(source: &str) -> InlineIgnores {
+pub(crate) fn inline_ignores(source: &str) -> InlineIgnores {
     let mut map: HashMap<u32, Spec> = HashMap::new();
     let mut parse_errors = Vec::new();
     for (i, line) in source.lines().enumerate() {
@@ -260,7 +366,7 @@ enum Marker {
 }
 
 fn marker(line: &str, lineno: u32) -> Marker {
-    for (prefix, strict) in [("@phpstan-ignore", true), ("@php-analyzer-ignore", false)] {
+    for (prefix, strict) in [("@phpstan-ignore", true), ("@phpxray-ignore", false)] {
         if let Some(pos) = line.find(prefix) {
             let mut rest = &line[pos + prefix.len()..];
             if let Some(end) = rest.find("*/") {
@@ -491,6 +597,7 @@ mod tests {
         Report {
             findings,
             files_analyzed: 1,
+            files_scanned: 0,
             timings: None,
         }
     }
@@ -553,6 +660,39 @@ mod tests {
             .findings
             .iter()
             .any(|f| f.identifier == Some("ignore.unmatched")));
+    }
+
+    #[test]
+    fn per_entry_report_unmatched_opt_out() {
+        // `reportUnmatched: false` on an entry silences both the
+        // matched-nothing and the count-mismatch reports for that entry,
+        // while other entries keep following the global setting.
+        let r = report(vec![finding("a.php", 1, "real", "return.type")]);
+        let entries = vec![
+            IgnoreEntry {
+                identifier: Some("never.happens".into()),
+                report_unmatched: Some(false),
+                ..Default::default()
+            },
+            IgnoreEntry {
+                message: Some("#^real$#".into()),
+                count: Some(2),
+                report_unmatched: Some(false),
+                ..Default::default()
+            },
+            IgnoreEntry {
+                identifier: Some("also.never".into()),
+                ..Default::default()
+            },
+        ];
+        let out = apply(r, &entries, true, &no_sources());
+        let unmatched: Vec<_> = out
+            .findings
+            .iter()
+            .filter(|f| f.identifier == Some("ignore.unmatched"))
+            .collect();
+        assert_eq!(unmatched.len(), 1, "{:#?}", out.findings);
+        assert!(unmatched[0].message.contains("also.never"));
     }
 
     #[test]

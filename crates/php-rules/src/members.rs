@@ -109,17 +109,17 @@ impl<'a> CallResolver<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MethodTarget {
+pub(crate) struct MethodTarget<'a> {
     pub receiver_fqn: String,
     pub method_name: String,
-    pub found: Found<MethodReflection>,
+    pub found: Found<'a, MethodReflection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PropertyTarget {
+pub(crate) struct PropertyTarget<'a> {
     pub receiver_fqn: String,
     pub property_name: String,
-    pub found: Found<PropertyReflection>,
+    pub found: Found<'a, PropertyReflection>,
 }
 
 pub(crate) struct MemberAccessResolver<'a> {
@@ -135,7 +135,7 @@ impl<'a> MemberAccessResolver<'a> {
         &self,
         receiver_ty: &Type,
         method_name: &str,
-    ) -> ResolveStatus<MethodTarget> {
+    ) -> ResolveStatus<MethodTarget<'a>> {
         let Some(receiver_fqn) = sole_class(receiver_ty) else {
             return ResolveStatus::Opaque;
         };
@@ -168,7 +168,7 @@ impl<'a> MemberAccessResolver<'a> {
         &self,
         class_fqn: &str,
         method_name: &str,
-    ) -> ResolveStatus<MethodTarget> {
+    ) -> ResolveStatus<MethodTarget<'a>> {
         if !self.fa.class_fully_known(class_fqn) {
             return ResolveStatus::Opaque;
         }
@@ -195,7 +195,7 @@ impl<'a> MemberAccessResolver<'a> {
         receiver_ty: &Type,
         property_name: &str,
         write: bool,
-    ) -> ResolveStatus<PropertyTarget> {
+    ) -> ResolveStatus<PropertyTarget<'a>> {
         let Some(receiver_fqn) = sole_class(receiver_ty) else {
             return ResolveStatus::Opaque;
         };
@@ -234,7 +234,7 @@ impl<'a> MemberAccessResolver<'a> {
         &self,
         class_fqn: &str,
         property_name: &str,
-    ) -> ResolveStatus<PropertyTarget> {
+    ) -> ResolveStatus<PropertyTarget<'a>> {
         if !symbols::class_tree_fully_known(self.fa, class_fqn) {
             return ResolveStatus::Opaque;
         }

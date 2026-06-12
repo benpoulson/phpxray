@@ -35,7 +35,6 @@ fn rule_timings_command_prints_all_buckets() {
         "resolve_ms",
         "facts_ms",
         "type_map_ms",
-        "native_type_map_ms",
         "rules_ms",
     ] {
         assert!(stdout.contains(bucket), "missing {bucket} in:\n{stdout}");
@@ -47,5 +46,5 @@ fn temp_dir(prefix: &str) -> std::path::PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("php-analyzer-{prefix}-{nanos}"))
+    std::env::temp_dir().join(format!("phpxray-{prefix}-{nanos}"))
 }

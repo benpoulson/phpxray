@@ -411,12 +411,12 @@ fn const_string_values(fa: &FileAnalysis, e: &Expr) -> Vec<String> {
 fn collect_literal_strings(t: &Type, out: &mut Vec<String>) {
     match t {
         Type::LiteralString(s) => {
-            if !out.contains(s) {
-                out.push(s.clone());
+            if !out.iter().any(|seen| seen.as_str() == &**s) {
+                out.push(s.to_string());
             }
         }
         Type::Union(parts) => {
-            for p in parts {
+            for p in parts.iter() {
                 collect_literal_strings(p, out);
             }
         }

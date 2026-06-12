@@ -220,18 +220,20 @@ fn run_ternary_condition(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_while_condition(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for s in fa.facts.statements() {
-        if let StmtKind::While { cond, .. } = &s.kind {
+        if let StmtKind::While { cond, body } = &s.kind {
             match const_bool(fa, cond) {
                 Some(false) => out.push(diag(
                     cond.span,
                     "While loop condition is always false.",
                     "while.alwaysFalse",
                 )),
-                Some(true) if is_literal_true(cond) => out.push(diag(
-                    cond.span,
-                    "While loop condition is always true.",
-                    "while.alwaysTrue",
-                )),
+                Some(true) if is_literal_true(cond) && !loop_body_exits(body, 0) => {
+                    out.push(diag(
+                        cond.span,
+                        "While loop condition is always true.",
+                        "while.alwaysTrue",
+                    ))
+                }
                 _ => {}
             }
         }
@@ -243,23 +245,86 @@ fn run_while_condition(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_do_while_condition(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for s in fa.facts.statements() {
-        if let StmtKind::DoWhile { cond, .. } = &s.kind {
+        if let StmtKind::DoWhile { cond, body } = &s.kind {
             match const_bool(fa, cond) {
                 Some(false) => out.push(diag(
                     cond.span,
                     "Do-while loop condition is always false.",
                     "doWhile.alwaysFalse",
                 )),
-                Some(true) if is_literal_true(cond) => out.push(diag(
-                    cond.span,
-                    "Do-while loop condition is always true.",
-                    "doWhile.alwaysTrue",
-                )),
+                Some(true) if is_literal_true(cond) && !loop_body_exits(body, 0) => {
+                    out.push(diag(
+                        cond.span,
+                        "Do-while loop condition is always true.",
+                        "doWhile.alwaysTrue",
+                    ))
+                }
                 _ => {}
             }
         }
     }
     out
+}
+
+/// Whether the loop body can *leave* the loop: a `break` reaching it, a
+/// `return`/`throw`/`exit`/`goto`, or a multi-level `continue`. phpstan only
+/// reports an always-true loop condition when the loop is breakless
+/// (`BreaklessWhileLoopNode`) — `while (true) { …; break; }` and
+/// `while (1) { …; return …; }` are intentional infinite-loop idioms, not
+/// redundancy bugs. `depth` counts the break-able constructs between the
+/// statement and OUR loop (a bare `break` inside a nested loop/switch exits
+/// that construct, not ours).
+fn loop_body_exits(s: &php_ast::Stmt, depth: i64) -> bool {
+    let level = |e: &Option<Expr>| match e {
+        None => 1,
+        Some(Expr {
+            kind: ExprKind::Int(n),
+            ..
+        }) => *n,
+        // A dynamic `break $n` (PHP 5 relic) — assume it can exit us.
+        Some(_) => i64::MAX,
+    };
+    match &s.kind {
+        StmtKind::Break(n) => level(n) > depth,
+        // `continue N` with N > depth+1 re-enters an OUTER construct — phpstan
+        // bails on these too (it cannot prove the loop is breakless).
+        StmtKind::Continue(n) => level(n) > depth + 1,
+        StmtKind::Return(_) | StmtKind::Goto(_) => true,
+        StmtKind::Expr(e) => matches!(&e.kind, ExprKind::Throw(_) | ExprKind::Exit(_)),
+        StmtKind::Block(body) => body.iter().any(|s| loop_body_exits(s, depth)),
+        StmtKind::If {
+            then, elseifs, els, ..
+        } => {
+            loop_body_exits(then, depth)
+                || elseifs.iter().any(|ei| loop_body_exits(&ei.body, depth))
+                || els.as_deref().is_some_and(|e| loop_body_exits(e, depth))
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::DoWhile { body, .. }
+        | StmtKind::For { body, .. }
+        | StmtKind::Foreach { body, .. } => loop_body_exits(body, depth + 1),
+        StmtKind::Switch { cases, .. } => cases
+            .iter()
+            .any(|c| c.body.iter().any(|s| loop_body_exits(s, depth + 1))),
+        StmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            body.iter().any(|s| loop_body_exits(s, depth))
+                || catches
+                    .iter()
+                    .any(|c| c.body.iter().any(|s| loop_body_exits(s, depth)))
+                || finally
+                    .as_ref()
+                    .is_some_and(|f| f.iter().any(|s| loop_body_exits(s, depth)))
+        }
+        StmtKind::Declare {
+            body: Some(body), ..
+        } => loop_body_exits(body, depth),
+        // Nested function/class bodies have their own control flow.
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -781,7 +846,7 @@ fn check_impossible_check_type_method_call_with_assertions(
         return;
     }
     let Some(assertion) = assertions.get(&(
-        symbols::fqn_key(&found.declaring_class),
+        symbols::fqn_key(found.declaring_class),
         found.member.name.to_ascii_lowercase(),
         false,
     )) else {
@@ -865,7 +930,7 @@ fn check_impossible_check_type_static_method_call_with_maps(
         return;
     }
     let Some(assertion) = assertions.get(&(
-        symbols::fqn_key(&found.declaring_class),
+        symbols::fqn_key(found.declaring_class),
         found.member.name.to_ascii_lowercase(),
         true,
     )) else {
@@ -914,7 +979,7 @@ fn member_ident(fa: &FileAnalysis, m: &MemberName) -> Option<String> {
 
 fn receiver_class(fa: &FileAnalysis, recv: &Expr) -> Option<String> {
     match fa.type_of(recv) {
-        Type::Named { fqn, .. } => Some(fqn),
+        Type::Named { fqn, .. } => Some(fqn.to_string()),
         _ => None,
     }
 }
@@ -1040,6 +1105,17 @@ fn check_strict_comparison(fa: &FileAnalysis, binary: &BinaryFact, out: &mut Vec
     if disjoint(&lt, &rt) {
         if !always_false {
             return;
+        }
+        // With `treatPhpDocTypesAsCertain: false`, phpstan only reports a
+        // redundancy provable from *native* types alone — a defensive check
+        // against a PHPDoc-declared type (`@return int|Node` … `false ===`)
+        // is deliberate runtime hardening, not dead code.
+        if !fa.treat_phpdoc_types_as_certain {
+            let nl = fa.native_type_of(binary.lhs);
+            let nr = fa.native_type_of(binary.rhs);
+            if !disjoint(&nl, &nr) {
+                return;
+            }
         }
         let (verb, code) = ("false", "identical.alwaysFalse");
         out.push(diag(
@@ -2010,7 +2086,7 @@ fn trait_class_const_value(ctx: &TraitCtx<'_>, class_fqn: &str, name: &str) -> O
         return Some(ConstVal::Int(v));
     }
     ctx.const_values
-        .get(&(class_key(&found.declaring_class), name.to_string()))
+        .get(&(class_key(found.declaring_class), name.to_string()))
         .cloned()
 }
 
@@ -2200,7 +2276,7 @@ pub(crate) static FACT_RULES: &[FactRuleEntry] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::codes;
+    use crate::testutil::{codes, codes_with};
 
     // --- impossible instanceof ---
 
@@ -2444,6 +2520,33 @@ mod tests {
     }
 
     #[test]
+    fn while_true_with_exit_points_is_an_intentional_loop() {
+        // phpstan only checks BREAKLESS loops: `while (true)` with a break,
+        // return, or throw is the idiomatic infinite loop.
+        for src in [
+            "<?php while (true) { if (foo()) { break; } }",
+            "<?php while (1) { if (foo()) { return 2; } }",
+            "<?php function f(): int { while (true) { if (foo()) { return 1; } } }",
+            "<?php while (true) { if (foo()) { throw new \\Exception('x'); } }",
+            // break 2 from a nested loop exits the outer one.
+            "<?php while (true) { foreach ($xs as $x) { break 2; } }",
+        ] {
+            assert!(
+                codes(src, run_while_condition).is_empty(),
+                "should be clean: {src}"
+            );
+        }
+        // A break that only exits a NESTED construct doesn't make ours exit.
+        assert_eq!(
+            codes(
+                "<?php while (true) { foreach ($xs as $x) { break; } }",
+                run_while_condition
+            ),
+            ["while.alwaysTrue"]
+        );
+    }
+
+    #[test]
     fn while_on_call_is_clean() {
         assert!(codes("<?php while (foo()) { echo 1; }", run_while_condition).is_empty());
     }
@@ -2556,6 +2659,36 @@ mod tests {
     fn strict_disjoint_via_typed_params() {
         let src = "<?php function f(int $a, string $b) { return $a === $b; }";
         assert_eq!(codes(src, run_strict_comparison), ["identical.alwaysFalse"]);
+    }
+
+    #[test]
+    fn strict_disjoint_honours_treat_phpdoc_types_as_certain() {
+        // The operand's type comes only from PHPDoc — with
+        // `treatPhpDocTypesAsCertain: false` the defensive runtime check is
+        // not reported (phpstan parity); native disjointness still is.
+        let doc_only = "<?php
+            interface V {
+                /** @return int */
+                public function g();
+            }
+            function f(V $v): bool { $r = $v->g(); return false === $r; }";
+        assert_eq!(
+            codes(doc_only, run_strict_comparison),
+            ["identical.alwaysFalse"]
+        );
+        assert!(codes_with(doc_only, run_strict_comparison, |fa| {
+            fa.treat_phpdoc_types_as_certain = false;
+        })
+        .is_empty());
+
+        // Natively provable: reported regardless of the option.
+        let native = "<?php function f(int $a, string $b) { return $a === $b; }";
+        assert_eq!(
+            codes_with(native, run_strict_comparison, |fa| {
+                fa.treat_phpdoc_types_as_certain = false;
+            }),
+            ["identical.alwaysFalse"]
+        );
     }
 
     #[test]

@@ -963,7 +963,7 @@ fn check_conditionals_in_doc_type(
             check_conditionals_in_doc_type(fa, scope, templates, bounds, params, inner, span, out);
         }
         DocType::Union(parts) | DocType::Intersection(parts) => {
-            for p in parts {
+            for p in parts.iter() {
                 check_conditionals_in_doc_type(fa, scope, templates, bounds, params, p, span, out);
             }
         }
@@ -1830,7 +1830,7 @@ fn referenced_classes(t: &Type) -> Vec<String> {
 fn collect_named(t: &Type, out: &mut Vec<String>) {
     match t {
         Type::Named { fqn, args } => {
-            out.push(fqn.clone());
+            out.push(fqn.to_string());
             for a in args {
                 collect_named(a, out);
             }
@@ -2387,7 +2387,7 @@ fn run_self_out(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 .map(|n| scope.qualify(fa.interner.resolve(n)))
                 .unwrap_or_else(|| "class@anonymous".to_string());
             let class_target = Type::Named {
-                fqn: class_name.clone(),
+                fqn: class_name.as_str().into(),
                 args: Vec::new(),
             };
             let class_docs = c.doc.as_deref().into_iter().collect::<Vec<_>>();
@@ -2774,10 +2774,10 @@ fn object_class_names(t: &Type) -> Vec<String> {
 
 fn collect_object_class_names(t: &Type, out: &mut Vec<String>) {
     match t {
-        Type::Named { fqn, .. } => out.push(fqn.clone()),
+        Type::Named { fqn, .. } => out.push(fqn.to_string()),
         Type::Nullable(inner) => collect_object_class_names(inner, out),
         Type::Union(parts) | Type::Intersection(parts) => {
-            for p in parts {
+            for p in parts.iter() {
                 collect_object_class_names(p, out);
             }
         }

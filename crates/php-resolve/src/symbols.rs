@@ -104,6 +104,16 @@ pub fn strip_leading_slash(fqn: &str) -> &str {
     fqn.trim_start_matches('\\')
 }
 
+/// Write the canonical case-insensitive key for a class/function FQN into `buf`
+/// (cleared first) — the allocation-free counterpart of
+/// [`SymbolKey::class_like`]/[`SymbolKey::function`] for lookup hot paths that
+/// reuse a scratch buffer instead of allocating a `String` per lookup.
+pub fn write_ci_key(fqn: &str, buf: &mut String) {
+    buf.clear();
+    buf.push_str(strip_leading_slash(fqn));
+    buf.make_ascii_lowercase();
+}
+
 /// Display-normalize an FQN while preserving case.
 pub fn display_fqn(fqn: impl AsRef<str>) -> String {
     strip_leading_slash(fqn.as_ref()).to_string()

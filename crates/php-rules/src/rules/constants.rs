@@ -867,13 +867,13 @@ fn check_overriding_constant_type(
 
 /// phpstan's `findPrototype`: an immediate interface's constant wins; otherwise
 /// the parent class's constant (unless private). Returns the overridden one.
-fn find_prototype(
-    fa: &FileAnalysis,
+fn find_prototype<'a>(
+    fa: &'a FileAnalysis,
     c: &ClassDecl,
     scope: &Scope,
     _self_fqn: &str,
     name: &str,
-) -> Option<php_reflect::Found<php_reflect::ConstReflection>> {
+) -> Option<php_reflect::Found<'a, php_reflect::ConstReflection>> {
     // Immediate interfaces first (in declaration order).
     for iface in &c.implements {
         if let Resolution::Fqn(ifqn) = scope.resolve_class(iface) {

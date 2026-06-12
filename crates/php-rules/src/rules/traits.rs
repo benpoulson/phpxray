@@ -289,6 +289,23 @@ fn cap(s: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn run_not_analysed_trait(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    // Collect this file's trait declarations first: most files declare none,
+    // and the project-wide usage scan below is a whole-index dependency that
+    // incremental analysis re-runs on any surface change — only pay it (and
+    // record it) for files that actually declare traits.
+    let mut own_traits: Vec<(String, php_span::Span)> = Vec::new();
+    for_each_class(fa.program, fa.interner, |scope, c| {
+        if c.kind != ClassKind::Trait {
+            return;
+        }
+        if let Some(name) = c.name {
+            own_traits.push((scope.qualify(fa.interner.resolve(name)), c.name_span));
+        }
+    });
+    if own_traits.is_empty() {
+        return Vec::new();
+    }
+
     let used_traits: HashSet<String> = fa
         .project
         .classes()
@@ -297,26 +314,19 @@ fn run_not_analysed_trait(fa: &FileAnalysis) -> Vec<Diagnostic> {
         .collect();
 
     let mut out = Vec::new();
-    for_each_class(fa.program, fa.interner, |scope, c| {
-        if c.kind != ClassKind::Trait {
-            return;
-        }
-        let Some(name) = c.name else {
-            return;
-        };
-        let fqn = scope.qualify(fa.interner.resolve(name));
+    for (fqn, name_span) in own_traits {
         let Some(entry) = fa.project.class(&fqn) else {
-            return;
+            continue;
         };
         if !entry.sources.iter().any(|source| source == fa.path) {
-            return;
+            continue;
         }
         if used_traits.contains(&fqn.trim_start_matches('\\').to_ascii_lowercase()) {
-            return;
+            continue;
         }
         out.push(
             Diagnostic::error(
-                php_span::Span::new(0, 0),
+                name_span,
                 format!(
                     "Trait {} is used zero times and is not analysed.",
                     fqn.trim_start_matches('\\')
@@ -324,7 +334,7 @@ fn run_not_analysed_trait(fa: &FileAnalysis) -> Vec<Diagnostic> {
             )
             .with_code("trait.unused"),
         );
-    });
+    }
     out
 }
 

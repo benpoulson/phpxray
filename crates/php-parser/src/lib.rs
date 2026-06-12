@@ -29,8 +29,8 @@ impl ParseResult {
 /// Parse PHP source into a [`Program`] with its own fresh interner. Total by
 /// contract: never panics. Use [`parse_into`] to share one interner across files.
 pub fn parse(source: &str) -> ParseResult {
-    let mut interner = Interner::new();
-    let (program, diagnostics) = parser::Parser::new(source, &mut interner).parse();
+    let interner = Interner::new();
+    let (program, diagnostics) = parser::Parser::new(source, &interner).parse();
     ParseResult {
         program,
         diagnostics,
@@ -42,6 +42,6 @@ pub fn parse(source: &str) -> ParseResult {
 /// resulting symbols are comparable/resolvable across every file parsed into the
 /// same interner. This is what lets the project-wide indexes and cross-file
 /// (interprocedural) analysis resolve a symbol from any file. Total: never panics.
-pub fn parse_into(source: &str, interner: &mut Interner) -> (Program, Vec<Diagnostic>) {
+pub fn parse_into(source: &str, interner: &Interner) -> (Program, Vec<Diagnostic>) {
     parser::Parser::new(source, interner).parse()
 }

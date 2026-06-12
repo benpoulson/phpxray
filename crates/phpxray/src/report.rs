@@ -46,15 +46,27 @@ pub fn render_table(report: &Report) -> String {
     }
 
     let errors = report.error_count();
+    // Scan-only files (e.g. vendor) are indexed for symbols, not rule-checked;
+    // mention them only when present so small runs stay uncluttered.
+    let scanned = if report.files_scanned > 0 {
+        format!(", {} scanned", report.files_scanned)
+    } else {
+        String::new()
+    };
+    let file_noun = if report.files_analyzed == 1 {
+        "file"
+    } else {
+        "files"
+    };
     if errors == 0 {
         out.push_str(&format!(
-            "[OK] No errors ({} files analyzed)\n",
+            "[OK] No errors ({} {file_noun} analyzed{scanned})\n",
             report.files_analyzed
         ));
     } else {
         let noun = if errors == 1 { "error" } else { "errors" };
         out.push_str(&format!(
-            "[ERROR] Found {errors} {noun} ({} files analyzed)\n",
+            "[ERROR] Found {errors} {noun} ({} {file_noun} analyzed{scanned})\n",
             report.files_analyzed
         ));
     }
@@ -88,7 +100,15 @@ pub fn render_json(report: &Report) -> String {
     }
 
     let mut files: BTreeMap<String, FileBlock> = BTreeMap::new();
+    // Non-file-specific findings (suppression bookkeeping like unmatched
+    // ignores, reported at the synthetic "(ignore)" path) go into phpstan's
+    // top-level `errors` array and `totals.errors`, not `files`.
+    let mut errors: Vec<String> = Vec::new();
     for f in &report.findings {
+        if f.path == "(ignore)" {
+            errors.push(f.message.clone());
+            continue;
+        }
         let block = files.entry(f.path.clone()).or_insert(FileBlock {
             errors: 0,
             messages: Vec::new(),
@@ -103,11 +123,11 @@ pub fn render_json(report: &Report) -> String {
     }
     let out = Out {
         totals: Totals {
-            errors: 0,
-            file_errors: report.error_count(),
+            errors: errors.len(),
+            file_errors: report.error_count().saturating_sub(errors.len()),
         },
         files,
-        errors: Vec::new(),
+        errors,
     };
     serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string())
 }
@@ -200,6 +220,7 @@ mod tests {
                 finding("src/A.php", 7, "unknown class `Foo`", "class.notFound"),
             ],
             files_analyzed: 2,
+            files_scanned: 0,
             timings: None,
         };
         let out = render_table(&report);
@@ -213,9 +234,21 @@ mod tests {
         let report = Report {
             findings: vec![],
             files_analyzed: 5,
+            files_scanned: 0,
             timings: None,
         };
         assert!(render_table(&report).contains("[OK] No errors (5 files analyzed)"));
+    }
+
+    #[test]
+    fn table_mentions_scanned_files_when_present() {
+        let report = Report {
+            findings: vec![],
+            files_analyzed: 5,
+            files_scanned: 12,
+            timings: None,
+        };
+        assert!(render_table(&report).contains("[OK] No errors (5 files analyzed, 12 scanned)"));
     }
 
     #[test]
@@ -223,6 +256,7 @@ mod tests {
         let report = Report {
             findings: vec![finding("src/A.php", 4, "bad return", "return.type")],
             files_analyzed: 1,
+            files_scanned: 0,
             timings: None,
         };
         let v: serde_json::Value = serde_json::from_str(&render_json(&report)).unwrap();
@@ -240,10 +274,34 @@ mod tests {
     }
 
     #[test]
+    fn json_routes_non_file_findings_to_top_level_errors() {
+        // phpstan puts non-file-specific errors (e.g. unmatched ignores) into
+        // the top-level `errors` array + `totals.errors`, not under `files`.
+        let report = Report {
+            findings: vec![
+                finding("src/A.php", 4, "bad return", "return.type"),
+                finding("(ignore)", 0, "Ignored pattern #x# was not matched in reported errors", "ignore.unmatched"),
+            ],
+            files_analyzed: 1,
+            files_scanned: 0,
+            timings: None,
+        };
+        let v: serde_json::Value = serde_json::from_str(&render_json(&report)).unwrap();
+        assert_eq!(v["totals"]["errors"], 1);
+        assert_eq!(v["totals"]["file_errors"], 1);
+        assert!(v["files"].get("(ignore)").is_none());
+        assert_eq!(
+            v["errors"][0],
+            "Ignored pattern #x# was not matched in reported errors"
+        );
+    }
+
+    #[test]
     fn github_and_checkstyle_formats() {
         let report = Report {
             findings: vec![finding("src/A.php", 4, "bad return", "return.type")],
             files_analyzed: 1,
+            files_scanned: 0,
             timings: None,
         };
         assert_eq!(
@@ -260,6 +318,7 @@ mod tests {
         let report = Report {
             findings: vec![],
             files_analyzed: 0,
+            files_scanned: 0,
             timings: None,
         };
         assert!(render(&report, "table").is_some());

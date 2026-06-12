@@ -51,7 +51,7 @@ use php_ast::{Arg, Expr, ExprKind, FunctionDecl, Member, Param, Stmt, StmtKind};
 use php_diagnostics::Diagnostic;
 use php_infer::TypeCtx;
 use php_intern::Interner;
-use php_reflect::{reflect_class, reflect_function, resolve_doc_type, ParamReflection};
+use php_reflect::{resolve_doc_type, ParamReflection};
 use php_resolve::{for_each_region, Scope};
 use php_types::Type;
 use std::collections::{HashMap, HashSet};
@@ -267,7 +267,7 @@ fn run_parameter_out_assigned_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
                         return;
                     };
                     let fqn = scope.qualify(fa.interner.resolve(name));
-                    let class_refl = reflect_class(scope, fa.interner, &fqn, c);
+                    let class_refl = fa.reflect_class(scope, &fqn, c);
                     for member in &c.members {
                         let Member::Method(m) = member else {
                             continue;
@@ -307,7 +307,7 @@ fn check_byref_param_assignments_in_function(
     fa: &FileAnalysis,
     out: &mut Vec<Diagnostic>,
 ) {
-    let refl = reflect_function(scope, fa.interner, f);
+    let refl = fa.reflect_function(scope, f);
     let description = format!("function {}()", refl.fqn);
     check_byref_param_assignments(&f.body, &refl.params, &description, fa, out);
 }
@@ -389,7 +389,7 @@ fn run_parameter_out_execution_end_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
                         return;
                     };
                     let class_fqn = scope.qualify(fa.interner.resolve(class_name));
-                    let class_refl = reflect_class(scope, fa.interner, &class_fqn, c);
+                    let class_refl = fa.reflect_class(scope, &class_fqn, c);
                     let class_templates = doc_templates(c.doc.as_deref());
                     for member in &c.members {
                         let Member::Method(m) = member else {
@@ -439,7 +439,7 @@ fn check_param_out_execution_function(
     fa: &FileAnalysis,
     out: &mut Vec<Diagnostic>,
 ) {
-    let refl = reflect_function(scope, fa.interner, f);
+    let refl = fa.reflect_function(scope, f);
     let description = format!("function {}()", refl.fqn);
     let templates = doc_templates(f.doc.as_deref());
     check_param_out_execution_body(
@@ -1107,7 +1107,7 @@ fn falsy_verdict(ty: &Type) -> Truth {
         Type::IntRange { min, max } if min == &Some(0) && max == &Some(0) => Truth::Yes,
         Type::IntRange { min, .. } if min.is_some_and(|n| n > 0) => Truth::No,
         Type::IntRange { max, .. } if max.is_some_and(|n| n < 0) => Truth::No,
-        Type::LiteralString(s) if s.is_empty() || s == "0" => Truth::Yes,
+        Type::LiteralString(s) if s.is_empty() || &**s == "0" => Truth::Yes,
         Type::LiteralString(_) => Truth::No,
         Type::Shape {
             fields,

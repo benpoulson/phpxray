@@ -86,7 +86,7 @@ use php_diagnostics::Diagnostic;
 use php_intern::Interner;
 use php_phpdoc::DocType;
 use php_reflect::{
-    reflect_class, ClassReflection, Found, MethodReflection, ParamReflection, ReflectionIndex,
+    ClassReflection, Found, MethodReflection, ParamReflection, ReflectionIndex,
 };
 use php_resolve::{for_each_region, Resolution, Scope};
 use php_span::Span;
@@ -131,40 +131,14 @@ fn display(fa: &FileAnalysis, c: &ClassDecl) -> String {
 
 /// A best-effort span for a method-level diagnostic. Our AST does not record a
 /// span on [`MethodDecl`] itself, so we point at the first available child span:
-/// a parameter, the return type, the first body statement, an attribute argument
-/// — else a zero span.
+/// The method-name token span.
 fn method_span(m: &MethodDecl) -> Span {
-    if let Some(p) = m.params.first() {
-        return p.span;
-    }
-    if let Some(t) = &m.return_type {
-        return t.span;
-    }
-    if let Some(body) = &m.body {
-        if let Some(first) = body.first() {
-            return first.span;
-        }
-    }
-    if let Some(a) = m.attrs.first().and_then(|g| g.attrs.first()) {
-        return a.name.span;
-    }
-    Span::new(0, 0)
+    m.name_span
 }
 
-/// A best-effort span for a class-level diagnostic: the first member's span, else
-/// a parent/interface reference, else a zero span (no class-name span in the AST).
+/// The class-name token span (the `class` keyword for anonymous classes).
 fn class_span(c: &ClassDecl) -> Span {
-    c.members
-        .iter()
-        .find_map(|m| match m {
-            Member::Method(md) => Some(method_span(md)),
-            Member::Property(pd) => pd.ty.as_ref().map(|t| t.span),
-            _ => None,
-        })
-        .or_else(|| c.extends.first().map(|n| n.span))
-        .or_else(|| c.implements.first().map(|n| n.span))
-        .or_else(|| c.backing.as_ref().map(|t| t.span))
-        .unwrap_or(Span::new(0, 0))
+    c.name_span
 }
 
 // ---------------------------------------------------------------------------
@@ -454,7 +428,7 @@ fn collect_unimplemented_abstracts(refl: &ReflectionIndex, fqn: &str) -> Vec<(St
         }
         if let Some(found) = refl.find_method(fqn, &name) {
             if found.member.is_abstract && !found.member.magic {
-                let declaring = describe_declarer(refl, &found.declaring_class);
+                let declaring = describe_declarer(refl, found.declaring_class);
                 out.push((found.member.name.clone(), declaring));
             }
         }
@@ -607,6 +581,12 @@ fn run_overriding_method(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     .with_code("method.parentMethodFinal"),
                 );
             }
+            // Constructors have no prototype: PHP lets a child constructor
+            // change the signature and visibility freely (phpstan's
+            // OverridingMethodRule only keeps the final-parent check above).
+            if m.name.eq_ignore_ascii_case("__construct") {
+                continue;
+            }
             if pm.is_static && !m.is_static {
                 out.push(
                     Diagnostic::error(
@@ -747,11 +727,11 @@ fn vis_word(v: Visibility) -> &'static str {
 
 /// Find the nearest non-magic method named `name` strictly above `class` in the
 /// hierarchy (parents, then interfaces).
-fn find_parent_method(
-    refl: &ReflectionIndex,
+fn find_parent_method<'a>(
+    refl: &'a ReflectionIndex,
     class: &ClassReflection,
     name: &str,
-) -> Option<Found<MethodReflection>> {
+) -> Option<Found<'a, MethodReflection>> {
     for parent in class.parents.iter().chain(&class.interfaces) {
         if let Type::Named { fqn: pf, .. } = parent {
             if let Some(found) = refl.find_method(pf, name) {
@@ -1393,7 +1373,7 @@ fn run_method_argument_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// The class FQN named by a type (through nullability), if any.
 fn named_fqn(t: &Type) -> Option<String> {
     match t {
-        Type::Named { fqn, .. } => Some(fqn.clone()),
+        Type::Named { fqn, .. } => Some(fqn.to_string()),
         Type::Nullable(inner) => named_fqn(inner),
         _ => None,
     }
@@ -1504,7 +1484,7 @@ fn union_method_status(fa: &FileAnalysis, ty: &Type, method: &str) -> Option<(bo
     }
     let mut has_method = false;
     let mut lacks_method = false;
-    for part in parts {
+    for part in parts.iter() {
         let Type::Named { fqn, .. } = part else {
             return None;
         };
@@ -1727,7 +1707,7 @@ fn collect_overriding_parameter_renames(fa: &FileAnalysis) -> Vec<ParameterRenam
             if parent.member.visibility == Visibility::Private || parent.member.magic {
                 continue;
             }
-            if !method_accepts_named_arguments(fa, &parent.declaring_class, &parent.member.name) {
+            if !method_accepts_named_arguments(fa, parent.declaring_class, &parent.member.name) {
                 continue;
             }
             for (prototype_param, method_param) in parent.member.params.iter().zip(&method.params) {
@@ -1735,7 +1715,7 @@ fn collect_overriding_parameter_renames(fa: &FileAnalysis) -> Vec<ParameterRenam
                     continue;
                 }
                 out.push(ParameterRename {
-                    prototype_class: parent.declaring_class.clone(),
+                    prototype_class: parent.declaring_class.to_string(),
                     method: parent.member.name.clone(),
                     subtype_class: class.fqn.clone(),
                     prototype_parameter: prototype_param.name.clone(),
@@ -1807,13 +1787,13 @@ fn collect_named_arg_calls_in_body(
             if found.member.magic || found.member.visibility == Visibility::Private {
                 return;
             }
-            let Some(declaring_class) = fa.reflection.class(&found.declaring_class) else {
+            let Some(declaring_class) = fa.reflection.class(found.declaring_class) else {
                 return;
             };
             if declaring_class.is_final {
                 return;
             }
-            if !method_accepts_named_arguments(fa, &found.declaring_class, &found.member.name) {
+            if !method_accepts_named_arguments(fa, found.declaring_class, &found.member.name) {
                 return;
             }
             for arg in args {
@@ -1824,7 +1804,7 @@ fn collect_named_arg_calls_in_body(
                     continue;
                 }
                 out.push(NamedArgMethodCall {
-                    prototype_class: found.declaring_class.clone(),
+                    prototype_class: found.declaring_class.to_string(),
                     method: found.member.name.clone(),
                     parameter: arg_name.to_string(),
                     span: arg.span,
@@ -2154,8 +2134,8 @@ fn find_consistent_constructor_prototype(
         if let Some(found) = fa.reflection.find_method(&class.fqn, "__construct") {
             if !found.member.magic {
                 return Some(ConstructorPrototype {
-                    declaring_class: found.declaring_class,
-                    params: found.member.params,
+                    declaring_class: found.declaring_class.to_string(),
+                    params: found.member.params.clone(),
                     visibility: found.member.visibility,
                 });
             }
@@ -2715,7 +2695,7 @@ fn run_method_no_discard(fa: &FileAnalysis) -> Vec<Diagnostic> {
             };
             if let Some(d) = no_discard_method_diag(
                 &found.member,
-                &found.declaring_class,
+                found.declaring_class,
                 "method",
                 in_void_cast,
                 e.span,
@@ -2763,7 +2743,7 @@ fn run_static_method_no_discard(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 };
                 if let Some(d) = no_discard_method_diag(
                     &found.member,
-                    &found.declaring_class,
+                    found.declaring_class,
                     "staticMethod",
                     in_void_cast,
                     e.span,
@@ -2871,7 +2851,7 @@ fn static_call_class_fqn_for_no_discard(
 
 fn static_class_fqn_from_type(fa: &FileAnalysis, t: &Type) -> Option<String> {
     match t {
-        Type::Named { fqn, .. } => Some(fqn.clone()),
+        Type::Named { fqn, .. } => Some(fqn.to_string()),
         Type::ClassString(Some(inner)) => static_class_fqn_from_type(fa, inner),
         Type::LiteralString(s) => fa.reflection.class(s).map(|c| c.fqn.clone()),
         Type::Nullable(inner) => static_class_fqn_from_type(fa, inner),
@@ -2942,7 +2922,7 @@ fn run_missing_method_iterable_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
             };
             let Some(nm) = c.name else { continue };
             let fqn = scope.qualify(fa.interner.resolve(nm));
-            let refl = reflect_class(scope, fa.interner, &fqn, c);
+            let refl = fa.reflect_class(scope, &fqn, c);
             // phpstan inherits @param/@return from overridden parent/interface
             // methods. We don't model that, so we only check methods that can't
             // inherit: the class (and all its ancestors) must be fully known, and
@@ -3781,6 +3761,29 @@ mod tests {
             class Base { public function f(int $x): void {} }
             class C extends Base { public function f(int|float $x): void {} }";
         assert!(codes(src, run_overriding_method).is_empty());
+    }
+
+    #[test]
+    fn constructor_has_no_prototype() {
+        // PHP exempts __construct from LSP entirely: a child constructor may
+        // freely change the signature AND narrow visibility (singletons).
+        let src = "<?php
+            class Base { public function __construct(array $attributes = []) {} }
+            class C extends Base {
+                protected function __construct(int $x) { parent::__construct(); }
+            }";
+        assert!(
+            codes(src, run_overriding_method).is_empty(),
+            "constructor signature/visibility must not be prototype-checked"
+        );
+    }
+
+    #[test]
+    fn final_parent_constructor_override_is_still_reported() {
+        let src = "<?php
+            class Base { final public function __construct() {} }
+            class C extends Base { public function __construct() {} }";
+        assert!(codes(src, run_overriding_method).contains(&"method.parentMethodFinal"));
     }
 
     #[test]

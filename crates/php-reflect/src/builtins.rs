@@ -31,6 +31,8 @@ pub(crate) fn builtin_functions_for(version: PhpVersion) -> Vec<FunctionReflecti
                 .map(|p| reflected_param(p, &scope, &[]))
                 .collect(),
             return_type: deser_type(f.return_type, &scope),
+            explicit_return: true,
+            inferred_return: false,
             native_return: deser_type(f.return_type, &scope),
             by_ref: false,
             templates: Vec::new(),
@@ -106,6 +108,7 @@ pub(crate) fn builtin_classes_for(version: PhpVersion) -> Vec<ClassReflection> {
                         .collect(),
                     return_type: deser_type_with_templates(return_type, &scope, &templates),
                     explicit_return: true,
+                    inferred_return: false,
                     native_return: deser_type(native_return, &scope),
                     templates: Vec::new(),
                     deprecated: false,
@@ -174,6 +177,7 @@ fn reflected_param(p: BuiltinParam<'_>, scope: &Scope, templates: &[String]) -> 
         optional: p.flags.contains('o'),
         promoted: false,
         explicit: true,
+        inferred: false,
     }
 }
 
@@ -212,7 +216,7 @@ fn named_types(names: Vec<&str>) -> Vec<Type> {
     names
         .into_iter()
         .map(|fqn| Type::Named {
-            fqn: fqn.to_string(),
+            fqn: fqn.into(),
             args: Vec::new(),
         })
         .collect()

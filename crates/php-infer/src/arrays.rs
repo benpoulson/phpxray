@@ -91,7 +91,7 @@ pub fn shape_offset_status(base_ty: &Type, key: &str) -> Option<ShapeOffsetStatu
         Type::Union(parts) if !parts.is_empty() => {
             let mut saw_missing = false;
             let mut present_types = Vec::new();
-            for part in parts {
+            for part in parts.iter() {
                 match shape_offset_status(part, key)? {
                     ShapeOffsetStatus::Missing => saw_missing = true,
                     ShapeOffsetStatus::Present(ty) => present_types.push(ty),
@@ -124,7 +124,7 @@ pub fn shape_offset_maybe_reportable(base_ty: &Type, key: &str) -> bool {
         Type::Union(parts) if !parts.is_empty() => {
             let mut present = false;
             let mut missing = false;
-            for part in parts {
+            for part in parts.iter() {
                 match shape_offset_status(part, key).map(ShapeOffsetStatus::without_type) {
                     Some(ShapeOffsetPresence::Present) => present = true,
                     Some(ShapeOffsetPresence::Missing) => missing = true,

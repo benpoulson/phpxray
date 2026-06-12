@@ -19,7 +19,10 @@ pub use model::{
     attr_target, reflect_class, reflect_function, AttributeSpec, ClassReflection, ConstReflection,
     FunctionReflection, MethodReflection, ParamReflection, PropertyReflection,
 };
-pub use project::{reflect_file, Found, ReflectedFile, ReflectionIndex, SourceKind};
+pub use project::{
+    reflect_artifact, reflect_file, FileReflectionArtifact, Found, InferredSig, InferredSignatures,
+    ReflectedFile, ReflectionIndex, SourceKind,
+};
 
 /// Resolve a native PHP type declaration to a semantic [`Type`] in `scope`.
 pub fn resolve_ast_type(scope: &Scope, ty: &AstType) -> Type {
@@ -32,12 +35,12 @@ pub fn resolve_ast_type(scope: &Scope, ty: &AstType) -> Type {
                 _ => Type::StaticType,
             },
             Resolution::Fqn(fqn) => Type::Named {
-                fqn,
+                fqn: fqn.into(),
                 args: Vec::new(),
             },
             // Native type position never yields a fallback, but be total.
             Resolution::Fallback { namespaced, .. } => Type::Named {
-                fqn: namespaced,
+                fqn: namespaced.into(),
                 args: Vec::new(),
             },
         },
@@ -98,7 +101,7 @@ pub fn resolve_doc_type(scope: &Scope, templates: &[String], t: &DocType) -> Typ
                 .map(|r| resolve_doc_type(scope, templates, r))
                 .unwrap_or(Type::Mixed),
         }))),
-        DocType::ConstString(s) => Type::LiteralString(s.clone()),
+        DocType::ConstString(s) => Type::LiteralString(s.as_str().into()),
         DocType::ConstInt(s) => match s.parse::<i64>() {
             Ok(n) => Type::LiteralInt(n),
             Err(_) => Type::Int,
@@ -113,7 +116,7 @@ pub fn resolve_doc_type(scope: &Scope, templates: &[String], t: &DocType) -> Typ
             then,
             els,
         } => Type::Conditional {
-            subject: subject.clone(),
+            subject: subject.as_str().into(),
             negated: *negated,
             target: Box::new(resolve_doc_type(scope, templates, target)),
             then: Box::new(resolve_doc_type(scope, templates, then)),
@@ -126,7 +129,7 @@ pub fn resolve_doc_type(scope: &Scope, templates: &[String], t: &DocType) -> Typ
 /// keyword, a native keyword, or a class reference.
 fn doc_named(scope: &Scope, templates: &[String], name: &str) -> Type {
     if templates.iter().any(|t| t == name) {
-        return Type::TemplateVar(name.to_string());
+        return Type::TemplateVar(name.into());
     }
     match doc_keyword(name) {
         Some(t) => t,
@@ -138,11 +141,11 @@ fn doc_named(scope: &Scope, templates: &[String], name: &str) -> Type {
                 _ => Type::StaticType,
             },
             Resolution::Fqn(fqn) => Type::Named {
-                fqn,
+                fqn: fqn.into(),
                 args: Vec::new(),
             },
             Resolution::Fallback { namespaced, .. } => Type::Named {
-                fqn: namespaced,
+                fqn: namespaced.into(),
                 args: Vec::new(),
             },
         },
@@ -271,7 +274,7 @@ fn builtin(kw: &str) -> Type {
         "array" => Type::Array(None),
         "iterable" => Type::Iterable(None),
         "callable" => Type::Callable(None),
-        other => Type::Unknown(other.to_string()),
+        other => Type::Unknown(other.into()),
     }
 }
 

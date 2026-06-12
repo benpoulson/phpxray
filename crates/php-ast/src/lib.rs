@@ -161,6 +161,8 @@ pub struct FunctionDecl {
     pub attrs: Vec<AttributeGroup>,
     pub doc: Option<String>,
     pub name: Symbol,
+    /// Span of the function-name token (for declaration-precise diagnostics).
+    pub name_span: Span,
     pub by_ref: bool,
     pub params: Vec<Param>,
     pub return_type: Option<Type>,
@@ -174,6 +176,9 @@ pub struct ClassDecl {
     pub kind: ClassKind,
     /// `None` for an anonymous class.
     pub name: Option<Symbol>,
+    /// Span of the class-name token; for an anonymous class, of the `class`
+    /// keyword (so class-level diagnostics always have a precise anchor).
+    pub name_span: Span,
     pub modifiers: Modifiers,
     /// `extends`: a class has 0–1; an interface may have many.
     pub extends: Vec<Name>,
@@ -207,6 +212,8 @@ pub struct MethodDecl {
     pub modifiers: Modifiers,
     pub by_ref: bool,
     pub name: Symbol,
+    /// Span of the method-name token (for member-precise diagnostics).
+    pub name_span: Span,
     pub params: Vec<Param>,
     pub return_type: Option<Type>,
     /// `None` for abstract/interface methods.
@@ -225,6 +232,8 @@ pub struct PropertyDecl {
 #[derive(Clone, PartialEq, Debug)]
 pub struct PropElem {
     pub name: Symbol,
+    /// Span of the property-name `$var` token.
+    pub name_span: Span,
     pub default: Option<Expr>,
     /// Property hooks (`{ get; set { … } }`). `None` = a plain property (no
     /// brace block); `Some` = a hook block was present (possibly empty `{}`).
@@ -240,6 +249,8 @@ pub struct PropertyHook {
     pub by_ref: bool,
     /// `get` or `set`.
     pub name: Symbol,
+    /// Span of the hook-name token.
+    pub name_span: Span,
     /// An explicit parameter list (`set(Type $v)`).
     pub params: Option<Vec<Param>>,
     pub body: HookBody,
@@ -267,6 +278,8 @@ pub struct ClassConstDecl {
 #[derive(Clone, PartialEq, Debug)]
 pub struct ConstElem {
     pub name: Symbol,
+    /// Span of the constant-name token.
+    pub name_span: Span,
     pub value: Expr,
 }
 
@@ -275,6 +288,8 @@ pub struct EnumCaseDecl {
     pub attrs: Vec<AttributeGroup>,
     pub doc: Option<String>,
     pub name: Symbol,
+    /// Span of the case-name token.
+    pub name_span: Span,
     pub value: Option<Expr>,
 }
 

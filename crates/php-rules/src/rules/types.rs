@@ -19,7 +19,6 @@ use php_ast::{
     Param, PropertyHook, Stmt, StmtKind, Type, TypeKind,
 };
 use php_diagnostics::Diagnostic;
-use php_reflect::{reflect_class, reflect_function};
 use php_resolve::{for_each_region, RefKind, Resolution, ResolvedRef, Scope};
 use std::collections::HashMap;
 
@@ -225,6 +224,22 @@ fn strict_mixed_source(
         || (include_implicit && ty.contains_implicit_mixed())
 }
 
+/// Whether a member-access receiver *is* mixed. Unlike [`strict_mixed_source`]
+/// this is a top-level test: `Collection<mixed, mixed>` or `array<int, mixed>`
+/// merely *contain* mixed in a type argument — calling/indexing on them is
+/// fine, and phpstan does not report it. Unions stay unreported (conservative).
+fn receiver_is_mixed(
+    ty: &php_types::Type,
+    include_explicit: bool,
+    include_implicit: bool,
+) -> bool {
+    match ty {
+        php_types::Type::ExplicitMixed => include_explicit,
+        php_types::Type::Mixed => include_implicit,
+        _ => false,
+    }
+}
+
 fn concrete_target(ty: &php_types::Type) -> bool {
     use php_types::Type as T;
     !ty.is_mixed()
@@ -383,7 +398,7 @@ fn check_method_call_mixed(
 
 fn named_fqn(ty: &php_types::Type) -> Option<String> {
     match ty {
-        php_types::Type::Named { fqn, .. } => Some(fqn.clone()),
+        php_types::Type::Named { fqn, .. } => Some(fqn.to_string()),
         php_types::Type::Nullable(inner) => named_fqn(inner),
         _ => None,
     }
@@ -412,7 +427,7 @@ fn collect_return_scopes(
 ) {
     match &st.kind {
         StmtKind::Function(f) => {
-            let refl = reflect_function(scope, fa.interner, f);
+            let refl = fa.reflect_function(scope, f);
             if concrete_target(&refl.return_type) {
                 for s in &f.body {
                     check_return_stmts(
@@ -429,7 +444,7 @@ fn collect_return_scopes(
         StmtKind::Class(c) => {
             let Some(name) = c.name else { return };
             let fqn = scope.qualify(fa.interner.resolve(name));
-            let cls = reflect_class(scope, fa.interner, &fqn, c);
+            let cls = fa.reflect_class(scope, &fqn, c);
             for m in &c.members {
                 let Member::Method(md) = m else { continue };
                 let Some(body) = &md.body else { continue };
@@ -550,7 +565,7 @@ fn check_member_access_mixed(
 ) {
     walk::for_each_expr(fa.program, &mut |e| match &e.kind {
         ExprKind::MethodCall { recv, method, .. } => {
-            if !strict_mixed_source(&fa.type_of(recv), include_explicit, include_implicit) {
+            if !receiver_is_mixed(&fa.type_of(recv), include_explicit, include_implicit) {
                 return;
             }
             let MemberName::Ident(name) = method else {
@@ -563,7 +578,7 @@ fn check_member_access_mixed(
             );
         }
         ExprKind::Prop { base, name, .. } => {
-            if !strict_mixed_source(&fa.type_of(base), include_explicit, include_implicit) {
+            if !receiver_is_mixed(&fa.type_of(base), include_explicit, include_implicit) {
                 return;
             }
             let MemberName::Ident(name) = name else {
@@ -576,7 +591,7 @@ fn check_member_access_mixed(
             );
         }
         ExprKind::Index { base, index } => {
-            if !strict_mixed_source(&fa.type_of(base), include_explicit, include_implicit) {
+            if !receiver_is_mixed(&fa.type_of(base), include_explicit, include_implicit) {
                 return;
             }
             let message = if let Some(index) = index {
@@ -818,6 +833,41 @@ mod tests {
     fn explicit_mixed_return_to_concrete_type_is_flagged() {
         let src = "<?php function f(mixed $x): int { return $x; }";
         assert_eq!(codes(src, run_explicit_mixed_strictness), ["return.type"]);
+    }
+
+    #[test]
+    fn generic_receiver_with_mixed_args_is_not_a_mixed_receiver() {
+        // The receiver IS a Collection — it merely has `mixed` in its generic
+        // arguments (the unbound-template case, e.g. Laravel's `collect($x)`).
+        // phpstan does not report member access on it; neither must we.
+        let src = r#"<?php
+class Collection { /** @return static */ public function filter(callable $cb) { return $this; } }
+/**
+ * @template TKey of array-key
+ * @template TValue
+ * @param iterable<TKey, TValue>|null $value
+ * @return Collection<TKey, TValue>
+ */
+function collect($value = []) { return new Collection(); }
+function f(mixed $x): void { collect($x)->filter(fn ($v) => $v !== false); }
+"#;
+        assert!(
+            !codes(src, run_explicit_mixed_strictness).contains(&"method.nonObject"),
+            "Collection<mixed, mixed> receiver must not count as mixed"
+        );
+        assert!(!codes(src, run_implicit_mixed_strictness).contains(&"method.nonObject"));
+    }
+
+    #[test]
+    fn array_of_mixed_values_is_not_a_mixed_offset_receiver() {
+        // `array<int, mixed>` is offset-accessible; only the VALUE is mixed.
+        // (Accessing an offset on that mixed value is a different expression.)
+        let src = r#"<?php
+/** @param array<int, mixed> $rows */
+function f(array $rows): void { $x = $rows[0]; }
+"#;
+        assert!(!codes(src, run_implicit_mixed_strictness)
+            .contains(&"offsetAccess.nonOffsetAccessible"));
     }
 
     #[test]

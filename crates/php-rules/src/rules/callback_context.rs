@@ -81,7 +81,6 @@ struct Overlay<'a> {
     fa: &'a FileAnalysis<'a>,
     scope: &'a Scope,
     types: TypeMap,
-    native_types: TypeMap,
 }
 
 impl Overlay<'_> {
@@ -89,15 +88,15 @@ impl Overlay<'_> {
         self.types
             .get(&span_key(e))
             .or_else(|| self.fa.types.get(&span_key(e)))
-            .cloned()
+            .map(|f| f.merged.clone())
             .unwrap_or(Type::Mixed)
     }
 
     fn native_type_of(&self, e: &Expr) -> Type {
-        self.native_types
+        self.types
             .get(&span_key(e))
-            .or_else(|| self.fa.native_types.get(&span_key(e)))
-            .cloned()
+            .or_else(|| self.fa.types.get(&span_key(e)))
+            .map(|f| f.native().clone())
             .unwrap_or(Type::Mixed)
     }
 
@@ -151,6 +150,8 @@ fn collect(fa: &FileAnalysis, rule: ContextRule) -> Vec<LocatedDiagnostic> {
 
 impl<'a> CallbackContext<'a> {
     fn overlay(&self, fa: &'a FileAnalysis<'a>) -> Overlay<'a> {
+        // One faceted overlay; the native facet is computed only when the run
+        // treats PHPDoc types as uncertain (otherwise it is never consulted).
         let types = contextual_body_type_map(
             fa.reflection,
             self.body.scope,
@@ -158,24 +159,13 @@ impl<'a> CallbackContext<'a> {
             self.body.class_fqn.clone(),
             &self.body.params,
             &self.inferred,
-            false,
-            self.body.body,
-        );
-        let native_types = contextual_body_type_map(
-            fa.reflection,
-            self.body.scope,
-            fa.interner,
-            self.body.class_fqn.clone(),
-            &self.body.params,
-            &self.inferred,
-            true,
+            !fa.treat_phpdoc_types_as_certain,
             self.body.body,
         );
         Overlay {
             fa,
             scope: self.body.scope,
             types,
-            native_types,
         }
     }
 }
@@ -454,13 +444,13 @@ fn function_callback_body<'a>(fa: &'a FileAnalysis<'a>, fqn: &str) -> Option<Cal
 
 fn method_callback_body<'a>(
     fa: &'a FileAnalysis<'a>,
-    found: php_reflect::Found<MethodReflection>,
+    found: php_reflect::Found<'_, MethodReflection>,
 ) -> Option<CallbackBody<'a>> {
     let meta = fa
         .reflection
-        .method_body_meta(&found.declaring_class, &found.member.name)?;
-    let class_fqn = found.declaring_class;
-    let method = found.member;
+        .method_body_meta(found.declaring_class, &found.member.name)?;
+    let class_fqn = found.declaring_class.to_string();
+    let method = found.member.into_owned();
     let method_name = method.name;
     Some(CallbackBody {
         body: meta.body,
@@ -631,7 +621,8 @@ fn check_method_call_args(
     if found.member.magic {
         return;
     }
-    let short = members::sole_class(&recv_ty).unwrap_or(found.declaring_class);
+    let short = members::sole_class(&recv_ty)
+        .unwrap_or_else(|| found.declaring_class.to_string());
     for (i, arg) in args.iter().enumerate() {
         let Some(param) = found.member.params.get(i) else {
             break;

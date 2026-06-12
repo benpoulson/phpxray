@@ -77,7 +77,6 @@ fn run_return_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
         fa.program,
         fa.interner,
         fa.types,
-        fa.native_types,
         fa.treat_phpdoc_types_as_certain,
         fa.check_nullables,
         fa.report_maybes,
@@ -827,7 +826,7 @@ fn is_maybe_callable(t: &php_types::Type) -> bool {
     }
     let mut callable = false;
     let mut non_callable = false;
-    for part in parts {
+    for part in parts.iter() {
         if is_definitely_callable(part) {
             callable = true;
         } else if is_definitely_not_callable(part) {
@@ -1813,9 +1812,9 @@ fn check_anonymous_return_expr(
 }
 
 fn known_anonymous_return_type(fa: &FileAnalysis, e: &Expr) -> Option<Type> {
-    if let Some(t) = fa.types.get(&expr_key(e)) {
-        if decisive_anonymous_actual(t) {
-            return Some(t.clone());
+    if let Some(f) = fa.types.get(&expr_key(e)) {
+        if decisive_anonymous_actual(&f.merged) {
+            return Some(f.merged.clone());
         }
     }
     const_return_expr_type(e)
@@ -1849,7 +1848,7 @@ fn literal_string_return_type(bytes: &[u8]) -> Type {
     const MAX_LITERAL_STRING: usize = 64;
     if bytes.len() <= MAX_LITERAL_STRING {
         if let Ok(s) = std::str::from_utf8(bytes) {
-            return Type::LiteralString(s.to_string());
+            return Type::LiteralString(s.into());
         }
     }
     Type::String
@@ -1984,7 +1983,7 @@ fn run_missing_function_iterable_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
             let StmtKind::Function(fd) = &st.kind else {
                 continue;
             };
-            let refl = php_reflect::reflect_function(scope, fa.interner, fd);
+            let refl = fa.reflect_function(scope, fd);
             let name = refl.fqn.trim_start_matches('\\');
             for (p, pr) in fd.params.iter().zip(refl.params.iter()) {
                 if let Some(word) = bare_iterable_word(&pr.ty) {
@@ -2343,7 +2342,7 @@ fn callable_no_discard_target(fa: &FileAnalysis, callee: &Expr) -> Option<NoDisc
 
 fn exact_callable_receiver_class(fa: &FileAnalysis, e: &Expr) -> Option<String> {
     match fa.type_of(e) {
-        Type::Named { fqn, .. } => Some(fqn),
+        Type::Named { fqn, .. } => Some(fqn.to_string()),
         Type::ClassString(Some(inner)) => named_type_fqn(&inner),
         Type::LiteralString(s) => fa.reflection.class(&s).map(|c| c.fqn.clone()),
         Type::Nullable(inner) => named_type_fqn(&inner),
@@ -2353,7 +2352,7 @@ fn exact_callable_receiver_class(fa: &FileAnalysis, e: &Expr) -> Option<String> 
 
 fn named_type_fqn(t: &Type) -> Option<String> {
     match t {
-        Type::Named { fqn, .. } => Some(fqn.clone()),
+        Type::Named { fqn, .. } => Some(fqn.to_string()),
         Type::Nullable(inner) => named_type_fqn(inner),
         _ => None,
     }
@@ -2364,7 +2363,7 @@ fn exact_string_value(fa: &FileAnalysis, e: &Expr) -> Option<String> {
         ExprKind::Str(bytes) => std::str::from_utf8(bytes).ok().map(ToOwned::to_owned),
         ExprKind::Paren(inner) => exact_string_value(fa, inner),
         _ => match fa.type_of(e) {
-            Type::LiteralString(s) => Some(s),
+            Type::LiteralString(s) => Some(s.to_string()),
             _ => None,
         },
     }
@@ -4746,6 +4745,47 @@ mod tests {
     fn array_values_named_arg_is_skipped() {
         let src = "<?php $x = [1, 2]; array_values(array: $x);";
         assert!(codes(src, run_array_values).is_empty());
+    }
+
+    #[test]
+    fn array_values_after_key_dropping_functions_is_meaningful() {
+        // array_filter/array_unique/array_diff preserve keys while dropping
+        // entries, so their result is NOT a list even when the input was —
+        // re-indexing with array_values() is exactly what you do next.
+        let src = r#"<?php
+/** @param list<string> $x */
+function f(array $x): void {
+    array_values(array_filter($x, fn ($v) => $v !== ''));
+    array_values(array_unique($x));
+    array_values(array_diff($x, ['a']));
+}
+"#;
+        assert!(codes(src, run_array_values).is_empty());
+    }
+
+    #[test]
+    fn array_values_after_array_map_over_filtered_input_is_meaningful() {
+        // array_map over ONE array preserves that array's keys: mapping a
+        // filtered (holey) array yields a holey array, not a list.
+        let src = r#"<?php
+/** @param list<string> $x */
+function f(array $x): void {
+    array_values(array_map(fn ($v) => (string) $v, array_filter($x)));
+}
+"#;
+        assert!(codes(src, run_array_values).is_empty());
+    }
+
+    #[test]
+    fn array_values_after_array_map_over_list_is_flagged() {
+        // Mapping a true list yields a list — array_values() is a no-op there.
+        let src = r#"<?php
+/** @param list<string> $x */
+function f(array $x): void {
+    array_values(array_map(fn ($v) => (string) $v, $x));
+}
+"#;
+        assert_eq!(codes(src, run_array_values), ["arrayValues.list"]);
     }
 
     // --- array_filter literal arrays --------------------------------------

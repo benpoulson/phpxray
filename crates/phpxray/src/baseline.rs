@@ -80,6 +80,7 @@ mod tests {
                 finding("b.php", 2, "unknown class `X`", "class.notFound"),
             ],
             files_analyzed: 2,
+            files_scanned: 0,
             timings: None,
         };
         let es = entries(&report);
@@ -105,6 +106,7 @@ mod tests {
                 finding("src/B.php", 9, "unknown class `Foo`", "class.notFound"),
             ],
             files_analyzed: 2,
+            files_scanned: 0,
             timings: None,
         };
         let yaml = to_yaml(&entries(&report));

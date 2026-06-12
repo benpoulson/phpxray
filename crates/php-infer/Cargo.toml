@@ -12,6 +12,7 @@ php-resolve.workspace = true
 php-types.workspace = true
 php-reflect.workspace = true
 php-phpdoc.workspace = true
+rayon.workspace = true
 
 [dev-dependencies]
 php-parser.workspace = true

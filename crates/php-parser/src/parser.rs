@@ -24,9 +24,11 @@ pub struct Parser<'a> {
     src: &'a str,
     tokens: Vec<Token>,
     pos: usize,
-    /// Borrowed so several files can share one project-wide interner (symbols are
-    /// then comparable/resolvable across files — required for cross-file analysis).
-    interner: &'a mut Interner,
+    /// Borrowed (shared) so several files can share one project-wide interner —
+    /// symbols are then comparable/resolvable across files (required for
+    /// cross-file analysis), and the concurrent interner lets files parse in
+    /// parallel into the same interner.
+    interner: &'a Interner,
     diags: Vec<Diagnostic>,
     depth: u32,
     /// Doc-comments are kept out of the parse stream (so they never disrupt
@@ -36,7 +38,7 @@ pub struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    pub fn new(source: &'a str, interner: &'a mut Interner) -> Parser<'a> {
+    pub fn new(source: &'a str, interner: &'a Interner) -> Parser<'a> {
         let (lexed, diags) = php_lexer::tokenize(source);
         let mut docs = Vec::new();
         let mut tokens = Vec::with_capacity(lexed.len());
@@ -929,6 +931,13 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Like [`member_ident`](Self::member_ident) but also returns the span of the
+    /// name token, for member-precise diagnostics.
+    fn member_ident_spanned(&mut self) -> (Symbol, Span) {
+        let start = self.cur_start();
+        (self.member_ident(), self.span_to(start))
+    }
+
     fn parse_attributed_decl(&mut self, doc: Option<String>) -> StmtKind {
         let attrs = self.parse_attributes();
         match self.peek() {
@@ -989,7 +998,7 @@ impl<'a> Parser<'a> {
     ) -> FunctionDecl {
         self.bump(); // function
         let by_ref = self.eat_amp();
-        let name = self.member_ident();
+        let (name, name_span) = self.member_ident_spanned();
         let params = self.parse_param_list();
         let return_type = if self.eat(T::Colon) {
             Some(self.parse_type())
@@ -1001,6 +1010,7 @@ impl<'a> Parser<'a> {
             attrs,
             doc,
             name,
+            name_span,
             by_ref,
             params,
             return_type,
@@ -1091,10 +1101,14 @@ impl<'a> Parser<'a> {
         self.bump(); // const
         let mut elems = Vec::new();
         loop {
-            let name = self.member_ident();
+            let (name, name_span) = self.member_ident_spanned();
             self.expect(T::Eq, "`=`");
             let value = self.parse_expr(0);
-            elems.push(ConstElem { name, value });
+            elems.push(ConstElem {
+                name,
+                name_span,
+                value,
+            });
             if !self.eat(T::Comma) {
                 break;
             }
@@ -1123,7 +1137,8 @@ impl<'a> Parser<'a> {
             }
         };
         self.bump();
-        let name = Some(self.member_ident());
+        let (n, name_span) = self.member_ident_spanned();
+        let name = Some(n);
         let backing = if kind == ClassKind::Enum && self.eat(T::Colon) {
             Some(self.parse_type())
         } else {
@@ -1145,6 +1160,7 @@ impl<'a> Parser<'a> {
             doc,
             kind,
             name,
+            name_span,
             modifiers,
             extends,
             implements,
@@ -1192,10 +1208,14 @@ impl<'a> Parser<'a> {
                 };
                 let mut consts = Vec::new();
                 loop {
-                    let name = self.member_ident();
+                    let (name, name_span) = self.member_ident_spanned();
                     self.expect(T::Eq, "`=`");
                     let value = self.parse_expr(0);
-                    consts.push(ConstElem { name, value });
+                    consts.push(ConstElem {
+                        name,
+                        name_span,
+                        value,
+                    });
                     if !self.eat(T::Comma) {
                         break;
                     }
@@ -1212,7 +1232,7 @@ impl<'a> Parser<'a> {
             T::Keyword(Kw::Function) => {
                 self.bump();
                 let by_ref = self.eat_amp();
-                let name = self.member_ident();
+                let (name, name_span) = self.member_ident_spanned();
                 let params = self.parse_param_list();
                 let return_type = if self.eat(T::Colon) {
                     Some(self.parse_type())
@@ -1231,6 +1251,7 @@ impl<'a> Parser<'a> {
                     modifiers,
                     by_ref,
                     name,
+                    name_span,
                     params,
                     return_type,
                     body,
@@ -1238,7 +1259,7 @@ impl<'a> Parser<'a> {
             }
             T::Keyword(Kw::Case) => {
                 self.bump();
-                let name = self.member_ident();
+                let (name, name_span) = self.member_ident_spanned();
                 let value = if self.eat(T::Eq) {
                     Some(self.parse_expr(0))
                 } else {
@@ -1249,6 +1270,7 @@ impl<'a> Parser<'a> {
                     attrs,
                     doc,
                     name,
+                    name_span,
                     value,
                 })
             }
@@ -1284,6 +1306,7 @@ impl<'a> Parser<'a> {
         let mut props = Vec::new();
         let mut hooked = false;
         loop {
+            let name_start = self.cur_start();
             let name = if self.at(T::Variable) {
                 let t = self.bump();
                 self.intern_var(t)
@@ -1291,6 +1314,7 @@ impl<'a> Parser<'a> {
                 self.error_here("expected property variable");
                 self.interner.intern("")
             };
+            let name_span = self.span_to(name_start);
             let default = if self.eat(T::Eq) {
                 Some(self.parse_expr(0))
             } else {
@@ -1305,6 +1329,7 @@ impl<'a> Parser<'a> {
             };
             props.push(PropElem {
                 name,
+                name_span,
                 default,
                 hooks,
             });
@@ -1336,7 +1361,7 @@ impl<'a> Parser<'a> {
             let attrs = self.parse_attributes();
             let modifiers = self.parse_modifiers();
             let by_ref = self.eat_amp();
-            let name = self.member_ident();
+            let (name, name_span) = self.member_ident_spanned();
             let params = if self.at(T::LParen) {
                 Some(self.parse_param_list())
             } else {
@@ -1360,6 +1385,7 @@ impl<'a> Parser<'a> {
                 modifiers,
                 by_ref,
                 name,
+                name_span,
                 params,
                 body,
             });
@@ -1568,7 +1594,7 @@ impl<'a> Parser<'a> {
         attrs: Vec<AttributeGroup>,
         modifiers: Modifiers,
     ) -> Expr {
-        self.bump(); // class
+        let name_span = self.bump().span; // `class` keyword — the anon class's anchor
         let args = if self.at(T::LParen) {
             self.parse_args()
         } else {
@@ -1590,6 +1616,7 @@ impl<'a> Parser<'a> {
             doc: None,
             kind: ClassKind::Class,
             name: None,
+            name_span,
             modifiers,
             extends,
             implements,

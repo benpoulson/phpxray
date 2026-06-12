@@ -3,7 +3,7 @@
 //! Our own config file (not a phpstan/NEON drop-in) using vocabulary familiar to
 //! phpstan users: `level`, `paths`, `exclude`, `ignore`, … Deserialized with
 //! serde; unknown keys are ignored for forward-compatibility. The engine
-//! ([`php-cli`]) consumes the resolved [`Config`] to discover files, pick rules
+//! ([`phpxray`]) consumes the resolved [`Config`] to discover files, pick rules
 //! by level, and suppress findings.
 
 use regex::Regex;
@@ -44,6 +44,11 @@ pub struct Config {
     /// types — matching projects that opt out (e.g. nikic/PHP-Parser).
     #[serde(rename = "treatPhpDocTypesAsCertain")]
     pub treat_phpdoc_types_as_certain: bool,
+    /// Infer signatures for fully untyped functions/methods from their bodies and
+    /// call sites (default `true`). Treated as PHPDoc-grade: refines inference for
+    /// legacy untyped code without affecting native-level (`treatPhpDocTypesAsCertain:
+    /// false`) checking. Set `false` to analyze declarations only, like PHPStan.
+    pub infer_untyped_signatures: bool,
     /// Suppression entries.
     pub ignore: Vec<IgnoreEntry>,
 }
@@ -62,6 +67,7 @@ impl Default for Config {
             baseline: None,
             report_unmatched_ignored: true,
             treat_phpdoc_types_as_certain: true,
+            infer_untyped_signatures: true,
             ignore: Vec::new(),
         }
     }
@@ -83,9 +89,9 @@ impl Config {
     pub fn discover(dir: impl AsRef<std::path::Path>) -> Option<std::path::PathBuf> {
         let dir = dir.as_ref();
         for name in [
-            "phpanalyzer.yaml",
-            "phpanalyzer.yml",
-            "phpanalyzer.dist.yaml",
+            "phpxray.yaml",
+            "phpxray.yml",
+            "phpxray.dist.yaml",
         ] {
             let p = dir.join(name);
             if p.is_file() {
@@ -217,6 +223,12 @@ pub struct IgnoreEntry {
     pub paths: Vec<String>,
     /// Expected number of occurrences (for baselines / strict ignores).
     pub count: Option<usize>,
+    /// Per-entry override of `reportUnmatchedIgnored` (phpstan's per-entry
+    /// `reportUnmatched`). `None` = follow the global setting. Baseline-loaded
+    /// entries default to `Some(false)`: a baseline is a snapshot of past debt,
+    /// so an entry going stale means the code got *fixed* — nagging about it
+    /// would punish progress.
+    pub report_unmatched: Option<bool>,
 }
 
 impl<'de> Deserialize<'de> for IgnoreEntry {
@@ -231,6 +243,7 @@ impl<'de> Deserialize<'de> for IgnoreEntry {
             #[serde(default)]
             paths: Vec<String>,
             count: Option<usize>,
+            report_unmatched: Option<bool>,
         }
         #[derive(Deserialize)]
         #[serde(untagged)]
@@ -249,6 +262,7 @@ impl<'de> Deserialize<'de> for IgnoreEntry {
                 path: m.path,
                 paths: m.paths,
                 count: m.count,
+                report_unmatched: m.report_unmatched,
             },
         })
     }

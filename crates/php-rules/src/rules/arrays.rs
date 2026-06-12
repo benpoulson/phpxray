@@ -1080,7 +1080,7 @@ fn union_offset_status(fa: &FileAnalysis, ty: &Type) -> Option<(bool, bool)> {
     }
     let mut accessible = false;
     let mut inaccessible = false;
-    for part in parts {
+    for part in parts.iter() {
         if definitely_offset_accessible(fa, part) {
             accessible = true;
         } else if definitely_not_offset_accessible(fa, part) {

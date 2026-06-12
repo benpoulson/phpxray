@@ -57,6 +57,7 @@ mod tests {
             doc: None,
             kind: ClassKind::Class,
             name: None,
+            name_span: Span::new(0, 0),
             modifiers: Modifiers::default(),
             extends: vec![],
             implements: vec![],

@@ -12,14 +12,32 @@ use crate::facts::{
     ArrayFact, AssignmentFact, BinaryFact, CallFact, CastFact, EchoFact, FileFacts, ForeachFact,
     IndexFact, MethodCallFact, PrintFact, StaticCallFact, UnaryFact,
 };
-use php_ast::{Expr, Program};
+use php_ast::{ClassDecl, Expr, FunctionDecl, Program};
 use php_diagnostics::Diagnostic;
 use php_index::ProjectIndex;
 use php_infer::TypeMap;
 use php_intern::Interner;
-use php_reflect::ReflectionIndex;
-use php_resolve::ResolvedRef;
+use php_reflect::{
+    reflect_class, reflect_function, ClassReflection, FunctionReflection, ReflectionIndex,
+};
+use php_resolve::{ResolvedRef, Scope};
 use php_types::{PhpVersion, Type};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Per-file memo of declared (AST) reflections, so the many rules that need a
+/// class/function's reflected signature don't each re-parse its docblock. Keyed by
+/// the declaration's address (stable and unique within one file). Single-threaded
+/// per file (rules run sequentially over one [`FileAnalysis`]), so `RefCell` is
+/// sound. **AST-declared** semantics: this reflects from source, deliberately
+/// *not* the project [`ReflectionIndex`] (which may carry inferred/PHPDoc-grade
+/// signature-inference enrichment) — rules that want the declared view rely on it.
+#[derive(Default)]
+pub struct ReflectCache {
+    classes: RefCell<HashMap<usize, Arc<ClassReflection>>>,
+    functions: RefCell<HashMap<usize, Arc<FunctionReflection>>>,
+}
 
 /// The read-only inputs a rule reads about one file. The shared project/reflection
 /// indexes are borrowed (built once for the whole run).
@@ -34,12 +52,11 @@ pub struct FileAnalysis<'a> {
     pub reflection: &'a ReflectionIndex,
     /// Resolved name references in this file.
     pub resolved_refs: &'a [ResolvedRef],
-    /// Inferred type of every expression in the file, keyed by span.
+    /// Inferred [`Facets`] (merged + native views) of every expression in the
+    /// file, keyed by span. Read via [`type_of`](Self::type_of) /
+    /// [`native_type_of`](Self::native_type_of); the native facet is present only
+    /// under `treatPhpDocTypesAsCertain: false`.
     pub types: &'a TypeMap,
-    /// Native-only inferred type of every expression (PHPDoc ignored), keyed by
-    /// span — used by the type-compatibility rules when `treatPhpDocTypesAsCertain`
-    /// is off, to suppress mismatches visible only at the PHPDoc-refined level.
-    pub native_types: &'a TypeMap,
     /// Shared whole-file AST facts collected once for rules that do not need
     /// flow-sensitive local-scope traversal.
     pub facts: FileFacts<'a>,
@@ -61,25 +78,61 @@ pub struct FileAnalysis<'a> {
     pub check_explicit_mixed: bool,
     /// phpstan's implicit `mixed` strictness gate (`max`).
     pub check_implicit_mixed: bool,
+    /// Per-file memo of declared reflections (see [`ReflectCache`]). Default-init
+    /// at every construction site; consume via [`FileAnalysis::reflect_class`] /
+    /// [`FileAnalysis::reflect_function`].
+    pub reflect_cache: ReflectCache,
 }
 
 impl FileAnalysis<'_> {
-    /// The inferred type of expression `e` (`mixed` if it wasn't typed — e.g.
-    /// inside a closure body, which the type map leaves opaque for now).
+    /// Reflect a class-like declaration, memoized per file. Returns the same
+    /// declared reflection (`Arc`-shared) for repeated calls on the same decl, so
+    /// rules don't each re-parse its docblock. `fqn` is its resolved name.
+    pub fn reflect_class(&self, scope: &Scope, fqn: &str, c: &ClassDecl) -> Arc<ClassReflection> {
+        let key = std::ptr::from_ref(c) as usize;
+        if let Some(r) = self.reflect_cache.classes.borrow().get(&key) {
+            return Arc::clone(r);
+        }
+        let r = Arc::new(reflect_class(scope, self.interner, fqn, c));
+        self.reflect_cache.classes.borrow_mut().insert(key, Arc::clone(&r));
+        r
+    }
+
+    /// Reflect a free-function declaration, memoized per file (see
+    /// [`reflect_class`](Self::reflect_class)).
+    pub fn reflect_function(&self, scope: &Scope, f: &FunctionDecl) -> Arc<FunctionReflection> {
+        let key = std::ptr::from_ref(f) as usize;
+        if let Some(r) = self.reflect_cache.functions.borrow().get(&key) {
+            return Arc::clone(r);
+        }
+        let r = Arc::new(reflect_function(scope, self.interner, f));
+        self.reflect_cache
+            .functions
+            .borrow_mut()
+            .insert(key, Arc::clone(&r));
+        r
+    }
+
+    /// The inferred type of expression `e` (`mixed` if it wasn't typed). Closure
+    /// and arrow-fn bodies *are* recorded (params, `use` captures and `$this` are
+    /// seeded), so this resolves inside them too; `mixed` means genuinely unknown
+    /// (e.g. an untyped parameter), as anywhere else.
     pub fn type_of(&self, e: &Expr) -> Type {
         let r = e.span.range();
         self.types
             .get(&(r.start as u32, r.end as u32))
-            .cloned()
+            .map(|f| f.merged.clone())
             .unwrap_or(Type::Mixed)
     }
 
     /// The native-only inferred type of `e` (`mixed` if untyped/PHPDoc-only).
+    /// Reads the native facet of the single faceted map; it is only meaningful
+    /// (and only consulted) under `treatPhpDocTypesAsCertain: false`.
     pub fn native_type_of(&self, e: &Expr) -> Type {
         let r = e.span.range();
-        self.native_types
+        self.types
             .get(&(r.start as u32, r.end as u32))
-            .cloned()
+            .map(|f| f.native().clone())
             .unwrap_or(Type::Mixed)
     }
 
@@ -822,8 +875,7 @@ mod tests {
         let mut reflection = ReflectionIndex::new();
         reflection.add_file(&r.program, &r.interner);
         let refs = resolve_references(&r.program, &r.interner);
-        let types = php_infer::type_map(&reflection, &r.program, &r.interner);
-        let native_types = php_infer::native_type_map(&reflection, &r.program, &r.interner);
+        let types = php_infer::type_map(&reflection, &r.program, &r.interner, true);
         let facts = FileFacts::new(&r.program, &r.interner);
         let fa = FileAnalysis {
             path: "t.php",
@@ -834,7 +886,6 @@ mod tests {
             reflection: &reflection,
             resolved_refs: &refs,
             types: &types,
-            native_types: &native_types,
             facts,
             php_version: PhpVersion::default(),
             treat_phpdoc_types_as_certain: true,
@@ -842,6 +893,7 @@ mod tests {
             check_nullables: true,
             check_explicit_mixed: true,
             check_implicit_mixed: true,
+            reflect_cache: Default::default(),
         };
 
         // Level 0: only the unknown-symbol rule fires.

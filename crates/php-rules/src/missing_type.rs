@@ -71,7 +71,7 @@ fn collect_type_iterable_words(ty: &Type, out: &mut Vec<&'static str>) {
         Type::Iterable(None) => out.push("iterable"),
         Type::Nullable(inner) => collect_type_iterable_words(inner, out),
         Type::Union(parts) | Type::Intersection(parts) => {
-            for part in parts {
+            for part in parts.iter() {
                 collect_type_iterable_words(part, out);
             }
         }
@@ -112,7 +112,7 @@ fn collect_type_generic_args_in_union(
         }
         Type::Nullable(inner) => collect_type_generic_args_in_union(reflection, inner, out),
         Type::Union(parts) | Type::Intersection(parts) => {
-            for part in parts {
+            for part in parts.iter() {
                 collect_type_generic_args_in_union(reflection, part, out);
             }
         }
@@ -160,7 +160,7 @@ fn collect_type_generic_args(
             }
         }
         Type::Union(parts) | Type::Intersection(parts) => {
-            for part in parts {
+            for part in parts.iter() {
                 collect_type_generic_args(reflection, part, seen, out);
             }
         }
@@ -217,7 +217,7 @@ fn collect_type_callable_signature_words(ty: &Type, out: &mut Vec<&'static str>)
         Type::Callable(None) => out.push("callable"),
         Type::Nullable(inner) => collect_type_callable_signature_words(inner, out),
         Type::Union(parts) | Type::Intersection(parts) => {
-            for part in parts {
+            for part in parts.iter() {
                 collect_type_callable_signature_words(part, out);
             }
         }
@@ -302,7 +302,7 @@ fn collect_doc_generic_args(
             collect_doc_generic_args(ctx, inner, out)
         }
         DocType::Union(parts) | DocType::Intersection(parts) => {
-            for p in parts {
+            for p in parts.iter() {
                 collect_doc_generic_args(ctx, p, out);
             }
         }

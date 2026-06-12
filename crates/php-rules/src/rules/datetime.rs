@@ -103,10 +103,10 @@ fn constant_strings(fa: &FileAnalysis, expr: &Expr) -> Vec<String> {
 
 fn collect_type_strings(ty: &Type, out: &mut Vec<String>) {
     match ty {
-        Type::LiteralString(s) => push_unique(out, s.clone()),
+        Type::LiteralString(s) => push_unique(out, s.to_string()),
         Type::Nullable(inner) => collect_type_strings(inner, out),
         Type::Union(parts) | Type::Intersection(parts) => {
-            for part in parts {
+            for part in parts.iter() {
                 collect_type_strings(part, out);
             }
         }

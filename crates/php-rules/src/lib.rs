@@ -25,7 +25,7 @@ pub use php_ast::walk;
 mod testutil;
 pub use facts::FileFacts;
 pub use php_infer::{
-    is_assignable, is_castable_to_string, native_type_map, type_map, undefined_variables, TypeMap,
+    is_assignable, is_castable_to_string, type_map, undefined_variables, Facets, TypeMap,
 };
 pub use php_types::PhpVersion;
 pub use registry::{
