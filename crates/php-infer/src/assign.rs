@@ -399,6 +399,14 @@ fn assignable_atom(index: &ReflectionIndex, value: &Type, target: &Type) -> bool
             Callable(_),
         ) => true,
 
+        // An unresolvable `Named` *target* — a class not in the index and not a
+        // built-in — cannot be checked, so stay lenient (the §8f "unindexed class
+        // is assumed compatible" principle, applied regardless of the value's
+        // shape). This is what rescues generic built-in signatures whose template
+        // parameters (`array<TKey, TValue>` on `array_flip`) load as phantom class
+        // names rather than template vars: `int`/`string` elements then fit them.
+        (_, Named { fqn, .. }) if index.class(fqn).is_none() => true,
+
         _ => false,
     }
 }
@@ -431,6 +439,27 @@ mod tests {
             fqn: s.into(),
             args: vec![],
         }
+    }
+
+    #[test]
+    fn unresolvable_named_target_is_lenient() {
+        // A concrete array fits `array<TKey, TValue>` when the template params
+        // load as unindexed phantom classes (built-in generic signatures like
+        // `array_flip`). Scalars fit unresolved class targets too.
+        let arr = |k: Type, v: Type| Type::Array(Some(Box::new((k, v))));
+        assert!(ok(
+            arr(Type::Int, Type::String),
+            arr(named("TKey"), named("TValue"))
+        ));
+        assert!(ok(Type::Int, named("SomeUnscannedVendorClass")));
+    }
+
+    #[test]
+    fn scalar_to_known_class_still_fails() {
+        // The leniency must not mask a real mismatch when the target class *is*
+        // known: passing `int` where a known class is expected still fails.
+        let (idx, _) = index_of("class C {}");
+        assert!(!is_assignable(&idx, &Type::Int, &named("C")));
     }
 
     #[test]
