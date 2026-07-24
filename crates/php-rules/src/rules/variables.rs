@@ -2127,6 +2127,16 @@ mod tests {
     }
 
     #[test]
+    fn isset_offset_written_through_index_is_clean() {
+        // The key is assigned via `$a['b'][] = …` inside the loop, so it may
+        // exist on a later iteration — `isset` is meaningful, not a "definitely
+        // absent" report. The shape must gain the written key.
+        let src = "<?php function f(array $xs) { $a = ['x' => 1]; \
+            foreach ($xs as $x) { if (!isset($a['b'])) { $a['b'][] = $x; } } return $a; }";
+        assert!(codes(src, run_isset).is_empty());
+    }
+
+    #[test]
     fn isset_dynamic_offset_is_clean() {
         let src = "<?php function f(string $k) { $a = ['a' => 1]; return isset($a[$k]); }";
         assert!(codes(src, run_isset).is_empty());

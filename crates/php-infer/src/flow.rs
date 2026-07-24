@@ -166,7 +166,53 @@ impl TypeCtx<'_> {
                     }
                 }
             }
+            ExprKind::Index { .. } => self.bind_index_target(target, ty),
             _ => {}
+        }
+    }
+
+    /// An assignment *through* an index chain rooted at a variable — `$v[k] = …`,
+    /// `$v[k][] = …`, `$v[] = …`. The root variable is mutated, so a sealed shape
+    /// (`array{a: …, b: …}`) must gain the written key, else the new key reads as
+    /// "definitely absent" and later `isset($v[k])` / `$v[k][…]` false-report
+    /// (notably across loop iterations, where the key is set on one pass and
+    /// tested on the next). Best-effort: only variables holding a shape are
+    /// widened; anything else is left untouched.
+    fn bind_index_target(&mut self, target: &Expr, ty: &Type) {
+        // Descend to the root variable, tracking every index level (outer→inner).
+        let mut cur = target;
+        let mut levels: Vec<Option<&Expr>> = Vec::new();
+        let root = loop {
+            let ExprKind::Index { base, index } = &cur.kind else {
+                return;
+            };
+            levels.push(index.as_deref());
+            match &base.kind {
+                ExprKind::Variable(sym) => {
+                    let n = self.interner.resolve(*sym);
+                    if n == "this" {
+                        return;
+                    }
+                    break n.to_string();
+                }
+                ExprKind::Index { .. } => cur = base,
+                _ => return, // not a plain variable index chain
+            }
+        };
+        // The index applied directly to the root is the last one pushed; the
+        // target nests deeper when the chain has more than that single level.
+        let nested = levels.len() > 1;
+        let key = levels
+            .last()
+            .copied()
+            .flatten()
+            .and_then(|e| literal_string_of(&self.infer(e)));
+        // A deeper write (`$v[k][…]`) makes `$v[k]` an array; a direct write
+        // (`$v[k] = X`) stores X.
+        let field_ty = if nested { Type::Array(None) } else { ty.clone() };
+        let cur_ty = self.vars.get(&root).cloned().unwrap_or(Type::Mixed);
+        if let Some(updated) = widen_shape_for_write(&cur_ty, key.as_deref(), field_ty) {
+            self.vars.insert(root, updated);
         }
     }
 
@@ -2620,6 +2666,38 @@ fn literal_string_of(t: &Type) -> Option<String> {
     match t {
         Type::LiteralString(s) => Some(s.to_string()),
         _ => None,
+    }
+}
+
+/// Widen a variable's type for a write through `$var[key]`. For a shape: a known
+/// literal `key` is added (or its type unioned in) as an *optional* field —
+/// keeping the shape's key enumeration precise while marking the key possibly
+/// present; a dynamic/append write (`key == None`) can't be named, so the shape
+/// is unsealed instead. Returns `None` for non-shape types (left unchanged).
+fn widen_shape_for_write(cur: &Type, key: Option<&str>, field_ty: Type) -> Option<Type> {
+    let Type::Shape { fields, sealed } = cur else {
+        return None;
+    };
+    let mut fields = fields.clone();
+    match key {
+        Some(k) => {
+            match fields.iter_mut().find(|f| f.key.as_deref() == Some(k)) {
+                Some(f) => f.ty = Type::union(vec![f.ty.clone(), field_ty]),
+                None => fields.push(php_types::ShapeField {
+                    key: Some(k.to_string()),
+                    optional: true,
+                    ty: field_ty,
+                }),
+            }
+            Some(Type::Shape {
+                fields,
+                sealed: *sealed,
+            })
+        }
+        None => Some(Type::Shape {
+            fields,
+            sealed: false,
+        }),
     }
 }
 
