@@ -645,13 +645,22 @@ fn check_overriding_method_signature(
     let there = parent.declaring_class.trim_start_matches('\\');
     let mname = &method.name;
 
-    if compat::declaration_mismatch(
-        fa,
-        &method.return_type,
-        &method.native_return,
-        &pm.return_type,
-        &pm.native_return,
-    ) {
+    // A parent whose return type is `void` only via PHPDoc (`@return void` with
+    // no native `: void`) does not constrain an overriding child that declares a
+    // return type — PHP lets a child add a native return type where the parent's
+    // native type is absent, and the `@return void` is advisory (the Laravel
+    // `Scope::apply()` pattern: implementations legitimately return the builder).
+    let parent_void_phpdoc_only =
+        matches!(pm.return_type, Type::Void) && !matches!(pm.native_return, Type::Void);
+    if !parent_void_phpdoc_only
+        && compat::declaration_mismatch(
+            fa,
+            &method.return_type,
+            &method.native_return,
+            &pm.return_type,
+            &pm.native_return,
+        )
+    {
         out.push(
             Diagnostic::error(
                 md.return_type
@@ -3883,6 +3892,25 @@ mod tests {
         let src = "<?php
             class Base { public function f(): int { return 1; } }
             class C extends Base { public function f(): string { return 'x'; } }";
+        assert!(codes(src, run_overriding_method).contains(&"method.childReturnType"));
+    }
+
+    #[test]
+    fn phpdoc_only_void_parent_does_not_constrain_child_return() {
+        // `@return void` with no native `: void` is advisory (Laravel's
+        // `Scope::apply()`); a child declaring a real return type is legal PHP.
+        let src = "<?php
+            interface Scope { /** @return void */ public function apply($b); }
+            class S implements Scope { public function apply($b): int { return 1; } }";
+        assert!(!codes(src, run_overriding_method).contains(&"method.childReturnType"));
+    }
+
+    #[test]
+    fn native_void_parent_still_constrains_child_return() {
+        // A genuine native `: void` parent is still enforced.
+        let src = "<?php
+            class Base { public function f(): void {} }
+            class C extends Base { public function f(): int { return 1; } }";
         assert!(codes(src, run_overriding_method).contains(&"method.childReturnType"));
     }
 
