@@ -68,7 +68,6 @@ use php_ast::{
 };
 use php_diagnostics::Diagnostic;
 use php_infer::{eval_const, ConstVal};
-use php_reflect::resolve_doc_type;
 use php_resolve::{for_each_region, RefKind, Resolution, ResolvedRef, Scope};
 use php_span::Span;
 use php_types::Type;
@@ -762,9 +761,9 @@ struct AssertMethod {
 /// `(declaring-class-lower, method-lower, is-static)`.
 fn assertion_methods(fa: &FileAnalysis) -> HashMap<(String, String, bool), AssertMethod> {
     let mut out = HashMap::new();
-    for_each_class(fa, |scope, class_fqn, c| {
+    for_each_class(fa, |_scope, class_fqn, c| {
         for m in methods(c) {
-            let Some(assertion) = method_assertion(fa, scope, m) else {
+            let Some(assertion) = method_assertion(fa, class_fqn, m) else {
                 continue;
             };
             out.insert(
@@ -780,54 +779,40 @@ fn assertion_methods(fa: &FileAnalysis) -> HashMap<(String, String, bool), Asser
     out
 }
 
-fn method_assertion(fa: &FileAnalysis, scope: &Scope, m: &MethodDecl) -> Option<AssertMethod> {
-    let doc = m.doc.as_deref()?;
-    for tag in php_phpdoc::parse_block(doc).tags {
-        let name = tag.name.as_str();
-        if !matches!(
-            name,
-            "phpstan-assert" | "phpstan-assert-if-true" | "psalm-assert" | "psalm-assert-if-true"
-        ) {
+/// A method's positive `@phpstan-assert`/`-if-true` on a parameter, read from
+/// the P2.2 reflected [`AssertReflection`]s (resolved with the method's
+/// templates) rather than re-parsing the docblock. Negated / if-false / `$this`
+/// property assertions and non-scalar-category targets are skipped — the
+/// impossible-check comparison below only reasons soundly about the coarse
+/// scalar categories.
+fn method_assertion(fa: &FileAnalysis, class_fqn: &str, m: &MethodDecl) -> Option<AssertMethod> {
+    use php_phpdoc::AssertWhen;
+    let method_name = fa.interner.resolve(m.name);
+    let cls = fa.reflection.class(class_fqn)?;
+    let refl = cls
+        .methods
+        .iter()
+        .find(|rm| !rm.magic && rm.name.eq_ignore_ascii_case(method_name))?;
+    for a in &refl.asserts {
+        if a.negated || !matches!(a.when, AssertWhen::Always | AssertWhen::IfTrue) {
             continue;
         }
-        let (ty, rest) = parse_assert_type(&tag.value)?;
-        let param_name = assert_param_name(rest)?;
-        let param_index = m
+        let Some(param_index) = m
             .params
             .iter()
-            .position(|p| fa.interner.resolve(p.name) == param_name)?;
-        let target = resolve_doc_type(scope, &[], &ty);
-        // Keep only the categories this module can compare without ambiguity.
-        category(&target)?;
+            .position(|p| fa.interner.resolve(p.name) == a.param)
+        else {
+            continue;
+        };
+        if category(&a.ty).is_none() {
+            continue;
+        }
         return Some(AssertMethod {
             param_index,
-            target,
+            target: a.ty.clone(),
         });
     }
     None
-}
-
-fn parse_assert_type(value: &str) -> Option<(php_phpdoc::DocType, &str)> {
-    let value = value.trim_start();
-    // Exact-type assertions (`=int`) are safe for our coarse category checks.
-    let value = value.strip_prefix('=').unwrap_or(value).trim_start();
-    // Negated assertions (`!int`) invert the method result; defer until we model
-    // the full assertion algebra.
-    if value.starts_with('!') {
-        return None;
-    }
-    let (ty, consumed) = php_phpdoc::parse_type_prefix(value)?;
-    Some((ty, &value[consumed..]))
-}
-
-fn assert_param_name(rest: &str) -> Option<&str> {
-    let rest = rest.trim_start();
-    let rest = rest.strip_prefix('$')?;
-    let end = rest
-        .char_indices()
-        .find_map(|(idx, ch)| (!(ch == '_' || ch.is_ascii_alphanumeric())).then_some(idx))
-        .unwrap_or(rest.len());
-    (end > 0).then_some(&rest[..end])
 }
 
 fn run_impossible_check_type_method_call(fa: &FileAnalysis) -> Vec<Diagnostic> {
