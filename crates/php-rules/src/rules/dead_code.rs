@@ -230,7 +230,15 @@ fn collect_member_refs(c: &ClassDecl, interner: &Interner) -> MemberRefs {
             StmtKind::Class(c.clone()),
         )],
     };
-    walk::for_each_expr(&prog, &mut |e| match &e.kind {
+    record_refs_in_program(&prog, interner, &mut refs);
+    refs
+}
+
+/// Record every member-name reference in `prog` into `refs` (additive). Shared by
+/// the class-body scan and the used-trait method-body scan so a private member a
+/// trait method touches is correctly seen as used.
+fn record_refs_in_program(prog: &php_ast::Program, interner: &Interner, refs: &mut MemberRefs) {
+    walk::for_each_expr(prog, &mut |e| match &e.kind {
         ExprKind::MethodCall { method, .. } => record_member(
             method,
             &mut refs.method_names,
@@ -273,7 +281,58 @@ fn collect_member_refs(c: &ClassDecl, interner: &Interner) -> MemberRefs {
         }
         _ => {}
     });
+}
+
+/// Member references from a concrete class *plus* the method bodies of every
+/// trait it (transitively) uses. A trait method is compiled into the using class
+/// and can reference its private members (`$this->prop`, `self::method()`), so a
+/// class-body-only scan wrongly reports those members unused. Trait bodies live
+/// in the reflection index (often cross-file); this only ever *adds* to the used
+/// sets, so it can shrink but never grow the reported-unused set.
+fn collect_member_refs_incl_traits(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    c: &ClassDecl,
+) -> MemberRefs {
+    let mut refs = collect_member_refs(c, fa.interner);
+    let Some(class_fqn) = c.name.map(|n| scope.qualify(fa.interner.resolve(n))) else {
+        return refs;
+    };
+    let Some(cref) = fa.reflection.class(&class_fqn) else {
+        return refs;
+    };
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut stack: Vec<String> = trait_fqns(&cref.traits);
+    while let Some(tfqn) = stack.pop() {
+        if !seen.insert(tfqn.to_ascii_lowercase()) {
+            continue;
+        }
+        let Some(tref) = fa.reflection.class(&tfqn) else {
+            continue;
+        };
+        // A trait can itself `use` further traits — follow them transitively.
+        stack.extend(trait_fqns(&tref.traits));
+        for md in &tref.methods {
+            if let Some((body, _)) = fa.reflection.method_body(&tfqn, &md.name) {
+                let prog = php_ast::Program {
+                    stmts: body.to_vec(),
+                };
+                record_refs_in_program(&prog, fa.interner, &mut refs);
+            }
+        }
+    }
     refs
+}
+
+/// The fully-qualified names of the trait types on a class reflection.
+fn trait_fqns(traits: &[Type]) -> Vec<String> {
+    traits
+        .iter()
+        .filter_map(|t| match t {
+            Type::Named { fqn, .. } => Some(fqn.to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Record a member name into `set` (lowercasing not applied here except by the
@@ -341,7 +400,7 @@ fn collect_classes(
 fn run_unused_private_method(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for_each_concrete_class(fa, |scope, c| {
-        let refs = collect_member_refs(c, fa.interner);
+        let refs = collect_member_refs_incl_traits(fa, scope, c);
         if refs.has_dynamic_member {
             return; // can't prove anything unused
         }
@@ -424,7 +483,7 @@ fn method_span(md: &MethodDecl) -> php_span::Span {
 fn run_unused_private_constant(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for_each_concrete_class(fa, |scope, c| {
-        let refs = collect_member_refs(c, fa.interner);
+        let refs = collect_member_refs_incl_traits(fa, scope, c);
         if refs.has_dynamic_member {
             return;
         }
@@ -468,7 +527,7 @@ fn run_unused_private_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
         if c.kind != ClassKind::Class {
             return;
         }
-        let refs = collect_member_refs(c, fa.interner);
+        let refs = collect_member_refs_incl_traits(fa, scope, c);
         if refs.has_dynamic_member {
             return;
         }
@@ -1544,6 +1603,33 @@ mod tests {
     fn dynamic_property_access_disables_rule() {
         let src = "<?php class C { private $data = 1; function f($k) { return $this->$k; } }";
         assert!(codes(src, run_unused_private_property).is_empty());
+    }
+
+    #[test]
+    fn private_property_read_only_in_used_trait_is_clean() {
+        // A trait method is compiled into the using class and can read the
+        // class's private property; the class body itself never touches it.
+        let src = "<?php \
+            trait T { public function show() { return $this->data; } } \
+            class C { use T; private $data = 1; }";
+        assert!(codes(src, run_unused_private_property).is_empty());
+    }
+
+    #[test]
+    fn private_method_called_only_from_used_trait_is_clean() {
+        let src = "<?php \
+            trait T { public function run() { return $this->helper(); } } \
+            class C { use T; private function helper() { return 1; } }";
+        assert!(codes(src, run_unused_private_method).is_empty());
+    }
+
+    #[test]
+    fn private_property_unused_even_with_trait_is_flagged() {
+        // The trait exists but touches nothing — the property is genuinely unused.
+        let src = "<?php \
+            trait T { public function run() { return 1; } } \
+            class C { use T; private $data = 1; }";
+        assert_eq!(codes(src, run_unused_private_property), ["property.unused"]);
     }
 
     // --- CallTo*StatementWithoutImpurePointsRule ------------------------
