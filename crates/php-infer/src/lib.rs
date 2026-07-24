@@ -110,6 +110,11 @@ pub struct TypeCtx<'a> {
     pub(crate) generator_send: Option<Type>,
     /// User-configured always-terminating calls (`earlyTerminating*` config).
     pub terminators: std::sync::Arc<Terminators>,
+    /// Whether flow may create shape types for auto-vivified index writes on
+    /// provably-undefined variables. Set only by scope drivers that verified
+    /// the body has no variable escape hatch ([`definedness`]); the safe
+    /// default is off.
+    pub(crate) autoviv_shapes: bool,
 }
 
 /// User-configured always-terminating calls (phpstan's
@@ -170,6 +175,7 @@ impl<'a> TypeCtx<'a> {
             native: false,
             generator_send: None,
             terminators: std::sync::Arc::new(Terminators::default()),
+            autoviv_shapes: false,
         }
     }
 

@@ -1261,6 +1261,23 @@ mod tests {
         PhpVersion,
     };
 
+    // --- foreach.emptyArray ---
+
+    #[test]
+    fn foreach_after_by_ref_closure_capture_is_clean() {
+        // A closure with `use (&$ids)` may append at any invocation — the
+        // sealed-empty claim from `$ids = []` must be dropped at the closure.
+        let src = "<?php function f(callable $q) { $ids = []; $q(function ($r) use (&$ids) { $ids[] = $r; }); foreach ($ids as $i) { echo $i; } }";
+        assert!(codes(src, run_dead_foreach).is_empty());
+    }
+
+    #[test]
+    fn foreach_over_provably_empty_array_is_flagged() {
+        // Without any escape, `$x = []` + no writes is a dead foreach.
+        let src = "<?php function f() { $x = []; foreach ($x as $i) { echo $i; } }";
+        assert_eq!(codes(src, run_dead_foreach), ["foreach.emptyArray"]);
+    }
+
     // --- array.duplicateKey ---
 
     #[test]

@@ -2279,6 +2279,15 @@ mod tests {
     }
 
     #[test]
+    fn null_coalesce_offset_written_after_branch_merge_is_clean() {
+        // The second conditional write lands on a *union* of shapes (from the
+        // first `if` merge) — the write must distribute over the arms, not be
+        // dropped, else `$c['x'] ?? 0` false-reports the offset as absent.
+        let src = "<?php function f(bool $a, bool $b) { $c = []; if ($a) { $c['x'] = 1; } if ($b) { $c['y'] = ($c['x'] ?? 0); } return $c; }";
+        assert!(codes(src, run_null_coalesce).is_empty());
+    }
+
+    #[test]
     fn isset_family_skips_escape_hatch_scope() {
         let src = "<?php function f(array $data) { extract($data); return isset($x) || empty($y) || ($z ?? false); }";
         assert!(codes(src, run_isset).is_empty());

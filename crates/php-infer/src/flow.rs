@@ -54,6 +54,7 @@ impl TypeCtx<'_> {
         for p in &refl.params {
             self.vars.insert(p.name.clone(), p.local_type());
         }
+        self.autoviv_shapes = !crate::definedness::scope_has_escape_hatch(&f.body, self.interner);
         self.exec_block(&f.body);
     }
 
@@ -82,11 +83,28 @@ impl TypeCtx<'_> {
             ExprKind::Paren(inner) => self.apply_expr(inner),
             ExprKind::Assign { target, rhs } | ExprKind::AssignRef { target, rhs } => {
                 let t = self.apply_expr(rhs);
+                // A stored closure with by-ref captures can rewrite them at
+                // any later call site.
+                self.widen_closure_ref_captures(rhs);
                 let callable = self.callable_alias_from_expr(rhs);
                 let bound = if matches!(&peel_paren(rhs).kind, ExprKind::Str(_)) {
                     t
                 } else {
                     self.callable_expr_type(rhs).unwrap_or(t)
+                };
+                // `$x = []` is exactly the empty array: bind the empty sealed
+                // shape so subsequent literal-key writes accumulate a precise
+                // shape (merged mode only — native arrays are untyped).
+                let bound = if !self.native
+                    && matches!(&peel_paren(rhs).kind,
+                        ExprKind::Array { items, .. } if items.is_empty())
+                {
+                    Type::Shape {
+                        fields: Vec::new(),
+                        sealed: true,
+                    }
+                } else {
+                    bound
                 };
                 self.bind_target_with_callable(target, &bound, callable);
                 bound
@@ -210,9 +228,21 @@ impl TypeCtx<'_> {
         // A deeper write (`$v[k][…]`) makes `$v[k]` an array; a direct write
         // (`$v[k] = X`) stores X.
         let field_ty = if nested { Type::Array(None) } else { ty.clone() };
-        let cur_ty = self.vars.get(&root).cloned().unwrap_or(Type::Mixed);
-        if let Some(updated) = widen_shape_for_write(&cur_ty, key.as_deref(), field_ty) {
-            self.vars.insert(root, updated);
+        match self.vars.get(&root).cloned() {
+            // PHP auto-vivification: an index write through an undefined
+            // variable creates exactly that array — a fresh sealed shape when
+            // the key is a known literal, a bare array otherwise. Sound only
+            // when "undefined" is provable, which the scope driver verified
+            // (`autoviv_shapes`).
+            None if self.autoviv_shapes => {
+                self.vars.insert(root, vivified(key.as_deref(), field_ty));
+            }
+            None => {}
+            Some(cur) => {
+                if let Some(updated) = widen_shape_for_write(&cur, key.as_deref(), field_ty) {
+                    self.vars.insert(root, updated);
+                }
+            }
         }
     }
 
@@ -1229,6 +1259,30 @@ impl TypeCtx<'_> {
         }
     }
 
+    /// Widen every variable captured by reference (`use (&$x)`) by any closure
+    /// literal inside `e`: once the closure value exists, an invocation at any
+    /// later point may rewrite the capture, so its outer type is no longer
+    /// known. (Arrow fns capture by value only — closures are the only case.)
+    fn widen_closure_ref_captures(&mut self, e: &Expr) {
+        let mut names: Vec<php_intern::Symbol> = Vec::new();
+        php_ast::walk::for_each_subexpr(e, &mut |sub| {
+            if let ExprKind::Closure(c) = &sub.kind {
+                for u in &c.uses {
+                    if u.by_ref {
+                        names.push(u.name);
+                    }
+                }
+            }
+        });
+        for sym in names {
+            let name = self.interner.resolve(sym).to_string();
+            if name != "this" {
+                self.callables.remove(&name);
+                self.vars.insert(name, Type::Mixed);
+            }
+        }
+    }
+
     /// A by-ref parameter may rebind its argument entirely: reset the argument
     /// variable to the parameter's declared type (phpstan's virtual-assign).
     /// Builtin exception: when the argument's current type already fits the
@@ -1238,6 +1292,12 @@ impl TypeCtx<'_> {
     /// re-typed. An out-of-fit arg (e.g. a string `$matches` before
     /// `preg_match`) still widens to the declared type.
     fn widen_by_ref_args(&mut self, params: Option<ParamRefInfo>, args: &[Arg]) {
+        // A closure argument with a `use (&$x)` capture may rewrite `$x` at
+        // any later invocation of the closure — widen such captures now,
+        // whatever the callee's own signature says.
+        for a in args {
+            self.widen_closure_ref_captures(&a.value);
+        }
         let Some(ParamRefInfo {
             params,
             variadic_last,
@@ -1743,6 +1803,8 @@ impl TypeCtx<'_> {
         child.depth = self.depth;
         child.native = self.native;
         child.generator_send = generator_send;
+        child.autoviv_shapes =
+            !crate::definedness::scope_has_escape_hatch(body, self.interner);
         child.record_block(body, map);
     }
 
@@ -2669,41 +2731,73 @@ fn literal_string_of(t: &Type) -> Option<String> {
     }
 }
 
+/// The array an index write through an undefined/`null` variable creates:
+/// exactly `array{key: field_ty}` for a known literal key, a bare array for a
+/// dynamic key or append (so a later `$x ?? …` isn't read as "always null").
+fn vivified(key: Option<&str>, field_ty: Type) -> Type {
+    match key {
+        Some(k) => Type::Shape {
+            fields: vec![php_types::ShapeField {
+                key: Some(k.to_string()),
+                optional: false,
+                ty: field_ty,
+            }],
+            sealed: true,
+        },
+        None => Type::Array(None),
+    }
+}
+
 /// Widen a variable's type for a write through `$var[key]`. For a shape: a known
 /// literal `key` is added (or its type unioned in) as an *optional* field —
 /// keeping the shape's key enumeration precise while marking the key possibly
 /// present; a dynamic/append write (`key == None`) can't be named, so the shape
-/// is unsealed instead. A `null` value is auto-vivified to an array (PHP turns
-/// `$x = null; $x[] = …` into an array), so a later `$x ?? …` isn't read as
-/// "always null". Returns `None` for other types (arrays keep their element
+/// is unsealed instead. A `null` auto-vivifies ([`vivified`]); a branch-merged
+/// *union* distributes the write over its arms (a write after `if`/`else`
+/// merges must not be dropped — that manufactured missing-offset false
+/// positives). Returns `None` for other types (arrays keep their element
 /// types; a string offset write or an `ArrayAccess` object is left unchanged).
 fn widen_shape_for_write(cur: &Type, key: Option<&str>, field_ty: Type) -> Option<Type> {
-    if matches!(cur, Type::Null) {
-        return Some(Type::Array(None));
-    }
-    let Type::Shape { fields, sealed } = cur else {
-        return None;
-    };
-    let mut fields = fields.clone();
-    match key {
-        Some(k) => {
-            match fields.iter_mut().find(|f| f.key.as_deref() == Some(k)) {
-                Some(f) => f.ty = Type::union(vec![f.ty.clone(), field_ty]),
-                None => fields.push(php_types::ShapeField {
-                    key: Some(k.to_string()),
-                    optional: true,
-                    ty: field_ty,
+    match cur {
+        Type::Null => Some(vivified(key, field_ty)),
+        Type::Union(parts) => {
+            let mut changed = false;
+            let widened: Vec<Type> = parts
+                .iter()
+                .map(|p| match widen_shape_for_write(p, key, field_ty.clone()) {
+                    Some(u) => {
+                        changed = true;
+                        u
+                    }
+                    None => p.clone(),
+                })
+                .collect();
+            changed.then(|| Type::union(widened))
+        }
+        Type::Shape { fields, sealed } => {
+            let mut fields = fields.clone();
+            match key {
+                Some(k) => {
+                    match fields.iter_mut().find(|f| f.key.as_deref() == Some(k)) {
+                        Some(f) => f.ty = Type::union(vec![f.ty.clone(), field_ty]),
+                        None => fields.push(php_types::ShapeField {
+                            key: Some(k.to_string()),
+                            optional: true,
+                            ty: field_ty,
+                        }),
+                    }
+                    Some(Type::Shape {
+                        fields,
+                        sealed: *sealed,
+                    })
+                }
+                None => Some(Type::Shape {
+                    fields,
+                    sealed: false,
                 }),
             }
-            Some(Type::Shape {
-                fields,
-                sealed: *sealed,
-            })
         }
-        None => Some(Type::Shape {
-            fields,
-            sealed: false,
-        }),
+        _ => None,
     }
 }
 
@@ -2804,9 +2898,75 @@ fn merge(envs: Vec<Env>) -> Env {
             .iter()
             .map(|e| e.get(&k).cloned().unwrap_or(Type::Mixed))
             .collect();
-        out.insert(k, Type::union(parts));
+        out.insert(k, collapse_shape_union(Type::union(parts)));
     }
     out
+}
+
+/// Every branch merge unions a variable's shape variants
+/// (`array{a}|array{a,b}|…`), so a scope with many conditional key writes
+/// doubles the arms at each merge — exponential without a bound. Above this
+/// cap the shape arms collapse into ONE shape: the union of their key sets,
+/// each key optional unless present-and-required in every arm, field types
+/// unioned. Strictly wider than the exact union (sound) and bounded.
+const SHAPE_UNION_ARM_CAP: usize = 6;
+
+fn collapse_shape_union(ty: Type) -> Type {
+    let Type::Union(parts) = &ty else { return ty };
+    let nshapes = parts
+        .iter()
+        .filter(|p| matches!(p, Type::Shape { .. }))
+        .count();
+    if nshapes <= SHAPE_UNION_ARM_CAP {
+        return ty;
+    }
+    let mut order: Vec<String> = Vec::new();
+    let mut types: HashMap<String, Vec<Type>> = HashMap::new();
+    let mut required: HashMap<String, usize> = HashMap::new();
+    let mut sealed = true;
+    let mut keyless_tys: Vec<Type> = Vec::new();
+    let mut rest: Vec<Type> = Vec::new();
+    for p in parts.iter() {
+        let Type::Shape { fields, sealed: s } = p else {
+            rest.push(p.clone());
+            continue;
+        };
+        sealed &= *s;
+        for f in fields {
+            let Some(k) = f.key.clone() else {
+                keyless_tys.push(f.ty.clone());
+                continue;
+            };
+            if !types.contains_key(&k) {
+                order.push(k.clone());
+            }
+            types.entry(k.clone()).or_default().push(f.ty.clone());
+            if !f.optional {
+                *required.entry(k).or_default() += 1;
+            }
+        }
+    }
+    if !keyless_tys.is_empty() {
+        // Positional (tuple) fields don't merge by name; widen to a keyed
+        // array of everything written — still bounded.
+        let mut vals: Vec<Type> = types.into_values().flatten().collect();
+        vals.append(&mut keyless_tys);
+        rest.push(Type::Array(Some(Box::new((
+            Type::union(vec![Type::Int, Type::String]),
+            Type::union(vals),
+        )))));
+        return Type::union(rest);
+    }
+    let fields = order
+        .into_iter()
+        .map(|k| php_types::ShapeField {
+            optional: required.get(&k).copied().unwrap_or(0) != nshapes,
+            ty: Type::union(types.remove(&k).unwrap_or_default()),
+            key: Some(k),
+        })
+        .collect();
+    rest.push(Type::Shape { fields, sealed });
+    Type::union(rest)
 }
 
 fn merge_states(states: Vec<FlowState>) -> FlowState {
@@ -2913,6 +3073,23 @@ mod tests {
         assert_eq!(var_after("$x = 'a' . 'b';", "x"), "'ab'"); // literal concat folds
         assert_eq!(var_after("$a = $b = 5;", "a"), "5");
         assert_eq!(var_after("$a = $b = 5;", "b"), "5");
+    }
+
+    #[test]
+    fn many_conditional_shape_writes_stay_bounded() {
+        // Each conditional key write doubles the shape-union arms at its
+        // branch merge; without the collapse cap 24 writes hang the analysis
+        // (2^24 arms). Completing at all — with a bounded rendering — is the
+        // assertion.
+        let mut src = String::from("function f(array $o) { $c = [];");
+        for i in 0..24 {
+            src.push_str(&format!("if ($o[{i}]) {{ $c['k{i}'] = {i}; }}"));
+        }
+        src.push_str(" return $c; }");
+        let ty = var_after(&src, "c");
+        assert!(ty.starts_with("array{") || ty.contains("array{"), "{ty}");
+        assert!(ty.len() < 2000, "unbounded rendering: {} chars", ty.len());
+        assert!(ty.contains("k0?") && ty.contains("k23?"), "{ty}");
     }
 
     #[test]

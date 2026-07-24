@@ -557,6 +557,14 @@ impl Analyzer<'_> {
 
 // --- escape-hatch detection ------------------------------------------------
 
+/// Whether a scope body contains a variable escape hatch (`extract`, `eval`,
+/// `include`, `$$x`, …) anywhere. Shared with the type flow: auto-vivification
+/// shape creation is sound only when "undefined variable" is provable, which
+/// these constructs break.
+pub(crate) fn scope_has_escape_hatch(stmts: &[Stmt], interner: &Interner) -> bool {
+    stmts_have_escape_hatch(stmts, interner)
+}
+
 fn stmts_have_escape_hatch(stmts: &[Stmt], interner: &Interner) -> bool {
     stmts.iter().any(|s| stmt_escape(s, interner))
 }

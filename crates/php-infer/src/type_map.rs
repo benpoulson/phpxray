@@ -368,6 +368,7 @@ fn record_scope(
     ctx.native = native;
     ctx.generator_send = generator_send;
     ctx.terminators = terminators.clone();
+    ctx.autoviv_shapes = !crate::definedness::scope_has_escape_hatch(body, interner);
     // The recording pass flows the environment statement-by-statement *and*
     // records each expression at its narrowed flow point, so expressions inside
     // `if`/`else`/loop branches are typed against the narrowed environment.

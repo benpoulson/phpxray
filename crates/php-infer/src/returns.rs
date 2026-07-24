@@ -34,6 +34,7 @@ pub(crate) fn refine_return(
         native: caller.native,
         generator_send: None,
         terminators: caller.terminators.clone(),
+        autoviv_shapes: false,
     };
     for (name, arg) in params.iter().zip(args) {
         sub.vars.insert(name.clone(), caller.infer(&arg.value));
