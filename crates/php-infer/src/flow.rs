@@ -2673,8 +2673,14 @@ fn literal_string_of(t: &Type) -> Option<String> {
 /// literal `key` is added (or its type unioned in) as an *optional* field —
 /// keeping the shape's key enumeration precise while marking the key possibly
 /// present; a dynamic/append write (`key == None`) can't be named, so the shape
-/// is unsealed instead. Returns `None` for non-shape types (left unchanged).
+/// is unsealed instead. A `null` value is auto-vivified to an array (PHP turns
+/// `$x = null; $x[] = …` into an array), so a later `$x ?? …` isn't read as
+/// "always null". Returns `None` for other types (arrays keep their element
+/// types; a string offset write or an `ArrayAccess` object is left unchanged).
 fn widen_shape_for_write(cur: &Type, key: Option<&str>, field_ty: Type) -> Option<Type> {
+    if matches!(cur, Type::Null) {
+        return Some(Type::Array(None));
+    }
     let Type::Shape { fields, sealed } = cur else {
         return None;
     };

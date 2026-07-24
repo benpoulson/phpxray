@@ -2245,6 +2245,17 @@ mod tests {
     }
 
     #[test]
+    fn null_coalesce_after_conditional_autovivification_is_clean() {
+        // `$x = null;` then a conditional `$x[] = …` makes `$x` `array|null`, so
+        // `$x ?? …` is meaningful — not "always null".
+        let src = "<?php function f(array $ps, $rec) { \
+            $acc = null; \
+            foreach ($ps as $p) { if ($rec[$p]) { $acc[] = 1; } } \
+            return $acc ?? []; }";
+        assert!(codes(src, run_null_coalesce).is_empty());
+    }
+
+    #[test]
     fn null_coalesce_foreach_var_inside_closure_is_clean() {
         // A `foreach` value var bound inside a closure body (e.g. a
         // `DB::transaction(fn () => …)`) must count as defined.
