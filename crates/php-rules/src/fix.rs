@@ -70,7 +70,9 @@ fn renderable(ty: &Type) -> bool {
         Type::Array(kv) | Type::Iterable(kv) => kv
             .as_deref()
             .is_none_or(|(k, v)| renderable(k) && renderable(v)),
-        Type::List(inner) | Type::ClassString(Some(inner)) => renderable(inner),
+        Type::List(inner) | Type::ClassString(Some(inner)) | Type::NonEmpty(inner) => {
+            renderable(inner)
+        }
         Type::Callable(sig) => sig
             .as_deref()
             .is_none_or(|s| s.params.iter().all(renderable) && renderable(&s.ret)),

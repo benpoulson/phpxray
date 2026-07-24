@@ -649,9 +649,10 @@ fn param_out_type_is_uncertain(ty: &Type) -> bool {
         | Type::TemplateVar(_)
         | Type::Conditional { .. }
         | Type::Unknown(_) => true,
-        Type::Nullable(inner) | Type::List(inner) | Type::ClassString(Some(inner)) => {
-            param_out_type_is_uncertain(inner)
-        }
+        Type::Nullable(inner)
+        | Type::List(inner)
+        | Type::ClassString(Some(inner))
+        | Type::NonEmpty(inner) => param_out_type_is_uncertain(inner),
         Type::Union(parts) | Type::Intersection(parts) => {
             parts.iter().any(param_out_type_is_uncertain)
         }
@@ -1116,6 +1117,8 @@ fn falsy_verdict(ty: &Type) -> Truth {
         Type::StringOf(
             php_types::StringRefinement::NonFalsy | php_types::StringRefinement::Callable,
         ) => Truth::No,
+        // A non-empty array is truthy by definition.
+        Type::NonEmpty(_) => Truth::No,
         Type::StringOf(_) => Truth::Maybe,
         Type::Shape {
             fields,

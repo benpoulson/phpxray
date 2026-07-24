@@ -691,7 +691,7 @@ fn check_impossible_check_type_with_refs(
     // Always-*true* type-check (`is_int($int)`) is OFF by default in phpstan
     // (`checkAlwaysTrueCheckTypeFunctionCall`) — it reports the resulting dead
     // code instead. Only report the impossible (always-false) case.
-    if vcat == pred {
+    if pred_admits(pred, vcat) {
         return;
     }
     let (verb, code) = ("false", "function.impossibleType");
@@ -702,17 +702,50 @@ fn check_impossible_check_type_with_refs(
     ));
 }
 
-/// The category a scalar/null type-predicate built-in asserts (only those whose
-/// category we can compare precisely; `is_bool`/`is_array`/`is_object` span
-/// categories we don't model here, so they're skipped — false-negative-safe).
-fn predicate_cat(fname: &str) -> Option<Cat> {
+/// The set a type-predicate built-in accepts. Compared against a value's
+/// concrete scalar [`Cat`] — array/object/mixed values have no `Cat`, so they
+/// are never judged (false-negative-safe).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PredCat {
+    Int,
+    Float,
+    Str,
+    Null,
+    Bool,
+    Array,
+    Object,
+    Callable,
+    Iterable,
+}
+
+fn predicate_cat(fname: &str) -> Option<PredCat> {
     Some(match fname {
-        "is_int" | "is_integer" | "is_long" => Cat::Int,
-        "is_string" => Cat::Str,
-        "is_float" | "is_double" => Cat::Float,
-        "is_null" => Cat::Null,
+        "is_int" | "is_integer" | "is_long" => PredCat::Int,
+        "is_string" => PredCat::Str,
+        "is_float" | "is_double" => PredCat::Float,
+        "is_null" => PredCat::Null,
+        "is_bool" => PredCat::Bool,
+        "is_array" => PredCat::Array,
+        "is_object" => PredCat::Object,
+        "is_callable" => PredCat::Callable,
+        "is_iterable" => PredCat::Iterable,
         _ => return None,
     })
+}
+
+/// Whether a value of scalar category `vcat` *may* satisfy the predicate.
+/// `false` means the check is provably impossible. `is_callable` admits
+/// strings (a function name); the container predicates admit no scalar.
+fn pred_admits(pred: PredCat, vcat: Cat) -> bool {
+    match pred {
+        PredCat::Int => vcat == Cat::Int,
+        PredCat::Float => vcat == Cat::Float,
+        PredCat::Str => vcat == Cat::Str,
+        PredCat::Null => vcat == Cat::Null,
+        PredCat::Bool => matches!(vcat, Cat::BoolTrue | Cat::BoolFalse),
+        PredCat::Callable => vcat == Cat::Str,
+        PredCat::Array | PredCat::Object | PredCat::Iterable => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2514,6 +2547,38 @@ mod tests {
     fn is_string_on_mixed_is_clean() {
         let src = "<?php function f($x) { return is_string($x); }";
         assert!(codes(src, run_impossible_check_type).is_empty());
+    }
+
+    #[test]
+    fn widened_predicate_categories_report_impossible() {
+        // Container/object predicates are impossible on concrete scalars.
+        for (call, param) in [
+            ("is_array($s)", "string $s"),
+            ("is_object($s)", "string $s"),
+            ("is_iterable($n)", "int $n"),
+            ("is_bool($n)", "int $n"),
+            ("is_callable($n)", "int $n"),
+        ] {
+            let src = format!("<?php function f({param}) {{ return {call}; }}");
+            assert_eq!(
+                codes(&src, run_impossible_check_type),
+                ["function.impossibleType"],
+                "{call}"
+            );
+        }
+        // ...but a string may name a callable, and bool admits both cases.
+        for (call, param) in [
+            ("is_callable($s)", "string $s"),
+            ("is_bool($b)", "bool $b"),
+            ("is_array($x)", "array $x"),
+            ("is_object($o)", "object $o"),
+        ] {
+            let src = format!("<?php function f({param}) {{ return {call}; }}");
+            assert!(
+                codes(&src, run_impossible_check_type).is_empty(),
+                "{call}"
+            );
+        }
     }
 
     #[test]

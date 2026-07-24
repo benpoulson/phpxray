@@ -40,7 +40,9 @@ impl Trinary {
 pub fn is_castable_to_string(index: &ReflectionIndex, ty: &Type) -> bool {
     use Type::*;
     match ty {
-        Array(_) | List(_) | Iterable(_) | Shape { .. } | Callable(_) | Void => false,
+        Array(_) | List(_) | Iterable(_) | Shape { .. } | Callable(_) | Void | NonEmpty(_) => {
+            false
+        }
         Nullable(inner) => is_castable_to_string(index, inner),
         Union(parts) => parts.iter().all(|p| is_castable_to_string(index, p)),
         // An object is castable iff it declares `__toString` (Stringable); be
@@ -64,6 +66,7 @@ pub fn native_shape(t: &Type) -> Type {
     use Type::*;
     match t {
         Array(_) | List(_) | Shape { .. } => Array(None),
+        NonEmpty(inner) => native_shape(inner),
         Iterable(_) => Iterable(None),
         ClassString(_) => ClassString(None),
         LiteralInt(_) | IntRange { .. } => Int,
@@ -357,6 +360,14 @@ fn assignable_atom(index: &ReflectionIndex, value: &Type, target: &Type) -> bool
         }
         (Named { .. } | Object, Object) => true,
 
+        // --- non-empty containers ---
+        // A non-empty value fits wherever its base fits; a base container
+        // toward a non-empty target stays lenient (can't disprove emptiness —
+        // the maybe-machinery is where "array might be empty" belongs).
+        (NonEmpty(v), NonEmpty(t)) => is_assignable(index, v, t),
+        (NonEmpty(v), _) => is_assignable(index, v, target),
+        (_, NonEmpty(t)) => is_assignable(index, value, t),
+
         // --- enum cases (unit subtypes of their enum) ---
         (
             EnumCase { fqn: a, case: ca },
@@ -448,6 +459,23 @@ mod tests {
                 Type::TemplateVar("TValue".into())
             )
         ));
+    }
+
+    #[test]
+    fn non_empty_container_lattice() {
+        let arr = Type::Array(Some(Box::new((Type::Int, Type::String))));
+        let ne = Type::non_empty(arr.clone());
+        // Non-empty fits its base and bare array; base toward non-empty stays
+        // lenient (can't disprove emptiness).
+        assert!(ok(ne.clone(), arr.clone()));
+        assert!(ok(ne.clone(), Type::Array(None)));
+        assert!(ok(arr.clone(), ne.clone()));
+        assert!(ok(ne.clone(), ne.clone()));
+        // Kind mismatches still fail through the wrapper.
+        assert!(!ok(ne.clone(), Type::Int));
+        assert!(!ok(Type::Int, ne));
+        // The wrapper only applies to containers.
+        assert_eq!(Type::non_empty(Type::Int), Type::Int);
     }
 
     #[test]

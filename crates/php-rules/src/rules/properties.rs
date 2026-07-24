@@ -893,7 +893,8 @@ fn native_hook_type_is_checkable(ty: &Type, fa: &FileAnalysis) -> bool {
         | Type::LiteralInt(_)
         | Type::LiteralString(_)
         | Type::StringOf(_)
-        | Type::EnumCase { .. } => false,
+        | Type::EnumCase { .. }
+        | Type::NonEmpty(_) => false,
         Type::Named { fqn, args } => args.is_empty() && fa.reflection.class(fqn).is_some(),
         Type::Nullable(inner) => native_hook_type_is_checkable(inner, fa),
         Type::Union(parts) => {

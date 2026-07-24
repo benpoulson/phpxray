@@ -76,6 +76,7 @@ pub fn const_shape_key(expr: &Expr) -> Option<String> {
 }
 
 pub fn shape_offset_status(base_ty: &Type, key: &str) -> Option<ShapeOffsetStatus> {
+    let base_ty = base_ty.peel_non_empty();
     match base_ty {
         Type::Shape { fields, sealed } => {
             match fields.iter().find(|f| f.key.as_deref() == Some(key)) {
@@ -139,6 +140,7 @@ pub fn shape_offset_maybe_reportable(base_ty: &Type, key: &str) -> bool {
 }
 
 pub fn array_value_type(ty: &Type) -> Option<Type> {
+    let ty = ty.peel_non_empty();
     match ty {
         Type::Array(Some(kv)) | Type::Iterable(Some(kv)) => Some(kv.1.clone()),
         Type::List(v) => Some((**v).clone()),
@@ -165,6 +167,7 @@ pub fn array_key_type(ty: &Type) -> Option<Type> {
 }
 
 pub fn iter_key_value(ty: &Type) -> (Type, Type) {
+    let ty = ty.peel_non_empty();
     match ty {
         Type::Array(Some(kv)) | Type::Iterable(Some(kv)) => (kv.0.clone(), kv.1.clone()),
         Type::List(v) => (Type::Int, (**v).clone()),

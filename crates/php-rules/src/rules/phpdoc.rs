@@ -338,6 +338,7 @@ fn definitely_not_callable_type(t: &Type) -> bool {
             definitely_not_callable_type(inner) && definitely_not_callable_type(&Type::Null)
         }
         Type::Union(parts) => parts.iter().all(definitely_not_callable_type),
+        Type::NonEmpty(inner) => definitely_not_callable_type(inner),
         Type::LiteralInt(_)
         | Type::Int
         | Type::IntRange { .. }

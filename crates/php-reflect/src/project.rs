@@ -418,6 +418,7 @@ impl ReflectionIndex {
     /// Extract the key/value pair yielded by an iterable value, when reflection
     /// has enough information to do so without guessing.
     pub fn iterable_key_value_on_type(&self, ty: &Type) -> Option<(Type, Type)> {
+        let ty = ty.peel_non_empty();
         let mut visited = Vec::new();
         self.iterable_key_value(ty, &mut visited)
     }

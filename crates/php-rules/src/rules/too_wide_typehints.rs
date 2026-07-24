@@ -1565,9 +1565,10 @@ fn type_is_uncertain(ty: &Type) -> bool {
         | Type::TemplateVar(_)
         | Type::Conditional { .. }
         | Type::Unknown(_) => true,
-        Type::Nullable(inner) | Type::List(inner) | Type::ClassString(Some(inner)) => {
-            type_is_uncertain(inner)
-        }
+        Type::Nullable(inner)
+        | Type::List(inner)
+        | Type::ClassString(Some(inner))
+        | Type::NonEmpty(inner) => type_is_uncertain(inner),
         Type::Union(parts) | Type::Intersection(parts) => parts.iter().any(type_is_uncertain),
         Type::Array(Some(pair)) | Type::Iterable(Some(pair)) => {
             type_is_uncertain(&pair.0) || type_is_uncertain(&pair.1)

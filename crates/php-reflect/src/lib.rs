@@ -165,7 +165,9 @@ fn doc_keyword(name: &str) -> Option<Type> {
         "parent" => Type::Parent,
         "static" => Type::StaticType,
         "resource" | "closed-resource" => Type::Resource,
-        "list" | "non-empty-list" => Type::List(Box::new(Type::Mixed)),
+        "list" => Type::List(Box::new(Type::Mixed)),
+        "non-empty-list" => Type::non_empty(Type::List(Box::new(Type::Mixed))),
+        "non-empty-array" => Type::non_empty(Type::Array(None)),
         "class-string" | "interface-string" | "trait-string" | "enum-string" => {
             Type::ClassString(None)
         }
@@ -208,19 +210,20 @@ fn doc_generic(scope: &Scope, templates: &[String], base: &str, args: &[DocType]
             [k, v] => Type::Array(Some(Box::new((k.clone(), v.clone())))),
             _ => Type::Array(None),
         },
-        "non-empty-array" => match resolved.as_slice() {
+        "non-empty-array" => Type::non_empty(match resolved.as_slice() {
             [v] => Type::Array(Some(Box::new((array_key(), v.clone())))),
             [k, v] => Type::Array(Some(Box::new((k.clone(), v.clone())))),
             _ => Type::Array(None),
-        },
+        }),
         "iterable" => match resolved.as_slice() {
             [v] => Type::Iterable(Some(Box::new((array_key(), v.clone())))),
             [k, v] => Type::Iterable(Some(Box::new((k.clone(), v.clone())))),
             _ => Type::Iterable(None),
         },
-        "list" | "non-empty-list" => {
-            Type::List(Box::new(resolved.into_iter().last().unwrap_or(Type::Mixed)))
-        }
+        "list" => Type::List(Box::new(resolved.into_iter().last().unwrap_or(Type::Mixed))),
+        "non-empty-list" => Type::non_empty(Type::List(Box::new(
+            resolved.into_iter().last().unwrap_or(Type::Mixed),
+        ))),
         "class-string" | "interface-string" => {
             Type::ClassString(resolved.into_iter().next().map(Box::new))
         }

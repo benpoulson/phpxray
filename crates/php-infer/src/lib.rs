@@ -217,7 +217,10 @@ impl<'a> TypeCtx<'a> {
                 method,
                 args,
             } => self.static_call_type(class, method, args),
-            ExprKind::New { class, .. } => self.class_type(class).unwrap_or(Type::Object),
+            ExprKind::New { class, args } => {
+                let base = self.class_type(class).unwrap_or(Type::Object);
+                self.instantiate_generic(base, args)
+            }
             ExprKind::NewAnon { .. } => Type::Object,
             ExprKind::Prop {
                 base,
@@ -465,11 +468,143 @@ impl<'a> TypeCtx<'a> {
             };
         }
 
+        if let Some(t) = self.string_builtin_return(fname, args) {
+            return Some(t);
+        }
+
+        // `count()` of a non-empty container is at least 1.
+        if matches!(fname, "count" | "sizeof") {
+            if let Type::NonEmpty(_) = self.infer(&args.first()?.value) {
+                return Some(Type::int_range(Some(1), None));
+            }
+            return None;
+        }
+
         // Array functions that preserve their first argument's element type — the
         // stubs return a bare `array`, losing the value type and cascading into
         // downstream `array<K,V>` argument/return mismatches.
         match fname {
             "array_map" => self.array_map_return(args),
+            // `array_merge(...$arrays)` unions element types; all-list inputs
+            // stay a list (re-indexed), and one non-empty input makes the
+            // result non-empty.
+            "array_merge" => {
+                if args.is_empty() {
+                    return None;
+                }
+                let mut keys = Vec::new();
+                let mut values = Vec::new();
+                let mut all_lists = true;
+                let mut any_non_empty = false;
+                for a in args {
+                    let t = self.infer(&a.value);
+                    any_non_empty |= matches!(t, Type::NonEmpty(_));
+                    match t.peel_non_empty() {
+                        Type::List(v) => values.push((**v).clone()),
+                        t @ (Type::Array(_) | Type::Shape { .. }) => {
+                            all_lists = false;
+                            let (k, v) = arrays::iter_key_value(t);
+                            keys.push(k);
+                            values.push(v);
+                        }
+                        _ => return None,
+                    }
+                }
+                let v = Type::union(values);
+                let merged = if all_lists {
+                    Type::List(Box::new(v))
+                } else {
+                    keys.push(Type::Int); // list parts contribute int keys
+                    Type::Array(Some(Box::new((Type::union(keys), v))))
+                };
+                Some(if any_non_empty {
+                    Type::non_empty(merged)
+                } else {
+                    merged
+                })
+            }
+            // `array_combine($keys, $values)` → `array<value-of-keys, value-of-values>`.
+            "array_combine" => {
+                let k = self.array_value_type(args.first()?)?;
+                let v = self.array_value_type(args.get(1)?)?;
+                Some(Type::Array(Some(Box::new((k, v)))))
+            }
+            // `array_fill($start, $count, $value)` → `array<int, V>`; a
+            // positive literal count is non-empty.
+            "array_fill" => {
+                let v = self.infer(&args.get(2)?.value);
+                let filled = Type::Array(Some(Box::new((Type::Int, v))));
+                Some(match self.infer(&args.get(1)?.value) {
+                    Type::LiteralInt(n) if n >= 1 => Type::non_empty(filled),
+                    _ => filled,
+                })
+            }
+            // `array_fill_keys($keys, $value)` → `array<value-of-keys, V>`.
+            "array_fill_keys" => {
+                let k = self.array_value_type(args.first()?)?;
+                let v = self.infer(&args.get(1)?.value);
+                Some(Type::Array(Some(Box::new((k, v)))))
+            }
+            // `array_flip(array<K, V>)` → `array<V, K>`.
+            "array_flip" => {
+                let t = self.infer(&args.first()?.value);
+                let (k, v) = arrays::iter_key_value(&t);
+                if matches!(k, Type::Mixed) && matches!(v, Type::Mixed) {
+                    return None;
+                }
+                Some(Type::Array(Some(Box::new((v, k)))))
+            }
+            // `array_pop`/`array_shift` return an element or `null` when empty.
+            "array_pop" | "array_shift" => {
+                let v = self.array_value_type(args.first()?)?;
+                Some(v.nullable())
+            }
+            // `array_chunk($a, $n)` → a list of non-empty chunks (re-indexed
+            // without the preserve-keys flag).
+            "array_chunk" if args.len() == 2 => {
+                let v = self.array_value_type(args.first()?)?;
+                Some(Type::List(Box::new(Type::non_empty(Type::List(
+                    Box::new(v),
+                )))))
+            }
+            // `range($a, $b)` always yields at least one element.
+            "range" => {
+                let int_ish = |t: &Type| {
+                    matches!(t, Type::Int | Type::LiteralInt(_) | Type::IntRange { .. })
+                };
+                let a = self.infer(&args.first()?.value);
+                let b = self.infer(&args.get(1)?.value);
+                let elem = if int_ish(&a) && int_ish(&b) && args.len() == 2 {
+                    Type::Int
+                } else if matches!(a, Type::Float) || matches!(b, Type::Float) {
+                    Type::Float
+                } else {
+                    return None;
+                };
+                Some(Type::non_empty(Type::List(Box::new(elem))))
+            }
+            // `iterator_to_array($it)` — element types via the iterable
+            // machinery; `preserve_keys: false` re-indexes into a list.
+            "iterator_to_array" => {
+                let t = self.infer(&args.first()?.value);
+                let (k, v) = self
+                    .index
+                    .iterable_key_value_on_type(&t)
+                    .unwrap_or_else(|| arrays::iter_key_value(&t));
+                if matches!(k, Type::Mixed) && matches!(v, Type::Mixed) {
+                    return None;
+                }
+                let preserve = match args.get(1).map(|a| self.infer(&a.value)) {
+                    Some(Type::False) => false,
+                    None | Some(Type::True) => true,
+                    _ => return None,
+                };
+                Some(if preserve {
+                    Type::Array(Some(Box::new((k, v))))
+                } else {
+                    Type::List(Box::new(v))
+                })
+            }
             "array_keys" => Some(Type::List(Box::new(self.array_key_type(args.first()?)?))),
             // `array_values(array<K,V>)` → `list<V>`.
             "array_values" => Some(Type::List(Box::new(self.array_value_type(args.first()?)?))),
@@ -731,6 +866,56 @@ impl<'a> TypeCtx<'a> {
         arrays::array_key_type(&self.infer(&arg.value))
     }
 
+    /// Bind a class's `@template`s from its constructor's parameters against the
+    /// `new` arguments (`new Collection([1, 2])` → `Collection<int>`). Only
+    /// applies when `base` is a bare (un-argumented) `Named` class that declares
+    /// templates and has a resolvable constructor; otherwise returns `base`
+    /// unchanged. Falls back to the bare class when nothing binds — a pure
+    /// precision add, never a regression.
+    fn instantiate_generic(&self, base: Type, args: &[Arg]) -> Type {
+        let Type::Named { fqn, args: existing } = &base else {
+            return base;
+        };
+        if !existing.is_empty() {
+            return base;
+        }
+        let Some(cls) = self.index.class(fqn) else {
+            return base;
+        };
+        if cls.templates.is_empty() {
+            return base;
+        }
+        let templates = cls.templates.clone();
+        let Some(ctor) = self.index.find_method(fqn, "__construct") else {
+            return base;
+        };
+        let Some(subst) = self.bind_call_templates(&ctor.member.params, args) else {
+            return base;
+        };
+        // Assemble the class-template arguments in declaration order; unbound
+        // templates become `mixed`. If none bound, keep the bare class.
+        let mut bound_any = false;
+        let bound: Vec<Type> = templates
+            .iter()
+            .map(|t| match subst.get(t) {
+                Some(ty) if !matches!(ty, Type::Mixed) => {
+                    bound_any = true;
+                    // Widen literals: a generic arg bound from a constructor
+                    // argument is `Box<int>`, not `Box<5>` (phpstan-conventional).
+                    crate::widen_literals(ty.clone())
+                }
+                _ => Type::Mixed,
+            })
+            .collect();
+        if !bound_any {
+            return base;
+        }
+        Type::Named {
+            fqn: fqn.clone(),
+            args: bound,
+        }
+    }
+
     fn bound_call_return(
         &self,
         params: &[php_reflect::ParamReflection],
@@ -740,7 +925,72 @@ impl<'a> TypeCtx<'a> {
         let Some(subst) = self.bind_call_templates(params, args) else {
             return declared.clone();
         };
-        subst_templates(declared, &subst, true)
+        let substituted = subst_templates(declared, &subst, true);
+        self.eval_conditionals(substituted, params, args, &subst)
+    }
+
+    /// Evaluate `($x is T ? A : B)` conditional return types at a call site.
+    /// The subject resolves to a parameter's argument type (`$name`) or a bound
+    /// template; `assignable_trinary` decides the branch (Yes→then, No→else,
+    /// Maybe→`then|else` — a safe superset). Unresolvable subjects keep the
+    /// conditional opaque, matching the prior behaviour (never a regression).
+    fn eval_conditionals(
+        &self,
+        ty: Type,
+        params: &[php_reflect::ParamReflection],
+        args: &[Arg],
+        subst: &HashMap<String, Type>,
+    ) -> Type {
+        ty.map(&mut |part| {
+            let Type::Conditional {
+                subject,
+                negated,
+                target,
+                then,
+                els,
+            } = part
+            else {
+                return part;
+            };
+            let Some(subj_ty) = self.conditional_subject_type(&subject, params, args, subst) else {
+                return Type::Conditional {
+                    subject,
+                    negated,
+                    target,
+                    then,
+                    els,
+                };
+            };
+            let mut verdict = crate::assignable_trinary(self.index, &subj_ty, &target);
+            if negated {
+                verdict = match verdict {
+                    crate::Trinary::Yes => crate::Trinary::No,
+                    crate::Trinary::No => crate::Trinary::Yes,
+                    crate::Trinary::Maybe => crate::Trinary::Maybe,
+                };
+            }
+            match verdict {
+                crate::Trinary::Yes => *then,
+                crate::Trinary::No => *els,
+                crate::Trinary::Maybe => Type::union(vec![*then, *els]),
+            }
+        })
+    }
+
+    /// The concrete type of a conditional's subject: a parameter reference
+    /// (`$name` → the matching argument's inferred type) or a bound template.
+    fn conditional_subject_type(
+        &self,
+        subject: &str,
+        params: &[php_reflect::ParamReflection],
+        args: &[Arg],
+        subst: &HashMap<String, Type>,
+    ) -> Option<Type> {
+        if let Some(name) = subject.strip_prefix('$') {
+            let idx = params.iter().position(|p| p.name == name)?;
+            return Some(self.infer(&args.get(idx)?.value));
+        }
+        subst.get(subject).cloned()
     }
 
     fn bind_call_templates(
@@ -752,6 +1002,7 @@ impl<'a> TypeCtx<'a> {
             return None;
         }
         let mut raw = HashMap::<String, Vec<Type>>::new();
+        // Pass 1: bind templates from every argument's *type*.
         let mut ai = 0;
         for p in params {
             if p.variadic {
@@ -766,6 +1017,32 @@ impl<'a> TypeCtx<'a> {
             };
             bind_templates_from_types(&p.ty, &self.infer(&arg.value), &mut raw);
             ai += 1;
+        }
+        // Pass 2: for each `callable(...): R` parameter given a closure/callable
+        // argument, seed the callback's parameter types from the pass-1 bindings,
+        // infer its return, and bind the return-position templates. This makes a
+        // generic userland `map`/`filter`/`pipe` (`@param callable(T): R`,
+        // `@return list<R>`) propagate the closure's return — the general form of
+        // the hard-coded array_map/Collection callback handling.
+        let partial = finalize_subst(raw.clone());
+        for (idx, p) in params.iter().enumerate() {
+            if p.variadic {
+                break;
+            }
+            let Some(arg) = args.get(idx) else {
+                break;
+            };
+            let Type::Callable(Some(sig)) = &p.ty else {
+                continue;
+            };
+            let seed: Vec<Type> = sig
+                .params
+                .iter()
+                .map(|pt| subst_templates(pt, &partial, true))
+                .collect();
+            if let Some(ret) = self.callback_return_type(arg, &seed) {
+                bind_templates_from_types(&sig.ret, &ret, &mut raw);
+            }
         }
         Some(finalize_subst(raw))
     }
@@ -1363,6 +1640,211 @@ impl<'a> TypeCtx<'a> {
         }
     }
 
+    /// Return refinements for the string builtins (phpstan's per-function
+    /// DynamicReturnTypeExtensions, batch B1): literal folding where the value
+    /// is fully known, non-emptiness where the output provably has a byte.
+    /// `None` falls back to the stub signature.
+    fn string_builtin_return(&self, fname: &str, args: &[php_ast::Arg]) -> Option<Type> {
+        const FOLD_CAP: usize = 512;
+        let lit = |i: usize| -> Option<String> {
+            match self.infer(&args.get(i)?.value) {
+                Type::LiteralString(s) => Some(s.to_string()),
+                _ => None,
+            }
+        };
+        let arg_non_empty = |i: usize| -> bool {
+            match args.get(i).map(|a| self.infer(&a.value)) {
+                Some(Type::LiteralString(s)) => !s.is_empty(),
+                Some(Type::StringOf(r)) => r.implies(php_types::StringRefinement::NonEmpty),
+                _ => false,
+            }
+        };
+        let non_empty_string = || Type::StringOf(php_types::StringRefinement::NonEmpty);
+        Some(match fname {
+            // A `%`-free literal format is the result verbatim; with
+            // conversions, every specifier but `%s` emits at least one char, so
+            // stripping `%%` and `%s` from a literal format proves
+            // non-emptiness when anything remains (positional `%1$s` forms are
+            // skipped via the `$` guard).
+            "sprintf" | "vsprintf" => {
+                let fmt = lit(0)?;
+                if !fmt.contains('%') {
+                    if fmt.is_empty() {
+                        return None;
+                    }
+                    return Some(Type::LiteralString(fmt.into()));
+                }
+                if fmt.contains('$') {
+                    return None;
+                }
+                let stripped = fmt.replace("%%", "").replace("%s", "");
+                if stripped.is_empty() {
+                    return None;
+                }
+                non_empty_string()
+            }
+            // `explode` with a non-empty separator and no limit always yields
+            // at least one element (the whole string when the separator is
+            // absent). A `limit` argument can produce an empty list.
+            "explode" => {
+                let base = Type::List(Box::new(Type::String));
+                if args.len() == 2 && arg_non_empty(0) {
+                    Type::non_empty(base)
+                } else {
+                    base
+                }
+            }
+            // Length-preserving transforms: fold literals (byte-wise ASCII
+            // semantics since PHP 8.0), keep non-emptiness otherwise.
+            "strtolower" | "strtoupper" | "ucfirst" | "lcfirst" | "strrev" => {
+                match self.infer(&args.first()?.value) {
+                    Type::LiteralString(s) => {
+                        let s = s.to_string();
+                        Type::LiteralString(
+                            match fname {
+                                "strtolower" => s.to_ascii_lowercase(),
+                                "strtoupper" => s.to_ascii_uppercase(),
+                                "ucfirst" => ascii_change_first(&s, true),
+                                "lcfirst" => ascii_change_first(&s, false),
+                                _ => s.chars().rev().collect(),
+                            }
+                            .into(),
+                        )
+                    }
+                    Type::StringOf(r) if r.implies(php_types::StringRefinement::NonEmpty) => {
+                        non_empty_string()
+                    }
+                    _ => return None,
+                }
+            }
+            // Default-charlist trim of a literal folds exactly.
+            "trim" | "ltrim" | "rtrim" if args.len() == 1 => {
+                let s = lit(0)?;
+                const WS: &[char] = &[' ', '\t', '\n', '\r', '\0', '\x0B'];
+                let folded = match fname {
+                    "trim" => s.trim_matches(WS),
+                    "ltrim" => s.trim_start_matches(WS),
+                    _ => s.trim_end_matches(WS),
+                };
+                Type::LiteralString(folded.into())
+            }
+            // `str_repeat`: two known literals fold (size-capped); a non-empty
+            // subject repeated a provably-positive count stays non-empty.
+            "str_repeat" => {
+                let times = match self.infer(&args.get(1)?.value) {
+                    Type::LiteralInt(n) => Some(n),
+                    Type::IntRange { min: Some(m), .. } if m >= 1 => None,
+                    _ => return None,
+                };
+                match (lit(0), times) {
+                    (Some(s), Some(n)) if n >= 0 && s.len().saturating_mul(n as usize) <= FOLD_CAP => {
+                        Type::LiteralString(s.repeat(n as usize).into())
+                    }
+                    _ if arg_non_empty(0) => non_empty_string(),
+                    _ => return None,
+                }
+            }
+            // `str_pad($s, $len)`: the result has max(len, strlen) bytes.
+            "str_pad" => {
+                let len_positive = matches!(
+                    self.infer(&args.get(1)?.value),
+                    Type::LiteralInt(n) if n >= 1
+                );
+                if len_positive || arg_non_empty(0) {
+                    non_empty_string()
+                } else {
+                    return None;
+                }
+            }
+            // `number_format` always prints at least one digit.
+            "number_format" => non_empty_string(),
+            // `date` with a non-empty literal format emits at least one char
+            // (every format char produces output; literal chars pass through).
+            "date" | "gmdate" => {
+                if lit(0)?.is_empty() {
+                    return None;
+                }
+                non_empty_string()
+            }
+            // `dirname('')` is `'.'` — always non-empty. `uniqid` likewise.
+            "dirname" | "uniqid" => non_empty_string(),
+            // `gettype` returns one of a fixed non-empty word set.
+            "gettype" => non_empty_string(),
+            // `filter_var($v, FILTER_VALIDATE_*)` — the filter constant names
+            // the success type (failure is `false`; flag args are skipped).
+            "filter_var" if args.len() == 2 => {
+                let ExprKind::Name(n) = &args[1].value.kind else {
+                    return None;
+                };
+                let success = match n.text.rsplit('\\').next().unwrap_or(&n.text) {
+                    "FILTER_VALIDATE_INT" => Type::Int,
+                    "FILTER_VALIDATE_FLOAT" => Type::Float,
+                    "FILTER_VALIDATE_BOOLEAN" | "FILTER_VALIDATE_BOOL" => {
+                        // Failure also yields `false` — plain bool covers it.
+                        return Some(Type::Bool);
+                    }
+                    "FILTER_VALIDATE_EMAIL" | "FILTER_VALIDATE_URL" | "FILTER_VALIDATE_IP"
+                    | "FILTER_VALIDATE_DOMAIN" | "FILTER_VALIDATE_MAC" => Type::String,
+                    _ => return None,
+                };
+                Type::union(vec![success, Type::False])
+            }
+            // `preg_split` without flags yields at least one piece (or `false`
+            // on a bad pattern). The 4th (flags) arg can produce an empty list.
+            "preg_split" if args.len() <= 3 => Type::union(vec![
+                Type::non_empty(Type::List(Box::new(Type::String))),
+                Type::False,
+            ]),
+            // `parse_url($url)` → the component shape (all keys optional) or
+            // `false` on a seriously malformed URL.
+            "parse_url" if args.len() == 1 => {
+                let f = |key: &str, ty: Type| php_types::ShapeField {
+                    key: Some(key.to_string()),
+                    optional: true,
+                    ty,
+                };
+                Type::union(vec![
+                    Type::Shape {
+                        fields: vec![
+                            f("scheme", Type::String),
+                            f("host", Type::String),
+                            f("port", Type::Int),
+                            f("user", Type::String),
+                            f("pass", Type::String),
+                            f("path", Type::String),
+                            f("query", Type::String),
+                            f("fragment", Type::String),
+                        ],
+                        sealed: true,
+                    },
+                    Type::False,
+                ])
+            }
+            // `pathinfo($p)` → its documented shape (`basename`/`filename`
+            // always present); the 2-arg component form returns a string.
+            "pathinfo" => {
+                if args.len() >= 2 {
+                    return Some(Type::String);
+                }
+                let f = |key: &str, optional: bool| php_types::ShapeField {
+                    key: Some(key.to_string()),
+                    optional,
+                    ty: Type::String,
+                };
+                Type::Shape {
+                    fields: vec![
+                        f("dirname", true),
+                        f("basename", false),
+                        f("extension", true),
+                        f("filename", false),
+                    ],
+                    sealed: true,
+                }
+            }
+            _ => return None,
+        })
+    }
+
     /// The class FQN to query members on, given a value's type.
     fn type_class_fqn(&self, t: &Type) -> Option<String> {
         match t {
@@ -1646,6 +2128,8 @@ fn bind_templates_from_types(param: &Type, arg: &Type, subst: &mut HashMap<Strin
             }
         }
         Type::Nullable(inner) => bind_templates_from_types(inner, arg, subst),
+        // Template binding sees through the non-empty refinement (both sides).
+        Type::NonEmpty(inner) => bind_templates_from_types(inner, arg.peel_non_empty(), subst),
         Type::Union(parts) | Type::Intersection(parts) => {
             for part in parts.iter() {
                 bind_templates_from_types(part, arg, subst);
@@ -1865,6 +2349,7 @@ fn inc_dec_type(t: Type) -> Type {
 /// bare `object`; a union maps member-wise; anything else is returned unchanged.
 fn instance_of(t: Type) -> Type {
     match t {
+        Type::NonEmpty(inner) => instance_of(*inner),
         Type::ClassString(Some(inner)) => *inner,
         Type::ClassString(None) | Type::String | Type::StringOf(_) | Type::LiteralString(_) => {
             Type::Object
@@ -1959,6 +2444,20 @@ fn concat_type(l: &Type, r: &Type) -> Type {
     } else {
         Type::String
     }
+}
+
+/// `ucfirst`/`lcfirst` semantics: change the case of the first ASCII byte.
+fn ascii_change_first(s: &str, upper: bool) -> String {
+    let mut out = s.to_string();
+    // Safety of the byte poke: ASCII case changes never alter UTF-8 validity.
+    if let Some(b) = unsafe { out.as_bytes_mut() }.first_mut() {
+        if upper {
+            b.make_ascii_uppercase();
+        } else {
+            b.make_ascii_lowercase();
+        }
+    }
+    out
 }
 
 /// The literal text of a concat operand when statically known.
@@ -2267,6 +2766,178 @@ mod tests {
         // Reading a constant offset of a shape yields that field's type.
         assert_eq!(infer_with("$a['b'];", &[("a", shape())], None), "string");
         assert_eq!(infer_with("$a['z'];", &[("a", shape())], None), "mixed");
+    }
+
+    #[test]
+    fn mixed_bag_builtin_returns() {
+        assert_eq!(infer("date('Y-m-d');"), "non-empty-string");
+        assert_eq!(infer("date($fmt);"), "string"); // unknown format — stub type
+        assert_eq!(infer("dirname($p);"), "non-empty-string");
+        assert_eq!(infer("gettype($x);"), "non-empty-string");
+        assert_eq!(
+            infer("filter_var($x, FILTER_VALIDATE_INT);"),
+            "int|false"
+        );
+        assert_eq!(
+            infer("filter_var($x, FILTER_VALIDATE_EMAIL);"),
+            "string|false"
+        );
+        assert_eq!(infer("filter_var($x, FILTER_VALIDATE_BOOL);"), "bool");
+        assert_eq!(
+            infer("preg_split('/,/', $s);"),
+            "non-empty-list<string>|false"
+        );
+        let url = infer("parse_url($u);");
+        assert!(url.contains("host?: string") && url.ends_with("|false"), "{url}");
+        let pi = infer("pathinfo($p);");
+        assert!(
+            pi.contains("basename: string") && pi.contains("extension?: string"),
+            "{pi}"
+        );
+        assert_eq!(infer("pathinfo($p, PATHINFO_EXTENSION);"), "string");
+    }
+
+    #[test]
+    fn array_builtin_returns() {
+        let vars = &[(
+            "list",
+            Type::List(Box::new(Type::String)),
+        ), (
+            "map",
+            Type::Array(Some(Box::new((Type::String, Type::Int)))),
+        )][..];
+        let probe = |src: &str| infer_with(src, vars, None);
+        assert_eq!(probe("array_merge($list, $list);"), "list<string>");
+        assert_eq!(
+            probe("array_merge($list, $map);"),
+            "array<string|int, string|int>"
+        );
+        assert_eq!(probe("array_combine($list, $list);"), "array<string, string>");
+        assert_eq!(probe("array_fill(0, 3, 'x');"), "non-empty-array<int, 'x'>");
+        assert_eq!(probe("array_fill_keys($list, 1);"), "array<string, 1>");
+        assert_eq!(probe("array_flip($map);"), "array<int, string>");
+        assert_eq!(probe("array_pop($list);"), "?string");
+        assert_eq!(
+            probe("array_chunk($list, 2);"),
+            "list<non-empty-list<string>>"
+        );
+        assert_eq!(probe("range(1, 10);"), "non-empty-list<int>");
+        assert_eq!(probe("range(0.5, 2.5);"), "non-empty-list<float>");
+        assert_eq!(
+            probe("iterator_to_array($map, false);"),
+            "list<int>"
+        );
+    }
+
+    #[test]
+    fn string_builtin_returns() {
+        // Literal folding.
+        assert_eq!(infer("sprintf('hello');"), "'hello'");
+        assert_eq!(infer("strtoupper('abc');"), "'ABC'");
+        assert_eq!(infer("strtolower('ABC');"), "'abc'");
+        assert_eq!(infer("ucfirst('abc');"), "'Abc'");
+        assert_eq!(infer("strrev('abc');"), "'cba'");
+        assert_eq!(infer("trim('  x  ');"), "'x'");
+        assert_eq!(infer("str_repeat('ab', 3);"), "'ababab'");
+        // Non-emptiness proofs.
+        assert_eq!(infer("sprintf('id-%d', 5);"), "non-empty-string");
+        assert_eq!(infer("number_format(1234.5);"), "non-empty-string");
+        assert_eq!(infer("str_pad('', 4);"), "non-empty-string");
+        assert_eq!(infer("explode(',', 'a,b');"), "non-empty-list<string>");
+        // Nothing provable: `%s` alone can be empty; explode with a limit can
+        // drop everything.
+        assert_eq!(infer("sprintf('%s', 'x');"), "string");
+        assert_eq!(infer("explode(',', 'a,b', -1);"), "list<string>");
+    }
+
+    #[test]
+    fn general_callable_template_return_flow() {
+        let def = r#"
+        /**
+         * @template T
+         * @template R
+         * @param list<T> $items
+         * @param callable(T): R $cb
+         * @return list<R>
+         */
+        function mapList(array $items, callable $cb): array {}
+        class User { public function id(): int {} }
+        "#;
+        // A typed closure param: its return (User::id() → int) binds R.
+        assert_eq!(
+            infer(&format!(
+                "{def} mapList([new User()], function (User $x) {{ return $x->id(); }});"
+            )),
+            "list<int>"
+        );
+        // An *untyped* arrow param seeded from the pass-1 binding T=int.
+        assert_eq!(
+            infer(&format!("{def} mapList([1, 2], fn($n) => $n * 2);")),
+            "list<int>"
+        );
+    }
+
+    #[test]
+    fn conditional_return_evaluation() {
+        // `($x is int ? string : bool)` — evaluated per the argument type.
+        let decl = r#"
+        /** @return ($x is int ? string : bool) */
+        function f($x) {}
+        "#;
+        assert_eq!(infer(&format!("{decl} f(5);")), "string");
+        assert_eq!(infer(&format!("{decl} f('a');")), "bool");
+        // Unknown argument → both branches (safe superset).
+        assert_eq!(infer(&format!("{decl} f($u);")), "string|bool");
+
+        // Negated subject flips the branches.
+        let neg = r#"
+        /** @return ($x is int ? bool : string) */
+        function g($x) {}
+        "#;
+        assert_eq!(infer(&format!("{neg} g(5);")), "bool");
+        assert_eq!(infer(&format!("{neg} g('a');")), "string");
+    }
+
+    #[test]
+    fn generic_constructor_inference() {
+        let src = r#"
+        /** @template T */
+        class Box {
+            /** @param T $value */
+            public function __construct($value) {}
+        }
+        new Box(5);
+        "#;
+        assert_eq!(infer(src), "Box<int>");
+
+        // Two type params bound from two args.
+        let src = r#"
+        /**
+         * @template K
+         * @template V
+         */
+        class Pair {
+            /**
+             * @param K $k
+             * @param V $v
+             */
+            public function __construct($k, $v) {}
+        }
+        new Pair('x', 3);
+        "#;
+        assert_eq!(infer(src), "Pair<string, int>");
+
+        // A non-generic class is unchanged.
+        let src = "class Plain { public function __construct($x) {} } new Plain(5);";
+        assert_eq!(infer(src), "Plain");
+
+        // Unbound template (arg doesn't reach it) → bare class, no noise.
+        let src = r#"
+        /** @template T */
+        class Lazy { public function __construct() {} }
+        new Lazy();
+        "#;
+        assert_eq!(infer(src), "Lazy");
     }
 
     #[test]

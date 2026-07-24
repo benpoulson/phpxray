@@ -129,6 +129,12 @@ pub enum Type {
         fields: Vec<ShapeField>,
         sealed: bool,
     },
+    /// A non-empty refinement of an array-ish type (phpstan's accessory
+    /// non-emptiness): `non-empty-array<K,V>` / `non-empty-list<T>`. Wraps the
+    /// base container; consumers peel via [`Type::peel_non_empty`], so an
+    /// unwrapped match on `Array(_)`/`List(_)` treats it leniently (never as
+    /// a different kind).
+    NonEmpty(Box<Type>),
     /// `T|null` shorthand.
     Nullable(Box<Type>),
     Union(std::sync::Arc<[Type]>),
@@ -311,6 +317,23 @@ impl Type {
 
     /// Smart constructor for a bounded int: a fully-open range is just `Int`, and
     /// a degenerate `min == max` collapses to that literal int.
+    /// Wrap an array-ish type in the non-empty refinement (idempotent; other
+    /// types pass through unchanged — non-emptiness only refines containers).
+    pub fn non_empty(t: Type) -> Type {
+        match t {
+            Type::Array(_) | Type::List(_) | Type::Shape { .. } => Type::NonEmpty(Box::new(t)),
+            other => other,
+        }
+    }
+
+    /// The base type under a possible [`Type::NonEmpty`] wrapper.
+    pub fn peel_non_empty(&self) -> &Type {
+        match self {
+            Type::NonEmpty(inner) => inner,
+            other => other,
+        }
+    }
+
     pub fn int_range(min: Option<i64>, max: Option<i64>) -> Type {
         match (min, max) {
             (None, None) => Type::Int,
@@ -481,6 +504,12 @@ impl fmt::Display for Type {
             Type::ClassString(None) => f.write_str("class-string"),
             Type::ClassString(Some(t)) => write!(f, "class-string<{t}>"),
             Type::EnumCase { fqn, case } => write!(f, "{fqn}::{case}"),
+            Type::NonEmpty(inner) => match &**inner {
+                Type::Array(None) => f.write_str("non-empty-array"),
+                Type::Array(Some(kv)) => write!(f, "non-empty-array<{}, {}>", kv.0, kv.1),
+                Type::List(elem) => write!(f, "non-empty-list<{elem}>"),
+                other => write!(f, "{other}"),
+            },
             Type::Named { fqn, args } if args.is_empty() => f.write_str(fqn),
             Type::Named { fqn, args } => {
                 let a = args

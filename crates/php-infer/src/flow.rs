@@ -287,6 +287,7 @@ impl TypeCtx<'_> {
                 // `$x === null` true ⇒ $x is null; false ⇒ null stripped.
                 BinOp::Identical | BinOp::Eq => {
                     self.null_cmp(lhs, rhs, truthy, out);
+                    self.count_eq_facts(lhs, rhs, truthy, out);
                     if matches!(op, BinOp::Identical) {
                         self.fn_result_cmp(lhs, rhs, truthy, out);
                         self.fn_result_cmp(rhs, lhs, truthy, out);
@@ -294,6 +295,7 @@ impl TypeCtx<'_> {
                 }
                 BinOp::NotIdentical | BinOp::NotEq => {
                     self.null_cmp(lhs, rhs, !truthy, out);
+                    self.count_eq_facts(lhs, rhs, !truthy, out);
                     if matches!(op, BinOp::NotIdentical) {
                         self.fn_result_cmp(lhs, rhs, !truthy, out);
                         self.fn_result_cmp(rhs, lhs, !truthy, out);
@@ -301,7 +303,8 @@ impl TypeCtx<'_> {
                 }
                 // Integer-range narrowing: `$x < 2` false ⇒ `$x: int<2, max>`, etc.
                 BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
-                    self.int_cmp_facts(*op, lhs, rhs, truthy, out)
+                    self.int_cmp_facts(*op, lhs, rhs, truthy, out);
+                    self.count_cmp_facts(*op, lhs, rhs, truthy, out);
                 }
                 _ => {}
             },
@@ -744,6 +747,17 @@ impl TypeCtx<'_> {
                     out.push((place, Type::StringOf(php_types::StringRefinement::Callable)));
                 }
             }
+            // Truthy `count($x)` / `sizeof($x)` ⇒ at least one element.
+            "count" | "sizeof" => {
+                if !truthy {
+                    return;
+                }
+                let Some(arg0) = args.first() else { return };
+                let Some(place) = self.place_key(&arg0.value) else {
+                    return;
+                };
+                self.push_non_empty(place, &arg0.value, out);
+            }
             // `array_is_list($a)` true ⇒ the array is a list.
             "array_is_list" => {
                 if !truthy {
@@ -760,6 +774,62 @@ impl TypeCtx<'_> {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// `count($x) CMP n` non-emptiness: a branch where the count is provably
+    /// >= 1 makes the counted container non-empty.
+    fn count_cmp_facts(&self, op: BinOp, lhs: &Expr, rhs: &Expr, truthy: bool, out: &mut Vec<Fact>) {
+        let (call, lit, op) = if let Some(n) = int_lit(rhs) {
+            (lhs, n, op)
+        } else if let Some(n) = int_lit(lhs) {
+            (rhs, n, flip_cmp(op))
+        } else {
+            return;
+        };
+        let Some(arg) = count_call_arg(call) else {
+            return;
+        };
+        let Some(place) = self.place_key(arg) else {
+            return;
+        };
+        let eff = if truthy { op } else { negate_cmp(op) };
+        let min_count = match eff {
+            BinOp::Gt => lit.saturating_add(1),
+            BinOp::GtEq => lit,
+            _ => return, // upper bounds prove nothing about non-emptiness
+        };
+        if min_count >= 1 {
+            self.push_non_empty(place, arg, out);
+        }
+    }
+
+    /// `count($x) === n` (n >= 1) / `count($x) !== 0` ⇒ non-empty. `eq` is the
+    /// branch's truth for the equality.
+    fn count_eq_facts(&self, lhs: &Expr, rhs: &Expr, eq: bool, out: &mut Vec<Fact>) {
+        let (call, lit) = if let Some(n) = int_lit(rhs) {
+            (lhs, n)
+        } else if let Some(n) = int_lit(lhs) {
+            (rhs, n)
+        } else {
+            return;
+        };
+        let Some(arg) = count_call_arg(call) else {
+            return;
+        };
+        let Some(place) = self.place_key(arg) else {
+            return;
+        };
+        if (eq && lit >= 1) || (!eq && lit == 0) {
+            self.push_non_empty(place, arg, out);
+        }
+    }
+
+    fn push_non_empty(&self, place: String, arg: &Expr, out: &mut Vec<Fact>) {
+        let cur = self.infer(arg);
+        let ne = Type::non_empty(cur.clone());
+        if ne != cur {
+            out.push((place, ne));
         }
     }
 
@@ -967,6 +1037,47 @@ impl TypeCtx<'_> {
             self.invalidate_object_args(args);
         }
         self.widen_by_ref_args(params, args);
+        self.apply_preg_match_out(callee, args);
+    }
+
+    /// `preg_match($p, $s, $m)` / `preg_match_all` type their `$matches`
+    /// out-parameter precisely: `array<int|string, string>` for `preg_match`
+    /// (each capture group is a matched string) and `array<int|string,
+    /// list<string>>` for `preg_match_all`. Applied unconditionally after the
+    /// call (sound in both branches: on no-match `$matches` is an empty array,
+    /// which fits). Only a plain `$var` matches argument is handled; a userland
+    /// redefinition of `preg_match` is skipped.
+    fn apply_preg_match_out(&mut self, callee: &Expr, args: &[Arg]) {
+        let ExprKind::Name(n) = &callee.kind else {
+            return;
+        };
+        // Skip a userland function that shadows the builtin name.
+        if self.function_reflection(n).is_some_and(|f| !f.builtin) {
+            return;
+        }
+        let matches_ty = match last_segment(&n.text).to_ascii_lowercase().as_str() {
+            "preg_match" => preg_match_array_type(),
+            "preg_match_all" => Type::Array(Some(Box::new((
+                Type::union(vec![Type::Int, Type::String]),
+                Type::List(Box::new(Type::String)),
+            )))),
+            _ => return,
+        };
+        let Some(arg) = args.get(2) else {
+            return;
+        };
+        if arg.spread || arg.name.is_some() || arg.placeholder {
+            return;
+        }
+        let ExprKind::Variable(sym) = &arg.value.kind else {
+            return;
+        };
+        let name = self.interner.resolve(*sym).to_string();
+        if name == "this" {
+            return;
+        }
+        self.callables.remove(&name);
+        self.vars.insert(name, matches_ty);
     }
 
     /// After `C::m(...)`. A `self::`/`parent::`/`static::` call to an instance
@@ -1929,6 +2040,9 @@ impl TypeCtx<'_> {
     ) {
         self.rec_here(subject, map);
         let subj_ty = self.apply_expr(subject);
+        // A non-empty subject runs the body at least once: the post-loop state
+        // is the post-body state, not merged with the never-ran entry state.
+        let definite = matches!(subj_ty, Type::NonEmpty(_));
         let (k, v) = self
             .index
             .iterable_key_value_on_type(&subj_ty)
@@ -1946,9 +2060,9 @@ impl TypeCtx<'_> {
             self.rec_here(value, map);
             self.record_stmt(body, map);
             let after = widen_loop_state(self.take_flow_state());
-            let next = merge_states(vec![base.clone(), after]);
+            let next = merge_states(vec![base.clone(), after.clone()]);
             if flow_state_same(&current, &next) {
-                self.set_flow_state(next);
+                self.set_flow_state(if definite { after } else { next });
                 return;
             }
             current = next;
@@ -2213,9 +2327,9 @@ fn predicate_matches(m: &Type, t: &Type) -> bool {
         Int => matches!(m, Int | LiteralInt(_)),
         Float => matches!(m, Float),
         Bool => matches!(m, Bool | True | False),
-        Array(_) => matches!(m, Array(_) | List(_) | Shape { .. }),
+        Array(_) => matches!(m.peel_non_empty(), Array(_) | List(_) | Shape { .. }),
         Object => matches!(m, Object | Named { .. } | EnumCase { .. } | SelfType | StaticType),
-        Iterable(_) => matches!(m, Iterable(_) | Array(_) | List(_) | Shape { .. }),
+        Iterable(_) => matches!(m.peel_non_empty(), Iterable(_) | Array(_) | List(_) | Shape { .. }),
         Callable(_) => matches!(m, Callable(_)),
         Null => matches!(m, Null),
         _ => false,
@@ -2427,10 +2541,27 @@ fn type_may_be_object(t: &Type) -> bool {
         | Type::ClassString(_)
         | Type::Void
         | Type::Never => false,
+        Type::NonEmpty(_) => false,
         Type::Nullable(inner) => type_may_be_object(inner),
         Type::Union(ms) => ms.iter().any(type_may_be_object),
         _ => true,
     }
+}
+
+/// The counted argument of a `count($x)`/`sizeof($x)` call expression.
+fn count_call_arg(e: &Expr) -> Option<&Expr> {
+    let ExprKind::Call { callee, args } = &peel_paren(e).kind else {
+        return None;
+    };
+    let ExprKind::Name(n) = &callee.kind else {
+        return None;
+    };
+    let last = n.text.rsplit('\\').next().unwrap_or(&n.text);
+    if !last.eq_ignore_ascii_case("count") && !last.eq_ignore_ascii_case("sizeof") {
+        return None;
+    }
+    let arg = args.first()?;
+    (!arg.spread && !arg.placeholder && arg.name.is_none()).then_some(&arg.value)
 }
 
 fn expr_is_true(e: &Expr) -> bool {
@@ -2891,6 +3022,33 @@ mod tests {
     }
 
     #[test]
+    fn preg_match_types_matches_out_param() {
+        // `$m` is the capture-group array after the call (even in a guard cond,
+        // which runs unconditionally).
+        let src = r#"
+            function f(string $s) {
+                if (preg_match('/(\d+)/', $s, $m)) {}
+            }
+        "#;
+        assert_eq!(var_after(src, "m"), "array<int|string, string>");
+        // preg_match_all: each group is a list of matches.
+        let src = r#"
+            function f(string $s) {
+                preg_match_all('/(\d+)/', $s, $m);
+            }
+        "#;
+        assert_eq!(var_after(src, "m"), "array<int|string, list<string>>");
+        // A userland preg_match is not clobbered.
+        let src = r#"
+            function preg_match($a, $b, &$c): int { return 0; }
+            function f(string $s) {
+                preg_match('/x/', $s, $m);
+            }
+        "#;
+        assert_ne!(var_after(src, "m"), "array<int|string, string>");
+    }
+
+    #[test]
     fn param_out_sets_post_call_type() {
         // `@param-out` beats the declared param type for the post-call value.
         let src = r#"
@@ -2934,6 +3092,74 @@ mod tests {
         assert_eq!(var_after(src, "x"), "Suit::Hearts|mixed");
         // The `!==` guard's fall-through pins the case too.
         assert_eq!(var_after(src, "y"), "Suit::Hearts");
+    }
+
+    // --- M-P2 non-empty arrays + count() ------------------------------------
+
+    #[test]
+    fn count_comparisons_narrow_to_non_empty() {
+        let probe = |guard: &str| {
+            format!(
+                "/** @param array<int, string> $a */\nfunction f(array $a) {{ if ({guard}) {{ $y = $a; }} }}"
+            )
+        };
+        for guard in [
+            "count($a) > 0",
+            "count($a) >= 1",
+            "count($a) !== 0",
+            "count($a) === 2",
+            "sizeof($a) > 0",
+            "count($a)",
+        ] {
+            assert_eq!(
+                var_after(&probe(guard), "y"),
+                "non-empty-array<int, string>|mixed",
+                "{guard}"
+            );
+        }
+        // Upper bounds and == 0 prove nothing about (non-)emptiness there.
+        assert_eq!(
+            var_after(&probe("count($a) < 5"), "y"),
+            "array<int, string>|mixed"
+        );
+        // The falsy branch of `count($a) === 0` is non-empty.
+        let src = r#"
+            /** @param array<int, string> $a */
+            function f(array $a) {
+                if (count($a) === 0) { return; }
+                $y = $a;
+            }
+        "#;
+        assert_eq!(var_after(src, "y"), "non-empty-array<int, string>");
+    }
+
+    #[test]
+    fn non_empty_doc_types_resolve_and_flow() {
+        let src = r#"
+            /** @param non-empty-list<string> $a */
+            function f(array $a) { $y = $a; }
+        "#;
+        assert_eq!(var_after(src, "y"), "non-empty-list<string>");
+    }
+
+    #[test]
+    fn foreach_over_non_empty_runs_at_least_once() {
+        // Over a plain array the loop may not run ($last stays maybe-unset);
+        // over a non-empty one the body ran, so $last is definite.
+        let plain = r#"
+            /** @param array<int, string> $a */
+            function f(array $a) {
+                foreach ($a as $v) { $last = $v; }
+            }
+        "#;
+        assert_eq!(var_after(plain, "last"), "mixed|string");
+        let non_empty = r#"
+            /** @param non-empty-list<string> $a */
+            function f(array $a) {
+                foreach ($a as $v) { $last = $v; }
+            }
+        "#;
+        assert_eq!(var_after(non_empty, "last"), "string");
     }
 
     // --- M-P2 @phpstan-assert ----------------------------------------------

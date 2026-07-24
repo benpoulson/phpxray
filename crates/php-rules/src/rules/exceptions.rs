@@ -22,19 +22,28 @@
 //! - **ThrowsVoidFunctionWithExplicitThrowPointRule** / **ThrowsVoidMethodWithExplicitThrowPointRule**
 //!   (`throws.void`, level 3) — a declaration with explicit `@throws void` and a
 //!   direct `throw` expression in its body.
+//! - **TooWide{Function,Method}ThrowTypeRule** (`throws.unusedType`, level 4) —
+//!   a declared `@throws T` the body never throws. FP-safe subset: only explicit
+//!   `throw` gives precise thrown types; any call/`new`/`clone`/`match`/`eval`/
+//!   division is a "broad" source that suppresses the report (see the block
+//!   above the rule). Validated against the phpstan oracle (byte-identical
+//!   messages; we under-report only the built-in-specific throw cases phpstan
+//!   models and we don't).
 //!
 //! Deferred (need analysis we don't model):
-//! - `CatchWithUnthrownExceptionRule` (`catch.neverThrown`) — needs throw-set
-//!   analysis of the try block + checked-exception config.
-//! - `MissingCheckedExceptionInThrows*` / `TooWide*ThrowType*` /
-//!   `MethodThrowTypeCovarianceRule` — need a full throw-set analysis.
+//! - `CatchWithUnthrownExceptionRule` (`catch.neverThrown`) — needs try-block
+//!   throw-set analysis + the checked-exception config subsystem (default
+//!   `reportUncheckedExceptionDeadCatch: false` + empty checked-class lists make
+//!   it near-dormant by default, so low priority).
+//! - `MissingCheckedExceptionInThrows*` / `MethodThrowTypeCovarianceRule` —
+//!   need checked-exception config + interprocedural throw sets.
 //! - `ThrowsVoidPropertyHookWithExplicitThrowPointRule` — property hooks don't
 //!   carry their own docblocks in our AST yet, so we can't tell hook-level
 //!   `@throws void` apart from a property docblock.
 
 use crate::{walk, FileAnalysis, RuleEntry};
 use php_ast::{
-    Catch, ClassDecl, Expr, ExprKind, FunctionDecl, HookBody, Member, MethodDecl, Name,
+    BinOp, Catch, ClassDecl, Expr, ExprKind, FunctionDecl, HookBody, Member, MethodDecl, Name,
     PropertyHook, Stmt, StmtKind,
 };
 use php_diagnostics::Diagnostic;
@@ -43,6 +52,7 @@ use php_reflect::{resolve_doc_type, ReflectionIndex};
 use php_resolve::{for_each_region, Resolution, Scope};
 use php_span::Span;
 use php_types::Type;
+use std::collections::HashSet;
 
 /// The reserved built-in throwable roots. These live in C and are *not* in the
 /// reflection index, so any user class extending one has an unindexed ancestor
@@ -882,7 +892,265 @@ fn run_throw_expression(fa: &FileAnalysis) -> Vec<Diagnostic> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// TooWide{Function,Method}ThrowTypeRule — `throws.unusedType` (level 4)
+//
+// A declared `@throws T` that the body never (statically) throws. phpstan does
+// interprocedural throw inference + curated built-in throw modeling; we have
+// neither, so we take the *FP-safe* subset: only **explicit `throw`** produces a
+// precise thrown type. ANY call/`new`/`clone`/`match`/`eval`/division is a
+// "broad" throw source (it could throw anything, incl. via an unannotated
+// callee), and its presence suppresses every unused report for that body. So we
+// report T only when the body has no broad source and no explicit `throw` of a
+// type *related* to T (matching phpstan on empty-body and unrelated-explicit-
+// throw cases; under-reporting the built-in-specific cases it can't see).
+
+/// Escaping throw signature of a body: the concrete thrown class types (from
+/// `throw new X` / `throw $typed`) and whether a broad (unmodelable) throw
+/// source is present. Caught-vs-uncaught is not distinguished — keeping caught
+/// throws only makes declared types *more* justified (fewer reports), which is
+/// the FP-safe direction.
+fn escaping_throw_signature(fa: &FileAnalysis, body: &[Stmt]) -> (Vec<Type>, bool) {
+    // `new`/anon-class operands that are the direct object of a `throw`: the
+    // construction of the thrown exception itself is not a broad source.
+    let mut thrown_new_ops: HashSet<*const Expr> = HashSet::new();
+    let mut concrete: Vec<Type> = Vec::new();
+    let mut broad = false;
+
+    for st in body {
+        walk::for_each_expr_in_scope(st, &mut |e| {
+            let ExprKind::Throw(inner) = &e.kind else {
+                return;
+            };
+            if matches!(&inner.kind, ExprKind::New { .. } | ExprKind::NewAnon { .. }) {
+                thrown_new_ops.insert(inner.as_ref() as *const Expr);
+            }
+            match fa.type_of(inner) {
+                t @ Type::Named { .. } => concrete.push(t),
+                // A dynamically-typed thrown value could be anything.
+                _ => broad = true,
+            }
+        });
+    }
+    for st in body {
+        walk::for_each_expr_in_scope(st, &mut |e| {
+            let is_broad = match &e.kind {
+                ExprKind::Call { .. }
+                | ExprKind::MethodCall { .. }
+                | ExprKind::StaticCall { .. }
+                | ExprKind::Clone(_)
+                | ExprKind::Match { .. }
+                | ExprKind::Eval(_) => true,
+                // A `new` throws (its constructor) unless it *is* the thrown
+                // object (`throw new X()` is a precise X point, not broad).
+                ExprKind::New { .. } | ExprKind::NewAnon { .. } => {
+                    !thrown_new_ops.contains(&(e as *const Expr))
+                }
+                // Division / modulo by zero throws DivisionByZeroError.
+                ExprKind::Binary {
+                    op: BinOp::Div | BinOp::Mod,
+                    ..
+                } => true,
+                _ => false,
+            };
+            broad |= is_broad;
+        });
+    }
+    (concrete, broad)
+}
+
+/// `sub` is-a `sup` in the throwable hierarchy (reflexive, transitive over
+/// parents/interfaces; everything throwable is-a `Throwable`). Cycle-tolerant.
+fn throwable_is_a(refl: &ReflectionIndex, sub: &str, sup: &str) -> bool {
+    let sub = sub.trim_start_matches('\\');
+    let sup = sup.trim_start_matches('\\');
+    if sub.eq_ignore_ascii_case(sup) {
+        return true;
+    }
+    if sup.eq_ignore_ascii_case("Throwable") && is_throwable_class(refl, sub) {
+        return true;
+    }
+    fn walk(refl: &ReflectionIndex, fqn: &str, sup: &str, seen: &mut Vec<String>) -> bool {
+        let key = fqn.trim_start_matches('\\').to_ascii_lowercase();
+        if seen.contains(&key) {
+            return false;
+        }
+        seen.push(key);
+        let Some(c) = refl.class(fqn) else {
+            return false;
+        };
+        c.parents.iter().chain(&c.interfaces).any(|t| match t {
+            Type::Named { fqn, .. } => {
+                fqn.trim_start_matches('\\').eq_ignore_ascii_case(sup) || walk(refl, fqn, sup, seen)
+            }
+            _ => false,
+        })
+    }
+    walk(refl, sub, sup, &mut Vec::new())
+}
+
+/// Whether `fqn`'s entire throwable ancestry is resolvable — a known root
+/// (`Throwable`/`Exception`/`Error`) or indexed with every ancestor likewise
+/// known. Only then can we *confidently* judge two classes unrelated (an
+/// unindexed ancestor could secretly relate them → would be a false positive).
+fn throwable_hierarchy_known(refl: &ReflectionIndex, fqn: &str) -> bool {
+    fn walk(refl: &ReflectionIndex, fqn: &str, seen: &mut Vec<String>) -> bool {
+        if is_throwable_name(fqn) {
+            return true;
+        }
+        let key = fqn.trim_start_matches('\\').to_ascii_lowercase();
+        if seen.contains(&key) {
+            return true;
+        }
+        seen.push(key);
+        let Some(c) = refl.class(fqn) else {
+            return false;
+        };
+        c.parents.iter().chain(&c.interfaces).all(|t| match t {
+            Type::Named { fqn, .. } => walk(refl, fqn, seen),
+            _ => true,
+        })
+    }
+    walk(refl, fqn, &mut Vec::new())
+}
+
+/// The FQN of a single concrete throwable type, if it is one.
+fn named_fqn(t: &Type) -> Option<&str> {
+    match t {
+        Type::Named { fqn, .. } => Some(fqn),
+        _ => None,
+    }
+}
+
+fn check_too_wide_throws(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    doc: Option<&str>,
+    body: &[Stmt],
+    subject: &str,
+    span: Span,
+    out: &mut Vec<Diagnostic>,
+) {
+    let Some(doc) = doc else { return };
+    let parsed = parse_doc(doc);
+    if parsed.throws.is_empty() {
+        return;
+    }
+    let refl = fa.reflection;
+    let (concrete, broad) = escaping_throw_signature(fa, body);
+    // A broad source could throw anything: we cannot prove any declared type
+    // unused.
+    if broad {
+        return;
+    }
+    // Every thrown type must be confidently resolvable, else "unrelated" is not
+    // provable.
+    if concrete
+        .iter()
+        .any(|c| named_fqn(c).is_none_or(|f| !throwable_hierarchy_known(refl, f)))
+    {
+        return;
+    }
+
+    // Flatten the declared @throws into individual class types.
+    let mut declared: Vec<Type> = Vec::new();
+    for t in &parsed.throws {
+        match resolve_doc_type(scope, &[], t) {
+            Type::Union(parts) => declared.extend(parts.iter().cloned()),
+            other => declared.push(other),
+        }
+    }
+    let mut seen_reported: Vec<String> = Vec::new();
+    for dt in &declared {
+        let Some(dfqn) = named_fqn(dt) else { continue };
+        // Only throwable, fully-resolvable declared types are judged here.
+        if !is_throwable_class(refl, dfqn) || !throwable_hierarchy_known(refl, dfqn) {
+            continue;
+        }
+        let key = dfqn.trim_start_matches('\\').to_ascii_lowercase();
+        if seen_reported.contains(&key) {
+            continue;
+        }
+        // Used iff some thrown type is related (either is-a the other).
+        let used = concrete.iter().any(|c| {
+            let cf = named_fqn(c).unwrap();
+            throwable_is_a(refl, cf, dfqn) || throwable_is_a(refl, dfqn, cf)
+        });
+        if used {
+            continue;
+        }
+        seen_reported.push(key);
+        out.push(
+            Diagnostic::error(
+                span,
+                format!(
+                    "{subject} has {} in PHPDoc @throws tag but it's not thrown.",
+                    display_throw_type(dt)
+                ),
+            )
+            .with_code("throws.unusedType"),
+        );
+    }
+}
+
+fn run_too_wide_throw_type_function(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            walk_function_decls(st, scope, &mut |scope, fd| {
+                let name = scope.qualify(fa.interner.resolve(fd.name));
+                check_too_wide_throws(
+                    fa,
+                    scope,
+                    fd.doc.as_deref(),
+                    &fd.body,
+                    &format!("Function {}()", name.trim_start_matches('\\')),
+                    fd.name_span,
+                    &mut out,
+                );
+            });
+        }
+    });
+    out
+}
+
+fn run_too_wide_throw_type_method(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
+        for st in region {
+            walk_method_decls(st, scope, &mut |scope, c, md| {
+                let Some(body) = &md.body else { return };
+                let class = c
+                    .name
+                    .map(|n| scope.qualify(fa.interner.resolve(n)))
+                    .unwrap_or_default();
+                let method = fa.interner.resolve(md.name);
+                check_too_wide_throws(
+                    fa,
+                    scope,
+                    md.doc.as_deref(),
+                    body,
+                    &format!("Method {}::{method}()", class.trim_start_matches('\\')),
+                    md.name_span,
+                    &mut out,
+                );
+            });
+        }
+    });
+    out
+}
+
 pub(crate) static RULES: &[RuleEntry] = &[
+    RuleEntry {
+        name: "throws.unusedType",
+        level: 4,
+        run: run_too_wide_throw_type_function,
+    },
+    RuleEntry {
+        name: "throws.unusedType",
+        level: 4,
+        run: run_too_wide_throw_type_method,
+    },
     RuleEntry {
         name: "throw.notThrowable",
         level: 3,
@@ -936,6 +1204,77 @@ mod tests {
     use crate::PhpVersion;
 
     use super::*;
+
+    // --- TooWide throw type (throws.unusedType) ---
+
+    #[test]
+    fn unused_throws_empty_body_is_flagged() {
+        let src = "<?php /** @throws \\RuntimeException */ function f(): void {}";
+        let ds = run(src, run_too_wide_throw_type_function);
+        assert_eq!(codes(src, run_too_wide_throw_type_function), ["throws.unusedType"]);
+        assert_eq!(
+            ds[0].message,
+            "Function f() has RuntimeException in PHPDoc @throws tag but it's not thrown."
+        );
+    }
+
+    #[test]
+    fn unused_throws_unrelated_explicit_throw_is_flagged() {
+        let src = "<?php /** @throws \\RuntimeException */ function f(): void { throw new \\LogicException('x'); }";
+        assert_eq!(
+            codes(src, run_too_wide_throw_type_function),
+            ["throws.unusedType"]
+        );
+    }
+
+    #[test]
+    fn declared_throws_matching_explicit_throw_is_clean() {
+        let src = "<?php /** @throws \\RuntimeException */ function f(): void { throw new \\RuntimeException('x'); }";
+        assert!(codes(src, run_too_wide_throw_type_function).is_empty());
+    }
+
+    #[test]
+    fn declared_supertype_of_thrown_is_clean() {
+        // @throws Exception, throws RuntimeException — Exception covers it.
+        let src = "<?php /** @throws \\Exception */ function f(): void { throw new \\RuntimeException('x'); }";
+        assert!(codes(src, run_too_wide_throw_type_function).is_empty());
+    }
+
+    #[test]
+    fn broad_call_suppresses_unused_report() {
+        // An unannotated call is a broad throw source → cannot prove unused.
+        let src = "<?php function helper(): void {} /** @throws \\RuntimeException */ function f(): void { helper(); }";
+        assert!(codes(src, run_too_wide_throw_type_function).is_empty());
+    }
+
+    #[test]
+    fn throw_new_is_not_a_broad_source() {
+        // `throw new X` must not itself count as a broad `new`, else the
+        // unrelated-throw report would never fire.
+        let src = "<?php /** @throws \\RuntimeException */ function f(): void { throw new \\LogicException('x'); }";
+        assert_eq!(
+            codes(src, run_too_wide_throw_type_function),
+            ["throws.unusedType"]
+        );
+    }
+
+    #[test]
+    fn unresolvable_declared_type_is_not_reported() {
+        // A declared type whose hierarchy we can't resolve is left alone (safe).
+        let src = "<?php /** @throws \\Vendor\\MysteryError */ function f(): void {}";
+        assert!(codes(src, run_too_wide_throw_type_function).is_empty());
+    }
+
+    #[test]
+    fn unused_throws_on_method_is_flagged() {
+        let src = "<?php class C { /** @throws \\RuntimeException */ public function m(): void {} }";
+        let ds = run(src, run_too_wide_throw_type_method);
+        assert_eq!(codes(src, run_too_wide_throw_type_method), ["throws.unusedType"]);
+        assert_eq!(
+            ds[0].message,
+            "Method C::m() has RuntimeException in PHPDoc @throws tag but it's not thrown."
+        );
+    }
 
     // --- ThrowExprTypeRule ---
 
