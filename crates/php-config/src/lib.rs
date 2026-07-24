@@ -97,6 +97,13 @@ pub struct Config {
     /// member/function types after indexing (a real class of the same name wins,
     /// keeping the collision FP-safe). Mirrors PHPStan's `parameters.typeAliases`.
     pub type_aliases: std::collections::HashMap<String, String>,
+    /// Resolve Laravel facade aliases (default `false`, opt-in). When enabled, the
+    /// engine registers the class aliases Laravel would register at runtime —
+    /// from `config/app.php`'s `aliases` array and every installed package's
+    /// `extra.laravel.aliases` (`vendor/composer/installed.json`) — so references
+    /// to facade names (`Sentry`, `Str`, …) resolve instead of firing
+    /// `class.notFound`. Framework-specific, so off unless requested.
+    pub laravel_aliases: bool,
     /// Suppression entries.
     pub ignore: Vec<IgnoreEntry>,
 }
@@ -127,6 +134,7 @@ impl Default for Config {
             infer_untyped_signatures: true,
             stub_files: Vec::new(),
             type_aliases: std::collections::HashMap::new(),
+            laravel_aliases: false,
             ignore: Vec::new(),
         }
     }

@@ -304,6 +304,36 @@ fn inline_suppression_suppresses_line_finding() {
 }
 
 #[test]
+fn laravel_facade_aliases_resolve_only_when_enabled() {
+    let p = TempProject::new("laravel-aliases");
+    p.write("src/Use.php", "<?php Sentry::captureException(); Str::random(8);\n");
+    // config/app.php: `Str` alias, resolved through the file's `use` import.
+    p.write(
+        "config/app.php",
+        "<?php\nuse Illuminate\\Support\\Str;\nreturn ['aliases' => ['Str' => Str::class]];\n",
+    );
+    // Package auto-discovery: the `Sentry` alias, as composer records it.
+    p.write(
+        "vendor/composer/installed.json",
+        r#"{"packages":[{"name":"sentry/sentry-laravel","extra":{"laravel":{"aliases":{"Sentry":"Sentry\\Laravel\\Facade"}}}}]}"#,
+    );
+
+    // Off by default: the facade names are unknown classes.
+    write_config(&p, "level: 0\npaths:\n  - src\n");
+    let off = stdout(&p.run([] as [&str; 0]));
+    assert!(off.contains("class.notFound"), "{off}");
+    assert!(off.contains("Sentry") && off.contains("Str"), "{off}");
+
+    // Enabled: both aliases resolve; no facade class.notFound, no new findings.
+    write_config(&p, "level: 0\npaths:\n  - src\nlaravelAliases: true\n");
+    let on_output = p.run([] as [&str; 0]);
+    let on = stdout(&on_output);
+    assert!(on_output.status.success(), "{on}");
+    assert!(!on.contains("Sentry"), "{on}");
+    assert!(!on.contains("Str"), "{on}");
+}
+
+#[test]
 fn scan_only_files_are_indexed_but_not_reported() {
     let p = TempProject::new("scan-only");
     write_config(&p, "level: 0\npaths:\n  - src\nscanPaths:\n  - vendor\n");

@@ -52,6 +52,7 @@ pub(crate) fn key(
     h.write_bool(rule_options.check_too_wide_return_public);
     h.write_bool(config.treat_phpdoc_types_as_certain);
     h.write_bool(config.infer_untyped_signatures);
+    h.write_bool(config.laravel_aliases);
     for f in &config.early_terminating_function_calls {
         h.write_str(f);
     }

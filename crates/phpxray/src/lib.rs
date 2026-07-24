@@ -24,6 +24,7 @@ use walkdir::WalkDir;
 pub mod baseline;
 pub mod fix;
 pub mod incremental;
+mod laravel;
 pub mod report;
 mod result_cache;
 pub mod suppress;
@@ -382,6 +383,11 @@ fn run_pipeline(config: &Config, root: &Path, options: RunOptions) -> (Report, V
         debug: options.debug,
         terminators: terminators_from_config(config),
         type_aliases: std::sync::Arc::new(config.type_aliases.clone()),
+        facade_aliases: std::sync::Arc::new(if config.laravel_aliases {
+            laravel::collect_facade_aliases(root)
+        } else {
+            Vec::new()
+        }),
     };
     let cache = (options.use_result_cache && !options.debug).then(|| {
         let cache_dir = result_cache_dir(config, root, options.cache_dir.as_deref());
@@ -466,6 +472,7 @@ pub fn analyze_parsed(
             debug: false,
             terminators: Default::default(),
             type_aliases: Default::default(),
+            facade_aliases: Default::default(),
         },
         &Progress::hidden(),
         None,
@@ -488,6 +495,10 @@ struct AnalyzeParsedOptions {
     terminators: std::sync::Arc<php_rules::Terminators>,
     /// Global `typeAliases` (config); expanded into reflected types after indexing.
     type_aliases: std::sync::Arc<std::collections::HashMap<String, String>>,
+    /// Laravel facade aliases (`alias` → `target FQN`) registered as known
+    /// classes so facade references don't report `class.notFound`. Empty unless
+    /// `laravelAliases` is enabled. See [`laravel::collect_facade_aliases`].
+    facade_aliases: std::sync::Arc<Vec<(String, String)>>,
 }
 
 fn analyze_parsed_progress(
@@ -516,6 +527,11 @@ fn analyze_parsed_progress(
         project.add_file_as(&f.path, &index_file(&f.program, interner), project_kind);
         reflection.add_file_labeled_as(Some(&f.path), &f.program, interner, reflect_kind);
         indexing.inc(1);
+    }
+    // Laravel facade aliases (opt-in): register each as a known class so facade
+    // references resolve. After real declarations, which always win.
+    for (alias, target) in options.facade_aliases.iter() {
+        project.add_alias(alias, target);
     }
     // Cross-class `@phpstan-import-type` needs every class indexed first.
     reflection.resolve_type_imports();

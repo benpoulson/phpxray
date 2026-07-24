@@ -169,6 +169,26 @@ impl ProjectIndex {
         }
     }
 
+    /// Register a runtime class alias (e.g. a Laravel facade: `Sentry` →
+    /// `Sentry\Laravel\Facade`) as a known class that extends its target, so
+    /// references to the alias no longer report `class.notFound`. A real
+    /// declaration of the same name always wins (never overwritten). Reflection
+    /// is intentionally left unaware, so member-existence rules — which gate on
+    /// the class being *fully known* — skip the alias rather than reporting
+    /// `staticMethod.notFound` on facade calls proxied via `__callStatic`.
+    pub fn add_alias(&mut self, alias: &str, target_fqn: &str) {
+        let key = SymbolKey::class_like(alias).into_string();
+        self.classes.entry(key).or_insert_with(|| ClassEntry {
+            fqn: alias.trim_start_matches('\\').to_string(),
+            kind: ClassKind::Class,
+            extends: vec![target_fqn.trim_start_matches('\\').to_string()],
+            implements: Vec::new(),
+            uses_traits: Vec::new(),
+            sources: Vec::new(),
+            origins: vec![SourceKind::Scan],
+        });
+    }
+
     // --- lookups (respecting PHP case rules) ----------------------------
     //
     // Lookups record the consulted name for incremental dependency tracking
@@ -405,5 +425,19 @@ mod tests {
             idx.function("strlen").unwrap().origins,
             [SourceKind::Builtin, SourceKind::Analyzed]
         );
+    }
+
+    #[test]
+    fn alias_registers_known_class_but_never_overrides_a_real_one() {
+        let mut idx = ProjectIndex::default();
+        idx.add_alias("Sentry", "Sentry\\Laravel\\Facade");
+        assert!(idx.has_class("Sentry"));
+        assert_eq!(idx.class("Sentry").unwrap().extends, ["Sentry\\Laravel\\Facade"]);
+
+        // A real declaration of the same name wins over a later alias.
+        let real = php_parser::parse("<?php class Str { public static function of() {} }");
+        idx.add_file("str.php", &index_file(&real.program, &real.interner));
+        idx.add_alias("Str", "Illuminate\\Support\\Str");
+        assert!(idx.class("Str").unwrap().extends.is_empty());
     }
 }
