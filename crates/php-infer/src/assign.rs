@@ -257,6 +257,17 @@ pub fn assignable_trinary(index: &ReflectionIndex, value: &Type, target: &Type) 
 
 /// Atomic (non-union, non-nullable) assignability: scalar widening, array/iterable
 /// covariance, and class subtyping.
+/// Array/iterable *key* compatibility, checked benevolently. PHP array keys are
+/// always `int|string`, and inference frequently widens a precise key to the full
+/// `int|string` (`array-key`); requiring the key be a strict subtype then
+/// false-flags `array<int|string, V>` where `array<int, V>` is wanted. Accept
+/// when the keys are assignable in *either* direction (widening or narrowing),
+/// which still rejects a genuinely disjoint key type (`string` vs `int`). Value
+/// types stay checked strictly by the caller.
+fn key_compatible(index: &ReflectionIndex, given: &Type, target: &Type) -> bool {
+    is_assignable(index, given, target) || is_assignable(index, target, given)
+}
+
 fn assignable_atom(index: &ReflectionIndex, value: &Type, target: &Type) -> bool {
     use Type::*;
     match (value, target) {
@@ -307,7 +318,7 @@ fn assignable_atom(index: &ReflectionIndex, value: &Type, target: &Type) -> bool
         // leniently (phpstan treats `[]` as assignable to every array type).
         (Array(None), Array(_) | List(_) | Iterable(_) | Shape { .. }) => true,
         (Array(Some(a)), Array(Some(b))) => {
-            is_assignable(index, &a.0, &b.0) && is_assignable(index, &a.1, &b.1)
+            key_compatible(index, &a.0, &b.0) && is_assignable(index, &a.1, &b.1)
         }
         (List(v), Array(Some(b))) => {
             is_assignable(index, &Int, &b.0) && is_assignable(index, v, &b.1)
@@ -339,7 +350,7 @@ fn assignable_atom(index: &ReflectionIndex, value: &Type, target: &Type) -> bool
         (Array(_) | List(_), Shape { .. }) => true,
         (Array(_) | List(_) | Iterable(_) | Shape { .. }, Iterable(None)) => true,
         (Iterable(Some(a)) | Array(Some(a)), Iterable(Some(b))) => {
-            is_assignable(index, &a.0, &b.0) && is_assignable(index, &a.1, &b.1)
+            key_compatible(index, &a.0, &b.0) && is_assignable(index, &a.1, &b.1)
         }
         // list<V> ⊑ iterable<K,V>: int keys, covariant values.
         (List(v), Iterable(Some(b))) => {
@@ -439,6 +450,25 @@ mod tests {
             fqn: s.into(),
             args: vec![],
         }
+    }
+
+    #[test]
+    fn array_key_widening_is_lenient_but_values_stay_strict() {
+        let arr = |k: Type, v: Type| Type::Array(Some(Box::new((k, v))));
+        let key = Type::union(vec![Type::Int, Type::String]); // array-key
+        // Key-only widening (`array<int|string, string>` → `array<int, string>`)
+        // is accepted; array keys are checked benevolently.
+        assert!(ok(
+            arr(key.clone(), Type::String),
+            arr(Type::Int, Type::String)
+        ));
+        // A real *value* mismatch is still rejected regardless of key widening.
+        assert!(!ok(arr(key, Type::Int), arr(Type::Int, Type::String)));
+        // A disjoint key type is still rejected (`string` keys vs `int` keys).
+        assert!(!ok(
+            arr(Type::String, Type::Int),
+            arr(Type::Int, Type::Int)
+        ));
     }
 
     #[test]
