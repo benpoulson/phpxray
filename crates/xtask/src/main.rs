@@ -1121,10 +1121,10 @@ fn cmd_gen_stubs() -> ExitCode {
             }
         }
         for rc in &reflected.classes {
-            for (id, _) in STUB_VERSIONS {
+            for (id, target) in STUB_VERSIONS {
                 typed_classes.get_mut(id).expect("version map").insert(
                     php_resolve::SymbolKey::class_like(&rc.reflection.fqn).into_string(),
-                    serialize_class(&rc.reflection),
+                    serialize_class(&rc.reflection, rc.decl, &parsed.interner, *target),
                 );
             }
         }
@@ -1255,7 +1255,37 @@ fn serialize_fn(
     format!("{}\t{}\t{}", fr.fqn, ret, params.join(";"))
 }
 
-fn serialize_class(cr: &php_reflect::ClassReflection) -> String {
+/// Whether a serialized type string denotes late-static binding — the whole
+/// type is `static` or `$this` (case-insensitive). A union arm like
+/// `static|false` is intentionally *not* matched: it already carries LSB, so we
+/// never want to override it with a version attribute.
+fn is_static_type(s: &str) -> bool {
+    let t = s.trim();
+    t.eq_ignore_ascii_case("static") || t == "$this"
+}
+
+fn serialize_class(
+    cr: &php_reflect::ClassReflection,
+    decl: &php_ast::ClassDecl,
+    interner: &php_intern::Interner,
+    target_php: (u32, u32),
+) -> String {
+    // Map each declared method's name to its attributes so a method-level
+    // `#[LanguageLevelTypeAware([...], default: ...)]` return annotation can
+    // override the reflected (docblock-merged) return — the same precedence the
+    // function path uses. Without this a stale `@return DateTime` beside a
+    // `static` attribute (e.g. `DateTime::createFromImmutable`) wins and kills
+    // late-static binding for every subclass (Carbon, DateTimeImmutable, …).
+    let method_attrs: std::collections::HashMap<String, &[php_ast::AttributeGroup]> = decl
+        .members
+        .iter()
+        .filter_map(|mem| match mem {
+            php_ast::Member::Method(md) => {
+                Some((interner.resolve(md.name).to_ascii_lowercase(), md.attrs.as_slice()))
+            }
+            _ => None,
+        })
+        .collect();
     let mut out = String::new();
     let mut flags = String::new();
     if cr.is_abstract {
@@ -1305,13 +1335,27 @@ fn serialize_class(cr: &php_reflect::ClassReflection) -> String {
             .map(|p| serialize_param(p, &p.ty))
             .collect::<Vec<_>>()
             .join(";");
+        let reflected_ret = ty_str(&m.return_type);
+        let ret = match method_attrs
+            .get(&m.name.to_ascii_lowercase())
+            .and_then(|attrs| level_aware_type(attrs, interner, target_php))
+        {
+            // Only let a version-aware attribute override the reflected return
+            // when it supplies late-static binding the docblock-merged type
+            // lacks — the stale `@return <BaseClass>` beside a `static` attribute
+            // pattern (`DateTime::createFromImmutable`). Otherwise the reflected
+            // type wins: it can be strictly more precise (e.g. `static|false` on
+            // `modify()`), and blindly trusting the attribute would downgrade it.
+            Some(attr) if is_static_type(&attr) && !is_static_type(&reflected_ret) => attr,
+            _ => reflected_ret,
+        };
         out.push_str(&format!(
             "method\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             cr.fqn,
             m.name,
             vis_str(m.visibility),
             flags,
-            ty_str(&m.return_type),
+            ret,
             ty_str(&m.native_return),
             params
         ));
