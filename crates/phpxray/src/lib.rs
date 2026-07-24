@@ -371,7 +371,7 @@ fn run_pipeline(config: &Config, root: &Path, options: RunOptions) -> (Report, V
         .as_deref()
         .and_then(php_rules::PhpVersion::parse)
         .unwrap_or_default();
-    let rule_options = config.level.rule_options();
+    let rule_options = config.rule_options();
     let analysis_options = AnalyzeParsedOptions {
         level: config.level.value(),
         php_version,

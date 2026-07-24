@@ -614,14 +614,19 @@ pub(crate) static RULES: &[RuleEntry] = &[
         level: 0,
         run: run_invalid_types_in_union,
     },
+    // Registered at level 0 but gated entirely on the `checkExplicitMixed` /
+    // `checkImplicitMixed` switches (which default to level 9 / max via
+    // `RuleOptions`, so default runs are unchanged). Scheduling them at every
+    // level is what lets the config overrides enable strict-mixed checking
+    // independently of level — phpstan's semantics.
     RuleEntry {
         name: "types.explicitMixedStrictness",
-        level: 9,
+        level: 0,
         run: run_explicit_mixed_strictness,
     },
     RuleEntry {
         name: "types.implicitMixedStrictness",
-        level: 10,
+        level: 0,
         run: run_implicit_mixed_strictness,
     },
 ];

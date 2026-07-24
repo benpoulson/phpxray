@@ -63,6 +63,14 @@ pub struct Config {
     /// types — matching projects that opt out (e.g. nikic/PHP-Parser).
     #[serde(rename = "treatPhpDocTypesAsCertain")]
     pub treat_phpdoc_types_as_certain: bool,
+    /// Override phpstan's `checkExplicitMixed` (report reading members/calling
+    /// methods on an explicit `mixed`). `None` uses the level default (level 9+);
+    /// `Some(b)` forces it on/off independently of level.
+    pub check_explicit_mixed: Option<bool>,
+    /// Override phpstan's `checkImplicitMixed` (the same, for *implicit* `mixed`
+    /// — untyped values). `None` uses the level default (level max); `Some(b)`
+    /// forces it independently of level.
+    pub check_implicit_mixed: Option<bool>,
     /// Infer signatures for fully untyped functions/methods from their bodies and
     /// call sites (default `true`). Treated as PHPDoc-grade: refines inference for
     /// legacy untyped code without affecting native-level (`treatPhpDocTypesAsCertain:
@@ -102,6 +110,8 @@ impl Default for Config {
             editor_url_title: None,
             report_unmatched_ignored: true,
             treat_phpdoc_types_as_certain: true,
+            check_explicit_mixed: None,
+            check_implicit_mixed: None,
             infer_untyped_signatures: true,
             stub_files: Vec::new(),
             type_aliases: std::collections::HashMap::new(),
@@ -111,6 +121,21 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The effective rule-engine switches: the level defaults, with the
+    /// per-flag `check*Mixed` config overrides applied on top. This is the
+    /// single source of truth for the engine's `RuleOptions` (the bare
+    /// [`Level::rule_options`] is used only by config-less entry points).
+    pub fn rule_options(&self) -> RuleOptions {
+        let mut opts = self.level.rule_options();
+        if let Some(v) = self.check_explicit_mixed {
+            opts.check_explicit_mixed = v;
+        }
+        if let Some(v) = self.check_implicit_mixed {
+            opts.check_implicit_mixed = v;
+        }
+        opts
+    }
+
     /// Parse a config from a YAML string.
     pub fn from_yaml(yaml: &str) -> Result<Config, ConfigError> {
         serde_yaml::from_str(yaml).map_err(ConfigError::Parse)
@@ -548,6 +573,25 @@ ignore:
         );
         assert_eq!(cfg.editor_url_title.as_deref(), Some("open"));
         assert_eq!(cfg.result_cache_path.as_deref(), Some("var/cache"));
+    }
+
+    #[test]
+    fn check_mixed_config_overrides_level_defaults() {
+        // Level 0 has both mixed checks off by default.
+        let base = Config::from_yaml("level: 0").unwrap();
+        assert!(!base.rule_options().check_explicit_mixed);
+        assert!(!base.rule_options().check_implicit_mixed);
+
+        // Overrides force them on independently of level.
+        let overridden =
+            Config::from_yaml("level: 0\ncheckExplicitMixed: true\ncheckImplicitMixed: true")
+                .unwrap();
+        assert!(overridden.rule_options().check_explicit_mixed);
+        assert!(overridden.rule_options().check_implicit_mixed);
+
+        // And can force them OFF at a high level.
+        let off = Config::from_yaml("level: max\ncheckImplicitMixed: false").unwrap();
+        assert!(!off.rule_options().check_implicit_mixed);
     }
 
     #[test]

@@ -102,6 +102,34 @@ fn json_output_uses_phpstan_like_shape() {
 }
 
 #[test]
+fn check_explicit_mixed_config_enables_strict_mixed_at_low_level() {
+    // `checkExplicitMixed: true` turns on strict-mixed reporting independently of
+    // level — a method call on an explicit `mixed` is flagged even at level 0.
+    let p = TempProject::new("checkmixed");
+    p.write(
+        "src/app.php",
+        "<?php\nfunction f(mixed $x): void { $x->go(); }\n",
+    );
+
+    write_config(
+        &p,
+        "level: 0\npaths:\n  - src\ncheckExplicitMixed: true\n",
+    );
+    let strict = p.run(["--error-format", "json"]);
+    assert!(!strict.status.success(), "{}", stdout(&strict));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&strict)).unwrap();
+    assert_eq!(
+        json["files"]["src/app.php"]["messages"][0]["identifier"],
+        "method.nonObject"
+    );
+
+    // Default level 0 leaves the mixed access unreported.
+    write_config(&p, "level: 0\npaths:\n  - src\n");
+    let lenient = p.run([] as [&str; 0]);
+    assert!(lenient.status.success(), "{}", stdout(&lenient));
+}
+
+#[test]
 fn stub_files_override_source_signatures() {
     // A stub file supplies a typed signature that wins over the untyped source
     // declaration, so a call with the wrong argument type is now reported.
