@@ -1136,7 +1136,10 @@ fn check_member_call(
             )
             .with_code("parameter.notOptional"),
         );
-    } else if !variadic && arg_count > max {
+    } else if !variadic
+        && arg_count > max
+        && !body_reads_variadic_args(fa, found.declaring_class, method)
+    {
         out.push(
             Diagnostic::error(
                 call.span,
@@ -1149,6 +1152,36 @@ fn check_member_call(
             .with_code("argument.unknown"),
         );
     }
+}
+
+/// Whether a method's body reads its arguments dynamically via `func_get_args`,
+/// `func_num_args`, or `func_get_arg`. Such a method legitimately accepts more
+/// positional arguments than its declared arity (the Laravel `Rule::in()` idiom:
+/// `in($values)` collects extras with `func_get_args()`), so "too many
+/// arguments" must not be reported. Only consulted when a call already exceeds
+/// the declared maximum, so the body scan is off the hot path.
+fn body_reads_variadic_args(fa: &FileAnalysis, declaring_class: &str, method: &str) -> bool {
+    let Some((body, _)) = fa.reflection.method_body(declaring_class, method) else {
+        return false;
+    };
+    let prog = php_ast::Program {
+        stmts: body.to_vec(),
+    };
+    let mut found = false;
+    crate::walk::for_each_expr(&prog, &mut |e| {
+        if let ExprKind::Call { callee, .. } = &e.kind {
+            if let ExprKind::Name(n) = &callee.kind {
+                let name = n.text.trim_start_matches('\\');
+                if name.eq_ignore_ascii_case("func_get_args")
+                    || name.eq_ignore_ascii_case("func_num_args")
+                    || name.eq_ignore_ascii_case("func_get_arg")
+                {
+                    found = true;
+                }
+            }
+        }
+    });
+    found
 }
 
 fn plural(n: usize) -> &'static str {
@@ -4024,6 +4057,16 @@ mod tests {
         let src =
             "<?php class C { public function a() { $this->one(1, 2); } public function one($x) {} }";
         assert!(codes(src, run_call_existence).contains(&"argument.unknown"));
+    }
+
+    #[test]
+    fn extra_args_to_func_get_args_method_are_clean() {
+        // `in($values)` collecting extras via `func_get_args()` (the Laravel
+        // `Rule::in()` idiom) legitimately accepts more args than declared.
+        let src = "<?php class C { \
+            public function a() { self::in('x', 'y', 'z'); } \
+            public static function in($values) { return func_get_args(); } }";
+        assert!(!codes(src, run_call_existence).contains(&"argument.unknown"));
     }
 
     #[test]
