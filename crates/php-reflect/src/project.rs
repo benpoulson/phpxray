@@ -421,6 +421,93 @@ impl ReflectionIndex {
         }
     }
 
+    /// Expand global `typeAliases` (from config) into every reflected member and
+    /// function type. Each alias name is matched by its unqualified short name
+    /// (so it works regardless of the using file's namespace), but a `Named` that
+    /// resolves to a *real indexed class* is never rewritten — a real class of the
+    /// same name wins, keeping the collision FP-safe. `defs` maps the alias name
+    /// to its PHPDoc type string (resolved in the global namespace). Call once
+    /// after all files are indexed; deterministic and idempotent.
+    pub fn apply_global_type_aliases(&mut self, defs: &std::collections::HashMap<String, String>) {
+        if defs.is_empty() {
+            return;
+        }
+        let scope = Scope::global();
+        let mut map: std::collections::HashMap<String, php_types::Type> =
+            std::collections::HashMap::new();
+        for (name, body) in defs {
+            let Some((dt, _)) = php_phpdoc::parse_type_prefix(body.trim()) else {
+                continue;
+            };
+            let ty = crate::resolve_doc_type(&scope, &[], &dt);
+            map.insert(name.trim_start_matches('\\').to_ascii_lowercase(), ty);
+        }
+        if map.is_empty() {
+            return;
+        }
+        // Fixpoint: aliases may reference each other (bounded).
+        for _ in 0..map.len().min(8) {
+            let mut changed = false;
+            for key in map.keys().cloned().collect::<Vec<_>>() {
+                let cur = map[&key].clone();
+                let next = expand_global_alias(&cur, &map, &key);
+                if next != cur {
+                    map.insert(key, next);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // Owned set of real class keys so the guard closure doesn't borrow `self`
+        // while its maps are mutated.
+        let real: std::collections::HashSet<String> = self.classes.keys().cloned().collect();
+        let ex = |t: &mut php_types::Type| *t = expand_global_alias_guarded(t, &map, &real);
+        for cls_arc in self.classes.values_mut() {
+            let cls = Arc::make_mut(cls_arc);
+            for m in &mut cls.methods {
+                ex(&mut m.return_type);
+                ex(&mut m.native_return);
+                for p in &mut m.params {
+                    ex(&mut p.ty);
+                    ex(&mut p.native_ty);
+                    if let Some(o) = &mut p.out_ty {
+                        ex(o);
+                    }
+                }
+                for a in &mut m.asserts {
+                    ex(&mut a.ty);
+                }
+                if let Some(s) = &mut m.self_out {
+                    ex(s);
+                }
+            }
+            for p in &mut cls.properties {
+                ex(&mut p.ty);
+                ex(&mut p.native_ty);
+            }
+            for k in &mut cls.constants {
+                ex(&mut k.ty);
+            }
+        }
+        for fn_arc in self.functions.values_mut() {
+            let f = Arc::make_mut(fn_arc);
+            ex(&mut f.return_type);
+            ex(&mut f.native_return);
+            for p in &mut f.params {
+                ex(&mut p.ty);
+                ex(&mut p.native_ty);
+                if let Some(o) = &mut p.out_ty {
+                    ex(o);
+                }
+            }
+            for a in &mut f.asserts {
+                ex(&mut a.ty);
+            }
+        }
+    }
+
     /// Look up a function by FQN (case-insensitive, leading `\` ignored).
     pub fn function(&self, fqn: &str) -> Option<&FunctionReflection> {
         depsrec::note_surface(fqn);
@@ -1039,6 +1126,52 @@ fn class_key(fqn: &str) -> String {
     SymbolKey::class_like(fqn).into_string()
 }
 
+/// Replace `Named` nodes whose *short name* keys `map` with the alias body
+/// (namespace-independent). Used for the alias-references-alias fixpoint, where
+/// no real-class guard is needed (the map only holds alias names).
+fn expand_global_alias(
+    ty: &Type,
+    map: &HashMap<String, Type>,
+    exclude: &str,
+) -> Type {
+    ty.clone().map(&mut |part| match part {
+        Type::Named { fqn, args } if args.is_empty() => {
+            let full = fqn.trim_start_matches('\\').to_ascii_lowercase();
+            let short = full.rsplit('\\').next().unwrap_or(&full);
+            if short != exclude {
+                if let Some(t) = map.get(short) {
+                    return t.clone();
+                }
+            }
+            Type::Named { fqn, args }
+        }
+        other => other,
+    })
+}
+
+/// Like [`expand_global_alias`] but never rewrites a `Named` that resolves to a
+/// real indexed class (`real` holds the class keys) — a real class of the same
+/// short name wins, so a global alias colliding with a class is a silent no-op.
+fn expand_global_alias_guarded(
+    ty: &Type,
+    map: &HashMap<String, Type>,
+    real: &std::collections::HashSet<String>,
+) -> Type {
+    ty.clone().map(&mut |part| match part {
+        Type::Named { fqn, args } if args.is_empty() => {
+            let full = fqn.trim_start_matches('\\').to_ascii_lowercase();
+            if !real.contains(&full) {
+                let short = full.rsplit('\\').next().unwrap_or(&full);
+                if let Some(t) = map.get(short) {
+                    return t.clone();
+                }
+            }
+            Type::Named { fqn, args }
+        }
+        other => other,
+    })
+}
+
 fn function_key(fqn: &str) -> String {
     SymbolKey::function(fqn).into_string()
 }
@@ -1215,6 +1348,46 @@ mod tests {
             fqn: fqn.into(),
             args,
         }
+    }
+
+    #[test]
+    fn global_type_alias_expands_in_member_and_function_types() {
+        let mut idx = index(
+            r#"<?php
+            namespace App;
+            class Repo {
+                /** @return UserId */
+                public function id() {}
+            }
+            /** @param UserId $x */
+            function take($x): void {}"#,
+        );
+        let mut defs = std::collections::HashMap::new();
+        defs.insert("UserId".to_string(), "int".to_string());
+        idx.apply_global_type_aliases(&defs);
+        let m = idx.class("App\\Repo").unwrap().methods[0].return_type.clone();
+        assert_eq!(m, Type::Int);
+        let p = idx.function("App\\take").unwrap().params[0].ty.clone();
+        assert_eq!(p, Type::Int);
+    }
+
+    #[test]
+    fn global_type_alias_does_not_shadow_a_real_class() {
+        // A real class named `UserId` must win over a same-named global alias.
+        let mut idx = index(
+            r#"<?php
+            namespace App;
+            class UserId {}
+            class Repo {
+                /** @return UserId */
+                public function id() {}
+            }"#,
+        );
+        let mut defs = std::collections::HashMap::new();
+        defs.insert("UserId".to_string(), "int".to_string());
+        idx.apply_global_type_aliases(&defs);
+        let m = idx.class("App\\Repo").unwrap().methods[0].return_type.clone();
+        assert_eq!(m, named("App\\UserId"));
     }
 
     #[test]

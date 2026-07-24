@@ -63,6 +63,14 @@ pub(crate) fn key(
             h.write_str(m);
         }
     }
+    for (name, body) in {
+        let mut entries: Vec<_> = config.type_aliases.iter().collect();
+        entries.sort();
+        entries
+    } {
+        h.write_str(name);
+        h.write_str(body);
+    }
     h.write_bool(config.report_unmatched_ignored);
     write_config_paths(&mut h, config);
     write_ignore_entries(&mut h, &config.ignore);

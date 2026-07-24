@@ -118,6 +118,7 @@ struct AnalysisFingerprint {
     infer_untyped_signatures: bool,
     early_terminating_function_calls: Vec<String>,
     early_terminating_method_calls: Vec<(String, Vec<String>)>,
+    type_aliases: Vec<(String, String)>,
 }
 
 impl AnalysisFingerprint {
@@ -137,6 +138,15 @@ impl AnalysisFingerprint {
                 entries
             },
             infer_untyped_signatures: config.infer_untyped_signatures,
+            type_aliases: {
+                let mut entries: Vec<(String, String)> = config
+                    .type_aliases
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                entries.sort();
+                entries
+            },
         }
     }
 }
@@ -358,6 +368,8 @@ impl Session {
         }
         // Cross-class `@phpstan-import-type` (needs every class indexed first).
         reflection.resolve_type_imports();
+        // Global `typeAliases` from config, expanded across all reflected types.
+        reflection.apply_global_type_aliases(&config.type_aliases);
 
         // Whole-project signature inference (untyped functions). It needs every
         // file's call sites, so each pass re-parses the whole tree (in parallel)

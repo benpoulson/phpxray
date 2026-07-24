@@ -356,6 +356,7 @@ fn run_pipeline(config: &Config, root: &Path, options: RunOptions) -> (Report, V
         collect_fixes: options.collect_fixes,
         debug: options.debug,
         terminators: terminators_from_config(config),
+        type_aliases: std::sync::Arc::new(config.type_aliases.clone()),
     };
     let cache = (options.use_result_cache && !options.debug).then(|| {
         let cache_dir = result_cache_dir(config, root, options.cache_dir.as_deref());
@@ -431,6 +432,7 @@ pub fn analyze_parsed(
             collect_fixes: false,
             debug: false,
             terminators: Default::default(),
+            type_aliases: Default::default(),
         },
         &Progress::hidden(),
         None,
@@ -451,6 +453,8 @@ struct AnalyzeParsedOptions {
     debug: bool,
     /// User-configured always-terminating calls (`earlyTerminating*` config).
     terminators: std::sync::Arc<php_rules::Terminators>,
+    /// Global `typeAliases` (config); expanded into reflected types after indexing.
+    type_aliases: std::sync::Arc<std::collections::HashMap<String, String>>,
 }
 
 fn analyze_parsed_progress(
@@ -482,6 +486,8 @@ fn analyze_parsed_progress(
     }
     // Cross-class `@phpstan-import-type` needs every class indexed first.
     reflection.resolve_type_imports();
+    // Global `typeAliases` from config, expanded across all reflected types.
+    reflection.apply_global_type_aliases(&options.type_aliases);
     indexing.finish();
     if let Some(t) = &mut timings {
         t.index = started.elapsed();

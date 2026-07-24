@@ -125,7 +125,91 @@ pub(crate) static RULES: &[RuleEntry] = &[
         level: 2,
         run: run_used_traits,
     },
+    RuleEntry {
+        name: "generics.notSubtype",
+        level: 2,
+        run: run_generic_bounds,
+    },
 ];
+
+/// `GenericObjectTypeCheck` (the `generics.notSubtype` branch) — when a generic
+/// ancestor supplies type arguments (`@extends Base<X>`, `@implements I<X>`,
+/// `@use Trait<X>`), each argument must be a subtype of the target class's
+/// declared `@template T of Bound`. FP-safe: an argument is only flagged when it
+/// is *confidently* not assignable to the bound (both sides concrete + known);
+/// unbounded templates, template pass-through, and unresolved/vendor targets stay
+/// silent.
+fn run_generic_bounds(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for_each_class_like(fa, |_scope, class, fqn, span| {
+        let Some(class_fqn) = fqn else { return };
+        let Some(refl) = fa.reflection.class(&class_fqn) else {
+            return;
+        };
+        let implements_tag = if class.kind == ClassKind::Enum || class.kind == ClassKind::Class {
+            "@implements"
+        } else {
+            "@extends"
+        };
+        check_generic_bounds(fa, &refl.parents, "@extends", span, &mut out);
+        check_generic_bounds(fa, &refl.interfaces, implements_tag, span, &mut out);
+        check_generic_bounds(fa, &refl.traits, "@use", span, &mut out);
+    });
+    out
+}
+
+fn check_generic_bounds(
+    fa: &FileAnalysis,
+    reflected: &[Type],
+    tag: &str,
+    span: Span,
+    out: &mut Vec<Diagnostic>,
+) {
+    for ancestor in reflected {
+        let Type::Named { fqn, args } = ancestor else {
+            continue;
+        };
+        if args.is_empty() {
+            continue;
+        }
+        let Some(ancestor_refl) = fa.reflection.class(fqn) else {
+            continue;
+        };
+        for (i, arg) in args.iter().enumerate() {
+            let Some(Some(bound)) = ancestor_refl.template_bounds.get(i) else {
+                continue;
+            };
+            if matches!(bound, Type::Mixed) {
+                continue;
+            }
+            if crate::is_assignable(fa.reflection, arg, bound) {
+                continue;
+            }
+            let Some(template_name) = ancestor_refl.templates.get(i) else {
+                continue;
+            };
+            out.push(
+                Diagnostic::error(
+                    span,
+                    format!(
+                        "Type {arg} in generic type {ancestor} in PHPDoc tag {tag} is not subtype of template type {template_name} of {bound} of {} {fqn}.",
+                        class_like_description(ancestor_refl.kind),
+                    ),
+                )
+                .with_code("generics.notSubtype"),
+            );
+        }
+    }
+}
+
+fn class_like_description(kind: ClassKind) -> &'static str {
+    match kind {
+        ClassKind::Class => "class",
+        ClassKind::Interface => "interface",
+        ClassKind::Trait => "trait",
+        ClassKind::Enum => "enum",
+    }
+}
 
 fn run_class_template_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
@@ -1572,6 +1656,55 @@ mod tests {
             diagnostics[0].message,
             "Class App\\Box uses generic trait App\\BagTrait but does not specify its types: T"
         );
+    }
+
+    #[test]
+    fn generic_arg_violating_bound_is_flagged() {
+        let diagnostics = run(
+            "<?php namespace App;
+            class Animal {}
+            /** @template T of Animal */
+            class Base {}
+            /** @extends Base<\\stdClass> */
+            class Child extends Base {}
+            ",
+            run_generic_bounds,
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|d| d.code.unwrap_or(""))
+                .collect::<Vec<_>>(),
+            ["generics.notSubtype"]
+        );
+        assert_eq!(
+            diagnostics[0].message,
+            "Type stdClass in generic type App\\Base<stdClass> in PHPDoc tag @extends is not subtype of template type T of App\\Animal of class App\\Base."
+        );
+    }
+
+    #[test]
+    fn generic_arg_satisfying_bound_is_clean() {
+        let src = "<?php namespace App;
+            class Animal {}
+            class Dog extends Animal {}
+            /** @template T of Animal */
+            class Base {}
+            /** @extends Base<Dog> */
+            class Child extends Base {}
+        ";
+        assert!(codes(src, run_generic_bounds).is_empty());
+    }
+
+    #[test]
+    fn unbounded_generic_arg_is_clean() {
+        let src = "<?php namespace App;
+            /** @template T */
+            class Base {}
+            /** @extends Base<\\stdClass> */
+            class Child extends Base {}
+        ";
+        assert!(codes(src, run_generic_bounds).is_empty());
     }
 
     #[test]

@@ -2950,6 +2950,54 @@ mod tests {
         assert_eq!(infer(src), "Lazy");
     }
 
+    /// Framework-shaped generic collections (Laravel/Doctrine `Collection<T>`,
+    /// `EntityRepository<T>`) resolve through the *general* generic machinery —
+    /// constructor binding, receiver-generic method instantiation, and
+    /// conditional/late-static returns — with no per-framework stub pack (see the
+    /// `no-custom-stubs` mandate). This pins that the pure-inference path covers
+    /// the patterns those ecosystems rely on.
+    #[test]
+    fn framework_collection_pattern_resolves_via_generics() {
+        // Doctrine-style repository: a generic base whose `find(): ?T` binds the
+        // concrete entity from a subclass's `@extends`.
+        let src = r#"
+        class User {}
+        /** @template T of object */
+        class EntityRepository {
+            /** @return T|null */
+            public function find() {}
+        }
+        /** @extends EntityRepository<User> */
+        class UserRepository extends EntityRepository {}
+        "#;
+        // A concrete receiver instantiates the inherited generic method return.
+        assert_eq!(
+            infer_with(
+                &format!("{src} $r->find();"),
+                &[("r", Type::Named { fqn: "UserRepository".into(), args: vec![] })],
+                None,
+            ),
+            "User|null"
+        );
+
+        // Laravel-style Collection: generic constructor binds T from the seeded
+        // array, and `first(): ?T` reads it back off the concrete receiver.
+        let src = r#"
+        class User {}
+        /**
+         * @template T
+         */
+        class Collection {
+            /** @param array<T> $items */
+            public function __construct(array $items) {}
+            /** @return T|null */
+            public function first() {}
+        }
+        new Collection([new User()]);
+        "#;
+        assert_eq!(infer(src), "Collection<User>");
+    }
+
     #[test]
     fn arithmetic() {
         assert_eq!(infer("1 + 2;"), "3"); // literal arithmetic folds

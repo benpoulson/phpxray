@@ -221,6 +221,10 @@ pub struct ClassReflection {
     pub traits: Vec<Type>,
     /// `@template` names declared on the class.
     pub templates: Vec<String>,
+    /// Resolved `@template T of Bound` upper bounds, aligned by index with
+    /// [`templates`]. `None` = unbounded (`mixed`). Drives the
+    /// `generics.notSubtype` check at instantiation sites.
+    pub template_bounds: Vec<Option<Type>>,
     pub methods: Vec<MethodReflection>,
     pub properties: Vec<PropertyReflection>,
     pub constants: Vec<ConstReflection>,
@@ -398,6 +402,15 @@ pub fn reflect_class(
 ) -> ClassReflection {
     let doc = parse_doc(c.doc.as_deref());
     let class_templates: Vec<String> = doc.templates.iter().map(|t| t.name.clone()).collect();
+    let template_bounds: Vec<Option<Type>> = doc
+        .templates
+        .iter()
+        .map(|t| {
+            t.bound
+                .as_ref()
+                .map(|b| resolve_doc_type(scope, &class_templates, b))
+        })
+        .collect();
 
     let mut methods = Vec::new();
     let mut properties = Vec::new();
@@ -504,6 +517,7 @@ pub fn reflect_class(
             .map(|m| resolve_doc_type(scope, &class_templates, m))
             .collect(),
         templates: class_templates,
+        template_bounds,
         methods,
         properties,
         constants,
