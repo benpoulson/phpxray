@@ -1238,6 +1238,14 @@ fn facts_with_unset_binding(fa: &FileAnalysis, count_unset: bool) -> IssetFacts 
                 for u in &cl.uses {
                     bound.insert(fa.interner.resolve(u.name).to_string());
                 }
+                // Statement-bound vars inside the closure body (notably `foreach`
+                // key/value vars) — `collect_all_bound_stmt` above never enters
+                // closures, and the expression pass can't see a `foreach` binding.
+                // Without this, a coalesce over such a var false-reports "never
+                // defined" (e.g. a `foreach` inside a `DB::transaction(fn () => …)`).
+                for st in &cl.body {
+                    collect_all_bound_stmt(st, fa.interner, &mut bound, count_unset);
+                }
             }
             ExprKind::ArrowFn(a) => {
                 for p in &a.params {
@@ -2233,6 +2241,17 @@ mod tests {
         // `mixed` includes null, so `$x ?? …` is meaningful — not a redundant
         // coalesce (e.g. `data_get()` returns `mixed`).
         let src = "<?php function f(mixed $x) { return $x ?? 2; }";
+        assert!(codes(src, run_null_coalesce).is_empty());
+    }
+
+    #[test]
+    fn null_coalesce_foreach_var_inside_closure_is_clean() {
+        // A `foreach` value var bound inside a closure body (e.g. a
+        // `DB::transaction(fn () => …)`) must count as defined.
+        let src = "<?php function f($rows) { \
+            run(function () use ($rows) { \
+                foreach ($rows as $row) { $x = $row['a'] ?? null; } \
+            }); }";
         assert!(codes(src, run_null_coalesce).is_empty());
     }
 
