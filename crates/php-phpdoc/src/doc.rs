@@ -174,7 +174,11 @@ pub fn parse(raw: &str) -> Doc {
                     doc.throws.push(ty);
                 }
             }
-            "template" => {
+            // Variance markers (`@template-covariant`/`@template-contravariant`,
+            // used heavily by Laravel/Doctrine collections) declare a template
+            // just like `@template`; we don't model variance, but the name must be
+            // registered or every generic that uses it collapses to unbound.
+            "template" | "template-covariant" | "template-contravariant" => {
                 if let Some(t) = parse_template(&tag.value) {
                     doc.templates.push(t);
                 }
@@ -613,6 +617,28 @@ mod tests {
                 name: "TKey".into(),
                 bound: None
             }]
+        );
+    }
+
+    #[test]
+    fn variance_marked_templates_are_registered() {
+        // `@template-covariant`/`-contravariant` (Laravel/Doctrine collections)
+        // declare a template just like `@template`; the name must be registered.
+        let d = parse(
+            "/**\n * @template-covariant TValue\n * @template-contravariant TIn of object\n */",
+        );
+        assert_eq!(
+            d.templates,
+            [
+                Template {
+                    name: "TValue".into(),
+                    bound: None
+                },
+                Template {
+                    name: "TIn".into(),
+                    bound: Some(named("object"))
+                }
+            ]
         );
     }
 
