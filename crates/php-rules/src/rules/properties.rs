@@ -3680,9 +3680,13 @@ fn run_missing_property_typehint(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 )
                 .with_code("missingType.property");
                 // `--fix`: a `@var` from the default value + the own-class
-                // `$this->prop = …` assignment evidence (private props only).
+                // `$this->prop = …` assignment evidence (private props only),
+                // else restate an overridden ancestor property's declared type.
                 if fa.collect_fixes && pd.props.len() == 1 && elem.hooks.is_none() {
                     if let Some(fix) = crate::fix::infer_property_type(fa, scope, fqn, class, pd, elem)
+                        .or_else(|| {
+                            crate::fix::inherited_property_type(fa, scope, fqn, class, pd, elem)
+                        })
                         .and_then(|ty| {
                             crate::fix::typed_tag_fix(
                                 fa,
@@ -5796,6 +5800,55 @@ mod tests {
     fn fix_protected_property_on_leaf_class() {
         let src = "<?php\nclass C {\n    protected $n = 0;\n    public function bump(): void { $this->n = 5; }\n}\n";
         assert_eq!(property_fix_tags(src), ["@var int"]);
+    }
+
+    #[test]
+    fn fix_var_inherited_from_overridden_parent_property() {
+        // The Eloquent pattern: the parent both declares the type and writes
+        // the slot, so own-evidence bails on the ancestor write; the fix
+        // restates the parent's declared type.
+        let src = "<?php\nclass B {\n    /** @var array<int, string> */\n    protected $fillable = [];\n    public function fill(array $f): void { $this->fillable = $f; }\n}\nclass C extends B {\n    protected $fillable = ['name'];\n}\n";
+        assert_eq!(property_fix_tags(src), ["@var array<int, string>"]);
+    }
+
+    #[test]
+    fn no_inherited_fix_when_child_default_conflicts() {
+        // A child default incompatible with the ancestor type would trade the
+        // finding for an assignment one.
+        let src = "<?php\nclass B {\n    /** @var array<int, string> */\n    protected $fillable = [];\n    public function fill(array $f): void { $this->fillable = $f; }\n}\nclass C extends B {\n    protected $fillable = 'nope';\n}\n";
+        for d in run_fixes(src, run_missing_property_typehint) {
+            assert!(d.fix.is_none(), "conflicting default must not be fixed");
+        }
+    }
+
+    #[test]
+    fn no_inherited_fix_from_private_ancestor_property() {
+        // A private ancestor property is a separate slot, not an override.
+        // (Child is public so the own-evidence path can't fix it either.)
+        let src = "<?php class B { /** @var int */ private $n = 0; } class C extends B { public $n = 0; }";
+        for d in run_fixes(src, run_missing_property_typehint) {
+            assert!(d.fix.is_none(), "private ancestor is not an override");
+        }
+    }
+
+    #[test]
+    fn no_inherited_fix_when_subclass_writes_the_property() {
+        // A subclass write through the shared slot would be checked against
+        // the new `@var`; the conservative guard bails.
+        let src = "<?php\nclass B {\n    /** @var int */\n    protected $n = 0;\n    public function set(int $v): void { $this->n = $v; }\n}\nclass C extends B {\n    protected $n = 5;\n}\nclass D extends C {\n    public function zap(): void { $this->n = 9; }\n}\n";
+        for d in run_fixes(src, run_missing_property_typehint) {
+            assert!(d.fix.is_none(), "subclass write must bail the inherited fix");
+        }
+    }
+
+    #[test]
+    fn no_inherited_fix_for_bare_array_ancestor_type() {
+        // Restating the parent's bare `array` would re-report as
+        // `missingType.iterableValue` — the check_type gate rejects it.
+        let src = "<?php\nclass B {\n    /** @var array */\n    protected $casts = [];\n    public function merge(array $c): void { $this->casts = $c; }\n}\nclass C extends B {\n    protected $casts = [];\n}\n";
+        for d in run_fixes(src, run_missing_property_typehint) {
+            assert!(d.fix.is_none(), "bare-array ancestor type must not be restated");
+        }
     }
 
     #[test]

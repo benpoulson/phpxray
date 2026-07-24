@@ -360,7 +360,7 @@ fn doc_generic_without_args(ctx: DocGenericContext<'_>, name: &str) -> Option<(S
     Some((display_fqn(&class_ref.fqn), templates.join(", ")))
 }
 
-fn name_from_doc(text: &str) -> Name {
+pub(crate) fn name_from_doc(text: &str) -> Name {
     let fq = if text.starts_with("namespace\\") {
         NameFq::Relative
     } else if text.starts_with('\\') {

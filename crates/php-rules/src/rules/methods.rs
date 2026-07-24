@@ -789,18 +789,37 @@ fn run_missing_return_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
             )
             .with_code("missingType.return");
             // `--fix`: signature inference (§8q) already synthesized the return
-            // type from the body when it had confident evidence.
-            if fa.collect_fixes && mr.inferred_return {
-                if let Some(fix) = crate::fix::typed_tag_fix(
-                    fa,
-                    scope,
-                    &mr.return_type,
-                    crate::fix::first_attr_span(&md.attrs).unwrap_or(md.name_span),
-                    md.doc.as_deref(),
-                    php_diagnostics::DocTagKind::Return,
-                    None,
-                ) {
-                    d = d.with_fix(fix);
+            // type from the body when it had confident evidence; a body that
+            // provably returns no value is `@return void` (inference never
+            // produces `void`, so the branches are disjoint).
+            if fa.collect_fixes {
+                let first_span = crate::fix::first_attr_span(&md.attrs).unwrap_or(md.name_span);
+                if mr.inferred_return {
+                    if let Some(fix) = crate::fix::typed_tag_fix(
+                        fa,
+                        scope,
+                        &mr.return_type,
+                        first_span,
+                        md.doc.as_deref(),
+                        php_diagnostics::DocTagKind::Return,
+                        None,
+                    ) {
+                        d = d.with_fix(fix);
+                    }
+                } else if md
+                    .body
+                    .as_deref()
+                    .is_some_and(crate::fix::void_return_evidence)
+                {
+                    if let Some(fix) = crate::fix::doc_tag_fix(
+                        fa,
+                        first_span,
+                        md.doc.as_deref(),
+                        php_diagnostics::DocTagKind::Return,
+                        "@return void".to_string(),
+                    ) {
+                        d = d.with_fix(fix);
+                    }
                 }
             }
             out.push(d);
@@ -3100,7 +3119,7 @@ fn run_missing_method_iterable_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
                                     ev.get(&php_infer::evidence_key(&fqn, Some(mname), idx))
                                 })
                                 .and_then(|ty| {
-                                    crate::fix::typed_tag_fix(
+                                    crate::fix::typed_tag_fix_ack(
                                         fa,
                                         scope,
                                         ty,
@@ -3136,7 +3155,7 @@ fn run_missing_method_iterable_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
                                 .as_deref()
                                 .and_then(|b| crate::fix::iterable_return_evidence(fa, b))
                                 .and_then(|ty| {
-                                    crate::fix::typed_tag_fix(
+                                    crate::fix::typed_tag_fix_ack(
                                         fa,
                                         scope,
                                         &ty,
@@ -4215,9 +4234,83 @@ mod tests {
     }
 
     #[test]
+    fn fix_iterable_value_accepts_mixed_inside_container() {
+        // The container structure is evidenced; its values honestly aren't.
+        // `mixed` is allowed inside the container at the iterableValue sites.
+        let src = "<?php\nclass C {\n    /** @var array<string, mixed> */\n    private $opts = [];\n    public function all(): array { return $this->opts; }\n}\n";
+        let fx = fixes(src, run_missing_method_iterable_value);
+        assert_eq!(fx.len(), 1, "{fx:?}");
+        assert_eq!(fx[0].0, "@return array<string, mixed>");
+    }
+
+    #[test]
+    fn fix_iterable_param_accepts_mixed_inside_container() {
+        let src = "<?php\nclass C {\n    /** @var array<string, mixed> */\n    private $opts = [];\n    public function f(array $o): void {}\n    public function go(): void { $this->f($this->opts); }\n}\n";
+        let fx = fixes(src, run_missing_method_iterable_value);
+        assert_eq!(fx.len(), 1, "{fx:?}");
+        assert_eq!(fx[0].0, "@param array<string, mixed> $o");
+    }
+
+    #[test]
+    fn no_iterable_fix_when_whole_evidence_is_mixed() {
+        // A fully-unknown return stays unfixed even at the relaxed site.
+        let src = "<?php\nclass C {\n    private $x;\n    public function all(): array { return $this->x; }\n}\n";
+        for d in run_fixes(src, run_missing_method_iterable_value) {
+            assert!(d.fix.is_none(), "whole-type mixed must not be written");
+        }
+    }
+
+    #[test]
+    fn no_iterable_fix_for_sole_empty_shape() {
+        // A loop assignment behind a `break` is invisible to flow, so the
+        // evidence claims exactly-empty — writing `@return array{}` would
+        // fence callers off every key. Whole-type empty shapes never fix.
+        let src = "<?php\nclass C {\n    public function v(): ?array {\n        $version = [];\n        foreach ([1] as $r) {\n            if ($r === 1) { $version = ['id' => $r]; break; }\n        }\n        return $version;\n    }\n}\n";
+        for d in run_fixes(src, run_missing_method_iterable_value) {
+            assert!(d.fix.is_none(), "empty-shape whole type must not be written");
+        }
+    }
+
+    #[test]
+    fn no_iterable_fix_for_zero_info_container() {
+        // `array<mixed, mixed>` documents nothing the bare word didn't.
+        let src = "<?php\nclass C {\n    /** @var array<mixed, mixed> */\n    private $x = [];\n    public function all(): array { return $this->x; }\n}\n";
+        for d in run_fixes(src, run_missing_method_iterable_value) {
+            assert!(d.fix.is_none(), "all-mixed container must not be written");
+        }
+    }
+
+    #[test]
     fn fix_return_skipped_for_generator_method() {
         // Generators are skipped by signature inference; the finding stays bare.
         let src = "<?php\nclass C {\n    public function g() { yield 1; }\n}\n";
+        for d in run_fixes(src, run_missing_return_type) {
+            assert!(d.fix.is_none());
+        }
+    }
+
+    #[test]
+    fn fix_return_void_for_valueless_body() {
+        // A body with only side effects (bare `return;` allowed) is `void`.
+        let src = "<?php\nclass C {\n    public function go(int $x) { if ($x > 0) { return; } echo $x; }\n}\n";
+        let fx = fixes(src, run_missing_return_type);
+        assert_eq!(fx.len(), 1, "{fx:?}");
+        assert_eq!(fx[0].0, "@return void");
+    }
+
+    #[test]
+    fn fix_return_void_ignores_closure_returns() {
+        // A nested closure's `return 1;` belongs to the closure, not the method.
+        let src = "<?php\nclass C {\n    public function go() { $f = function () { return 1; }; $f(); }\n}\n";
+        let fx = fixes(src, run_missing_return_type);
+        assert_eq!(fx.len(), 1, "{fx:?}");
+        assert_eq!(fx[0].0, "@return void");
+    }
+
+    #[test]
+    fn no_void_fix_for_abstract_method() {
+        // No body, no evidence.
+        let src = "<?php\nabstract class C {\n    abstract public function go();\n}\n";
         for d in run_fixes(src, run_missing_return_type) {
             assert!(d.fix.is_none());
         }

@@ -22,7 +22,11 @@ use php_types::Type;
 /// as a fully-qualified `\`-prefixed name (bare qualified names in PHPDoc would
 /// resolve relative to the namespace — wrong).
 pub(crate) fn render_phpdoc(ty: &Type, scope: &Scope) -> Option<String> {
-    if matches!(ty, Type::Null) || !renderable(ty) {
+    render_phpdoc_mode(ty, scope, false)
+}
+
+fn render_phpdoc_mode(ty: &Type, scope: &Scope, container_mixed: bool) -> Option<String> {
+    if matches!(ty, Type::Null) || !renderable_in(ty, container_mixed, false) {
         return None;
     }
     let display = ty.clone().map(&mut |t| match t {
@@ -35,14 +39,19 @@ pub(crate) fn render_phpdoc(ty: &Type, scope: &Scope) -> Option<String> {
     Some(display.to_string())
 }
 
-/// Whether every node of `ty` has a faithful, context-free PHPDoc rendering.
-fn renderable(ty: &Type) -> bool {
+/// Whether every node of `ty` has a faithful, context-free PHPDoc rendering,
+/// with a positional relaxation: when `container_mixed` is set,
+/// `mixed` is accepted *inside* a container slot (`in_container`) — the
+/// evidenced-structure-with-unknown-values shape (`array<string, mixed>`) that
+/// the `missingType.iterableValue` fix writes — but never as the whole type.
+fn renderable_in(ty: &Type, container_mixed: bool, in_container: bool) -> bool {
+    let inner = |t: &Type| renderable_in(t, container_mixed, in_container);
+    let slot = |t: &Type| renderable_in(t, container_mixed, true);
     match ty {
+        Type::Mixed | Type::ExplicitMixed => container_mixed && in_container,
         // No information, bottom/return-position types, or context-dependent
         // names — never write these into a docblock we synthesize.
-        Type::Mixed
-        | Type::ExplicitMixed
-        | Type::Never
+        Type::Never
         | Type::Void
         | Type::Unknown(_)
         | Type::TemplateVar(_)
@@ -56,29 +65,42 @@ fn renderable(ty: &Type) -> bool {
         | Type::IntRange { .. } => false,
         // `?A|B` renders ambiguously; the union smart constructor flattens these
         // away, so reject the stray shape rather than re-parenthesize.
-        Type::Nullable(inner) => {
-            !matches!(**inner, Type::Union(_) | Type::Intersection(_)) && renderable(inner)
+        Type::Nullable(x) => {
+            !matches!(**x, Type::Union(_) | Type::Intersection(_)) && inner(x)
         }
         // A literal string renders as `'…'`; reject contents that would break
         // the quoting or the surrounding comment.
         Type::LiteralString(s) => {
             !s.contains(['\'', '\\', '\n', '\r']) && !s.contains("*/")
         }
-        Type::Shape { fields, .. } => fields.iter().all(|f| {
-            f.key.as_deref().is_none_or(plain_shape_key) && renderable(&f.ty)
-        }),
+        // An *unsealed* empty shape (`array{...}`) is just bare `array` in
+        // disguise — never write it. (A sealed `array{}` is exactly-empty and
+        // fine.)
+        Type::Shape { fields, sealed } => {
+            (*sealed || !fields.is_empty())
+                && fields.iter().all(|f| {
+                    f.key.as_deref().is_none_or(plain_shape_key) && slot(&f.ty)
+                })
+        }
         Type::Array(kv) | Type::Iterable(kv) => kv
             .as_deref()
-            .is_none_or(|(k, v)| renderable(k) && renderable(v)),
-        Type::List(inner) | Type::ClassString(Some(inner)) | Type::NonEmpty(inner) => {
-            renderable(inner)
-        }
+            .is_none_or(|(k, v)| slot(k) && slot(v)),
+        Type::List(x) => slot(x),
+        // `class-string<mixed>` is meaningless, and `NonEmpty` wraps the whole
+        // container (its inner is not a value slot).
+        Type::ClassString(Some(x)) | Type::NonEmpty(x) => inner(x),
         Type::Callable(sig) => sig
             .as_deref()
-            .is_none_or(|s| s.params.iter().all(renderable) && renderable(&s.ret)),
-        Type::Named { args, .. } => args.iter().all(renderable),
+            .is_none_or(|s| s.params.iter().all(inner) && inner(&s.ret)),
+        Type::Named { args, .. } => args.iter().all(slot),
+        // `string|mixed` in a slot would be dishonest noise — a union arm of
+        // `mixed` must have been absorbed by the caller, so reject it here.
         Type::Union(parts) | Type::Intersection(parts) => {
-            !parts.is_empty() && parts.iter().all(renderable)
+            !parts.is_empty()
+                && !parts
+                    .iter()
+                    .any(|p| matches!(p, Type::Mixed | Type::ExplicitMixed))
+                && parts.iter().all(inner)
         }
         _ => true,
     }
@@ -183,6 +205,95 @@ pub(crate) fn typed_tag_fix(
     kind: DocTagKind,
     var: Option<&str>,
 ) -> Option<DocTagFix> {
+    typed_tag_fix_mode(fa, scope, ty, first_span, doc, kind, var, false)
+}
+
+/// [`typed_tag_fix`] for the `missingType.iterableValue` sites: additionally
+/// accepts `mixed` *inside* an evidenced container (`array<string, mixed>` —
+/// the structure is known, the values honestly aren't), never as the whole
+/// type. Union slots that retained `mixed` are absorbed to plain `mixed`
+/// first (`int|mixed` claims less than it looks like it does).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn typed_tag_fix_ack(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    ty: &Type,
+    first_span: Span,
+    doc: Option<&str>,
+    kind: DocTagKind,
+    var: Option<&str>,
+) -> Option<DocTagFix> {
+    let absorbed = ty.clone().map(&mut |t| match &t {
+        Type::Union(parts)
+            if parts
+                .iter()
+                .any(|p| matches!(p, Type::Mixed | Type::ExplicitMixed)) =>
+        {
+            Type::Mixed
+        }
+        Type::Nullable(x) if matches!(**x, Type::Mixed | Type::ExplicitMixed) => Type::Mixed,
+        _ => t,
+    });
+    // An all-mixed container as the whole type (`array<mixed, mixed>`,
+    // `array<int|string, mixed>`) documents nothing the bare word didn't —
+    // that's suppression, not a fix. (Inside a shape it stays: the shape keys
+    // are the information, and a bare inner `array` couldn't be written.)
+    if zero_info_container(&absorbed) {
+        return None;
+    }
+    typed_tag_fix_mode(fa, scope, &absorbed, first_span, doc, kind, var, true)
+}
+
+/// A type that is nothing but empty-shape (and `null`) arms — the
+/// "exactly-empty array" claim [`typed_tag_fix_mode`] refuses to write.
+fn sole_empty_shape(ty: &Type) -> bool {
+    match ty {
+        Type::Shape { fields, .. } => fields.is_empty(),
+        Type::Nullable(x) => sole_empty_shape(x),
+        Type::Union(parts) => {
+            !parts.is_empty()
+                && parts
+                    .iter()
+                    .all(|p| matches!(p, Type::Null) || sole_empty_shape(p))
+        }
+        _ => false,
+    }
+}
+
+/// A container type whose key carries no information (`mixed` or the full
+/// `array-key` = `int|string`) and whose value is `mixed`, through nullability.
+fn zero_info_container(ty: &Type) -> bool {
+    fn mixedish_key(k: &Type) -> bool {
+        match k {
+            Type::Mixed | Type::ExplicitMixed => true,
+            Type::Union(parts) => {
+                parts.len() == 2
+                    && parts.iter().any(|p| matches!(p, Type::Int))
+                    && parts.iter().any(|p| matches!(p, Type::String))
+            }
+            _ => false,
+        }
+    }
+    match ty {
+        Type::Array(Some(kv)) | Type::Iterable(Some(kv)) => {
+            mixedish_key(&kv.0) && matches!(kv.1, Type::Mixed | Type::ExplicitMixed)
+        }
+        Type::Nullable(inner) => zero_info_container(inner),
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn typed_tag_fix_mode(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    ty: &Type,
+    first_span: Span,
+    doc: Option<&str>,
+    kind: DocTagKind,
+    var: Option<&str>,
+    container_mixed: bool,
+) -> Option<DocTagFix> {
     if !php_infer::useful_inference(ty) {
         return None;
     }
@@ -201,7 +312,14 @@ pub(crate) fn typed_tag_fix(
     if !crate::missing_type::check_type(fa.reflection, &widened).is_empty() {
         return None;
     }
-    let rendered = render_phpdoc(&widened, scope)?;
+    // Never write an exactly-empty array as the whole type: `array{}` evidence
+    // almost always means the population path wasn't observed (e.g. a loop
+    // assignment behind a `break`), and the written seal fences callers off
+    // every key — minting offset findings instead of fixing one.
+    if sole_empty_shape(&widened) {
+        return None;
+    }
+    let rendered = render_phpdoc_mode(&widened, scope, container_mixed)?;
     let tag = match (kind, var) {
         (DocTagKind::Param, Some(v)) => format!("@param {rendered} ${v}"),
         (DocTagKind::Return, None) => format!("@return {rendered}"),
@@ -269,6 +387,395 @@ pub(crate) fn iterable_return_evidence(fa: &FileAnalysis, body: &[php_ast::Stmt]
     Some(union)
 }
 
+/// Whether a body provably returns no value: no `return <expr>` anywhere in
+/// its own scope (bare `return;` is fine) and no `yield` (a generator's return
+/// type is `Generator`, not `void`). Evidence for a `@return void` fix on the
+/// `missingType.return` finding — `void` is unrenderable by [`render_phpdoc`]
+/// on purpose (never *inferred* into value positions), so the fix site builds
+/// the tag directly.
+pub(crate) fn void_return_evidence(body: &[php_ast::Stmt]) -> bool {
+    let mut has_yield = false;
+    for s in body {
+        crate::walk::for_each_expr_in_scope(s, &mut |e| {
+            if matches!(
+                e.kind,
+                php_ast::ExprKind::Yield { .. } | php_ast::ExprKind::YieldFrom(_)
+            ) {
+                has_yield = true;
+            }
+        });
+    }
+    if has_yield {
+        return false;
+    }
+    let mut has_value_return = false;
+    crate::decls::collect_returns_in_body(body, &mut |e| {
+        if e.is_some() {
+            has_value_return = true;
+        }
+    });
+    !has_value_return
+}
+
+// ---------------------------------------------------------------------------
+// Wrong doc-narrowing rewrite (for `return.type` fixes)
+// ---------------------------------------------------------------------------
+
+/// A `Replace` fix correcting a PHPDoc `@return` whose type *narrows* the
+/// native return hint in a way the body provably violates (the generated
+/// `@return true` on `authorize(): bool` pattern). Only fires when the doc is
+/// redundant-or-wrong relative to a real native contract — never when the doc
+/// is the only contract (rewriting that could codify a body bug):
+///
+/// - a native return hint exists (not `mixed`/`void`/`never`),
+/// - the doc-refined type differs from it and is assignable *to* it,
+/// - the body's return-expression union is confidently typed, fits the
+///   native type, but not the doc type,
+/// - the docblock has exactly one `@return` and anchors byte-exactly.
+///
+/// When the body union equals the native type the tag adds nothing: its line
+/// is deleted (multi-line docblocks only). Otherwise the written type text is
+/// replaced with the rendered body union.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn return_narrowing_fix(
+    index: &php_reflect::ReflectionIndex,
+    types: &php_infer::TypeMap,
+    source: &str,
+    scope: &Scope,
+    declared: &Type,
+    native: &Type,
+    doc: Option<&str>,
+    first_span: Span,
+    body: &[php_ast::Stmt],
+) -> Option<php_diagnostics::ReplaceFix> {
+    use php_diagnostics::ReplaceFix;
+    if matches!(
+        native,
+        Type::Mixed | Type::ExplicitMixed | Type::Void | Type::Never
+    ) || declared == native
+        || !crate::is_assignable(index, declared, native)
+    {
+        return None;
+    }
+    // Confident body union: every `return <expr>` typed (no bare returns, no
+    // yields, nothing mixed/unknown), read from the flow-narrowed type map.
+    let mut has_yield = false;
+    for s in body {
+        crate::walk::for_each_expr_in_scope(s, &mut |e| {
+            if matches!(
+                e.kind,
+                php_ast::ExprKind::Yield { .. } | php_ast::ExprKind::YieldFrom(_)
+            ) {
+                has_yield = true;
+            }
+        });
+    }
+    if has_yield {
+        return None;
+    }
+    let mut parts = Vec::new();
+    let mut bare = false;
+    crate::decls::collect_returns_in_body(body, &mut |e| match e {
+        Some(expr) => {
+            let r = expr.span.range();
+            parts.push(
+                types
+                    .get(&(r.start as u32, r.end as u32))
+                    .map(|f| f.merged.clone())
+                    .unwrap_or(Type::Mixed),
+            );
+        }
+        None => bare = true,
+    });
+    if bare || parts.is_empty() {
+        return None;
+    }
+    let union = php_infer::widen_literals(Type::union(parts)).map(&mut |t| match t {
+        Type::Union(parts) => Type::union(parts.to_vec()),
+        other => other,
+    });
+    if !php_infer::useful_inference(&union)
+        || !crate::is_assignable(index, &union, native)
+        || crate::is_assignable(index, &union, declared)
+    {
+        return None;
+    }
+    // Locate the docblock byte-exactly, then the single `@return` inside it.
+    let doc_text = doc?;
+    let (FixAnchor::ExistingDoc(doc_span), _) = doc_anchor(source, first_span, Some(doc_text))?
+    else {
+        return None;
+    };
+    if doc_text.matches("@return").count() != 1 {
+        return None;
+    }
+    let tag_off = doc_text.find("@return")?;
+    let after_tag = &doc_text[tag_off + "@return".len()..];
+    let ws = after_tag.len() - after_tag.trim_start_matches([' ', '\t']).len();
+    if ws == 0 {
+        return None; // `@returns`/glued text — not the tag we think it is.
+    }
+    let operand = &after_tag[ws..];
+    let (_, consumed) = php_phpdoc::parse_type_prefix(operand)?;
+    if consumed == 0 {
+        return None;
+    }
+    let type_start = doc_span.start as usize + tag_off + "@return".len() + ws;
+    let rest_of_line = operand[consumed..].split(['\n', '\r']).next().unwrap_or("");
+    let only_type_on_line = rest_of_line.trim_start_matches([' ', '\t']).is_empty()
+        || rest_of_line.trim_start_matches([' ', '\t']).starts_with("*/");
+    let multi_line = doc_text.contains('\n');
+    if union == *native && multi_line && only_type_on_line && !rest_of_line.contains("*/") {
+        // The tag would just restate the native hint: delete its whole line,
+        // provided the line holds nothing but framing and the tag.
+        let mut line_start = doc_text[..tag_off].rfind('\n').map(|i| i + 1)?;
+        if !doc_text[line_start..tag_off]
+            .chars()
+            .all(|c| matches!(c, ' ' | '\t' | '*'))
+        {
+            return None;
+        }
+        let line_end = doc_text[tag_off..]
+            .find('\n')
+            .map(|i| tag_off + i + 1)
+            .unwrap_or(doc_text.len());
+        // When the tag was the last content — next line closes the block —
+        // absorb a now-dangling blank ` * ` separator line above it.
+        if doc_text[line_end..].trim_start_matches([' ', '\t']).starts_with("*/") {
+            if let Some(prev_nl) = doc_text[..line_start.saturating_sub(1)].rfind('\n') {
+                let prev_line = &doc_text[prev_nl + 1..line_start - 1];
+                let bare_star = prev_line.trim_matches([' ', '\t']) == "*";
+                if bare_star {
+                    line_start = prev_nl + 1;
+                }
+            }
+        }
+        return Some(ReplaceFix {
+            span: Span::new(
+                (doc_span.start as usize + line_start) as u32,
+                (doc_span.start as usize + line_end) as u32,
+            ),
+            replacement: String::new(),
+        });
+    }
+    // Rewrite the written type text to the body union.
+    let rendered = render_phpdoc(&union, scope)?;
+    if !crate::missing_type::check_type(index, &union).is_empty() || sole_empty_shape(&union) {
+        return None;
+    }
+    Some(ReplaceFix {
+        span: Span::new(type_start as u32, (type_start + consumed) as u32),
+        replacement: rendered,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Inline `@var` generic completion (for `missingType.generics` fixes)
+// ---------------------------------------------------------------------------
+
+/// A `Replace` fix completing the type args of an inline `@var` naming a bare
+/// generic class (`/** @var Builder $q */ $q = Screen::query();` →
+/// `@var Builder<Screen> $q`), when the statement is a simple `$var = <expr>`
+/// assignment whose RHS infers to a concrete instantiation of that same class.
+/// The rewrite preserves the rest of the tag (`$var` name, prose).
+pub(crate) fn var_generic_completion_fix(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    st: &php_ast::Stmt,
+    doc_raw: &str,
+) -> Option<php_diagnostics::ReplaceFix> {
+    use php_ast::{ExprKind, StmtKind};
+    let parsed = php_phpdoc::parse(doc_raw);
+    let var = parsed.vars.first()?;
+    if parsed.vars.len() != 1 {
+        return None;
+    }
+    let php_phpdoc::DocType::Named(written) = var.ty.as_ref()? else {
+        return None;
+    };
+    // Evidence: the annotated statement's own assignment RHS, else the flow
+    // type of the named variable's first occurrence in it (`@var` frequently
+    // floats above a *use* of the variable, not its assignment).
+    let rhs_ty = match &st.kind {
+        StmtKind::Expr(e)
+            if matches!(&e.kind, ExprKind::Assign { target, .. }
+                if matches!(&target.kind, ExprKind::Variable(sym)
+                    if var.name.as_deref().is_none_or(|n| n == fa.interner.resolve(*sym)))) =>
+        {
+            let ExprKind::Assign { rhs, .. } = &e.kind else {
+                return None;
+            };
+            fa.type_of(rhs)
+        }
+        _ => {
+            let name = var.name.as_deref()?;
+            let mut found: Option<Type> = None;
+            crate::walk::for_each_expr_in_stmt(st, &mut |e| {
+                if found.is_none()
+                    && matches!(&e.kind, ExprKind::Variable(sym)
+                        if fa.interner.resolve(*sym) == name)
+                {
+                    found = Some(fa.type_of(e));
+                }
+            });
+            found?
+        }
+    };
+    let Type::Named { fqn, args } = &rhs_ty else {
+        return None;
+    };
+    if args.is_empty()
+        || !crate::missing_type::check_type(fa.reflection, &rhs_ty).is_empty()
+    {
+        return None;
+    }
+    let written_fqn = match scope.resolve_class(&crate::missing_type::name_from_doc(written)) {
+        php_resolve::Resolution::Fqn(f) => f,
+        php_resolve::Resolution::Fallback { namespaced, .. } => namespaced,
+        _ => return None,
+    };
+    if !written_fqn
+        .trim_start_matches('\\')
+        .eq_ignore_ascii_case(fqn.trim_start_matches('\\'))
+    {
+        return None;
+    }
+    let rendered = render_phpdoc(&rhs_ty, scope)?;
+    // Locate the doc directly above the statement, then the single `@var`.
+    let st_start = st.span.start as usize;
+    let doc_start = fa.source.get(..st_start)?.rfind(doc_raw)?;
+    if !fa.source[doc_start + doc_raw.len()..st_start]
+        .chars()
+        .all(char::is_whitespace)
+    {
+        return None;
+    }
+    if doc_raw.matches("@var").count() != 1 {
+        return None;
+    }
+    let tag_off = doc_raw.find("@var")?;
+    let after = &doc_raw[tag_off + "@var".len()..];
+    let ws = after.len() - after.trim_start_matches([' ', '\t']).len();
+    if ws == 0 {
+        return None;
+    }
+    let (_, consumed) = php_phpdoc::parse_type_prefix(&after[ws..])?;
+    if consumed == 0 {
+        return None;
+    }
+    let type_start = doc_start + tag_off + "@var".len() + ws;
+    Some(php_diagnostics::ReplaceFix {
+        span: Span::new(type_start as u32, (type_start + consumed) as u32),
+        replacement: rendered,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Unused closure capture removal (for `closure.unusedUse` fixes)
+// ---------------------------------------------------------------------------
+
+/// A `Replace` fix deleting an unused `use ($x)` capture. When *every* capture
+/// is unused the whole clause goes (each finding carries the identical edit —
+/// the applier dedups); otherwise just the item and its comma. The AST carries
+/// no per-use spans, so the clause is located by scanning the closure's source
+/// slice — and only trusted when exactly one candidate `use (…)` reproduces
+/// the AST's capture list verbatim (names, by-ref flags, order).
+pub(crate) fn closure_use_removal_fix(
+    fa: &FileAnalysis,
+    closure_span: Span,
+    c: &php_ast::ClosureExpr,
+    target: php_intern::Symbol,
+    unused: &[php_intern::Symbol],
+) -> Option<php_diagnostics::ReplaceFix> {
+    use php_diagnostics::ReplaceFix;
+    let text = fa.source.get(closure_span.range())?;
+    let expected: Vec<(String, bool)> = c
+        .uses
+        .iter()
+        .map(|u| (fa.interner.resolve(u.name).to_string(), u.by_ref))
+        .collect();
+    // Find the unique `use (…)` whose items match the AST captures:
+    // `(keyword offset, `)` offset, trimmed item byte ranges)`.
+    type UseClause = (usize, usize, Vec<(usize, usize)>);
+    let mut found: Option<UseClause> = None;
+    let mut search = 0;
+    while let Some(rel) = text[search..].find("use") {
+        let at = search + rel;
+        search = at + 3;
+        // Keyword boundary on both sides.
+        if at > 0
+            && text.as_bytes()[at - 1]
+                .is_ascii_alphanumeric()
+        {
+            continue;
+        }
+        let after = &text[at + 3..];
+        let ws = after.len() - after.trim_start().len();
+        if !after[ws..].starts_with('(') {
+            continue;
+        }
+        let open = at + 3 + ws;
+        let Some(close_rel) = text[open + 1..].find(')') else {
+            continue;
+        };
+        let close = open + 1 + close_rel;
+        let inner = &text[open + 1..close];
+        // Split on commas; a use list has no nested delimiters.
+        let mut items: Vec<(usize, usize)> = Vec::new(); // trimmed byte ranges
+        let mut ok = true;
+        let mut pos = 0;
+        for (i, raw) in inner.split(',').enumerate() {
+            let lead = raw.len() - raw.trim_start().len();
+            let item_start = open + 1 + pos + lead;
+            let item_end = item_start + raw.trim().len();
+            let trimmed = raw.trim();
+            let (by_ref, rest) = match trimmed.strip_prefix('&') {
+                Some(r) => (true, r.trim_start()),
+                None => (false, trimmed),
+            };
+            match (rest.strip_prefix('$'), expected.get(i)) {
+                (Some(name), Some((want, want_ref)))
+                    if name == want && by_ref == *want_ref => {}
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+            items.push((item_start, item_end));
+            pos += raw.len() + 1;
+        }
+        if ok && items.len() == expected.len() {
+            if found.is_some() {
+                return None; // ambiguous (e.g. a string constant lookalike).
+            }
+            found = Some((at, close, items));
+        }
+    }
+    let (kw_at, close, items) = found?;
+    let base = closure_span.start as usize;
+    if unused.len() == c.uses.len() {
+        // Whole clause: from the end of the previous token through `)`.
+        let lead_ws = text[..kw_at].len() - text[..kw_at].trim_end().len();
+        return Some(ReplaceFix {
+            span: Span::new((base + kw_at - lead_ws) as u32, (base + close + 1) as u32),
+            replacement: String::new(),
+        });
+    }
+    let idx = c.uses.iter().position(|u| u.name == target)?;
+    let (start, end) = items[idx];
+    let span = if idx + 1 < items.len() {
+        // Item plus its trailing comma and spacing.
+        Span::new((base + start) as u32, (base + items[idx + 1].0) as u32)
+    } else {
+        // Last item: absorb the preceding comma.
+        Span::new((base + items[idx - 1].1) as u32, (base + end) as u32)
+    };
+    Some(ReplaceFix {
+        span,
+        replacement: String::new(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Property type evidence (for `missingType.property` fixes)
 // ---------------------------------------------------------------------------
@@ -318,6 +825,19 @@ pub(crate) fn infer_property_type(
     if ancestors_write_property(fa, class_fqn, elem.name) {
         return None;
     }
+    own_write_evidence(fa, scope, class_fqn, c, elem)?.into_type()
+}
+
+/// The class's own writes to `$this->{elem}` (default value + method-body
+/// assignments) as typed [`Evidence`]; `None` when any write shape can't be
+/// typed (the shared bail semantics of [`infer_property_type`]).
+fn own_write_evidence(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    class_fqn: &str,
+    c: &php_ast::ClassDecl,
+    elem: &php_ast::PropElem,
+) -> Option<Evidence> {
     let mut evidence = Evidence::default();
     if let Some(default) = &elem.default {
         let ctx = php_infer::TypeCtx::new(fa.reflection, scope, fa.interner);
@@ -343,10 +863,80 @@ pub(crate) fn infer_property_type(
             });
         }
     }
-    if bail {
+    (!bail).then_some(evidence)
+}
+
+/// Fallback `@var` evidence for an untyped property that overrides an ancestor
+/// declaration (the Eloquent `protected $fillable = […]` pattern): restate the
+/// nearest ancestor's declared type. Sound because the non-private override
+/// shares the ancestor's storage contract — but the annotation must not mint
+/// new findings, so the child's own writes (and any subclass's write-shaped
+/// uses) must be verifiably compatible with the ancestor type.
+pub(crate) fn inherited_property_type(
+    fa: &FileAnalysis,
+    scope: &Scope,
+    class_fqn: &str,
+    c: &php_ast::ClassDecl,
+    pd: &php_ast::PropertyDecl,
+    elem: &php_ast::PropElem,
+) -> Option<Type> {
+    use php_ast::{ClassKind, Visibility};
+    if c.kind != ClassKind::Class {
         return None;
     }
-    evidence.into_type()
+    let cr = fa.reflection.class(class_fqn)?;
+    let prop = fa.interner.resolve(elem.name);
+    // Nearest ancestor declaration: the class's own traits (flattened into it),
+    // then parents; `find_property` continues each walk transitively.
+    let found = cr.traits.iter().chain(&cr.parents).find_map(|t| match t {
+        Type::Named { fqn, .. } => fa.reflection.find_property(fqn, prop),
+        _ => None,
+    })?;
+    let member = &*found.member;
+    // A private ancestor property is a separate per-class slot, and a magic
+    // `@property` tag is not a declaration. Static properties are excluded
+    // outright: their writes go through `self::$p`, which the write-evidence
+    // collector below doesn't model, so conformance couldn't be verified.
+    if member.magic
+        || member.visibility == Visibility::Private
+        || member.is_static
+        || pd.modifiers.is_static
+    {
+        return None;
+    }
+    let ty = member.ty.clone();
+    // The child's own writes must conform, else the `@var` trades this finding
+    // for an assignment one. Unanalyzable write shapes bail as usual.
+    if let Some(written) = own_write_evidence(fa, scope, class_fqn, c, elem)?.into_type() {
+        if !crate::is_assignable(fa.reflection, &written, &ty) {
+            return None;
+        }
+    }
+    // Subclasses write through the same slot; any write-shaped use of the
+    // property in a subclass body would now be checked against the new `@var`.
+    let base = class_fqn.trim_start_matches('\\');
+    for e in fa.project.classes() {
+        if e.fqn.trim_start_matches('\\').eq_ignore_ascii_case(base)
+            || !fa.reflection.is_subclass_of(&e.fqn, class_fqn)
+        {
+            continue;
+        }
+        let sub = fa.reflection.class(&e.fqn)?;
+        for m in &sub.methods {
+            if m.magic {
+                continue;
+            }
+            if let Some((body, body_scope)) = fa.reflection.method_body(&sub.fqn, &m.name) {
+                if body
+                    .iter()
+                    .any(|st| stmt_writes_prop(fa, body_scope, &sub.fqn, st, elem.name))
+                {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(ty)
 }
 
 /// Whether any ancestor class or used trait (transitively) has a method body

@@ -80,6 +80,7 @@ fn run_return_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
         fa.treat_phpdoc_types_as_certain,
         fa.check_nullables,
         fa.report_maybes,
+        fa.collect_fixes.then_some(fa.source),
     )
 }
 
@@ -582,19 +583,33 @@ fn run_unused_closure_uses(fa: &FileAnalysis) -> Vec<Diagnostic> {
             return;
         }
         let used = collect_used_variables(c, fa.interner);
+        let unused: Vec<php_intern::Symbol> = c
+            .uses
+            .iter()
+            .filter(|u| !u.by_ref && !used.contains(fa.interner.resolve(u.name)))
+            .map(|u| u.name)
+            .collect();
         for u in &c.uses {
             if u.by_ref {
                 continue; // by-ref use is never "unused" — it exports a value.
             }
             let name = fa.interner.resolve(u.name);
             if !used.contains(name) {
-                out.push(
-                    Diagnostic::error(
-                        e.span,
-                        format!("Anonymous function has an unused use ${name}."),
-                    )
-                    .with_code("closure.unusedUse"),
-                );
+                let mut d = Diagnostic::error(
+                    e.span,
+                    format!("Anonymous function has an unused use ${name}."),
+                )
+                .with_code("closure.unusedUse");
+                // `--fix`: delete the capture (the whole clause when every
+                // capture is unused).
+                if fa.collect_fixes {
+                    if let Some(fix) =
+                        crate::fix::closure_use_removal_fix(fa, e.span, c, u.name, &unused)
+                    {
+                        d = d.with_fix(fix);
+                    }
+                }
+                out.push(d);
             }
         }
     });
@@ -618,10 +633,34 @@ fn collect_used_variables(c: &ClosureExpr, interner: &Interner) -> HashSet<Strin
                     names.insert(interner.resolve(u.name).to_string());
                 }
             }
+            // Arrow fns auto-capture: every variable referenced in their body
+            // (transitively through further arrow fns) is a use of this scope.
+            ExprKind::ArrowFn(inner) => {
+                collect_arrow_captured(&inner.body, interner, &mut names);
+            }
             _ => {}
         });
     }
     names
+}
+
+/// Variables an arrow-fn body references from its enclosing scope: bare
+/// variables (auto-capture), nested closures' `use` lists, and nested arrow
+/// bodies recursively. Over-approximates (the arrow's own params count too),
+/// which only makes an outer `use` look used — the safe direction.
+fn collect_arrow_captured(body: &Expr, interner: &Interner, names: &mut HashSet<String>) {
+    crate::walk::for_each_subexpr(body, &mut |e| match &e.kind {
+        ExprKind::Variable(sym) => {
+            names.insert(interner.resolve(*sym).to_string());
+        }
+        ExprKind::Closure(inner) => {
+            for u in &inner.uses {
+                names.insert(interner.resolve(u.name).to_string());
+            }
+        }
+        ExprKind::ArrowFn(inner) => collect_arrow_captured(&inner.body, interner, names),
+        _ => {}
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1934,10 +1973,12 @@ fn run_missing_function_return_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
         )
         .with_code("missingType.return");
         // `--fix`: signature inference (§8q) already synthesized the return
-        // type from the body when it had confident evidence.
+        // type from the body when it had confident evidence; a body that
+        // provably returns no value is `@return void`.
         if fa.collect_fixes {
             let refl = fa.reflect_function(scope, fd);
-            if let Some(fix) = fa
+            let first_span = crate::fix::first_attr_span(&fd.attrs).unwrap_or(fd.name_span);
+            let inferred = fa
                 .reflection
                 .function(&refl.fqn)
                 .filter(|f| f.inferred_return)
@@ -1946,14 +1987,24 @@ fn run_missing_function_return_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
                         fa,
                         scope,
                         &f.return_type,
-                        crate::fix::first_attr_span(&fd.attrs).unwrap_or(fd.name_span),
+                        first_span,
                         fd.doc.as_deref(),
                         php_diagnostics::DocTagKind::Return,
                         None,
                     )
-                })
-            {
+                });
+            if let Some(fix) = inferred {
                 d = d.with_fix(fix);
+            } else if crate::fix::void_return_evidence(&fd.body) {
+                if let Some(fix) = crate::fix::doc_tag_fix(
+                    fa,
+                    first_span,
+                    fd.doc.as_deref(),
+                    php_diagnostics::DocTagKind::Return,
+                    "@return void".to_string(),
+                ) {
+                    d = d.with_fix(fix);
+                }
             }
         }
         out.push(d);
@@ -2042,7 +2093,7 @@ fn run_missing_function_iterable_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
                             .iterable_param_evidence
                             .and_then(|ev| ev.get(&php_infer::evidence_key(&refl.fqn, None, idx)))
                             .and_then(|ty| {
-                                crate::fix::typed_tag_fix(
+                                crate::fix::typed_tag_fix_ack(
                                     fa,
                                     scope,
                                     ty,
@@ -2073,7 +2124,7 @@ fn run_missing_function_iterable_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     if fa.collect_fixes {
                         if let Some(fix) = crate::fix::iterable_return_evidence(fa, &fd.body)
                             .and_then(|ty| {
-                                crate::fix::typed_tag_fix(
+                                crate::fix::typed_tag_fix_ack(
                                     fa,
                                     scope,
                                     &ty,
@@ -3651,7 +3702,95 @@ pub(crate) static RULES: &[RuleEntry] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{codes, codes_version, fixes, run, run_fixes};
+    use crate::testutil::{codes, codes_version, fixes, replace_fixes, run, run_fixes};
+
+    #[test]
+    fn use_referenced_by_nested_arrow_fn_is_not_unused() {
+        // Arrow fns auto-capture from the closure's scope: the `use` IS used.
+        let src = "<?php\n$id = 1;\n$f = function () use ($id) { return array_map(fn($x) => [$x, $id], [1]); };\n";
+        assert!(codes(src, run_unused_closure_uses).is_empty());
+    }
+
+    #[test]
+    fn fix_removes_sole_unused_closure_use() {
+        let src = "<?php\n$a = 1;\n$f = function (int $x) use ($a) { return $x; };\n";
+        let fx = replace_fixes(src, run_unused_closure_uses);
+        assert_eq!(fx.len(), 1, "{fx:?}");
+        let (span, replacement) = &fx[0];
+        assert_eq!(replacement, "");
+        assert_eq!(&src[span.range()], " use ($a)");
+    }
+
+    #[test]
+    fn fix_removes_one_of_several_closure_uses() {
+        let src = "<?php\n$a = 1;\n$b = 2;\n$f = function () use ($a, $b) { return $b; };\n";
+        let fx = replace_fixes(src, run_unused_closure_uses);
+        assert_eq!(fx.len(), 1, "{fx:?}");
+        assert_eq!(&src[fx[0].0.range()], "$a, ");
+        // And the last-item case absorbs the preceding comma.
+        let src2 = "<?php\n$a = 1;\n$b = 2;\n$f = function () use ($a, $b) { return $a; };\n";
+        let fx2 = replace_fixes(src2, run_unused_closure_uses);
+        assert_eq!(fx2.len(), 1, "{fx2:?}");
+        assert_eq!(&src2[fx2[0].0.range()], ", $b");
+    }
+
+    #[test]
+    fn all_unused_closure_uses_share_one_whole_clause_fix() {
+        let src = "<?php\n$a = 1;\n$b = 2;\n$f = function () use ($a, $b) { return 1; };\n";
+        let fx = replace_fixes(src, run_unused_closure_uses);
+        assert_eq!(fx.len(), 2, "{fx:?}");
+        assert_eq!(fx[0], fx[1], "identical whole-clause edits must dedup");
+        assert_eq!(&src[fx[0].0.range()], " use ($a, $b)");
+    }
+
+    #[test]
+    fn no_use_removal_fix_when_clause_is_ambiguous() {
+        // A string constant containing a lookalike clause: two candidates.
+        let src = "<?php\n$a = 1;\n$f = function (string $x = 'use ($a)') use ($a) { return $x; };\n";
+        for d in run_fixes(src, run_unused_closure_uses) {
+            assert!(d.fix.is_none(), "ambiguous clause must not be edited");
+        }
+    }
+
+    #[test]
+    fn fix_deletes_wrong_doc_narrowing_restating_native() {
+        // The generated `@return true` on a `: bool` body returning bool: the
+        // narrowing is provably wrong and the tag would just restate the
+        // native hint — its line is deleted.
+        let src = "<?php\nclass C {\n    /**\n     * Authorized?\n     *\n     * @return true\n     */\n    public function authorize(): bool {\n        return $this->x() === true;\n    }\n    private function x(): bool { return true; }\n}\n";
+        let fx = replace_fixes(src, run_return_type);
+        assert_eq!(fx.len(), 1, "{fx:?}");
+        let (span, replacement) = &fx[0];
+        assert_eq!(replacement, "");
+        // The dangling blank separator line above the tag is absorbed too.
+        assert_eq!(&src[span.range()], "     *\n     * @return true\n");
+    }
+
+    #[test]
+    fn fix_rewrites_doc_narrowing_to_body_union() {
+        // Doc narrows `int|string` to `int`; the body returns string only.
+        let src = "<?php\n/** @return int */\nfunction f(bool $b): int|string {\n    return $b ? 'a' : 'b';\n}\n";
+        let fx = replace_fixes(src, run_return_type);
+        assert_eq!(fx.len(), 1, "{fx:?}");
+        let (span, replacement) = &fx[0];
+        assert_eq!(replacement, "string");
+        assert_eq!(&src[span.range()], "int");
+    }
+
+    #[test]
+    fn no_narrowing_fix_when_doc_is_the_only_contract() {
+        // No native hint: the doc IS the contract; the body violating it may
+        // be the bug — never rewrite it.
+        let src = "<?php\nclass C {\n    /** @return array */\n    public function get() {\n        return null;\n    }\n}\n";
+        assert!(replace_fixes(src, run_return_type).is_empty());
+    }
+
+    #[test]
+    fn no_narrowing_fix_when_body_violates_native() {
+        // Body doesn't even fit the native hint — a real bug, don't touch docs.
+        let src = "<?php\n/** @return true */\nfunction f(): bool {\n    return 'nope';\n}\n";
+        assert!(replace_fixes(src, run_return_type).is_empty());
+    }
     use crate::PhpVersion;
 
     // --- first-class-callable version gate (callable.notSupported) --------
@@ -4644,6 +4783,22 @@ mod tests {
         let fx = fixes(src, run_missing_function_return_type);
         assert_eq!(fx.len(), 1);
         assert_eq!(fx[0].0, "@return User");
+    }
+
+    #[test]
+    fn fix_function_return_void_for_valueless_body() {
+        let src = "<?php\nfunction side(int $x) { echo $x; }\n";
+        let fx = fixes(src, run_missing_function_return_type);
+        assert_eq!(fx.len(), 1, "{fx:?}");
+        assert_eq!(fx[0].0, "@return void");
+    }
+
+    #[test]
+    fn no_void_fix_for_generator_function() {
+        let src = "<?php\nfunction g() { yield 1; }\n";
+        for d in run_fixes(src, run_missing_function_return_type) {
+            assert!(d.fix.is_none());
+        }
     }
 
     #[test]

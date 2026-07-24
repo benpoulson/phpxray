@@ -33,6 +33,10 @@ struct Ret {
     /// Native-only declared return (for treatPhpDocTypesAsCertain=false checking).
     native_declared: Type,
     label: String,
+    /// `--fix`: one shared repair for a provably-wrong doc narrowing — every
+    /// finding of this function-like carries the identical replacement (the
+    /// applier dedups them).
+    fix: Option<php_diagnostics::ReplaceFix>,
 }
 
 /// Report `return` statements that don't match their declared return type.
@@ -50,6 +54,7 @@ pub fn return_type_errors(
     treat_phpdoc_certain: bool,
     check_nullables: bool,
     report_maybes: bool,
+    fix_source: Option<&str>,
 ) -> Vec<Diagnostic> {
     let cx = Cx {
         index,
@@ -58,6 +63,7 @@ pub fn return_type_errors(
         treat_phpdoc_certain,
         check_nullables,
         report_maybes,
+        fix_source,
     };
     let mut out = Vec::new();
     decls::for_each_named_function_in(program, interner, &mut |scope, function| {
@@ -83,6 +89,8 @@ struct Cx<'a> {
     check_nullables: bool,
     /// phpstan's `checkUnionTypes` / `reportMaybes` (level 7+).
     report_maybes: bool,
+    /// `--fix`: the analyzed source, enabling the wrong-doc-narrowing repair.
+    fix_source: Option<&'a str>,
 }
 
 impl Cx<'_> {
@@ -90,6 +98,19 @@ impl Cx<'_> {
         let refl = reflect_function(scope, self.interner, f);
         if !skip_return(&refl.return_type) {
             let ret = Ret {
+                fix: self.fix_source.and_then(|source| {
+                    crate::fix::return_narrowing_fix(
+                        self.index,
+                        self.types,
+                        source,
+                        scope,
+                        &refl.return_type,
+                        &refl.native_return,
+                        f.doc.as_deref(),
+                        crate::fix::first_attr_span(&f.attrs).unwrap_or(f.name_span),
+                        &f.body,
+                    )
+                }),
                 declared: refl.return_type.clone(),
                 native_declared: refl.native_return.clone(),
                 label: format!("function {}()", refl.fqn),
@@ -113,6 +134,19 @@ impl Cx<'_> {
             };
             if !skip_return(&mr.return_type) {
                 let ret = Ret {
+                    fix: self.fix_source.and_then(|source| {
+                        crate::fix::return_narrowing_fix(
+                            self.index,
+                            self.types,
+                            source,
+                            scope,
+                            &mr.return_type,
+                            &mr.native_return,
+                            md.doc.as_deref(),
+                            crate::fix::first_attr_span(&md.attrs).unwrap_or(md.name_span),
+                            body,
+                        )
+                    }),
                     declared: mr.return_type.clone(),
                     native_declared: mr.native_return.clone(),
                     label: format!("{}::{}()", fqn, mr.name),
@@ -168,6 +202,9 @@ impl Cx<'_> {
             }
         }
         function_like::push_return_type_error(out, e, &ret.label, &ret.declared, &actual);
+        if let (Some(fix), Some(d)) = (&ret.fix, out.last_mut()) {
+            d.fix = Some(php_diagnostics::Fix::Replace(fix.clone()));
+        }
     }
 }
 
@@ -191,10 +228,10 @@ mod tests {
         let mut index = ReflectionIndex::new();
         index.add_file(&r.program, &r.interner);
         let types = php_infer::type_map(&index, &r.program, &r.interner, true);
-        return_type_errors(&index, &r.program, &r.interner, &types, true, true, true)
-        .into_iter()
-        .map(|d| d.message)
-        .collect()
+        return_type_errors(&index, &r.program, &r.interner, &types, true, true, true, None)
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
     }
 
     #[test]

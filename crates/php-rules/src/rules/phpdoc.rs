@@ -1905,7 +1905,7 @@ fn check_var_tag_missing_types_in_stmt(
 ) {
     if let Some(doc) = &st.doc {
         if var_tag_missing_type_applies_to_stmt(st) {
-            check_var_tag_missing_types(fa, scope, env, doc, st.span, out);
+            check_var_tag_missing_types(fa, scope, env, doc, st, out);
         }
     }
 
@@ -2014,9 +2014,10 @@ fn check_var_tag_missing_types(
     scope: &Scope,
     env: &TemplateEnv,
     doc_raw: &str,
-    span: Span,
+    st: &Stmt,
     out: &mut Vec<Diagnostic>,
 ) {
+    let span = st.span;
     for var in php_phpdoc::parse(doc_raw).vars {
         let Some(ty) = var.ty else { continue };
         let ident = match &var.name {
@@ -2044,13 +2045,20 @@ fn check_var_tag_missing_types(
                     );
                 }
                 crate::missing_type::MissingTypeIssue::GenericArgs { name, templates } => {
-                    out.push(
-                        Diagnostic::error(
-                            span,
-                            format!("{ident} contains generic {name} but does not specify its types: {templates}"),
-                        )
-                        .with_code("missingType.generics"),
-                    );
+                    let mut d = Diagnostic::error(
+                        span,
+                        format!("{ident} contains generic {name} but does not specify its types: {templates}"),
+                    )
+                    .with_code("missingType.generics");
+                    // `--fix`: complete the args from the assignment's RHS.
+                    if fa.collect_fixes {
+                        if let Some(fix) =
+                            crate::fix::var_generic_completion_fix(fa, scope, st, doc_raw)
+                        {
+                            d = d.with_fix(fix);
+                        }
+                    }
+                    out.push(d);
                 }
                 crate::missing_type::MissingTypeIssue::CallableSignature => {
                     out.push(
@@ -3082,7 +3090,30 @@ pub(crate) static RULES: &[RuleEntry] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::codes;
+    use crate::testutil::{codes, replace_fixes};
+
+    #[test]
+    fn fix_completes_inline_var_generic_from_rhs() {
+        // The RHS instantiation of the same class completes the bare tag.
+        let src = "<?php\n/** @template T */\nclass Box {\n    /** @param T $v */\n    public function __construct(public mixed $v) {}\n}\nfunction f(): void {\n    /** @var Box $b */\n    $b = new Box(new DateTime());\n}\n";
+        let fx = replace_fixes(src, run_var_tag_missing_types);
+        assert_eq!(fx.len(), 1, "{fx:?}");
+        let (span, replacement) = &fx[0];
+        assert_eq!(&src[span.range()], "Box");
+        assert_eq!(replacement, "Box<DateTime>");
+    }
+
+    #[test]
+    fn no_var_generic_fix_when_rhs_is_a_different_class() {
+        let src = "<?php\n/** @template T */\nclass Box {}\nclass Other {}\nfunction f(): void {\n    /** @var Box $b */\n    $b = new Other();\n}\n";
+        assert!(replace_fixes(src, run_var_tag_missing_types).is_empty());
+    }
+
+    #[test]
+    fn no_var_generic_fix_for_wrong_variable_name() {
+        let src = "<?php\n/** @template T */\nclass Box {\n    public function __construct(public mixed $v) {}\n}\nfunction f(): void {\n    /** @var Box $other */\n    $b = new Box(1);\n}\n";
+        assert!(replace_fixes(src, run_var_tag_missing_types).is_empty());
+    }
 
     // --- @property / @method tag class refs ---
 
