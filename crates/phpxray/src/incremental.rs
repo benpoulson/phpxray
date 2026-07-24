@@ -169,6 +169,11 @@ pub struct Session {
     /// current pass's result so files depending on an *inferred* signature that
     /// changed are invalidated (declared-artifact diffing alone can't see it).
     prev_inferred: Option<php_reflect::InferredSignatures>,
+    /// The `(display-path, source)` of each configured stub file as of the last
+    /// pass. Stubs are re-read/parsed every pass and indexed last (winning over
+    /// source); when their content changes, every analyzed file is re-checked
+    /// (a stub edit can affect any symbol), keeping the session batch-equivalent.
+    stub_sources: Vec<(String, String)>,
     first_pass: bool,
     stats: PassStats,
 }
@@ -203,6 +208,7 @@ impl Session {
             discovery_fingerprint: DiscoveryFingerprint::of(config),
             analysis_fingerprint: AnalysisFingerprint::of(config),
             prev_inferred: None,
+            stub_sources: Vec::new(),
             first_pass: true,
             stats: PassStats::default(),
         }
@@ -347,12 +353,32 @@ impl Session {
                 ParsedFile {
                     path: rel,
                     analyze,
+                    stub: false,
                     source,
                     program,
                     diagnostics,
                 },
             );
         }
+
+        // Stub files: re-read + parsed fresh each pass (a handful of files; this
+        // matches the batch engine, which re-reads them every run) and indexed
+        // LAST so their reflection wins over project source. A change in stub
+        // content forces every analyzed file to be re-checked (below), since a
+        // stub can redefine any symbol.
+        let stub_srcs = crate::stub_inputs(config, root);
+        let stub_programs: Vec<(String, php_ast::Program)> = stub_srcs
+            .iter()
+            .map(|(path, source, _)| {
+                (path.clone(), php_parser::parse_into(source, &self.interner).0)
+            })
+            .collect();
+        let stub_now: Vec<(String, String)> = stub_srcs
+            .iter()
+            .map(|(path, source, _)| (path.clone(), source.clone()))
+            .collect();
+        let stubs_changed = !self.first_pass && stub_now != self.stub_sources;
+        self.stub_sources = stub_now;
 
         // Rebuild the shared indexes from cached artifacts (Arc merges).
         let mut project = self.project_base.clone();
@@ -365,6 +391,14 @@ impl Session {
             };
             project.add_file_as(rel, &e.file_index, kind);
             reflection.add_artifact(&e.reflect_artifact);
+        }
+        // Stubs indexed last (win over source).
+        for (path, program) in &stub_programs {
+            let file_index = index_file(program, &self.interner);
+            let artifact =
+                reflect_artifact(Some(path), program, &self.interner, php_reflect::SourceKind::Scan);
+            project.add_file_as(path, &file_index, php_index::SourceKind::Scan);
+            reflection.add_artifact(&artifact);
         }
         // Cross-class `@phpstan-import-type` (needs every class indexed first).
         reflection.resolve_type_imports();
@@ -386,7 +420,12 @@ impl Session {
                 .par_iter()
                 .map(|src| php_parser::parse_into(src, &self.interner).0)
                 .collect();
-            let prog_refs: Vec<&php_ast::Program> = programs.iter().collect();
+            // Stub programs contribute signatures too, and are ordered last to
+            // mirror the batch engine (where stubs trail `parsed`).
+            let prog_refs: Vec<&php_ast::Program> = programs
+                .iter()
+                .chain(stub_programs.iter().map(|(_, p)| p))
+                .collect();
             let inferred = php_infer::infer_and_apply(
                 &mut reflection,
                 &prog_refs,
@@ -408,7 +447,7 @@ impl Session {
             .iter()
             .filter(|(_, e)| e.analyze)
             .filter(|(rel, e)| {
-                if analysis_changed || changed_files.contains(*rel) {
+                if analysis_changed || stubs_changed || changed_files.contains(*rel) {
                     return true;
                 }
                 if e.deps.global && any_surface_changed {
@@ -449,6 +488,7 @@ impl Session {
             to_analyze.push(ParsedFile {
                 path: rel.clone(),
                 analyze: e.analyze,
+                stub: false,
                 source: e.source.clone(),
                 program,
                 diagnostics,

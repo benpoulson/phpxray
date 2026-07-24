@@ -102,6 +102,39 @@ fn json_output_uses_phpstan_like_shape() {
 }
 
 #[test]
+fn stub_files_override_source_signatures() {
+    // A stub file supplies a typed signature that wins over the untyped source
+    // declaration, so a call with the wrong argument type is now reported.
+    let p = TempProject::new("stubfiles");
+    write_config(
+        &p,
+        "level: 5\npaths:\n  - src\nstubFiles:\n  - stubs/repo.stub\n",
+    );
+    p.write(
+        "src/app.php",
+        "<?php\nclass Repository {\n    public function find($id) { return null; }\n}\nfunction go(Repository $r): void {\n    $r->find([]);\n}\n",
+    );
+    p.write(
+        "stubs/repo.stub",
+        "<?php\nclass Repository {\n    public function find(int $id) {}\n}\n",
+    );
+
+    let output = p.run(["--error-format", "json"]);
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(json["totals"]["file_errors"], 1, "{}", stdout(&output));
+    assert_eq!(
+        json["files"]["src/app.php"]["messages"][0]["identifier"],
+        "argument.type"
+    );
+
+    // Without the stub, the untyped source signature yields no finding.
+    write_config(&p, "level: 5\npaths:\n  - src\n");
+    let clean = p.run(["--error-format", "json"]);
+    assert!(clean.status.success(), "{}", stdout(&clean));
+}
+
+#[test]
 fn configured_baseline_suppresses_findings() {
     let p = TempProject::new("baseline");
     write_config(&p, "level: 0\npaths:\n  - src\nbaseline: baseline.yaml\n");

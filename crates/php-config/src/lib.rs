@@ -68,6 +68,12 @@ pub struct Config {
     /// legacy untyped code without affecting native-level (`treatPhpDocTypesAsCertain:
     /// false`) checking. Set `false` to analyze declarations only, like PHPStan.
     pub infer_untyped_signatures: bool,
+    /// User-supplied stub files (`.stub`/`.php`), parsed with our own front end
+    /// and indexed *after* project source so their declarations win over (or fill
+    /// in) reflection for the named symbols — the standard way to correct or
+    /// supply third-party signatures. Paths resolve relative to the project root.
+    /// Mirrors PHPStan's `parameters.stubFiles`.
+    pub stub_files: Vec<String>,
     /// Global type aliases (`typeAliases: { AliasName: 'int|string' }`). Each
     /// alias name is usable unqualified in any PHPDoc; expanded into reflected
     /// member/function types after indexing (a real class of the same name wins,
@@ -97,6 +103,7 @@ impl Default for Config {
             report_unmatched_ignored: true,
             treat_phpdoc_types_as_certain: true,
             infer_untyped_signatures: true,
+            stub_files: Vec::new(),
             type_aliases: std::collections::HashMap::new(),
             ignore: Vec::new(),
         }

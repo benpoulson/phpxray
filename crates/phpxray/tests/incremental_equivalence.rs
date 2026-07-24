@@ -37,6 +37,22 @@ impl Project {
         }
     }
 
+    /// Like [`Project::new`] but with a full config YAML (e.g. to set
+    /// `stubFiles`). Files are written before the session is constructed.
+    fn new_with_config(config_yaml: &str, files: &[(&str, &str)]) -> Project {
+        let root = temp_dir("incr-equiv");
+        for (rel, src) in files {
+            write_file(&root, rel, src);
+        }
+        let config = Config::from_yaml(config_yaml).unwrap();
+        let session = Session::new(&config);
+        Project {
+            root,
+            config,
+            session,
+        }
+    }
+
     fn write(&self, rel: &str, src: &str) {
         write_file(&self.root, rel, src);
     }
@@ -130,6 +146,42 @@ fn temp_dir(label: &str) -> PathBuf {
     ));
     fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+#[test]
+fn stub_file_edit_stays_equivalent() {
+    // A stub supplies a typed signature that wins over untyped source; editing
+    // the stub between passes must re-analyze dependents and stay batch-identical.
+    let mut p = Project::new_with_config(
+        "level: 5\npaths:\n  - src\nstubFiles:\n  - stubs/lib.stub\n",
+        &[
+            (
+                "src/app.php",
+                "<?php\nfunction take(Lib $l): void { $l->work([]); }\n",
+            ),
+            (
+                "src/lib.php",
+                "<?php\nclass Lib { public function work($x) {} }\n",
+            ),
+            (
+                "stubs/lib.stub",
+                "<?php\nclass Lib { public function work(int $x) {} }\n",
+            ),
+        ],
+    );
+    // Initial: stub types `work(int)`, so `work([])` is an argument.type error.
+    let before = p.check("initial", None);
+    assert!(!before.is_empty(), "stub-typed param should flag array arg");
+
+    // Edit the stub so the param accepts arrays: the finding must disappear, and
+    // the session (which doesn't watch the stub file) must still match batch.
+    p.write(
+        "stubs/lib.stub",
+        "<?php\nclass Lib { public function work(array $x) {} }\n",
+    );
+    let hint = p.hint(&["src/app.php"]);
+    let after = p.check("stub edit", Some(&hint));
+    assert!(after.is_empty(), "widened stub param should clear the finding");
 }
 
 #[test]

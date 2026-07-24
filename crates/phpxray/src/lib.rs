@@ -37,6 +37,10 @@ pub struct ParsedFile {
     pub path: String,
     /// Whether diagnostics should be reported for this file.
     pub analyze: bool,
+    /// A user-supplied stub file (`stubFiles` config): never analyzed, indexed
+    /// after project source so it wins for the named symbols, and excluded from
+    /// the scanned-file count.
+    pub stub: bool,
     pub source: String,
     pub program: php_ast::Program,
     pub diagnostics: Vec<php_diagnostics::Diagnostic>,
@@ -75,6 +79,20 @@ impl Default for RunOptions {
             debug: false,
         }
     }
+}
+
+/// Read the configured `stubFiles` into `(display-path, source, analyze=false)`
+/// inputs. Paths resolve relative to the project root; a missing/unreadable stub
+/// degrades to empty source (indexes nothing) rather than failing the run.
+pub(crate) fn stub_inputs(config: &Config, root: &Path) -> Vec<(String, String, bool)> {
+    config
+        .stub_files
+        .iter()
+        .map(|rel| {
+            let path = root.join(rel);
+            (rel_path(&path, root), read_source_lossy(&path), false)
+        })
+        .collect()
 }
 
 /// Build the flow-terminator set from the config's `earlyTerminating*` lists
@@ -157,6 +175,7 @@ fn parse_files_with_mode_progress(
             ParsedFile {
                 path,
                 analyze,
+                stub: false,
                 source,
                 program,
                 diagnostics,
@@ -325,7 +344,7 @@ fn run_pipeline(config: &Config, root: &Path, options: RunOptions) -> (Report, V
     }
     let started = Instant::now();
     let read = progress.counter(files.len(), "Reading files");
-    let inputs: Vec<(String, String, bool)> = files
+    let mut inputs: Vec<(String, String, bool)> = files
         .iter()
         .map(|f| {
             let input = (
@@ -338,6 +357,12 @@ fn run_pipeline(config: &Config, root: &Path, options: RunOptions) -> (Report, V
         })
         .collect();
     read.finish();
+    // Stub files are appended *last* (so their reflection wins over source in the
+    // last-write index) and marked non-analyzed (they emit no diagnostics). Their
+    // source is part of `inputs`, so it feeds the result-cache key and parse.
+    let stub_inputs = stub_inputs(config, root);
+    let stub_count = stub_inputs.len();
+    inputs.extend(stub_inputs);
     if let Some(t) = &mut timings {
         t.read = started.elapsed();
     }
@@ -381,7 +406,15 @@ fn run_pipeline(config: &Config, root: &Path, options: RunOptions) -> (Report, V
         }
     }
     let started = Instant::now();
-    let (parsed, interner) = parse_files_with_mode_progress(inputs, &progress);
+    let (mut parsed, interner) = parse_files_with_mode_progress(inputs, &progress);
+    // Mark the trailing stub entries (appended last above): they are indexed but
+    // never analyzed, and excluded from the scanned-file count.
+    if stub_count > 0 {
+        let start = parsed.len() - stub_count;
+        for f in &mut parsed[start..] {
+            f.stub = true;
+        }
+    }
     if let Some(t) = &mut timings {
         t.parse = started.elapsed();
     }
@@ -570,10 +603,12 @@ fn analyze_parsed_progress(
         .flat_map(|(_, findings, _)| findings)
         .collect();
     analyzing.finish();
+    let stub_count = parsed.iter().filter(|f| f.stub).count();
     Report {
         findings,
         files_analyzed: analyzed_count,
-        files_scanned: parsed.len() - analyzed_count,
+        // Stub files are indexed but neither analyzed nor user-facing "scanned".
+        files_scanned: parsed.len() - analyzed_count - stub_count,
         timings: None,
     }
 }
