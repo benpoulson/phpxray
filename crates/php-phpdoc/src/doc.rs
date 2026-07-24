@@ -271,16 +271,25 @@ fn normalize(name: &str) -> (&str, i8) {
 }
 
 /// Parse a leading type from `s`, returning it and the remaining text. When `s`
-/// starts with `$` there is no type (the variable comes first).
+/// starts with `$` there is normally no type (the variable comes first) — except
+/// `$this`, the one valid `$`-prefixed *type* (fluent `@return $this`), which
+/// must be parsed so late-static binding survives instead of decaying to `mixed`.
 fn split_type(s: &str) -> (Option<DocType>, &str) {
     let t = s.trim_start();
-    if t.starts_with('$') {
+    if t.starts_with('$') && !starts_with_this_type(t) {
         return (None, t);
     }
     match parse_type_prefix(t) {
         Some((ty, n)) => (Some(ty), t[n..].trim_start()),
         None => (None, t),
     }
+}
+
+/// Whether `t` begins with the `$this` type token (not a `$thisSomething`
+/// variable): `$this` followed by end-of-string or a non-identifier character.
+fn starts_with_this_type(t: &str) -> bool {
+    t.strip_prefix("$this")
+        .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_'))
 }
 
 fn parse_param(value: &str) -> Param {
@@ -533,6 +542,19 @@ mod tests {
         assert_eq!(d.params[0].ty, None);
         assert_eq!(d.params[0].name.as_deref(), Some("thing"));
         assert_eq!(d.params[0].description, "a thing");
+    }
+
+    #[test]
+    fn return_this_is_parsed_as_a_type() {
+        // `@return $this` is a fluent late-static return, not a missing type — it
+        // must not decay to `None` (which would surface as `mixed`).
+        let d = parse("/** @return $this */");
+        assert_eq!(d.returns, parse_type("$this"));
+        assert!(d.returns.is_some());
+        // A `$this`-prefixed *variable* name is still a nameless param, not a type.
+        let p = parse("/** @param $thisThing a value */");
+        assert_eq!(p.params[0].ty, None);
+        assert_eq!(p.params[0].name.as_deref(), Some("thisThing"));
     }
 
     #[test]
