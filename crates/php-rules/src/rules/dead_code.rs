@@ -1225,13 +1225,23 @@ fn run_noop(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     .with_code("booleanOr.resultUnused"),
             ),
             // Any other pure value expression on its own line does nothing.
-            _ if is_pure_value_noop(e) => out.push(
-                Diagnostic::error(
-                    e.span,
-                    "Expression on a separate line does not do anything.",
+            // phpstan prints the expression in the message; use the source
+            // text with whitespace runs collapsed (multi-line spans).
+            _ if is_pure_value_noop(e) => {
+                let text = e
+                    .span
+                    .text(fa.source)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                out.push(
+                    Diagnostic::error(
+                        e.span,
+                        format!("Expression \"{text}\" on a separate line does not do anything."),
+                    )
+                    .with_code("expr.resultUnused"),
                 )
-                .with_code("expr.resultUnused"),
-            ),
+            }
             _ => {}
         }
     });
@@ -1766,6 +1776,12 @@ mod tests {
     #[test]
     fn bare_variable_statement_is_flagged() {
         assert_eq!(codes("<?php $a;", run_noop), ["expr.resultUnused"]);
+        // phpstan-faithful message: the expression text is included.
+        let ds = crate::testutil::run("<?php $a;", run_noop);
+        assert_eq!(
+            ds[0].message,
+            "Expression \"$a\" on a separate line does not do anything."
+        );
     }
 
     #[test]

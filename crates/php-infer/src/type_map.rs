@@ -82,9 +82,27 @@ pub fn type_map(
     interner: &Interner,
     want_native: bool,
 ) -> TypeMap {
-    let merged = build(reflection, program, interner, false);
-    let native = want_native.then(|| build(reflection, program, interner, true));
+    type_map_with(reflection, program, interner, want_native, empty_terminators())
+}
+
+/// [`type_map`] honouring user-configured `earlyTerminating*` calls.
+pub fn type_map_with(
+    reflection: &ReflectionIndex,
+    program: &Program,
+    interner: &Interner,
+    want_native: bool,
+    terminators: &std::sync::Arc<crate::Terminators>,
+) -> TypeMap {
+    let merged = build(reflection, program, interner, false, terminators);
+    let native = want_native.then(|| build(reflection, program, interner, true, terminators));
     facet(merged, native)
+}
+
+/// The shared empty terminator set (the no-config default).
+fn empty_terminators() -> &'static std::sync::Arc<crate::Terminators> {
+    static EMPTY: std::sync::OnceLock<std::sync::Arc<crate::Terminators>> =
+        std::sync::OnceLock::new();
+    EMPTY.get_or_init(Default::default)
 }
 
 /// Build a contextual type map for a single function-like body under callback
@@ -126,7 +144,16 @@ fn contextual_raw(
     let vars = contextual_param_vars(params, inferred_params, native);
     let mut map = RawMap::new();
     record_scope(
-        reflection, scope, interner, class, vars, native, None, body, &mut map,
+        reflection,
+        scope,
+        interner,
+        class,
+        vars,
+        native,
+        None,
+        empty_terminators(),
+        body,
+        &mut map,
     );
     map
 }
@@ -136,6 +163,7 @@ fn build(
     program: &Program,
     interner: &Interner,
     native: bool,
+    terminators: &std::sync::Arc<crate::Terminators>,
 ) -> RawMap {
     let mut map = RawMap::new();
     for_each_region(&program.stmts, interner, |scope, region| {
@@ -148,6 +176,7 @@ fn build(
             HashMap::new(),
             native,
             None,
+            terminators,
             region,
             &mut map,
         );
@@ -155,7 +184,7 @@ fn build(
         // and conditional declarations; each is its own scope).
         for st in region {
             walk::for_each_stmt_in_stmt(st, &mut |s| {
-                collect_scope(reflection, scope, interner, s, native, &mut map)
+                collect_scope(reflection, scope, interner, s, native, terminators, &mut map)
             });
         }
     });
@@ -213,12 +242,14 @@ fn contextual_param_type(p: &ParamReflection, inferred: &[Type], native: bool) -
 
 /// If `s` declares a function or class, record types for each of its bodies in a
 /// fresh scope.
+#[allow(clippy::too_many_arguments)]
 fn collect_scope(
     reflection: &ReflectionIndex,
     scope: &Scope,
     interner: &Interner,
     s: &php_ast::Stmt,
     native: bool,
+    terminators: &std::sync::Arc<crate::Terminators>,
     map: &mut RawMap,
 ) {
     match &s.kind {
@@ -254,6 +285,7 @@ fn collect_scope(
                 vars,
                 native,
                 crate::generator_send_type(return_type),
+                terminators,
                 &f.body,
                 map,
             );
@@ -305,6 +337,7 @@ fn collect_scope(
                     } else {
                         &mr.return_type
                     }),
+                    terminators,
                     body,
                     map,
                 );
@@ -325,6 +358,7 @@ fn record_scope(
     init_vars: HashMap<String, Type>,
     native: bool,
     generator_send: Option<Type>,
+    terminators: &std::sync::Arc<crate::Terminators>,
     body: &[php_ast::Stmt],
     map: &mut RawMap,
 ) {
@@ -333,6 +367,7 @@ fn record_scope(
     ctx.vars = init_vars;
     ctx.native = native;
     ctx.generator_send = generator_send;
+    ctx.terminators = terminators.clone();
     // The recording pass flows the environment statement-by-statement *and*
     // records each expression at its narrowed flow point, so expressions inside
     // `if`/`else`/loop branches are typed against the narrowed environment.

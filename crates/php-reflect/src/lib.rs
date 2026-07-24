@@ -16,8 +16,9 @@ mod builtins;
 mod model;
 mod project;
 pub use model::{
-    attr_target, reflect_class, reflect_function, AttributeSpec, ClassReflection, ConstReflection,
-    FunctionReflection, MethodReflection, ParamReflection, PropertyReflection,
+    attr_target, reflect_class, reflect_function, AssertReflection, AttributeSpec,
+    ClassReflection, ConstReflection, FunctionReflection, MethodReflection, ParamReflection,
+    PropertyReflection,
 };
 pub use project::{
     reflect_artifact, reflect_file, FileReflectionArtifact, Found, InferredSig, InferredSignatures,
@@ -171,18 +172,22 @@ fn doc_keyword(name: &str) -> Option<Type> {
         "array-key" => array_key(),
         "scalar" => Type::union(vec![Type::Int, Type::Float, Type::String, Type::Bool]),
         "number" | "numeric" => Type::union(vec![Type::Int, Type::Float]),
+        // Sign-refined ints are ranges (phpstan's IntegerRangeType views).
+        "positive-int" => Type::int_range(Some(1), None),
+        "negative-int" => Type::int_range(None, Some(-1)),
+        "non-negative-int" => Type::int_range(Some(0), None),
+        "non-positive-int" => Type::int_range(None, Some(0)),
         // Refinements we don't model precisely collapse to their base type.
-        "positive-int" | "negative-int" | "non-positive-int" | "non-negative-int"
-        | "non-zero-int" | "int-mask" | "integer" => Type::Int,
+        "non-zero-int" | "int-mask" | "integer" => Type::Int,
         "double" => Type::Float,
         "boolean" => Type::Bool,
-        "non-empty-string"
-        | "non-falsy-string"
-        | "truthy-string"
-        | "numeric-string"
-        | "lowercase-string"
-        | "literal-string"
-        | "html-escaped-string" => Type::String,
+        "non-empty-string" => Type::StringOf(php_types::StringRefinement::NonEmpty),
+        "non-falsy-string" | "truthy-string" => Type::StringOf(php_types::StringRefinement::NonFalsy),
+        "numeric-string" => Type::StringOf(php_types::StringRefinement::Numeric),
+        "literal-string" => Type::StringOf(php_types::StringRefinement::Literal),
+        "callable-string" => Type::StringOf(php_types::StringRefinement::Callable),
+        // Case/escaping refinements we don't model collapse to their base type.
+        "lowercase-string" | "uppercase-string" | "html-escaped-string" => Type::String,
         "key-of" | "value-of" => Type::Mixed,
         "noreturn" | "no-return" => Type::Never,
         "empty" => Type::Unknown("empty".into()),
@@ -219,10 +224,58 @@ fn doc_generic(scope: &Scope, templates: &[String], base: &str, args: &[DocType]
         "class-string" | "interface-string" => {
             Type::ClassString(resolved.into_iter().next().map(Box::new))
         }
-        // `int<0, 100>` — a bounded int range we don't model; collapse to `int`.
-        "int" => Type::Int,
-        // `key-of<T>` / `value-of<T>` / `int-mask-of<T>` — unmodelled refinements.
-        "key-of" | "value-of" | "int-mask-of" | "int-mask" => Type::Mixed,
+        // `int<0, 100>` — a bounded integer range. Bounds are literal ints or
+        // the `min`/`max` keywords (open); anything else stays plain `int`.
+        "int" => match args {
+            [lo, hi] => {
+                let bound = |a: &DocType, open_kw: &str| -> Option<Option<i64>> {
+                    match a {
+                        DocType::ConstInt(n) => n.parse::<i64>().ok().map(Some),
+                        DocType::Named(w) if w.eq_ignore_ascii_case(open_kw) => Some(None),
+                        _ => None,
+                    }
+                };
+                match (bound(lo, "min"), bound(hi, "max")) {
+                    (Some(lo), Some(hi)) => Type::int_range(lo, hi),
+                    _ => Type::Int,
+                }
+            }
+            _ => Type::Int,
+        },
+        // `key-of<T>` / `value-of<T>` over array-shaped operands resolve to the
+        // key/value type. Enum `value-of<Suit>` needs reflection (not available
+        // here) and stays `mixed`; `int-mask-of` is at least an `int`.
+        "key-of" => match resolved.as_slice() {
+            [Type::Array(Some(kv))] | [Type::Iterable(Some(kv))] => kv.0.clone(),
+            [Type::List(_)] => Type::Int,
+            [Type::Shape { fields, sealed: true }] => {
+                let keys: Vec<Type> = fields
+                    .iter()
+                    .map(|f| match &f.key {
+                        Some(k) => match k.parse::<i64>() {
+                            Ok(n) => Type::LiteralInt(n),
+                            Err(_) => Type::LiteralString(k.as_str().into()),
+                        },
+                        None => Type::Int,
+                    })
+                    .collect();
+                if keys.is_empty() {
+                    Type::Mixed
+                } else {
+                    Type::union(keys)
+                }
+            }
+            _ => Type::Mixed,
+        },
+        "value-of" => match resolved.as_slice() {
+            [Type::Array(Some(kv))] | [Type::Iterable(Some(kv))] => kv.1.clone(),
+            [Type::List(inner)] => (**inner).clone(),
+            [Type::Shape { fields, sealed: true }] if !fields.is_empty() => {
+                Type::union(fields.iter().map(|f| f.ty.clone()).collect())
+            }
+            _ => Type::Mixed,
+        },
+        "int-mask-of" | "int-mask" => Type::Int,
         // A user/class generic, e.g. `Collection<int, User>`.
         _ => match doc_named(scope, templates, base) {
             Type::Named { fqn, .. } => Type::Named {
@@ -443,8 +496,30 @@ mod tests {
         assert_eq!(doc(&s, &[], "array-key").to_string(), "int|string");
         assert_eq!(doc(&s, &[], "class-string"), Type::ClassString(None));
         assert_eq!(doc(&s, &[], "list"), Type::List(Box::new(Type::Mixed)));
-        assert_eq!(doc(&s, &[], "positive-int"), Type::Int);
-        assert_eq!(doc(&s, &[], "non-empty-string"), Type::String);
+        assert_eq!(doc(&s, &[], "positive-int"), Type::int_range(Some(1), None));
+        assert_eq!(doc(&s, &[], "negative-int"), Type::int_range(None, Some(-1)));
+        assert_eq!(
+            doc(&s, &[], "non-negative-int"),
+            Type::int_range(Some(0), None)
+        );
+        assert_eq!(
+            doc(&s, &[], "non-empty-string"),
+            Type::StringOf(php_types::StringRefinement::NonEmpty)
+        );
+        assert_eq!(
+            doc(&s, &[], "numeric-string"),
+            Type::StringOf(php_types::StringRefinement::Numeric)
+        );
+        assert_eq!(
+            doc(&s, &[], "callable-string"),
+            Type::StringOf(php_types::StringRefinement::Callable)
+        );
+        assert_eq!(
+            doc(&s, &[], "literal-string"),
+            Type::StringOf(php_types::StringRefinement::Literal)
+        );
+        // Case refinements still collapse (unmodelled).
+        assert_eq!(doc(&s, &[], "lowercase-string"), Type::String);
         assert_eq!(doc(&s, &[], "scalar").to_string(), "int|float|string|bool");
         assert_eq!(doc(&s, &[], "numeric").to_string(), "int|float");
         assert_eq!(doc(&s, &[], "$this"), Type::StaticType);
@@ -512,7 +587,37 @@ mod tests {
             doc(&s, &[], "class-string<User>").to_string(),
             "class-string<App\\User>"
         );
-        assert_eq!(doc(&s, &[], "int<0, 100>"), Type::Int);
+        assert_eq!(
+            doc(&s, &[], "int<0, 100>"),
+            Type::int_range(Some(0), Some(100))
+        );
+        // key-of / value-of resolve over array-shaped operands.
+        assert_eq!(
+            doc(&s, &[], "key-of<array<string, int>>").to_string(),
+            "string"
+        );
+        assert_eq!(
+            doc(&s, &[], "value-of<array<string, int>>").to_string(),
+            "int"
+        );
+        assert_eq!(doc(&s, &[], "value-of<list<Foo>>").to_string(), "App\\Foo");
+        assert_eq!(
+            doc(&s, &[], "key-of<array{a: int, b: string}>").to_string(),
+            "'a'|'b'"
+        );
+        assert_eq!(
+            doc(&s, &[], "value-of<array{a: int, b: string}>").to_string(),
+            "int|string"
+        );
+        assert_eq!(doc(&s, &[], "int-mask-of<1|2|4>"), Type::Int);
+        assert_eq!(
+            doc(&s, &[], "int<min, 0>"),
+            Type::int_range(None, Some(0))
+        );
+        assert_eq!(
+            doc(&s, &[], "int<1, max>"),
+            Type::int_range(Some(1), None)
+        );
     }
 
     #[test]

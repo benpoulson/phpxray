@@ -194,7 +194,7 @@ fn body_return_type(
         return None;
     }
     let ty = Type::union(returns);
-    is_useful(&ty).then_some(ty)
+    useful_inference(&ty).then_some(ty)
 }
 
 /// Whether `body` is a generator (contains `yield`/`yield from` in its own scope).
@@ -274,6 +274,113 @@ fn infer_params_from_callsites(
 
 type FnArgs = HashMap<String, Vec<Vec<Type>>>;
 type MethodArgs = HashMap<(String, String), Vec<Vec<Type>>>;
+
+// --- explicit-`array` parameter evidence (for `--fix`) -----------------------
+
+/// Call-site evidence for parameters *explicitly* declared as a bare
+/// `array`/`iterable`: the refined union of observed argument types, keyed by
+/// [`evidence_key`]. The ordinary inference above deliberately skips explicit
+/// params (declarations are trusted); this side-channel exists solely so
+/// `--fix` can fill in `@param array<K, V>` value types — it is **never**
+/// applied to the [`ReflectionIndex`] and cannot change analysis results.
+pub type ExplicitParamEvidence = HashMap<(String, String, usize), Type>;
+
+/// Canonical evidence-map key: lowercased, `\`-stripped function/class FQN,
+/// lowercased method name (empty for free functions), parameter index.
+pub fn evidence_key(class_or_fn: &str, method: Option<&str>, idx: usize) -> (String, String, usize) {
+    (
+        class_or_fn.trim_start_matches('\\').to_ascii_lowercase(),
+        method.unwrap_or("").to_ascii_lowercase(),
+        idx,
+    )
+}
+
+/// Harvest [`ExplicitParamEvidence`] across `programs`. Same call-site walk as
+/// parameter inference (skips builtins, spread/named/placeholder calls), but
+/// selecting explicitly-typed bare-iterable params, and only recording evidence
+/// that is useful and actually refines (no bare iterable left in the union).
+pub fn explicit_iterable_param_evidence(
+    index: &ReflectionIndex,
+    programs: &[&Program],
+    interner: &Interner,
+) -> ExplicitParamEvidence {
+    let per_file: Vec<(FnArgs, MethodArgs)> = programs
+        .par_iter()
+        .map(|program| harvest_file(index, program, interner))
+        .collect();
+    let mut fn_args: FnArgs = HashMap::new();
+    let mut method_args: MethodArgs = HashMap::new();
+    for (file_fns, file_methods) in per_file {
+        for (fqn, positions) in file_fns {
+            merge_positions(fn_args.entry(fqn).or_default(), positions);
+        }
+        for (key, positions) in file_methods {
+            merge_positions(method_args.entry(key).or_default(), positions);
+        }
+    }
+
+    let mut out = ExplicitParamEvidence::new();
+    for (fqn, positions) in fn_args {
+        let Some(f) = index.function(&fqn) else {
+            continue;
+        };
+        if f.builtin {
+            continue;
+        }
+        collect_explicit_iterable(&f.params, &positions, |idx, ty| {
+            out.insert(evidence_key(&fqn, None, idx), ty);
+        });
+    }
+    for ((class_fqn, mname), positions) in method_args {
+        let Some(c) = index.class(&class_fqn) else {
+            continue;
+        };
+        if c.builtin {
+            continue;
+        }
+        let Some(m) = c.methods.iter().find(|m| m.name.eq_ignore_ascii_case(&mname)) else {
+            continue;
+        };
+        collect_explicit_iterable(&m.params, &positions, |idx, ty| {
+            out.insert(evidence_key(&class_fqn, Some(&mname), idx), ty);
+        });
+    }
+    out
+}
+
+fn collect_explicit_iterable(
+    params: &[ParamReflection],
+    positions: &[Vec<Type>],
+    mut record: impl FnMut(usize, Type),
+) {
+    for (i, p) in params.iter().enumerate() {
+        if !p.explicit || p.variadic || !contains_bare_iterable(&p.ty) {
+            continue;
+        }
+        let Some(observed) = positions.get(i) else {
+            continue;
+        };
+        if observed.is_empty() {
+            continue;
+        }
+        let u = Type::union(observed.iter().cloned().map(widen_literals).collect());
+        if useful_inference(&u) && !contains_bare_iterable(&u) {
+            record(i, u);
+        }
+    }
+}
+
+/// Whether `ty` contains a bare `array`/`iterable` (no key/value) anywhere.
+fn contains_bare_iterable(ty: &Type) -> bool {
+    let mut found = false;
+    ty.clone().map(&mut |t| {
+        if matches!(t, Type::Array(None) | Type::Iterable(None)) {
+            found = true;
+        }
+        t
+    });
+    found
+}
 
 /// Collect one file's observed argument types per resolved call target.
 fn harvest_file(
@@ -362,8 +469,8 @@ fn build_param_sig(params: &[ParamReflection], positions: &[Vec<Type>]) -> Infer
             }
             // A parameter's type is the *general* type of the values passed, not the
             // specific literals observed — widen `'x'`→`string`, `7`→`int`, etc.
-            let u = Type::union(observed.iter().cloned().map(widen).collect());
-            is_useful(&u).then_some(u)
+            let u = Type::union(observed.iter().cloned().map(widen_literals).collect());
+            useful_inference(&u).then_some(u)
         })
         .collect();
     InferredSig {
@@ -377,17 +484,17 @@ fn build_param_sig(params: &[ParamReflection], positions: &[Vec<Type>]) -> Infer
 /// A type precise enough to record: not `mixed`/unknown/`never`/`void`, and (for a
 /// union) every member is itself useful — so a union that retained `mixed` from an
 /// uncertain branch is rejected, falling back to the declared `mixed`.
-fn is_useful(ty: &Type) -> bool {
+pub fn useful_inference(ty: &Type) -> bool {
     match ty {
         Type::Mixed | Type::ExplicitMixed | Type::Never | Type::Void | Type::Unknown(_) => false,
-        Type::Union(parts) => !parts.is_empty() && parts.iter().all(is_useful),
+        Type::Union(parts) => !parts.is_empty() && parts.iter().all(useful_inference),
         _ => true,
     }
 }
 
 /// Widen literal/singleton types to their base for parameter inference:
 /// `'draft'`→`string`, `42`→`int`, `true`/`false`→`bool`.
-fn widen(ty: Type) -> Type {
+pub fn widen_literals(ty: Type) -> Type {
     ty.map(&mut |part| match part {
         Type::LiteralInt(_) => Type::Int,
         Type::LiteralString(_) => Type::String,
@@ -481,8 +588,9 @@ mod tests {
 
     #[test]
     fn return_with_concat_is_string() {
+        // The "!" side is provably non-empty, so the concat is too.
         let idx = run(r#"function g($x) { return $x . "!"; }"#);
-        assert_eq!(fret(&idx, "g"), "string");
+        assert_eq!(fret(&idx, "g"), "non-empty-string");
     }
 
     #[test]

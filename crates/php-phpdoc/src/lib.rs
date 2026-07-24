@@ -16,7 +16,8 @@ mod doc;
 pub mod query;
 mod types;
 pub use doc::{
-    parse, Doc, MethodParam, MethodTag, Param, PropertyAccess, PropertyTag, Template, Var,
+    parse, AssertTag, AssertWhen, Doc, MethodParam, MethodTag, Param, PropertyAccess, PropertyTag,
+    Template, Var,
 };
 pub use types::{parse_type, parse_type_prefix, DocType, ShapeField};
 

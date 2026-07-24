@@ -260,16 +260,34 @@ fn run_missing_const_iterable_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
             };
             for ce in &cd.consts {
                 let cname = fa.interner.resolve(ce.name);
-                out.push(
-                    Diagnostic::error(
-                        ce.value.span,
-                        format!(
-                            "Constant {short}::{cname} type has no value type specified in \
-                             iterable type {word}."
-                        ),
-                    )
-                    .with_code("missingType.iterableValue"),
-                );
+                let mut d = Diagnostic::error(
+                    ce.value.span,
+                    format!(
+                        "Constant {short}::{cname} type has no value type specified in \
+                         iterable type {word}."
+                    ),
+                )
+                .with_code("missingType.iterableValue");
+                // `--fix`: a constant's type is exactly its literal value's type.
+                if fa.collect_fixes && cd.consts.len() == 1 {
+                    let value_ty = php_infer::TypeCtx::new(fa.reflection, scope, fa.interner)
+                        .infer(&ce.value);
+                    // Only refine: the evidence must actually carry a value type.
+                    if crate::rules::functions::bare_iterable_word(&value_ty).is_none() {
+                        if let Some(fix) = crate::fix::typed_tag_fix(
+                            fa,
+                            scope,
+                            &value_ty,
+                            crate::fix::first_attr_span(&cd.attrs).unwrap_or(ce.name_span),
+                            cd.doc.as_deref(),
+                            php_diagnostics::DocTagKind::Var,
+                            None,
+                        ) {
+                            d = d.with_fix(fix);
+                        }
+                    }
+                }
+                out.push(d);
             }
         }
     });
@@ -820,7 +838,7 @@ fn check_overriding_constant_type(
     proto: &php_reflect::Found<php_reflect::ConstReflection>,
     out: &mut Vec<Diagnostic>,
 ) {
-    let parent_has_native = has_native_const_type(&proto.member.ty);
+    let parent_has_native = proto.member.declared && has_native_const_type(&proto.member.ty);
     let proto_decl = proto.declaring_class.trim_start_matches('\\');
     if parent_has_native && !child_has_native {
         out.push(
@@ -1091,7 +1109,7 @@ pub(crate) static RULES: &[RuleEntry] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{codes, codes_version};
+    use crate::testutil::{codes, codes_version, fixes, run_fixes};
     use crate::PhpVersion;
 
     // --- MissingClassConstantTypehintRule (missingType.iterableValue) ----
@@ -1103,6 +1121,23 @@ mod tests {
             codes(src, run_missing_const_iterable_value),
             ["missingType.iterableValue"]
         );
+    }
+
+    #[test]
+    fn fix_var_for_bare_array_const_from_value() {
+        let src = "<?php\nclass C {\n    const array FOO = [1, 2];\n}\n";
+        let fx = fixes(src, run_missing_const_iterable_value);
+        assert_eq!(fx.len(), 1, "{fx:?}");
+        assert_eq!(fx[0].0, "@var list<int>");
+        assert_eq!(fx[0].2, "    ");
+    }
+
+    #[test]
+    fn no_const_fix_for_multi_element_declaration() {
+        let src = "<?php class C { const array A = [1], B = [2]; }";
+        for d in run_fixes(src, run_missing_const_iterable_value) {
+            assert!(d.fix.is_none());
+        }
     }
 
     #[test]

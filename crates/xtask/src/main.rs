@@ -769,6 +769,14 @@ fn cmd_check_run(dir: Option<PathBuf>) -> ExitCode {
         }
     };
     let mut by_code: BTreeMap<String, u64> = BTreeMap::new();
+    let dump_code = std::env::var("XTASK_CHECK_DUMP").ok();
+    for finding in &findings {
+        if let Some(code) = &dump_code {
+            if finding.identifier == Some(code.as_str()) {
+                println!("DUMP {} {}: {}", finding.path, finding.line, finding.message);
+            }
+        }
+    }
     for finding in findings {
         let code = finding.identifier.unwrap_or("?").to_string();
         *by_code.entry(code).or_default() += 1;

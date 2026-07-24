@@ -31,7 +31,36 @@ pub struct Doc {
     pub implements: Vec<DocType>,
     /// Generic trait type arguments: `@use`/`@template-use`.
     pub uses: Vec<DocType>,
+    /// `@phpstan-assert`/`-if-true`/`-if-false` (and psalm equivalents).
+    pub asserts: Vec<AssertTag>,
+    /// `@param-out Type $name` — the type a by-ref parameter holds *after*
+    /// the call returns.
+    pub param_outs: Vec<Param>,
     pub deprecated: bool,
+}
+
+/// A `@phpstan-assert [!]Type $param` assertion: after a call (or in the
+/// branch selected by `when`), `$param` is (not) of `Type`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssertTag {
+    pub ty: DocType,
+    /// The asserted target without the `$`: a parameter name (`value`) or a
+    /// `$this` property path (`this->prop`).
+    pub param: String,
+    /// `!Type` — the value is asserted *not* to be of the type.
+    pub negated: bool,
+    pub when: AssertWhen,
+}
+
+/// Which outcome activates an assertion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssertWhen {
+    /// `@phpstan-assert` — holds after the call returns at all.
+    Always,
+    /// `@phpstan-assert-if-true` — holds when the call returned truthy.
+    IfTrue,
+    /// `@phpstan-assert-if-false` — holds when the call returned falsy.
+    IfFalse,
 }
 
 /// A `@method [static] [ret] name(params) [desc]` declaration.
@@ -126,6 +155,7 @@ pub fn parse(raw: &str) -> Doc {
                 }
             }
             "var" => doc.vars.push(parse_var(&tag.value)),
+            "param-out" => doc.param_outs.push(parse_param(&tag.value)),
             "throws" => {
                 if let Some((ty, _)) = parse_type_prefix(&tag.value) {
                     doc.throws.push(ty);
@@ -156,6 +186,18 @@ pub fn parse(raw: &str) -> Doc {
                 }
             }
             "deprecated" => doc.deprecated = true,
+            // Assertion tags carry type effect only in their prefixed
+            // (phpstan-/psalm-) forms; a bare `@assert` is phpDocumentor prose.
+            "assert" | "assert-if-true" | "assert-if-false" if pri > 0 => {
+                let when = match base {
+                    "assert-if-true" => AssertWhen::IfTrue,
+                    "assert-if-false" => AssertWhen::IfFalse,
+                    _ => AssertWhen::Always,
+                };
+                if let Some(a) = parse_assert(&tag.value, when) {
+                    doc.asserts.push(a);
+                }
+            }
             // Generic parent/interface/trait type args (incl. `template-` forms).
             _ => match gbase {
                 "extends" => push_type(&mut doc.extends, &tag.value),
@@ -166,6 +208,35 @@ pub fn parse(raw: &str) -> Doc {
         }
     }
     doc
+}
+
+/// Parse `[!][=]Type $param` (the `=` "same value" refinement is treated as a
+/// plain type assertion). The target is `$name` or a `$this->prop` path.
+fn parse_assert(value: &str, when: AssertWhen) -> Option<AssertTag> {
+    let mut rest = value.trim_start();
+    let negated = rest.starts_with('!');
+    if negated {
+        rest = rest[1..].trim_start();
+    }
+    if let Some(stripped) = rest.strip_prefix('=') {
+        rest = stripped.trim_start();
+    }
+    let (ty, n) = crate::parse_type_prefix(rest)?;
+    let after = rest[n..].trim_start();
+    let target = after.strip_prefix('$')?;
+    let end = target
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '>'))
+        .unwrap_or(target.len());
+    let param = &target[..end];
+    if param.is_empty() {
+        return None;
+    }
+    Some(AssertTag {
+        ty,
+        param: param.to_string(),
+        negated,
+        when,
+    })
 }
 
 fn push_type(out: &mut Vec<DocType>, value: &str) {
@@ -568,6 +639,26 @@ mod tests {
         assert_eq!(d.properties[1].access, PropertyAccess::ReadOnly);
         assert_eq!(d.properties[1].description, "the name");
         assert_eq!(d.properties[2].access, PropertyAccess::WriteOnly);
+    }
+
+    #[test]
+    fn assert_tags() {
+        let d = parse(
+            "/**\n * @phpstan-assert string $value\n * @phpstan-assert-if-true !null $x\n * @psalm-assert-if-false =int $n\n * @phpstan-assert !null $this->conn\n * @assert prose-only tag ignored\n */",
+        );
+        assert_eq!(d.asserts.len(), 4);
+        assert_eq!(d.asserts[0].param, "value");
+        assert_eq!(d.asserts[0].ty, named("string"));
+        assert!(!d.asserts[0].negated);
+        assert_eq!(d.asserts[0].when, AssertWhen::Always);
+        assert_eq!(d.asserts[1].param, "x");
+        assert!(d.asserts[1].negated);
+        assert_eq!(d.asserts[1].when, AssertWhen::IfTrue);
+        // `=` (same-value) parses as a plain assertion; psalm prefix accepted.
+        assert_eq!(d.asserts[2].param, "n");
+        assert_eq!(d.asserts[2].when, AssertWhen::IfFalse);
+        // `$this->prop` paths keep the arrow path.
+        assert_eq!(d.asserts[3].param, "this->conn");
     }
 
     #[test]

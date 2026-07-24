@@ -1589,10 +1589,12 @@ fn type_is_uncertain(ty: &Type) -> bool {
         | Type::IntRange { .. }
         | Type::Float
         | Type::String
+        | Type::StringOf(_)
         | Type::Object
         | Type::Resource
         | Type::LiteralInt(_)
-        | Type::LiteralString(_) => false,
+        | Type::LiteralString(_)
+        | Type::EnumCase { .. } => false,
     }
 }
 

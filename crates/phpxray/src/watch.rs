@@ -21,6 +21,7 @@ use notify::event::ModifyKind;
 use notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::new_debouncer;
 use php_config::{Config, ExcludeMatcher};
+use php_diagnostics::Severity;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -143,7 +144,8 @@ pub fn run_watch(
     let targets = watch_targets(&config, root, config_file.as_deref());
 
     // Initial render so the user sees results immediately.
-    analyze_and_render(&mut session, &config, root, &options, format, None, None);
+    let report = analyze_and_render(&mut session, &config, root, &options, format, None, None);
+    notify_on_errors(&options, &canonical_root, &report);
 
     let (tx, rx) = mpsc::channel();
     let mut debouncer =
@@ -211,7 +213,7 @@ pub fn run_watch(
                 paths: changed,
                 saw_creates_or_removes,
             });
-            analyze_and_render(
+            let report = analyze_and_render(
                 &mut session,
                 &config,
                 root,
@@ -220,9 +222,56 @@ pub fn run_watch(
                 Some(&reason),
                 hint.as_ref(),
             );
+            notify_on_errors(&options, &canonical_root, &report);
         }
     }
     Ok(())
+}
+
+/// Fire a desktop notification when the last analysis pass contained errors.
+///
+/// This is intentionally quiet: when no desktop notification service is running
+/// (headless CI, missing dbus-daemon, etc.) the call simply returns. The
+/// caller is expected to gate invocations on `options.notify` so that single-
+/// shot CLI runs (where the user is sitting in front of the terminal) don't
+/// get spammed. The notification payload contains the current root directory
+/// name and the error count, so the user gets a quick summary in their tray.
+fn notify_on_errors(options: &RunOptions, root: &Path, report: &crate::Report) {
+    if !options.notify {
+        return;
+    }
+    let count = report
+        .findings
+        .iter()
+        .filter(|f| matches!(f.severity, Severity::Error | Severity::Warning))
+        .count();
+    if count == 0 {
+        return;
+    }
+
+    let root_name = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("<root>");
+    let text = match count {
+        1 => format!("phpxray · {root_name} · 1 issue"),
+        n => format!("phpxray · {root_name} · {n} issues"),
+    };
+    // If the notification API is unavailable (missing XDG server, Wayland,
+    // or macOS privacy restrictions blocking notifications) we log a message
+    // and silently return — users can always re-check the terminal.
+    //
+    // On macOS Ventura+, you may need to opt-in: System Settings > Notifications >
+    // Notifications Center > turn on for your terminal (Terminal.app or your
+    // preferred terminal emulator).
+    if notify_rust::Notification::new()
+        .summary("phpxray")
+        .body(&text)
+        .show()
+        .is_err()
+    {
+        eprintln!("phpxray: notification not sent (desktop notification service unavailable)");
+    }
 }
 
 /// Run one analysis pass and render it. For the human `table` format the screen
@@ -230,6 +279,9 @@ pub fn run_watch(
 /// slow) analysis so a re-run never looks like a hang; the final results replace
 /// it, annotated with how long the run took. `reason`, if set, names what
 /// triggered the run.
+///
+/// Returns the report so callers (like the watch loop) can inspect error counts
+/// for post-processing (e.g. desktop notifications).
 #[allow(clippy::too_many_arguments)]
 fn analyze_and_render(
     session: &mut Option<Session>,
@@ -239,7 +291,7 @@ fn analyze_and_render(
     format: &str,
     reason: Option<&str>,
     hint: Option<&ChangeHint>,
-) {
+) -> crate::Report {
     let is_table = format == "table";
     let mut working = None;
     if is_table {
@@ -281,10 +333,15 @@ fn analyze_and_render(
         out.push_str("\x1b[2J\x1b[3J\x1b[H");
         out.push_str(&header(&segments));
     }
-    if let Some(rendered) = report::render(&report, format) {
+    let render_opts = report::RenderOptions {
+        editor_url: config.editor_url.clone(),
+        editor_url_title: config.editor_url_title.clone(),
+    };
+    if let Some(rendered) = report::render_with(&report, format, &render_opts) {
         out.push_str(&rendered);
     }
     write_stdout(&out);
+    report
 }
 
 const BOLD: &str = "\x1b[1m";

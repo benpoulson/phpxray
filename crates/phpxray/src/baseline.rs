@@ -1,29 +1,35 @@
 //! M-C5: **baseline** — snapshot current findings so a legacy codebase passes,
 //! then ratchet down over time.
 //!
-//! Generating writes a YAML file of `ignore` entries (grouped by message + path
-//! with a count). Consuming is free: the file is just `ignore:` entries, so
-//! `php_config::Config::load` reads it and the engine merges them into the active
-//! ignore set (see the binary). A baselined error that disappears is surfaced via
-//! `reportUnmatchedIgnored`, nudging you to shrink the baseline.
+//! Generating writes a YAML file of `ignore` entries (grouped by message +
+//! identifier + path with a count), or — when the target file ends in `.neon`
+//! — a phpstan-compatible `phpstan-baseline.neon`. Consuming is free: the YAML
+//! file is just `ignore:` entries read by `php_config::Config::load`, and NEON
+//! baselines load through `php_config::neon::parse_baseline`. A baselined
+//! error that disappears is surfaced via `reportUnmatchedIgnored`, nudging you
+//! to shrink the baseline.
 
 use crate::Report;
+use php_config::neon::encode_scalar;
 use serde::Serialize;
 use std::collections::BTreeMap;
 
 /// One baseline entry: an exact message (as an anchored regex) for a file, with
-/// the number of occurrences.
+/// the error identifier and the number of occurrences.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct Entry {
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identifier: Option<String>,
     pub count: usize,
     pub path: String,
 }
 
 /// Collect a report's findings into baseline entries (sorted, deduped by
-/// message+path with counts). Synthetic unmatched-ignore findings are excluded.
+/// message+identifier+path with counts). Synthetic unmatched-ignore findings
+/// are excluded.
 pub fn entries(report: &Report) -> Vec<Entry> {
-    let mut counts: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut counts: BTreeMap<(String, String, Option<&'static str>), usize> = BTreeMap::new();
     for f in &report.findings {
         if f.identifier == Some("ignore.unmatched") {
             continue;
@@ -31,12 +37,15 @@ pub fn entries(report: &Report) -> Vec<Entry> {
         // Anchored, regex-escaped exact message (matches the suppression layer's
         // `#…#` delimiter convention).
         let message = format!("#^{}$#", regex::escape(&f.message));
-        *counts.entry((f.path.clone(), message)).or_default() += 1;
+        *counts
+            .entry((f.path.clone(), message, f.identifier))
+            .or_default() += 1;
     }
     counts
         .into_iter()
-        .map(|((path, message), count)| Entry {
+        .map(|((path, message, identifier), count)| Entry {
             message,
+            identifier: identifier.map(str::to_string),
             count,
             path,
         })
@@ -50,6 +59,22 @@ pub fn to_yaml(entries: &[Entry]) -> String {
         ignore: &'a [Entry],
     }
     serde_yaml::to_string(&Baseline { ignore: entries }).unwrap_or_default()
+}
+
+/// Serialize entries to a phpstan-compatible `phpstan-baseline.neon` document
+/// (`parameters: → ignoreErrors:`, tab-indented, phpstan's key order).
+pub fn to_neon(entries: &[Entry]) -> String {
+    let mut out = String::from("parameters:\n\tignoreErrors:\n");
+    for e in entries {
+        out.push_str("\t\t-\n");
+        out.push_str(&format!("\t\t\tmessage: {}\n", encode_scalar(&e.message)));
+        if let Some(id) = &e.identifier {
+            out.push_str(&format!("\t\t\tidentifier: {}\n", encode_scalar(id)));
+        }
+        out.push_str(&format!("\t\t\tcount: {}\n", e.count));
+        out.push_str(&format!("\t\t\tpath: {}\n", encode_scalar(&e.path)));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -68,6 +93,7 @@ mod tests {
             message: msg.into(),
             identifier: Some(id),
             severity: Severity::Error,
+            fix: None,
         }
     }
 

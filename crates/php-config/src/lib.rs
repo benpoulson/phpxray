@@ -5,6 +5,9 @@
 //! serde; unknown keys are ignored for forward-compatibility. The engine
 //! ([`phpxray`]) consumes the resolved [`Config`] to discover files, pick rules
 //! by level, and suppress findings.
+//!
+//! The [`neon`] module additionally reads phpstan's `phpstan-baseline.neon`
+//! format, so a migrating project's existing baseline loads unchanged.
 
 use regex::Regex;
 use serde::de::{self, Deserializer};
@@ -32,10 +35,26 @@ pub struct Config {
     pub exclude_paths: ExcludePaths,
     /// File extensions to analyze (without the dot). Defaults to `["php"]`.
     pub extensions: Vec<String>,
-    /// Target PHP version (e.g. `"8.4"`), if pinned.
+    /// Target PHP version, if pinned. Accepts `"8.4"`, a phpstan version id
+    /// (`80400`), or a `{min, max}` range (normalized to the range minimum).
+    #[serde(deserialize_with = "de_php_version")]
     pub php_version: Option<String>,
     /// Path to a baseline file of findings to ignore.
     pub baseline: Option<String>,
+    /// Result-cache directory, relative to the project root (default:
+    /// `.phpxray/cache/results-v1`). phpstan's `resultCachePath`.
+    pub result_cache_path: Option<String>,
+    /// Functions that never return (`dd`, `abort`) — branches calling them
+    /// terminate like `throw`. phpstan's `earlyTerminatingFunctionCalls`.
+    pub early_terminating_function_calls: Vec<String>,
+    /// Methods that never return, keyed by class (phpstan's
+    /// `earlyTerminatingMethodCalls`: `{ "PHPUnit\\Framework\\TestCase": ["fail"] }`).
+    pub early_terminating_method_calls: std::collections::HashMap<String, Vec<String>>,
+    /// Editor link template shown under each table finding (`%file%`,
+    /// `%relFile%`, `%line%`, `%column%` placeholders). phpstan's `editorUrl`.
+    pub editor_url: Option<String>,
+    /// Display text for the editor link (phpstan's `editorUrlTitle`).
+    pub editor_url_title: Option<String>,
     /// Report `ignore` entries that matched nothing (default: true).
     pub report_unmatched_ignored: bool,
     /// Treat PHPDoc types as certain for the always-true/impossible-type rules
@@ -65,6 +84,11 @@ impl Default for Config {
             extensions: vec!["php".to_string()],
             php_version: None,
             baseline: None,
+            result_cache_path: None,
+            early_terminating_function_calls: Vec::new(),
+            early_terminating_method_calls: std::collections::HashMap::new(),
+            editor_url: None,
+            editor_url_title: None,
             report_unmatched_ignored: true,
             treat_phpdoc_types_as_certain: true,
             infer_untyped_signatures: true,
@@ -215,8 +239,17 @@ impl<'de> Deserialize<'de> for Level {
 pub struct IgnoreEntry {
     /// A regex matched against the message (with optional `/…/` delimiters).
     pub message: Option<String>,
+    /// Multiple message regexes (any match).
+    pub messages: Vec<String>,
+    /// A literal message matched by string equality, not as a regex
+    /// (phpstan's `rawMessage`).
+    pub raw_message: Option<String>,
+    /// Multiple literal messages (any match).
+    pub raw_messages: Vec<String>,
     /// An exact error identifier (e.g. `return.type`).
     pub identifier: Option<String>,
+    /// Multiple identifiers (any match).
+    pub identifiers: Vec<String>,
     /// A single path glob the finding's file must match.
     pub path: Option<String>,
     /// Multiple path globs (any match).
@@ -238,7 +271,14 @@ impl<'de> Deserialize<'de> for IgnoreEntry {
         #[serde(rename_all = "camelCase")]
         struct Map {
             message: Option<String>,
+            #[serde(default)]
+            messages: Vec<String>,
+            raw_message: Option<String>,
+            #[serde(default)]
+            raw_messages: Vec<String>,
             identifier: Option<String>,
+            #[serde(default)]
+            identifiers: Vec<String>,
             path: Option<String>,
             #[serde(default)]
             paths: Vec<String>,
@@ -258,7 +298,11 @@ impl<'de> Deserialize<'de> for IgnoreEntry {
             },
             Repr::Map(m) => IgnoreEntry {
                 message: m.message,
+                messages: m.messages,
+                raw_message: m.raw_message,
+                raw_messages: m.raw_messages,
                 identifier: m.identifier,
+                identifiers: m.identifiers,
                 path: m.path,
                 paths: m.paths,
                 count: m.count,
@@ -361,6 +405,40 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// `phpVersion` accepts a string (`"8.4"`), a phpstan version id (`80400`),
+/// or a `{min, max}` range. Ranges normalize to the minimum: analysis against
+/// the lowest supported version is the conservative choice until per-version
+/// range checking exists.
+fn de_php_version<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Bound {
+        Int(u64),
+        Str(String),
+    }
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Int(u64),
+        Str(String),
+        Range { min: Option<Bound>, max: Option<Bound> },
+    }
+    fn norm(b: Bound) -> String {
+        match b {
+            Bound::Int(id) => format!("{}.{}", id / 10_000, (id / 100) % 100),
+            Bound::Str(s) => s,
+        }
+    }
+    Ok(match Option::<Raw>::deserialize(d)? {
+        None => None,
+        Some(Raw::Int(id)) => Some(norm(Bound::Int(id))),
+        Some(Raw::Str(s)) => Some(s),
+        Some(Raw::Range { min, max }) => min.or(max).map(norm),
+    })
+}
+
+pub mod neon;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,6 +491,50 @@ ignore:
         );
         assert_eq!(cfg.ignore[1].identifier.as_deref(), Some("return.type"));
         assert_eq!(cfg.ignore[1].path.as_deref(), Some("src/Generated"));
+    }
+
+    #[test]
+    fn php_version_accepts_string_int_and_range() {
+        assert_eq!(
+            Config::from_yaml("phpVersion: \"8.4\"").unwrap().php_version.as_deref(),
+            Some("8.4")
+        );
+        assert_eq!(
+            Config::from_yaml("phpVersion: 80400").unwrap().php_version.as_deref(),
+            Some("8.4")
+        );
+        assert_eq!(
+            Config::from_yaml("phpVersion: 70125").unwrap().php_version.as_deref(),
+            Some("7.1")
+        );
+        assert_eq!(
+            Config::from_yaml("phpVersion:\n  min: 80100\n  max: 80400\n")
+                .unwrap()
+                .php_version
+                .as_deref(),
+            Some("8.1")
+        );
+        assert_eq!(
+            Config::from_yaml("phpVersion:\n  max: 80400\n")
+                .unwrap()
+                .php_version
+                .as_deref(),
+            Some("8.4")
+        );
+    }
+
+    #[test]
+    fn editor_url_and_cache_path_fields() {
+        let cfg = Config::from_yaml(
+            "editorUrl: \"phpstorm://open?file=%file%&line=%line%\"\neditorUrlTitle: \"open\"\nresultCachePath: var/cache\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.editor_url.as_deref(),
+            Some("phpstorm://open?file=%file%&line=%line%")
+        );
+        assert_eq!(cfg.editor_url_title.as_deref(), Some("open"));
+        assert_eq!(cfg.result_cache_path.as_deref(), Some("var/cache"));
     }
 
     #[test]

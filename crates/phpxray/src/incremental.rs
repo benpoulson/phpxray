@@ -116,6 +116,8 @@ struct AnalysisFingerprint {
     php_version: Option<String>,
     treat_phpdoc_types_as_certain: bool,
     infer_untyped_signatures: bool,
+    early_terminating_function_calls: Vec<String>,
+    early_terminating_method_calls: Vec<(String, Vec<String>)>,
 }
 
 impl AnalysisFingerprint {
@@ -124,6 +126,16 @@ impl AnalysisFingerprint {
             level: config.level.value(),
             php_version: config.php_version.clone(),
             treat_phpdoc_types_as_certain: config.treat_phpdoc_types_as_certain,
+            early_terminating_function_calls: config.early_terminating_function_calls.clone(),
+            early_terminating_method_calls: {
+                let mut entries: Vec<(String, Vec<String>)> = config
+                    .early_terminating_method_calls
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                entries.sort();
+                entries
+            },
             infer_untyped_signatures: config.infer_untyped_signatures,
         }
     }
@@ -436,6 +448,9 @@ impl Session {
             php_version: self.php_version,
             treat_phpdoc_types_as_certain: self.analysis_fingerprint.treat_phpdoc_types_as_certain,
             rule_options: config.level.rule_options(),
+            collect_fixes: false,
+            terminators: crate::terminators_from_config(config),
+            iterable_param_evidence: None,
             project: &project,
             reflection: &reflection,
             sources: self

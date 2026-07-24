@@ -59,11 +59,16 @@ pub fn strip_false(t: &Type) -> Type {
 }
 
 /// Remove always-falsy members (`null`, `false`) from a type. `bool` narrows to
-/// `true`.
+/// `true`, and a truthy `string` narrows to `non-falsy-string` (a truthy
+/// string can be neither `""` nor `"0"` — phpstan's semantics).
 pub fn strip_falsy(t: &Type) -> Type {
     match t {
         Type::Null | Type::False => Type::Never,
         Type::Bool => Type::True,
+        Type::String => Type::StringOf(php_types::StringRefinement::NonFalsy),
+        Type::StringOf(
+            php_types::StringRefinement::NonEmpty | php_types::StringRefinement::NonFalsy,
+        ) => Type::StringOf(php_types::StringRefinement::NonFalsy),
         Type::Nullable(inner) => strip_falsy(inner),
         Type::Union(parts) => Type::union(
             parts

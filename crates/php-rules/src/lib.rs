@@ -19,13 +19,15 @@ pub(crate) mod missing_type;
 mod registry;
 mod return_type;
 mod rules;
+pub(crate) mod fix;
 pub(crate) mod symbols;
 pub use php_ast::walk;
 #[cfg(test)]
 mod testutil;
 pub use facts::FileFacts;
 pub use php_infer::{
-    is_assignable, is_castable_to_string, type_map, undefined_variables, Facets, TypeMap,
+    is_assignable, is_castable_to_string, type_map, type_map_with, undefined_variables,
+    undefined_variables_with, useful_inference, widen_literals, Facets, Terminators, TypeMap,
 };
 pub use php_types::PhpVersion;
 pub use registry::{

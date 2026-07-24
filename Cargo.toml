@@ -55,7 +55,9 @@ indicatif = "0.18"
 rayon = "1"
 lasso = { version = "0.7", features = ["multi-threaded"] }
 notify = "8"
-notify-debouncer-full = "0.5"
+notify-rust = "4"
+notify-debouncer-full = "0.7.0"
+sha2 = "0.10"
 libc = "0.2"
 
 [profile.release]

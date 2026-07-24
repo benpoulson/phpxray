@@ -71,8 +71,19 @@ const ESCAPE_FUNCTIONS: &[&str] = &[
 
 /// Analyse a whole program and return the possibly-undefined variable reads.
 pub fn undefined_variables(program: &php_ast::Program, interner: &Interner) -> Vec<UndefVar> {
+    undefined_variables_with(program, interner, &crate::Terminators::default())
+}
+
+/// [`undefined_variables`] honouring user-configured `earlyTerminating*` calls
+/// (a branch ending in `$this->fail()` doesn't leak maybe-undefined vars).
+pub fn undefined_variables_with(
+    program: &php_ast::Program,
+    interner: &Interner,
+    terminators: &crate::Terminators,
+) -> Vec<UndefVar> {
     let mut a = Analyzer {
         interner,
+        terminators,
         out: Vec::new(),
     };
     // The global region is its own scope; nested function/class decls recurse.
@@ -82,6 +93,7 @@ pub fn undefined_variables(program: &php_ast::Program, interner: &Interner) -> V
 
 struct Analyzer<'a> {
     interner: &'a Interner,
+    terminators: &'a crate::Terminators,
     out: Vec<UndefVar>,
 }
 
@@ -266,7 +278,7 @@ impl Analyzer<'_> {
 
         let mut then_env = base.clone();
         self.exec_stmt(then, &mut then_env);
-        if !always_terminates(then) {
+        if !self.always_terminates(then) {
             envs.push(then_env);
         }
 
@@ -274,7 +286,7 @@ impl Analyzer<'_> {
             let mut ee = base.clone();
             self.read_expr(&ei.cond, &mut ee);
             self.exec_stmt(&ei.body, &mut ee);
-            if !always_terminates(&ei.body) {
+            if !self.always_terminates(&ei.body) {
                 envs.push(ee);
             }
         }
@@ -283,7 +295,7 @@ impl Analyzer<'_> {
             Some(e) => {
                 let mut ee = base.clone();
                 self.exec_stmt(e, &mut ee);
-                if !always_terminates(e) {
+                if !self.always_terminates(e) {
                     envs.push(ee);
                 }
             }
@@ -516,24 +528,30 @@ fn merge(envs: Vec<Env>) -> Env {
 }
 
 /// Whether `s` always leaves the current block (so its env doesn't flow past it).
-fn always_terminates(s: &Stmt) -> bool {
-    match &s.kind {
-        StmtKind::Return(_) | StmtKind::Break(_) | StmtKind::Continue(_) | StmtKind::Goto(_) => {
-            true
+impl Analyzer<'_> {
+    fn always_terminates(&self, s: &Stmt) -> bool {
+        match &s.kind {
+            StmtKind::Return(_)
+            | StmtKind::Break(_)
+            | StmtKind::Continue(_)
+            | StmtKind::Goto(_) => true,
+            StmtKind::Expr(e) => {
+                matches!(&e.kind, ExprKind::Throw(_) | ExprKind::Exit(_))
+                    || self.terminators.expr_terminates(e, self.interner)
+            }
+            StmtKind::Block(b) => b.last().is_some_and(|s| self.always_terminates(s)),
+            StmtKind::If {
+                then,
+                elseifs,
+                els: Some(els),
+                ..
+            } => {
+                self.always_terminates(then)
+                    && elseifs.iter().all(|ei| self.always_terminates(&ei.body))
+                    && self.always_terminates(els)
+            }
+            _ => false,
         }
-        StmtKind::Expr(e) => matches!(&e.kind, ExprKind::Throw(_) | ExprKind::Exit(_)),
-        StmtKind::Block(b) => b.last().is_some_and(always_terminates),
-        StmtKind::If {
-            then,
-            elseifs,
-            els: Some(els),
-            ..
-        } => {
-            always_terminates(then)
-                && elseifs.iter().all(|ei| always_terminates(&ei.body))
-                && always_terminates(els)
-        }
-        _ => false,
     }
 }
 

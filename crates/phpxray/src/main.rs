@@ -9,7 +9,10 @@ use std::process::ExitCode;
 /// A fast PHP static analyzer.
 #[derive(Parser)]
 #[command(name = "phpxray", about = "A fast PHP static analyzer", version)]
+#[command(args_conflicts_with_subcommands = true)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Cmd>,
     /// Files or directories to analyze (overrides `paths` in the config).
     paths: Vec<String>,
     /// Config file to use (default: autodiscover `phpxray.yaml` in the CWD).
@@ -21,9 +24,22 @@ struct Cli {
     /// Output format.
     #[arg(long = "error-format", value_name = "FORMAT", default_value = "table")]
     error_format: String,
-    /// Write current findings to a baseline file (default: phpxray-baseline.yaml).
-    #[arg(long = "generate-baseline", value_name = "FILE", num_args = 0..=1, default_missing_value = "phpxray-baseline.yaml")]
+    /// Write current findings to a baseline file (default: phpxray-baseline.yaml;
+    /// a `.neon` extension writes phpstan's baseline format).
+    #[arg(short = 'b', long = "generate-baseline", value_name = "FILE", num_args = 0..=1, default_missing_value = "phpxray-baseline.yaml")]
     generate_baseline: Option<String>,
+    /// Allow `--generate-baseline` to write a baseline with zero entries
+    /// (by default that is refused so a broken run can't wipe a baseline).
+    #[arg(long = "allow-empty-baseline")]
+    allow_empty_baseline: bool,
+    /// Debug mode: print each analyzed file to stderr and bypass the result
+    /// cache.
+    #[arg(long = "debug")]
+    debug: bool,
+    /// Exit with code 2 when the result cache could not be used (fresh
+    /// analysis was required). A CI guard for jobs that expect a warm cache.
+    #[arg(long = "fail-without-result-cache")]
+    fail_without_result_cache: bool,
     /// Suppress progress output (accepted for compatibility; currently a no-op).
     #[arg(long = "no-progress")]
     no_progress: bool,
@@ -39,12 +55,102 @@ struct Cli {
     /// only, like PHPStan.
     #[arg(long = "no-infer-untyped")]
     no_infer_untyped: bool,
+    /// Repair fixable findings in place (insert inferred @var/@param/@return
+    /// PHPDoc for the missingType.* family), then re-analyze and report what
+    /// remains. Only confidently-inferred types are written.
+    #[arg(long = "fix")]
+    fix: bool,
+    /// Watch the analyzed paths and send a desktop notification when there
+    /// are errors.
+    ///
+    /// Designed for the `table` format; debounced to coalesce bursts of saves.
+    /// When there are no errors, the notification is silent.
+    #[arg(long = "notify")]
+    notify: bool,
+}
+
+/// Auxiliary maintenance commands (plain `phpxray [paths…]` analyzes).
+#[derive(clap::Subcommand)]
+enum Cmd {
+    /// Delete the stored result cache for this project.
+    #[command(name = "clear-result-cache")]
+    ClearResultCache {
+        /// Config file to use (default: autodiscover `phpxray.yaml` in the CWD).
+        #[arg(short = 'c', long = "config", value_name = "FILE")]
+        config: Option<PathBuf>,
+    },
+}
+
+fn clear_result_cache(config_path: Option<&PathBuf>) -> ExitCode {
+    let (config, root) = if let Some(path) = config_path {
+        match Config::load(path) {
+            Ok(c) => {
+                let root = path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("."));
+                (c, root)
+            }
+            Err(e) => {
+                eprintln!("error: loading config {}: {e}", path.display());
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        let cwd = PathBuf::from(".");
+        match Config::discover(&cwd) {
+            Some(found) => match Config::load(&found) {
+                Ok(c) => (c, cwd),
+                Err(e) => {
+                    eprintln!("error: loading config {}: {e}", found.display());
+                    return ExitCode::from(2);
+                }
+            },
+            None => (Config::default(), cwd),
+        }
+    };
+    let dir = phpxray::result_cache_dir(&config, &root, None);
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {
+            eprintln!("Result cache cleared from {}", dir.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("Result cache already empty ({})", dir.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: clearing result cache {}: {e}", dir.display());
+            ExitCode::from(2)
+        }
+    }
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
+    if let Some(Cmd::ClearResultCache { config }) = &cli.command {
+        return clear_result_cache(config.as_ref());
+    }
+
     if cli.watch && cli.generate_baseline.is_some() {
+        eprintln!("error: --watch cannot be combined with --generate-baseline");
+        return ExitCode::from(2);
+    }
+    if cli.fix && cli.watch {
+        eprintln!("error: --watch cannot be combined with --fix");
+        return ExitCode::from(2);
+    }
+    if cli.fix && cli.generate_baseline.is_some() {
+        eprintln!("error: --fix cannot be combined with --generate-baseline");
+        return ExitCode::from(2);
+    }
+    if cli.notify && cli.fix {
+        eprintln!("error: --watch cannot be combined with --fix");
+        return ExitCode::from(2);
+    }
+    if cli.notify && cli.generate_baseline.is_some() {
         eprintln!("error: --watch cannot be combined with --generate-baseline");
         return ExitCode::from(2);
     }
@@ -63,9 +169,21 @@ fn main() -> ExitCode {
         };
         let report = run_with_options(&config, &root, run_options);
         let entries = baseline::entries(&report);
-        let yaml = baseline::to_yaml(&entries);
+        if entries.is_empty() && !cli.allow_empty_baseline {
+            eprintln!(
+                "error: no errors found, refusing to write an empty baseline (pass --allow-empty-baseline to allow)"
+            );
+            return ExitCode::from(2);
+        }
+        // The extension picks the format: `.neon` writes a phpstan-compatible
+        // baseline, anything else our YAML `ignore:` form.
+        let rendered = if out.ends_with(".neon") {
+            baseline::to_neon(&entries)
+        } else {
+            baseline::to_yaml(&entries)
+        };
         let path = root.join(out);
-        if let Err(e) = std::fs::write(&path, yaml) {
+        if let Err(e) = std::fs::write(&path, rendered) {
             eprintln!("error: writing baseline {}: {e}", path.display());
             return ExitCode::from(2);
         }
@@ -110,18 +228,43 @@ fn main() -> ExitCode {
         }
     }
 
-    let report = run_with_options(&config, &root, run_options);
-    let rendered = match report::render(&report, &cli.error_format) {
+    let (report, fix_summary) = if cli.fix {
+        let fixed = phpxray::run_fix(&config, &root, run_options);
+        (fixed.report, Some(fixed.summary))
+    } else {
+        (run_with_options(&config, &root, run_options), None)
+    };
+    let render_opts = report::RenderOptions {
+        editor_url: config.editor_url.clone(),
+        editor_url_title: config.editor_url_title.clone(),
+    };
+    let rendered = match report::render_with(&report, &cli.error_format, &render_opts) {
         Some(s) => s,
         None => {
             eprintln!(
-                "error: unknown error format {:?} (supported: table, json, github, checkstyle)",
+                "error: unknown error format {:?} (supported: table, json, prettyJson, raw, github, checkstyle, gitlab, junit)",
                 cli.error_format
             );
             return ExitCode::from(2);
         }
     };
     print!("{rendered}");
+    if let Some(summary) = fix_summary {
+        eprintln!(
+            "Fixed {} finding(s) in {} file(s).",
+            summary.findings_fixed, summary.files_changed
+        );
+        for (path, reason) in &summary.files_skipped {
+            eprintln!("Skipped {path}: {reason}.");
+        }
+    }
+
+    if cli.fail_without_result_cache
+        && !report.timings.as_ref().is_some_and(|t| t.cache_hit)
+    {
+        eprintln!("error: result cache was not used (fresh analysis was required)");
+        return ExitCode::from(2);
+    }
 
     if report.has_errors() {
         ExitCode::from(1)
@@ -151,6 +294,11 @@ fn resolve_and_override(cli: &Cli) -> Result<RunConfig, ExitCode> {
 
     let run_options = RunOptions {
         progress: !cli.no_progress,
+        notify: cli.notify,
+        debug: cli.debug,
+        // `--fail-without-result-cache` needs the cache-hit flag, which ships
+        // in the timings.
+        collect_timings: cli.fail_without_result_cache,
         ..RunOptions::default()
     };
 
@@ -185,9 +333,20 @@ fn resolve_and_override(cli: &Cli) -> Result<RunConfig, ExitCode> {
 /// Merge a configured baseline file's ignore entries into `config`.
 fn merge_baseline(config: &mut Config, root: &Path) -> Result<(), ExitCode> {
     if let Some(b) = &config.baseline {
-        match Config::load(root.join(b)) {
-            Ok(bc) => {
-                config.ignore.extend(bc.ignore.into_iter().map(|mut e| {
+        // `.neon` baselines are phpstan's format (`parameters: → ignoreErrors:`);
+        // anything else is our YAML `ignore:` form.
+        let loaded = if b.ends_with(".neon") {
+            std::fs::read_to_string(root.join(b))
+                .map_err(|e| e.to_string())
+                .and_then(|text| php_config::neon::parse_baseline(&text))
+        } else {
+            Config::load(root.join(b))
+                .map(|bc| bc.ignore)
+                .map_err(|e| e.to_string())
+        };
+        match loaded {
+            Ok(ignore) => {
+                config.ignore.extend(ignore.into_iter().map(|mut e| {
                     // A baseline is a snapshot of past debt: an entry going
                     // stale means the finding was FIXED, so don't nag about it
                     // (unlike hand-written `ignore:` entries, which follow

@@ -342,3 +342,281 @@ fn infers_untyped_parameter_from_call_sites() {
     let out = stdout(&off);
     assert!(!out.contains("Widget::paint"), "{out}");
 }
+
+// --- `--fix` ----------------------------------------------------------------
+
+fn read(p: &TempProject, path: &str) -> String {
+    fs::read_to_string(p.root.join(path)).unwrap()
+}
+
+#[test]
+fn fix_inserts_phpdoc_and_is_idempotent() {
+    let p = TempProject::new("fix-basic");
+    write_config(&p, "level: 6\npaths:\n  - src\n");
+    p.write(
+        "src/app.php",
+        "<?php\nclass Repo {\n    private $rows = [];\n    public function set(): void { $this->rows = ['a']; }\n    public function find($id) {\n        return $id;\n    }\n}\n$r = new Repo();\n$r->find(7);\n",
+    );
+
+    let first = p.run(["--fix", "--no-progress"]);
+    let err = String::from_utf8_lossy(&first.stderr).into_owned();
+    assert!(err.contains("Fixed 3 finding(s) in 1 file(s)."), "{err}");
+
+    let fixed = read(&p, "src/app.php");
+    assert_eq!(
+        fixed,
+        "<?php\nclass Repo {\n    /** @var list<string> */\n    private $rows = [];\n    public function set(): void { $this->rows = ['a']; }\n    /**\n     * @param int $id\n     * @return int\n     */\n    public function find($id) {\n        return $id;\n    }\n}\n$r = new Repo();\n$r->find(7);\n"
+    );
+
+    // Second run: the repaired declarations no longer report, nothing changes.
+    let second = p.run(["--fix", "--no-progress"]);
+    let err2 = String::from_utf8_lossy(&second.stderr).into_owned();
+    assert!(err2.contains("Fixed 0 finding(s) in 0 file(s)."), "{err2}");
+    assert_eq!(read(&p, "src/app.php"), fixed);
+    let out2 = stdout(&second);
+    assert!(!out2.contains("missingType.property"), "{out2}");
+    assert!(!out2.contains("find() has parameter"), "{out2}");
+}
+
+#[test]
+fn fix_respects_baseline() {
+    let p = TempProject::new("fix-baseline");
+    write_config(&p, "level: 6\npaths:\n  - src\n");
+    p.write(
+        "src/app.php",
+        "<?php\nclass C {\n    private $v = 1;\n}\n",
+    );
+    let baseline = p.run(["--generate-baseline", "--no-progress"]);
+    assert!(baseline.status.success());
+    write_config(
+        &p,
+        "level: 6\npaths:\n  - src\nbaseline: phpxray-baseline.yaml\n",
+    );
+
+    let original = read(&p, "src/app.php");
+    let fixed = p.run(["--fix", "--no-progress"]);
+    let err = String::from_utf8_lossy(&fixed.stderr).into_owned();
+    assert!(err.contains("Fixed 0 finding(s) in 0 file(s)."), "{err}");
+    assert_eq!(read(&p, "src/app.php"), original, "baselined finding must not be fixed");
+}
+
+#[test]
+fn early_terminating_calls_end_branches() {
+    let p = TempProject::new("early-terminating");
+    // Without config: the dd() branch falls through, so $y is maybe-undefined
+    // at level 1 (and the $this->fail() variant likewise).
+    let src = r#"<?php
+function myDd(string $m): string { return $m; }
+function f(bool $c): void {
+    if ($c) { myDd('x'); } else { $y = 1; }
+    echo $y;
+}
+class T {
+    public function fail(string $m): string { return $m; }
+    public function g(bool $c): void {
+        if ($c) { $this->fail('x'); } else { $z = 1; }
+        echo $z;
+    }
+}
+"#;
+    p.write("src/app.php", src);
+    write_config(&p, "level: 1\npaths:\n  - src\n");
+    let out = stdout(&p.run(["--no-progress"]));
+    assert!(out.contains("$y might not be defined"), "{out}");
+    assert!(out.contains("$z might not be defined"), "{out}");
+
+    // With the calls configured as terminating, the branches end like `throw`
+    // and both variables are definitely assigned on every fall-through path.
+    write_config(
+        &p,
+        "level: 1\npaths:\n  - src\nearlyTerminatingFunctionCalls:\n  - myDd\nearlyTerminatingMethodCalls:\n  T:\n    - fail\n",
+    );
+    let out = stdout(&p.run(["--no-progress"]));
+    assert!(!out.contains("might not be defined"), "{out}");
+}
+
+#[test]
+fn clear_result_cache_subcommand() {
+    let p = TempProject::new("clear-cache");
+    write_config(&p, "level: 0\npaths:\n  - src\n");
+    p.write("src/ok.php", "<?php\nclass C {}\n");
+
+    // Prime the cache, then clear it.
+    let run = p.run(["--no-progress"]);
+    assert!(run.status.success());
+    assert!(cache_file_count(&p) > 0, "cache should be primed");
+    let clear = p.run(["clear-result-cache"]);
+    assert!(clear.status.success(), "{clear:?}");
+    assert_eq!(cache_file_count(&p), 0);
+
+    // Clearing an already-empty cache still succeeds.
+    let again = p.run(["clear-result-cache"]);
+    assert!(again.status.success());
+}
+
+#[test]
+fn debug_prints_files_and_bypasses_cache() {
+    let p = TempProject::new("debug-flag");
+    write_config(&p, "level: 0\npaths:\n  - src\n");
+    p.write("src/ok.php", "<?php\nclass C {}\n");
+
+    let out = p.run(["--debug", "--no-progress"]);
+    assert!(out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("src/ok.php"), "{err}");
+    assert_eq!(cache_file_count(&p), 0, "--debug must not write the cache");
+}
+
+#[test]
+fn fail_without_result_cache_guard() {
+    let p = TempProject::new("fail-without-cache");
+    write_config(&p, "level: 0\npaths:\n  - src\n");
+    p.write("src/ok.php", "<?php\nclass C {}\n");
+
+    // Cold: fresh analysis was required -> exit 2.
+    let cold = p.run(["--fail-without-result-cache", "--no-progress"]);
+    assert_eq!(cold.status.code(), Some(2), "{cold:?}");
+    // Warm: the cache primed by the failed-guard run now hits -> exit 0.
+    let warm = p.run(["--fail-without-result-cache", "--no-progress"]);
+    assert_eq!(warm.status.code(), Some(0), "{warm:?}");
+}
+
+#[test]
+fn empty_baseline_refused_unless_allowed() {
+    let p = TempProject::new("empty-baseline");
+    write_config(&p, "level: 0\npaths:\n  - src\n");
+    p.write("src/ok.php", "<?php\nclass C {}\n");
+
+    let refused = p.run(["--generate-baseline", "--no-progress"]);
+    assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+    assert!(!p.root.join("phpxray-baseline.yaml").exists());
+
+    let allowed = p.run([
+        "--generate-baseline",
+        "--allow-empty-baseline",
+        "--no-progress",
+    ]);
+    assert!(allowed.status.success(), "{allowed:?}");
+    assert!(p.root.join("phpxray-baseline.yaml").exists());
+}
+
+#[test]
+fn result_cache_path_config_is_honored() {
+    let p = TempProject::new("cache-path");
+    write_config(
+        &p,
+        "level: 0\npaths:\n  - src\nresultCachePath: var/cache\n",
+    );
+    p.write("src/ok.php", "<?php\nclass C {}\n");
+
+    let run = p.run(["--no-progress"]);
+    assert!(run.status.success());
+    let custom = fs::read_dir(p.root.join("var/cache"))
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or(0);
+    assert!(custom > 0, "custom cache dir should be used");
+    assert_eq!(cache_file_count(&p), 0, "default cache dir should be empty");
+
+    // clear-result-cache honors the configured path too.
+    let clear = p.run(["clear-result-cache"]);
+    assert!(clear.status.success());
+    assert!(!p.root.join("var/cache").exists());
+}
+
+#[test]
+fn neon_baseline_generate_and_consume_round_trip() {
+    let p = TempProject::new("neon-baseline");
+    write_config(&p, "level: 0\npaths:\n  - src\n");
+    p.write("src/app.php", "<?php\nunknown_fn_xyz();\n");
+
+    // Findings exist without a baseline.
+    let bare = p.run(["--no-progress"]);
+    assert_eq!(bare.status.code(), Some(1));
+
+    // Generate a phpstan-compatible NEON baseline.
+    let gen = p.run(["--generate-baseline", "phpstan-baseline.neon", "--no-progress"]);
+    assert!(gen.status.success());
+    let neon = read(&p, "phpstan-baseline.neon");
+    assert!(neon.starts_with("parameters:\n\tignoreErrors:\n"), "{neon}");
+    assert!(neon.contains("identifier: function.notFound"), "{neon}");
+    assert!(neon.contains("path: src/app.php"), "{neon}");
+
+    // Consuming it suppresses everything (clean exit 0).
+    write_config(
+        &p,
+        "level: 0\npaths:\n  - src\nbaseline: phpstan-baseline.neon\n",
+    );
+    let with_baseline = p.run(["--no-progress"]);
+    assert_eq!(
+        with_baseline.status.code(),
+        Some(0),
+        "{}",
+        stdout(&with_baseline)
+    );
+}
+
+#[test]
+fn phpstan_written_neon_baseline_loads() {
+    // The exact shape phpstan writes (tabs, quoted message, identifier).
+    let p = TempProject::new("phpstan-neon-baseline");
+    p.write("src/app.php", "<?php\nunknown_fn_xyz();\n");
+    p.write(
+        "phpstan-baseline.neon",
+        "parameters:\n\tignoreErrors:\n\t\t-\n\t\t\tmessage: '#^Function unknown_fn_xyz not found\\.$#'\n\t\t\tidentifier: function.notFound\n\t\t\tcount: 1\n\t\t\tpath: src/app.php\n",
+    );
+    write_config(
+        &p,
+        "level: 0\npaths:\n  - src\nbaseline: phpstan-baseline.neon\n",
+    );
+    let out = p.run(["--no-progress"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+}
+
+#[test]
+fn fix_skips_non_utf8_file() {
+    let p = TempProject::new("fix-non-utf8");
+    write_config(&p, "level: 6\npaths:\n  - src\n");
+    let bytes: &[u8] = b"<?php // \xFF\xFE\nclass C {\n    private $v = 1;\n}\n";
+    fs::create_dir_all(p.root.join("src")).unwrap();
+    fs::write(p.root.join("src/bad.php"), bytes).unwrap();
+
+    let fixed = p.run(["--fix", "--no-progress"]);
+    let err = String::from_utf8_lossy(&fixed.stderr).into_owned();
+    assert!(
+        err.contains("Fixed 0 finding(s) in 0 file(s).") && err.contains("Skipped"),
+        "{err}"
+    );
+    assert_eq!(fs::read(p.root.join("src/bad.php")).unwrap(), bytes);
+}
+
+#[test]
+fn fix_conflicts_with_watch_and_baseline_generation() {
+    let p = TempProject::new("fix-exclusive");
+    write_config(&p, "level: 6\npaths:\n  - src\n");
+    p.write("src/app.php", "<?php\n");
+    let watch = p.run(["--fix", "--watch"]);
+    assert_eq!(watch.status.code(), Some(2), "{}", stdout(&watch));
+    let gen = p.run(["--fix", "--generate-baseline"]);
+    assert_eq!(gen.status.code(), Some(2), "{}", stdout(&gen));
+}
+
+#[test]
+fn fix_inserts_into_existing_docblock_and_array_param() {
+    let p = TempProject::new("fix-existing-doc");
+    write_config(&p, "level: 6\npaths:\n  - src\n");
+    p.write(
+        "src/app.php",
+        "<?php\n/**\n * Maps ids.\n */\nfunction mapIds(array $ids): array {\n    return array_values($ids);\n}\nmapIds([1, 2]);\n",
+    );
+
+    let fixed = p.run(["--fix", "--no-progress"]);
+    let err = String::from_utf8_lossy(&fixed.stderr).into_owned();
+    assert!(err.contains("in 1 file(s)."), "{err}");
+    let content = read(&p, "src/app.php");
+    // Round 1 fixes the param from call sites; with `$ids` typed, round 2 can
+    // refine the bare `array` return from the body too (the fix loop iterates).
+    assert!(
+        content.contains(" * Maps ids.\n * @param list<int> $ids\n * @return list<int>\n */"),
+        "{content}"
+    );
+}

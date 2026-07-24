@@ -751,11 +751,11 @@ fn find_parent_method<'a>(
 /// `MissingMethodReturnTypehintRule` — a method with no return type at all.
 fn run_missing_return_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    for_each_class(fa, |_, fqn, c| {
+    for_each_class(fa, |scope, fqn, c| {
         let Some(class) = fa.reflection.class(fqn) else {
             return;
         };
-        for (md, _mr) in zip_methods(fa.interner, c, class) {
+        for (md, mr) in zip_methods(fa.interner, c, class) {
             // "Specified" = a native return type OR a `@return` tag in the method's
             // docblock. We key off the tag's *presence* (like phpstan), not the
             // resolved type — a `@return $this`/exotic type that resolves to `mixed`
@@ -771,16 +771,30 @@ fn run_missing_return_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
             if inherited_return_typed(fa, class, name) {
                 continue;
             }
-            out.push(
-                Diagnostic::error(
-                    method_span(md),
-                    format!(
-                        "Method {}::{name}() has no return type specified.",
-                        display(fa, c)
-                    ),
-                )
-                .with_code("missingType.return"),
-            );
+            let mut d = Diagnostic::error(
+                method_span(md),
+                format!(
+                    "Method {}::{name}() has no return type specified.",
+                    display(fa, c)
+                ),
+            )
+            .with_code("missingType.return");
+            // `--fix`: signature inference (§8q) already synthesized the return
+            // type from the body when it had confident evidence.
+            if fa.collect_fixes && mr.inferred_return {
+                if let Some(fix) = crate::fix::typed_tag_fix(
+                    fa,
+                    scope,
+                    &mr.return_type,
+                    crate::fix::first_attr_span(&md.attrs).unwrap_or(md.name_span),
+                    md.doc.as_deref(),
+                    php_diagnostics::DocTagKind::Return,
+                    None,
+                ) {
+                    d = d.with_fix(fix);
+                }
+            }
+            out.push(d);
         }
     });
     out
@@ -871,11 +885,11 @@ fn doc_has_param(doc: Option<&str>, name: &str) -> bool {
 /// `MissingMethodParameterTypehintRule` — a method parameter with no type.
 fn run_missing_param_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    for_each_class(fa, |_, fqn, c| {
+    for_each_class(fa, |scope, fqn, c| {
         let Some(class) = fa.reflection.class(fqn) else {
             return;
         };
-        for (md, _mr) in zip_methods(fa.interner, c, class) {
+        for (md, mr) in zip_methods(fa.interner, c, class) {
             let mname = fa.interner.resolve(md.name);
             for (idx, p) in md.params.iter().enumerate() {
                 if p.ty.is_some() {
@@ -888,18 +902,34 @@ fn run_missing_param_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 if inherited_param_typed(fa, class, mname, idx) {
                     continue; // inherited from an overridden prototype
                 }
-                out.push(
-                    Diagnostic::error(
-                        method_span(md),
-                        format!(
-                            "Method {}::{}() has parameter ${} with no type specified.",
-                            display(fa, c),
-                            fa.interner.resolve(md.name),
-                            pname
-                        ),
-                    )
-                    .with_code("missingType.parameter"),
-                );
+                let mut d = Diagnostic::error(
+                    method_span(md),
+                    format!(
+                        "Method {}::{}() has parameter ${} with no type specified.",
+                        display(fa, c),
+                        fa.interner.resolve(md.name),
+                        pname
+                    ),
+                )
+                .with_code("missingType.parameter");
+                // `--fix`: signature inference (§8q) synthesized the type from
+                // call-site arguments when it had confident evidence.
+                if fa.collect_fixes {
+                    if let Some(pr) = mr.params.get(idx).filter(|pr| pr.inferred) {
+                        if let Some(fix) = crate::fix::typed_tag_fix(
+                            fa,
+                            scope,
+                            &pr.ty,
+                            crate::fix::first_attr_span(&md.attrs).unwrap_or(md.name_span),
+                            md.doc.as_deref(),
+                            php_diagnostics::DocTagKind::Param,
+                            Some(pname),
+                        ) {
+                            d = d.with_fix(fix);
+                        }
+                    }
+                }
+                out.push(d);
             }
         }
     });
@@ -1385,6 +1415,57 @@ fn named_fqn(t: &Type) -> Option<String> {
 
 /// Level-8 `checkNullables` strictness for method calls: at lower levels
 /// phpstan strips `null` from a nullable receiver before judging the call, while
+/// `CallMethodsRule`'s non-object branch (level 2): calling a method on a
+/// value that is *definitely* not an object — a single concrete scalar/array
+/// type. Unions, `mixed`, `null`-ish, templates and unknowns are skipped
+/// (the level-8 nullable and level-9/10 mixed strictness arms own the maybes).
+fn run_non_object_method_call(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    crate::walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::MethodCall { recv, method, .. } = &e.kind else {
+            return;
+        };
+        let MemberName::Ident(name) = method else {
+            return;
+        };
+        let recv_ty = fa.type_of(recv);
+        if !definitely_non_object_receiver(&recv_ty) {
+            return;
+        }
+        let mname = fa.interner.resolve(*name);
+        out.push(
+            Diagnostic::error(
+                e.span,
+                format!("Cannot call method {mname}() on {recv_ty}."),
+            )
+            .with_code("method.nonObject"),
+        );
+    });
+    out
+}
+
+/// A single concrete non-object type (method calls on it always fail).
+/// Deliberately excludes `null` (the nullable arm reports it with better
+/// wording), unions, and anything abstract/unknown.
+fn definitely_non_object_receiver(t: &Type) -> bool {
+    matches!(
+        t,
+        Type::Int
+            | Type::IntRange { .. }
+            | Type::LiteralInt(_)
+            | Type::Float
+            | Type::Bool
+            | Type::True
+            | Type::False
+            | Type::String
+            | Type::StringOf(_)
+            | Type::LiteralString(_)
+            | Type::Array(_)
+            | Type::List(_)
+            | Type::Shape { .. }
+    )
+}
+
 /// level 8+ reports `method.nonObject` for `$maybeC->m()`. This branch is
 /// intentionally separate from method-existence so `?C->missing()` is reported
 /// as a nullable receiver problem, not as an undefined method.
@@ -1930,6 +2011,7 @@ fn type_is_definitely_non_null(t: &Type) -> bool {
         | Type::Int
         | Type::Float
         | Type::String
+        | Type::StringOf(_)
         | Type::Bool
         | Type::True
         | Type::False
@@ -2956,34 +3038,78 @@ fn run_missing_method_iterable_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 {
                     continue;
                 }
-                for (p, pr) in md.params.iter().zip(mr.params.iter()) {
+                for (idx, (p, pr)) in md.params.iter().zip(mr.params.iter()).enumerate() {
                     if let Some(word) = crate::rules::functions::bare_iterable_word(&pr.ty) {
                         let pname = fa.interner.resolve(p.name);
-                        out.push(
-                            Diagnostic::error(
-                                crate::rules::functions::p_span(p),
-                                format!(
-                                    "Method {short}::{mname}() has parameter ${pname} with no \
-                                     value type specified in iterable type {word}."
-                                ),
-                            )
-                            .with_code("missingType.iterableValue"),
-                        );
+                        let mut d = Diagnostic::error(
+                            crate::rules::functions::p_span(p),
+                            format!(
+                                "Method {short}::{mname}() has parameter ${pname} with no \
+                                 value type specified in iterable type {word}."
+                            ),
+                        )
+                        .with_code("missingType.iterableValue");
+                        // `--fix`: cross-file call-site evidence for the
+                        // explicitly-`array`-typed parameter (side map, §8q).
+                        if fa.collect_fixes {
+                            if let Some(fix) = fa
+                                .iterable_param_evidence
+                                .and_then(|ev| {
+                                    ev.get(&php_infer::evidence_key(&fqn, Some(mname), idx))
+                                })
+                                .and_then(|ty| {
+                                    crate::fix::typed_tag_fix(
+                                        fa,
+                                        scope,
+                                        ty,
+                                        crate::fix::first_attr_span(&md.attrs)
+                                            .unwrap_or(md.name_span),
+                                        md.doc.as_deref(),
+                                        php_diagnostics::DocTagKind::Param,
+                                        Some(pname),
+                                    )
+                                })
+                            {
+                                d = d.with_fix(fix);
+                            }
+                        }
+                        out.push(d);
                     }
                 }
                 if let Some(rt) = &md.return_type {
                     if let Some(word) = crate::rules::functions::bare_iterable_word(&mr.return_type)
                     {
-                        out.push(
-                            Diagnostic::error(
-                                rt.span,
-                                format!(
-                                    "Method {short}::{mname}() return type has no value type \
-                                     specified in iterable type {word}."
-                                ),
-                            )
-                            .with_code("missingType.iterableValue"),
-                        );
+                        let mut d = Diagnostic::error(
+                            rt.span,
+                            format!(
+                                "Method {short}::{mname}() return type has no value type \
+                                 specified in iterable type {word}."
+                            ),
+                        )
+                        .with_code("missingType.iterableValue");
+                        // `--fix`: refine from the body's own return expressions.
+                        if fa.collect_fixes {
+                            if let Some(fix) = md
+                                .body
+                                .as_deref()
+                                .and_then(|b| crate::fix::iterable_return_evidence(fa, b))
+                                .and_then(|ty| {
+                                    crate::fix::typed_tag_fix(
+                                        fa,
+                                        scope,
+                                        &ty,
+                                        crate::fix::first_attr_span(&md.attrs)
+                                            .unwrap_or(md.name_span),
+                                        md.doc.as_deref(),
+                                        php_diagnostics::DocTagKind::Return,
+                                        None,
+                                    )
+                                })
+                            {
+                                d = d.with_fix(fix);
+                            }
+                        }
+                        out.push(d);
                     }
                 }
             }
@@ -3109,6 +3235,11 @@ impl SelfOutDocCheck<'_, '_> {
 }
 
 pub(crate) static RULES: &[RuleEntry] = &[
+    RuleEntry {
+        name: "method.nonObject",
+        level: 2,
+        run: run_non_object_method_call,
+    },
     RuleEntry {
         name: "method.resultUnused",
         level: 4,
@@ -3279,7 +3410,7 @@ pub(crate) static RULES: &[RuleEntry] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{codes, codes_version, codes_with};
+    use crate::testutil::{codes, codes_version, codes_with, fixes, run, run_fixes};
     use crate::PhpVersion;
 
     // --- missingType.iterableValue ---
@@ -3943,6 +4074,84 @@ mod tests {
         assert!(codes(src, run_missing_param_type).is_empty());
     }
 
+    // --- `--fix` repairs for the missing-typehint rules -------------------
+
+    #[test]
+    fn fix_attached_for_inferred_method_return() {
+        let src = "<?php\nclass C {\n    public function f() { return 1; }\n}\n";
+        let fx = fixes(src, run_missing_return_type);
+        let line_start = src.find("    public").unwrap() as u32;
+        assert_eq!(
+            fx,
+            [(
+                "@return int".to_string(),
+                php_diagnostics::FixAnchor::NewDocAt(line_start),
+                "    ".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn fix_param_from_call_sites() {
+        let src = "<?php\nclass C {\n    public function f($x): void {}\n}\n$c = new C();\n$c->f('a');\n";
+        let fx = fixes(src, run_missing_param_type);
+        assert_eq!(fx.len(), 1);
+        assert_eq!(fx[0].0, "@param string $x");
+    }
+
+    #[test]
+    fn fix_inserts_into_existing_docblock() {
+        let src = "<?php\nclass C {\n    /** Hi. */\n    public function f() { return 1; }\n}\n";
+        let fx = fixes(src, run_missing_return_type);
+        let doc_at = src.find("/** Hi. */").unwrap() as u32;
+        assert_eq!(
+            fx,
+            [(
+                "@return int".to_string(),
+                php_diagnostics::FixAnchor::ExistingDoc(php_span::Span::new(doc_at, doc_at + 10)),
+                "    ".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn no_fix_without_evidence() {
+        // No call sites for `$x`, no `return` statements for `f`: both findings
+        // report, neither carries a fix.
+        let src = "<?php class C { public function f($x) {} }";
+        for d in run_fixes(src, run_missing_param_type)
+            .into_iter()
+            .chain(run_fixes(src, run_missing_return_type))
+        {
+            assert!(d.fix.is_none(), "{:?}", d.message);
+        }
+    }
+
+    #[test]
+    fn no_fix_when_collect_fixes_off() {
+        let src = "<?php\nclass C {\n    public function f() { return 1; }\n}\n";
+        for d in run(src, run_missing_return_type) {
+            assert!(d.fix.is_none());
+        }
+    }
+
+    #[test]
+    fn fix_method_param_iterable_value_from_call_sites() {
+        let src = "<?php\nclass C {\n    public function f(array $rows): void {}\n}\n$c = new C();\n$c->f([1, 2]);\n";
+        let fx = fixes(src, run_missing_method_iterable_value);
+        assert_eq!(fx.len(), 1, "{fx:?}");
+        assert_eq!(fx[0].0, "@param list<int> $rows");
+    }
+
+    #[test]
+    fn fix_return_skipped_for_generator_method() {
+        // Generators are skipped by signature inference; the finding stays bare.
+        let src = "<?php\nclass C {\n    public function g() { yield 1; }\n}\n";
+        for d in run_fixes(src, run_missing_return_type) {
+            assert!(d.fix.is_none());
+        }
+    }
+
     #[test]
     fn array_literal_default_for_typed_array_param_clean() {
         // `array<string,mixed> $o = []` — an empty array fits any array<K,V>.
@@ -4171,6 +4380,34 @@ mod tests {
     fn magic_call_receiver_is_lenient() {
         let src = "<?php class C { public function __call($n, $a) {} } function f(): void { $c = new C(); $c->whatever(); }";
         assert!(codes(src, run_call_methods_typed).is_empty());
+    }
+
+    #[test]
+    fn method_call_on_concrete_scalar_is_flagged() {
+        let src = "<?php class B { const FOO = 'foo'; } B::FOO->length();";
+        let ds = crate::testutil::run(src, run_non_object_method_call);
+        assert_eq!(ds.len(), 1, "{ds:?}");
+        assert_eq!(ds[0].message, "Cannot call method length() on 'foo'.");
+        assert_eq!(
+            codes("<?php $n = 5; $n->m();", run_non_object_method_call),
+            ["method.nonObject"]
+        );
+        // Objects, unions, mixed stay silent here.
+        assert!(codes(
+            "<?php class C { function m() {} } (new C)->m();",
+            run_non_object_method_call
+        )
+        .is_empty());
+        assert!(codes(
+            "<?php function f(int|object $x) { $x->m(); }",
+            run_non_object_method_call
+        )
+        .is_empty());
+        assert!(codes(
+            "<?php function f($x) { $x->m(); }",
+            run_non_object_method_call
+        )
+        .is_empty());
     }
 
     #[test]

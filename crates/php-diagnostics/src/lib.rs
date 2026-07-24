@@ -30,6 +30,39 @@ impl Label {
     }
 }
 
+/// Where a [`DocTagFix`]'s tag is written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FixAnchor {
+    /// The declaration has no docblock: insert a new block at this byte offset
+    /// (always the start of the declaration's first line).
+    NewDocAt(u32),
+    /// A docblock exists at exactly this byte range in the analyzed source:
+    /// add the tag before its closing `*/`.
+    ExistingDoc(Span),
+}
+
+/// Tag ordering inside a merged docblock: `@param` lines first, then
+/// `@return`, then `@var` (the derived `Ord` encodes this).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DocTagKind {
+    Param,
+    Return,
+    Var,
+}
+
+/// A machine-applicable repair: one PHPDoc tag to add to a declaration's
+/// docblock. Several fixes sharing an anchor merge into a single docblock.
+#[derive(Clone, Debug)]
+pub struct DocTagFix {
+    pub anchor: FixAnchor,
+    pub kind: DocTagKind,
+    /// The tag line without framing, e.g. `@param string $name`,
+    /// `@return int`, `@var array<int, string>`.
+    pub tag: String,
+    /// Verbatim leading whitespace of the declaration's first line.
+    pub indent: String,
+}
+
 /// A single problem found in the source. The parser is error-recovering: it
 /// pushes diagnostics and synthesizes error nodes rather than aborting.
 #[derive(Clone, Debug)]
@@ -41,6 +74,8 @@ pub struct Diagnostic {
     /// The primary location the diagnostic points at.
     pub primary: Span,
     pub labels: Vec<Label>,
+    /// A machine-applicable repair, when the producing rule knows one.
+    pub fix: Option<DocTagFix>,
 }
 
 impl Diagnostic {
@@ -51,6 +86,7 @@ impl Diagnostic {
             message: message.into(),
             primary,
             labels: Vec::new(),
+            fix: None,
         }
     }
 
@@ -61,6 +97,7 @@ impl Diagnostic {
             message: message.into(),
             primary,
             labels: Vec::new(),
+            fix: None,
         }
     }
 
@@ -71,6 +108,11 @@ impl Diagnostic {
 
     pub fn with_label(mut self, label: Label) -> Diagnostic {
         self.labels.push(label);
+        self
+    }
+
+    pub fn with_fix(mut self, fix: DocTagFix) -> Diagnostic {
+        self.fix = Some(fix);
         self
     }
 

@@ -27,10 +27,13 @@ pub use assign::{
     Trinary,
 };
 pub use const_eval::{eval_const, ConstVal};
-pub use definedness::{undefined_variables, UndefVar};
+pub use definedness::{undefined_variables, undefined_variables_with, UndefVar};
 pub use refine::{strip_false, strip_falsy, strip_null_lenient, strip_null_strict};
-pub use signatures::{infer_and_apply, InferOpts};
-pub use type_map::{contextual_body_type_map, type_map, Facets, TypeMap};
+pub use signatures::{
+    evidence_key, explicit_iterable_param_evidence, infer_and_apply, useful_inference,
+    widen_literals, ExplicitParamEvidence, InferOpts,
+};
+pub use type_map::{contextual_body_type_map, type_map, type_map_with, Facets, TypeMap};
 
 use php_ast::{
     Arg, ArrowFn, BinOp, CastKind, ClosureExpr, Expr, ExprKind, MemberName, Name, Param, UnOp,
@@ -105,6 +108,52 @@ pub struct TypeCtx<'a> {
     /// Type received by a plain `yield` expression in this generator scope, when
     /// the declared return type makes it precise enough to use.
     pub(crate) generator_send: Option<Type>,
+    /// User-configured always-terminating calls (`earlyTerminating*` config).
+    pub terminators: std::sync::Arc<Terminators>,
+}
+
+/// User-configured always-terminating calls (phpstan's
+/// `earlyTerminatingFunctionCalls` / `earlyTerminatingMethodCalls`): a
+/// statement calling one ends its branch like `throw`/`exit` (PHPUnit's
+/// `$this->fail()`, Laravel's `abort()`). Matching is syntactic — function
+/// names by resolved last segment, method names without re-checking the
+/// receiver class (configure distinctive names).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Terminators {
+    /// Lowercased function names.
+    pub functions: std::collections::HashSet<String>,
+    /// Lowercased method names (from every configured class).
+    pub methods: std::collections::HashSet<String>,
+}
+
+impl Terminators {
+    pub fn is_empty(&self) -> bool {
+        self.functions.is_empty() && self.methods.is_empty()
+    }
+
+    /// Whether statement-level expression `e` is a configured terminating call.
+    pub fn expr_terminates(&self, e: &Expr, interner: &Interner) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        match &e.kind {
+            ExprKind::Call { callee, .. } => {
+                let ExprKind::Name(n) = &callee.kind else {
+                    return false;
+                };
+                let last = n.text.rsplit('\\').next().unwrap_or(&n.text);
+                self.functions.contains(&last.to_ascii_lowercase())
+            }
+            ExprKind::MethodCall { method, .. } | ExprKind::StaticCall { method, .. } => {
+                let MemberName::Ident(sym) = method else {
+                    return false;
+                };
+                self.methods
+                    .contains(&interner.resolve(*sym).to_ascii_lowercase())
+            }
+            _ => false,
+        }
+    }
 }
 
 impl<'a> TypeCtx<'a> {
@@ -120,6 +169,7 @@ impl<'a> TypeCtx<'a> {
             depth: 0,
             native: false,
             generator_send: None,
+            terminators: std::sync::Arc::new(Terminators::default()),
         }
     }
 
@@ -131,6 +181,14 @@ impl<'a> TypeCtx<'a> {
             ExprKind::Int(n) => Type::LiteralInt(*n),
             ExprKind::Float(_) => Type::Float,
             ExprKind::Str(bytes) => literal_string(bytes),
+            // An interpolation with a non-empty literal run is a non-empty string.
+            ExprKind::Interpolated(parts)
+                if parts
+                    .iter()
+                    .any(|p| matches!(&p.kind, ExprKind::Str(s) if !s.is_empty())) =>
+            {
+                Type::StringOf(php_types::StringRefinement::NonEmpty)
+            }
             ExprKind::Interpolated(_) | ExprKind::ShellExec(_) => Type::String,
 
             // --- references ---
@@ -401,7 +459,7 @@ impl<'a> TypeCtx<'a> {
             _ => None,
         } {
             return match self.infer(&args.get(idx)?.value) {
-                Type::String | Type::LiteralString(_) => Some(Type::String),
+                Type::String | Type::StringOf(_) | Type::LiteralString(_) => Some(Type::String),
                 Type::Array(_) | Type::List(_) => Some(Type::Array(None)),
                 _ => None,
             };
@@ -1066,6 +1124,21 @@ impl<'a> TypeCtx<'a> {
         let Some(prop) = self.member_ident(name) else {
             return Type::Mixed;
         };
+        // A known enum case has per-case `->name`/`->value` literals.
+        if let Type::EnumCase { fqn, case } = &base_ty {
+            if !self.native {
+                if prop == "name" {
+                    return Type::LiteralString(case.clone());
+                }
+                if prop == "value" {
+                    if let Some(found) = self.index.find_constant(fqn, case) {
+                        if let Some(backing) = &found.member.case_backing {
+                            return backing.clone();
+                        }
+                    }
+                }
+            }
+        }
         let Some(fqn) = self.type_class_fqn(&base_ty) else {
             return Type::Mixed;
         };
@@ -1153,7 +1226,7 @@ impl<'a> TypeCtx<'a> {
             UnOp::Not => Type::Bool,
             // `~` is bytewise on a string (→ string), bitwise on a number (→ int).
             UnOp::BitNot => match self.infer(expr) {
-                Type::String | Type::LiteralString(_) => Type::String,
+                Type::String | Type::StringOf(_) | Type::LiteralString(_) => Type::String,
                 Type::Float => Type::Float,
                 _ => Type::Int,
             },
@@ -1167,7 +1240,7 @@ impl<'a> TypeCtx<'a> {
     fn binary_type(&self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Type {
         use BinOp::*;
         match op {
-            Concat => Type::String,
+            Concat => concat_type(&self.infer(lhs), &self.infer(rhs)),
             // `&` `|` `^` are *bytewise* on two strings (→ string), bitwise on
             // numbers (→ int). Shift/modulo are always int.
             BitOr | BitAnd | BitXor => {
@@ -1206,6 +1279,15 @@ impl<'a> TypeCtx<'a> {
         // arithmetic), which otherwise fell through to the `int|float` arm below.
         if contains_mixed(&l) || contains_mixed(&r) {
             return Type::Mixed;
+        }
+        // Bounded integer arithmetic: two literals fold (`1 + 2` is `3`), and
+        // ranges propagate bound math (`int<0,10> + 1` is `int<1,11>`).
+        if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+            if let (Some(a), Some(b)) = (int_bounds(&l), int_bounds(&r)) {
+                if let Some(t) = range_arith(op, a, b) {
+                    return t;
+                }
+            }
         }
         // `/` and `**` may produce a float even from two ints.
         let may_float = matches!(op, BinOp::Div | BinOp::Pow);
@@ -1284,7 +1366,7 @@ impl<'a> TypeCtx<'a> {
     /// The class FQN to query members on, given a value's type.
     fn type_class_fqn(&self, t: &Type) -> Option<String> {
         match t {
-            Type::Named { fqn, .. } => Some(fqn.to_string()),
+            Type::Named { fqn, .. } | Type::EnumCase { fqn, .. } => Some(fqn.to_string()),
             Type::SelfType | Type::StaticType => self.class.clone(),
             Type::Parent => self.parent_type().and_then(|p| self.type_class_fqn(&p)),
             Type::Nullable(inner) => self.type_class_fqn(inner),
@@ -1638,6 +1720,7 @@ fn bind_templates_from_types(param: &Type, arg: &Type, subst: &mut HashMap<Strin
         | Type::IntRange { .. }
         | Type::Float
         | Type::String
+        | Type::StringOf(_)
         | Type::Object
         | Type::Resource
         | Type::SelfType
@@ -1645,6 +1728,7 @@ fn bind_templates_from_types(param: &Type, arg: &Type, subst: &mut HashMap<Strin
         | Type::Parent
         | Type::LiteralInt(_)
         | Type::LiteralString(_)
+        | Type::EnumCase { .. }
         | Type::Unknown(_) => {}
     }
 }
@@ -1769,7 +1853,7 @@ fn numeric_unary(t: Type) -> Type {
 
 /// `++`/`--`: keeps the operand's numeric/string type, else int.
 fn inc_dec_type(t: Type) -> Type {
-    if is_int(&t) || is_float(&t) || matches!(t, Type::String) {
+    if is_int(&t) || is_float(&t) || matches!(t, Type::String | Type::StringOf(_)) {
         t
     } else {
         Type::union(vec![Type::Int, Type::Float])
@@ -1782,7 +1866,9 @@ fn inc_dec_type(t: Type) -> Type {
 fn instance_of(t: Type) -> Type {
     match t {
         Type::ClassString(Some(inner)) => *inner,
-        Type::ClassString(None) | Type::String | Type::LiteralString(_) => Type::Object,
+        Type::ClassString(None) | Type::String | Type::StringOf(_) | Type::LiteralString(_) => {
+            Type::Object
+        }
         Type::Union(parts) => Type::union(parts.iter().map(|p| instance_of(p.clone())).collect()),
         other => other,
     }
@@ -1836,7 +1922,52 @@ fn contains_mixed(t: &Type) -> bool {
 }
 
 fn is_string_ty(t: &Type) -> bool {
-    matches!(t, Type::String | Type::LiteralString(_))
+    matches!(t, Type::String | Type::StringOf(_) | Type::LiteralString(_))
+}
+
+/// The result type of string concatenation. Two known literals fold to the
+/// joined literal (size-capped); otherwise phpstan's refinement rules apply:
+/// literal-ish operands keep `literal-string`, and one provably non-empty
+/// side makes the result `non-empty-string`.
+fn concat_type(l: &Type, r: &Type) -> Type {
+    const FOLD_CAP: usize = 512;
+    if let (Some(a), Some(b)) = (literal_text(l), literal_text(r)) {
+        if a.len() + b.len() <= FOLD_CAP {
+            return Type::LiteralString(format!("{a}{b}").into());
+        }
+    }
+    let literal_ish = |t: &Type| {
+        matches!(
+            t,
+            Type::LiteralString(_)
+                | Type::LiteralInt(_)
+                | Type::StringOf(php_types::StringRefinement::Literal)
+        )
+    };
+    let non_empty = |t: &Type| match t {
+        Type::LiteralString(s) => !s.is_empty(),
+        // Any int/float prints at least one character.
+        Type::LiteralInt(_) | Type::Int | Type::IntRange { .. } | Type::Float => true,
+        Type::StringOf(r) => r.implies(php_types::StringRefinement::NonEmpty),
+        Type::ClassString(_) => true,
+        _ => false,
+    };
+    if literal_ish(l) && literal_ish(r) {
+        Type::StringOf(php_types::StringRefinement::Literal)
+    } else if non_empty(l) || non_empty(r) {
+        Type::StringOf(php_types::StringRefinement::NonEmpty)
+    } else {
+        Type::String
+    }
+}
+
+/// The literal text of a concat operand when statically known.
+fn literal_text(t: &Type) -> Option<String> {
+    match t {
+        Type::LiteralString(s) => Some(s.to_string()),
+        Type::LiteralInt(n) => Some(n.to_string()),
+        _ => None,
+    }
 }
 
 /// The `(min, max)` integer bounds of an int-valued type (`None` = unbounded),
@@ -1846,6 +1977,61 @@ fn int_bounds(t: &Type) -> Option<(Option<i64>, Option<i64>)> {
         Type::Int => Some((None, None)),
         Type::LiteralInt(n) => Some((Some(*n), Some(*n))),
         Type::IntRange { min, max } => Some((*min, *max)),
+        _ => None,
+    }
+}
+
+/// `a OP b` over integer bounds (`None` = ±∞): singletons fold to a literal
+/// (PHP int overflow produces a float, so a checked overflow folds to `float`),
+/// bounded ranges propagate bound arithmetic, and an open or overflowing bound
+/// stays open. Multiplication needs all four corners finite (sign flips make
+/// half-open products unbounded in both directions); otherwise `None` falls
+/// back to the caller's plain-`int` path.
+fn range_arith(
+    op: BinOp,
+    a: (Option<i64>, Option<i64>),
+    b: (Option<i64>, Option<i64>),
+) -> Option<Type> {
+    let apply = |x: i64, y: i64| -> Option<i64> {
+        match op {
+            BinOp::Add => x.checked_add(y),
+            BinOp::Sub => x.checked_sub(y),
+            BinOp::Mul => x.checked_mul(y),
+            _ => None,
+        }
+    };
+    // Two singletons: fold to the literal (or float on overflow).
+    if let ((Some(al), Some(ah)), (Some(bl), Some(bh))) = (a, b) {
+        if al == ah && bl == bh {
+            return Some(match apply(al, bl) {
+                Some(n) => Type::LiteralInt(n),
+                None => Type::Float,
+            });
+        }
+    }
+    // A finite bound pair combines; an open (or overflowed) side stays open.
+    let bound = |x: Option<i64>, y: Option<i64>| -> Option<i64> {
+        match (x, y) {
+            (Some(x), Some(y)) => apply(x, y),
+            _ => None,
+        }
+    };
+    match op {
+        BinOp::Add => Some(Type::int_range(bound(a.0, b.0), bound(a.1, b.1))),
+        BinOp::Sub => Some(Type::int_range(bound(a.0, b.1), bound(a.1, b.0))),
+        BinOp::Mul => {
+            let (a0, a1, b0, b1) = (a.0?, a.1?, b.0?, b.1?);
+            let corners = [
+                a0.checked_mul(b0)?,
+                a0.checked_mul(b1)?,
+                a1.checked_mul(b0)?,
+                a1.checked_mul(b1)?,
+            ];
+            Some(Type::int_range(
+                corners.iter().min().copied(),
+                corners.iter().max().copied(),
+            ))
+        }
         _ => None,
     }
 }
@@ -1962,7 +2148,8 @@ mod tests {
         assert_eq!(infer("42;"), "42"); // literal-int type
         assert_eq!(infer("1.5;"), "float");
         assert_eq!(infer("'hi';"), "'hi'"); // literal-string type
-        assert_eq!(infer("\"a$b\";"), "string"); // interpolation widens
+        // Interpolation with a non-empty literal run is non-empty.
+        assert_eq!(infer("\"a$b\";"), "non-empty-string");
         assert_eq!(infer("true;"), "true");
         assert_eq!(infer("false;"), "false");
         assert_eq!(infer("null;"), "null");
@@ -2084,12 +2271,15 @@ mod tests {
 
     #[test]
     fn arithmetic() {
-        assert_eq!(infer("1 + 2;"), "int");
+        assert_eq!(infer("1 + 2;"), "3"); // literal arithmetic folds
+        assert_eq!(infer("10 - 4;"), "6");
+        assert_eq!(infer("6 * 7;"), "42");
+        assert_eq!(infer("9223372036854775807 + 1;"), "float"); // PHP overflow
         assert_eq!(infer("1 + 2.0;"), "float");
         assert_eq!(infer("1 / 2;"), "int|float");
         assert_eq!(infer("2 ** 3;"), "int|float");
         assert_eq!(infer("7 % 3;"), "int");
-        assert_eq!(infer("'a' . 'b';"), "string");
+        assert_eq!(infer("'a' . 'b';"), "'ab'"); // literal concat folds
         assert_eq!(infer("[1] + [2];"), "array");
         assert_eq!(infer("1 <=> 2;"), "-1|0|1");
     }

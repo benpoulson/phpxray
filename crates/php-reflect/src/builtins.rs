@@ -40,6 +40,8 @@ pub(crate) fn builtin_functions_for(version: PhpVersion) -> Vec<FunctionReflecti
             // Built-in purity is curated separately (rules' PURE_BUILTINS); the
             // stub manifest carries no purity info.
             pure: false,
+            impure: false,
+            asserts: Vec::new(),
             must_use_return_value: false,
             builtin: true,
         })
@@ -113,6 +115,8 @@ pub(crate) fn builtin_classes_for(version: PhpVersion) -> Vec<ClassReflection> {
                     templates: Vec::new(),
                     deprecated: false,
                     pure: flags.contains('p'),
+                    impure: false,
+                    asserts: Vec::new(),
                     must_use_return_value: flags.contains('u'),
                     magic: false,
                 });
@@ -153,12 +157,18 @@ pub(crate) fn builtin_classes_for(version: PhpVersion) -> Vec<ClassReflection> {
                     continue;
                 };
                 let templates = cr.templates.clone();
+                let ty = deser_type_with_templates(ty, &scope, &templates);
                 cr.constants.push(ConstReflection {
                     name: name.to_string(),
                     visibility: parse_visibility(visibility),
-                    ty: deser_type_with_templates(ty, &scope, &templates),
+                    // The stub manifest doesn't distinguish declared from
+                    // inferred const types; a non-`mixed` type acts declared
+                    // (preserves the pre-`declared` override-rule behavior).
+                    declared: !matches!(ty, Type::Mixed),
+                    ty,
                     is_final: flags.contains('f'),
                     int_value,
+                    case_backing: None,
                 });
             }
         }
@@ -177,6 +187,7 @@ fn reflected_param(p: BuiltinParam<'_>, scope: &Scope, templates: &[String]) -> 
         optional: p.flags.contains('o'),
         promoted: false,
         explicit: true,
+        out_ty: None,
         inferred: false,
     }
 }

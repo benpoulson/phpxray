@@ -676,8 +676,10 @@ fn param_out_type_is_uncertain(ty: &Type) -> bool {
         | Type::IntRange { .. }
         | Type::Float
         | Type::String
+        | Type::StringOf(_)
         | Type::Object
         | Type::Resource
+        | Type::EnumCase { .. }
         | Type::LiteralInt(_)
         | Type::LiteralString(_) => false,
     }
@@ -706,7 +708,7 @@ fn param_decl_span(params: &[Param], name: &str, interner: &Interner) -> Option<
 /// on the path to its use (phpstan's `Undefined variable:` case). Backed by the
 /// Cap #5 definedness lattice.
 fn run_defined_variable(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    crate::undefined_variables(fa.program, fa.interner)
+    crate::undefined_variables_with(fa.program, fa.interner, &fa.terminators)
         .into_iter()
         .filter(|u| u.definite)
         .map(|u| {
@@ -720,7 +722,7 @@ fn run_defined_variable(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// (assigned on only some paths). phpstan gates this behind
 /// `checkMaybeUndefinedVariables`, enabled from level 1.
 fn run_maybe_undefined_variable(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    crate::undefined_variables(fa.program, fa.interner)
+    crate::undefined_variables_with(fa.program, fa.interner, &fa.terminators)
         .into_iter()
         .filter(|u| !u.definite)
         .map(|u| {
@@ -1101,7 +1103,7 @@ fn null_verdict(ty: &Type) -> Truth {
 fn falsy_verdict(ty: &Type) -> Truth {
     match ty {
         Type::Null | Type::False => Truth::Yes,
-        Type::True | Type::Object | Type::Named { .. } | Type::ClassString(_) => Truth::No,
+        Type::True | Type::Object | Type::Named { .. } | Type::EnumCase { .. } | Type::ClassString(_) => Truth::No,
         Type::LiteralInt(0) => Truth::Yes,
         Type::LiteralInt(_) => Truth::No,
         Type::IntRange { min, max } if min == &Some(0) && max == &Some(0) => Truth::Yes,
@@ -1109,6 +1111,12 @@ fn falsy_verdict(ty: &Type) -> Truth {
         Type::IntRange { max, .. } if max.is_some_and(|n| n < 0) => Truth::No,
         Type::LiteralString(s) if s.is_empty() || &**s == "0" => Truth::Yes,
         Type::LiteralString(_) => Truth::No,
+        // A non-falsy or callable string is definitely truthy; other refined
+        // strings can still be "0" (numeric) or "" ("0" for non-empty).
+        Type::StringOf(
+            php_types::StringRefinement::NonFalsy | php_types::StringRefinement::Callable,
+        ) => Truth::No,
+        Type::StringOf(_) => Truth::Maybe,
         Type::Shape {
             fields,
             sealed: true,

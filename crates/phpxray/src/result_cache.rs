@@ -50,6 +50,19 @@ pub(crate) fn key(
     h.write_bool(rule_options.check_implicit_mixed);
     h.write_bool(config.treat_phpdoc_types_as_certain);
     h.write_bool(config.infer_untyped_signatures);
+    for f in &config.early_terminating_function_calls {
+        h.write_str(f);
+    }
+    for (class, methods) in {
+        let mut entries: Vec<_> = config.early_terminating_method_calls.iter().collect();
+        entries.sort();
+        entries
+    } {
+        h.write_str(class);
+        for m in methods {
+            h.write_str(m);
+        }
+    }
     h.write_bool(config.report_unmatched_ignored);
     write_config_paths(&mut h, config);
     write_ignore_entries(&mut h, &config.ignore);
@@ -178,6 +191,7 @@ impl From<&Finding> for CachedFinding {
             message: finding.message.clone(),
             identifier: finding.identifier.map(str::to_string),
             severity: finding.severity.into(),
+            // Fixes are never cached: `--fix` runs bypass the result cache.
         }
     }
 }
@@ -193,6 +207,7 @@ impl From<CachedFinding> for Finding {
                 .identifier
                 .map(|id| Box::leak(id.into_boxed_str()) as &'static str),
             severity: finding.severity.into(),
+            fix: None,
         }
     }
 }

@@ -46,6 +46,9 @@ pub struct ParamReflection {
     /// The type from the *native* hint alone (`mixed` if none), ignoring PHPDoc —
     /// used for `treatPhpDocTypesAsCertain: false` native-level checking.
     pub native_ty: Type,
+    /// `@param-out` — the type a by-ref parameter holds *after* the call
+    /// (`preg_match`-style out parameters). `None` = unannotated.
+    pub out_ty: Option<Type>,
     /// `ty` was synthesized by whole-project signature inference (from call-site
     /// argument types), not declared. Treated as PHPDoc-grade: refines `ty` but
     /// leaves `native_ty`/`explicit` untouched, so the native-level checking and the
@@ -89,6 +92,13 @@ pub struct FunctionReflection {
     /// Declared side-effect-free via `@pure`/`@phpstan-pure`/`@psalm-pure` (and not
     /// `@phpstan-impure`). Used by the `*.resultUnused` rules.
     pub pure: bool,
+    /// Explicitly declared side-effect-having via `@phpstan-impure`/`@impure`.
+    /// Distinct from `!pure` (unmarked): flow narrowing invalidates object-state
+    /// facts only for callees *known* to have side effects.
+    pub impure: bool,
+    /// `@phpstan-assert*` declarations, with types resolved — call sites narrow
+    /// the matching argument (webmozart/assert-style helpers).
+    pub asserts: Vec<AssertReflection>,
     /// Declared with PHP 8.5's `#[NoDiscard]`; call-as-statement should report
     /// that the return value is discarded.
     pub must_use_return_value: bool,
@@ -123,11 +133,28 @@ pub struct MethodReflection {
     /// Declared side-effect-free via `@pure`/`@phpstan-pure`/`@psalm-pure` (and not
     /// `@phpstan-impure`). Used by the `*.resultUnused` rules.
     pub pure: bool,
+    /// Explicitly declared side-effect-having via `@phpstan-impure`/`@impure`.
+    /// Distinct from `!pure` (unmarked); see [`FunctionReflection::impure`].
+    pub impure: bool,
+    /// `@phpstan-assert*` declarations; see [`FunctionReflection::asserts`].
+    pub asserts: Vec<AssertReflection>,
     /// Declared with PHP 8.5's `#[NoDiscard]`; call-as-statement should report
     /// that the return value is discarded.
     pub must_use_return_value: bool,
     /// Declared only via a class-level `@method` tag (no real implementation).
     pub magic: bool,
+}
+
+/// A resolved `@phpstan-assert*` declaration on a function/method.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssertReflection {
+    /// The asserted target without `$`: a parameter name, or a `this->prop`
+    /// path (asserting on the receiver's own property).
+    pub param: String,
+    pub ty: Type,
+    /// `!Type` — asserted *not* to be of the type.
+    pub negated: bool,
+    pub when: php_phpdoc::AssertWhen,
 }
 
 /// A reflected property (real or magic `@property*`).
@@ -154,15 +181,23 @@ pub struct PropertyReflection {
 pub struct ConstReflection {
     pub name: String,
     pub visibility: Visibility,
-    /// Declared const type (`const int X = 1`) or `mixed`. Value inference is a
-    /// later milestone.
+    /// Declared const type (`const int X = 1`), or the literal type of the
+    /// initializer for an undeclared constant (`const X = 'draft'` is
+    /// `'draft'`), else `mixed`.
     pub ty: Type,
+    /// A native const type was *written* (`const int X = 1`). Distinguishes a
+    /// declared type from a literal-folded one for the override rules.
+    pub declared: bool,
     pub is_final: bool,
     /// The constant's integer value when the initializer is a plain int literal
     /// (`const TYPE_NORMAL = 1`). Lets inference treat `Foo::BAR` as a literal-int
     /// type, which drives constant-comparison dead-branch pruning. `None` for
     /// non-int / non-trivial initializers.
     pub int_value: Option<i64>,
+    /// For an enum case: the literal type of its backing value
+    /// (`case Draft = 'draft'` → `'draft'`). `None` for pure cases and
+    /// ordinary constants. Drives per-case `->value` inference.
+    pub case_backing: Option<Type>,
 }
 
 /// The semantic view of a class/interface/trait/enum declaration.
@@ -303,6 +338,7 @@ pub fn reflect_function(
 ) -> FunctionReflection {
     let doc = parse_doc(f.doc.as_deref());
     let templates: Vec<String> = doc.templates.iter().map(|t| t.name.clone()).collect();
+    let asserts = reflect_asserts(scope, &templates, &doc);
     FunctionReflection {
         fqn: scope.qualify(interner.resolve(f.name)),
         params: reflect_params(scope, interner, &templates, &f.params, &doc),
@@ -319,6 +355,8 @@ pub fn reflect_function(
         templates,
         deprecated: doc.deprecated,
         pure: doc_is_pure(f.doc.as_deref()),
+        impure: doc_is_impure(f.doc.as_deref()),
+        asserts,
         must_use_return_value: has_nodiscard_attr(&f.attrs),
         builtin: false,
     }
@@ -365,16 +403,21 @@ pub fn reflect_class(
             // An enum case (`RoundingMode::Up`) is accessed like a class constant and
             // its value is an instance of the enum — reflect it as a constant so
             // cross-file `Enum::Case` access resolves through the index.
-            Member::EnumCase(ec) => constants.push(ConstReflection {
-                name: interner.resolve(ec.name).to_string(),
-                visibility: Visibility::Public,
-                ty: Type::Named {
-                    fqn: fqn.into(),
-                    args: Vec::new(),
-                },
-                is_final: true,
-                int_value: None,
-            }),
+            Member::EnumCase(ec) => {
+                let case = interner.resolve(ec.name).to_string();
+                constants.push(ConstReflection {
+                    ty: Type::EnumCase {
+                        fqn: fqn.into(),
+                        case: case.as_str().into(),
+                    },
+                    name: case,
+                    visibility: Visibility::Public,
+                    declared: false,
+                    is_final: true,
+                    int_value: None,
+                    case_backing: ec.value.as_ref().and_then(const_literal_type),
+                });
+            }
             // Trait-use adaptations aren't members the type query layer needs yet;
             // traits are surfaced via `traits` below.
             Member::TraitUse(_) => {}
@@ -503,6 +546,8 @@ fn synthetic_method(
         templates: Vec::new(),
         deprecated: false,
         pure: true,
+        impure: false,
+        asserts: Vec::new(),
         must_use_return_value: false,
         magic: false,
     }
@@ -518,6 +563,7 @@ fn synthetic_param(name: &str, ty: Type) -> ParamReflection {
         promoted: false,
         explicit: true,
         native_ty: ty,
+        out_ty: None,
         inferred: false,
     }
 }
@@ -567,6 +613,7 @@ fn reflect_method(
 ) -> MethodReflection {
     let doc = parse_doc(m.doc.as_deref());
     let templates = combine_templates(class_templates, &doc);
+    let asserts = reflect_asserts(scope, &templates, &doc);
     MethodReflection {
         name: interner.resolve(m.name).to_string(),
         visibility: m.modifiers.visibility.unwrap_or(Visibility::Public),
@@ -586,6 +633,8 @@ fn reflect_method(
         templates,
         deprecated: doc.deprecated,
         pure: doc_is_pure(m.doc.as_deref()),
+        impure: doc_is_impure(m.doc.as_deref()),
+        asserts,
         must_use_return_value: has_nodiscard_attr(&m.attrs),
         magic: false,
     }
@@ -625,19 +674,57 @@ fn reflect_consts(
     interner: &Interner,
     out: &mut Vec<ConstReflection>,
 ) {
-    let ty = cd
-        .ty
-        .as_ref()
-        .map(|t| resolve_ast_type(scope, t))
-        .unwrap_or(Type::Mixed);
+    let declared = cd.ty.as_ref().map(|t| resolve_ast_type(scope, t));
     for c in &cd.consts {
+        // An undeclared constant types as its literal initializer (phpstan's
+        // constant scalar folding): `const STATUS = 'draft'` is `'draft'`.
+        let ty = declared
+            .clone()
+            .or_else(|| const_literal_type(&c.value))
+            .unwrap_or(Type::Mixed);
         out.push(ConstReflection {
             name: interner.resolve(c.name).to_string(),
             visibility: cd.modifiers.visibility.unwrap_or(Visibility::Public),
-            ty: ty.clone(),
+            ty,
+            declared: declared.is_some(),
             is_final: cd.modifiers.is_final,
             int_value: const_int_value(&c.value),
+            case_backing: None,
         });
+    }
+}
+
+/// The literal type of a constant initializer, when it is a scalar literal
+/// (through parentheses and a unary sign). Arrays type as bare `array`
+/// (element folding is a later step); anything else → `None` (`mixed`).
+fn const_literal_type(e: &php_ast::Expr) -> Option<Type> {
+    use php_ast::ExprKind as E;
+    const LITERAL_CAP: usize = 512;
+    match &e.kind {
+        E::Int(n) => Some(Type::LiteralInt(*n)),
+        E::Float(_) => Some(Type::Float),
+        E::Str(bytes) => Some(match std::str::from_utf8(bytes) {
+            Ok(s) if s.len() <= LITERAL_CAP => Type::LiteralString(s.into()),
+            _ => Type::String,
+        }),
+        E::Name(n) if n.text.eq_ignore_ascii_case("true") => Some(Type::True),
+        E::Name(n) if n.text.eq_ignore_ascii_case("false") => Some(Type::False),
+        E::Name(n) if n.text.eq_ignore_ascii_case("null") => Some(Type::Null),
+        E::Array { .. } => Some(Type::Array(None)),
+        E::Paren(inner) => const_literal_type(inner),
+        E::Unary {
+            op: php_ast::UnOp::Minus,
+            expr,
+        } => match const_literal_type(expr)? {
+            Type::LiteralInt(n) => Some(Type::LiteralInt(n.wrapping_neg())),
+            Type::Float => Some(Type::Float),
+            _ => None,
+        },
+        E::Unary {
+            op: php_ast::UnOp::Plus,
+            expr,
+        } => const_literal_type(expr),
+        _ => None,
     }
 }
 
@@ -689,6 +776,8 @@ fn magic_method(
         templates,
         deprecated: false,
         pure: false,
+        impure: false,
+        asserts: Vec::new(),
         must_use_return_value: false,
         magic: true,
     }
@@ -708,6 +797,7 @@ fn magic_param(scope: &Scope, templates: &[String], p: &MethodParam) -> ParamRef
         promoted: false,
         explicit: p.ty.is_some(),
         native_ty: Type::Mixed,
+        out_ty: None,
         inferred: false,
     }
 }
@@ -753,6 +843,12 @@ fn reflect_params(
                 .iter()
                 .find(|dp| dp.name.as_deref() == Some(name.as_str()))
                 .and_then(|dp| dp.ty.as_ref());
+            let out_ty = doc
+                .param_outs
+                .iter()
+                .find(|dp| dp.name.as_deref() == Some(name.as_str()))
+                .and_then(|dp| dp.ty.as_ref())
+                .map(|t| resolve_doc_type(scope, templates, t));
             ParamReflection {
                 ty: merge_type(scope, templates, p.ty.as_ref(), doc_ty),
                 native_ty: native_type(scope, p.ty.as_ref()),
@@ -762,6 +858,7 @@ fn reflect_params(
                 optional: p.default.is_some() || p.variadic,
                 promoted: !p.modifiers.is_empty(),
                 explicit: p.ty.is_some() || doc_ty.is_some(),
+                out_ty,
                 inferred: false,
             }
         })
@@ -853,6 +950,37 @@ fn doc_is_pure(raw: Option<&str>) -> bool {
         }
     }
     pure && !impure
+}
+
+/// Resolve a docblock's `@phpstan-assert*` tags against the declaring scope.
+fn reflect_asserts(
+    scope: &Scope,
+    templates: &[String],
+    doc: &Doc,
+) -> Vec<AssertReflection> {
+    doc.asserts
+        .iter()
+        .map(|a| AssertReflection {
+            param: a.param.clone(),
+            ty: resolve_doc_type(scope, templates, &a.ty),
+            negated: a.negated,
+            when: a.when,
+        })
+        .collect()
+}
+
+/// Whether a docblock explicitly declares the symbol side-effect-having: a
+/// `@phpstan-impure`/`@psalm-impure`/`@impure` tag is present.
+fn doc_is_impure(raw: Option<&str>) -> bool {
+    let Some(raw) = raw else { return false };
+    php_phpdoc::parse_block(raw).tags.iter().any(|t| {
+        let base = t
+            .name
+            .strip_prefix("phpstan-")
+            .or_else(|| t.name.strip_prefix("psalm-"))
+            .unwrap_or(t.name.as_str());
+        base == "impure"
+    })
 }
 
 fn has_nodiscard_attr(attrs: &[AttributeGroup]) -> bool {
@@ -1010,14 +1138,26 @@ mod tests {
             class C {
                 const A = 1;
                 final protected const int B = 2;
+                const S = 'draft';
+                const NEG = -3;
+                const F = false;
             }"#,
         );
         let a = c.constants.iter().find(|k| k.name == "A").unwrap();
         assert_eq!(a.visibility, Visibility::Public);
-        assert_eq!(a.ty, Type::Mixed);
+        // Undeclared constants type as their literal initializer.
+        assert_eq!(a.ty, Type::LiteralInt(1));
+        assert!(!a.declared);
         let b = c.constants.iter().find(|k| k.name == "B").unwrap();
         assert!(b.is_final && b.visibility == Visibility::Protected);
         assert_eq!(b.ty, Type::Int);
+        assert!(b.declared);
+        let s = c.constants.iter().find(|k| k.name == "S").unwrap();
+        assert_eq!(s.ty, Type::LiteralString("draft".into()));
+        let neg = c.constants.iter().find(|k| k.name == "NEG").unwrap();
+        assert_eq!(neg.ty, Type::LiteralInt(-3));
+        let f = c.constants.iter().find(|k| k.name == "F").unwrap();
+        assert_eq!(f.ty, Type::False);
     }
 
     #[test]

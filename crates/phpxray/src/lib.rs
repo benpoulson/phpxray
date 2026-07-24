@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
 pub mod baseline;
+pub mod fix;
 pub mod incremental;
 pub mod report;
 mod result_cache;
@@ -45,22 +46,66 @@ pub struct ParsedFile {
 pub struct RunOptions {
     /// Show transient progress indicators on stderr when stderr is a terminal.
     pub progress: bool,
+    /// Fire a desktop notification when there are errors (on notification
+    /// only, not on clean passes). Only meaningful when combined with
+    /// `--watch`.
+    pub notify: bool,
     /// Collect internal wall-clock timings in [`Report::timings`].
     pub collect_timings: bool,
     /// Reuse final post-suppression reports for identical project reruns.
     pub use_result_cache: bool,
     /// Override the result cache directory. Defaults under the project root.
     pub cache_dir: Option<PathBuf>,
+    /// Compute machine-applicable fixes for supported findings (`--fix` runs).
+    pub collect_fixes: bool,
+    /// Debug mode (`--debug`): print each analyzed file to stderr as analysis
+    /// reaches it and bypass the result cache, so every run is a real run.
+    pub debug: bool,
 }
 
 impl Default for RunOptions {
     fn default() -> Self {
         Self {
+            notify: false,
             progress: false,
             collect_timings: false,
             use_result_cache: true,
             cache_dir: None,
+            collect_fixes: false,
+            debug: false,
         }
+    }
+}
+
+/// Build the flow-terminator set from the config's `earlyTerminating*` lists
+/// (method names are matched without re-checking the class — see
+/// [`php_rules::Terminators`]).
+fn terminators_from_config(config: &Config) -> std::sync::Arc<php_rules::Terminators> {
+    std::sync::Arc::new(php_rules::Terminators {
+        functions: config
+            .early_terminating_function_calls
+            .iter()
+            .map(|f| f.trim_start_matches('\\').to_ascii_lowercase())
+            .collect(),
+        methods: config
+            .early_terminating_method_calls
+            .values()
+            .flatten()
+            .map(|m| m.to_ascii_lowercase())
+            .collect(),
+    })
+}
+
+/// The effective result-cache directory for a project: `RunOptions::cache_dir`
+/// wins, then the config's `resultCachePath` (relative to the root), then the
+/// default `.phpxray/cache/results-v1`.
+pub fn result_cache_dir(config: &Config, root: &Path, override_dir: Option<&Path>) -> PathBuf {
+    if let Some(d) = override_dir {
+        return d.to_path_buf();
+    }
+    match &config.result_cache_path {
+        Some(p) => root.join(p),
+        None => result_cache::default_cache_dir(root),
     }
 }
 
@@ -132,6 +177,9 @@ pub struct Finding {
     /// phpstan-style identifier (e.g. `return.type`), if the rule set one.
     pub identifier: Option<&'static str>,
     pub severity: Severity,
+    /// A machine-applicable repair (`--fix` runs only). Byte offsets are valid
+    /// in `path`'s analyzed source; only kept for findings local to their file.
+    pub fix: Option<php_diagnostics::DocTagFix>,
 }
 
 /// The result of an analysis run.
@@ -200,6 +248,72 @@ pub fn run(config: &Config, root: &Path) -> Report {
 
 /// Run analysis with CLI/UI options such as progress reporting.
 pub fn run_with_options(config: &Config, root: &Path, options: RunOptions) -> Report {
+    run_pipeline(config, root, options).0
+}
+
+/// The result of [`run_fix`]: what was repaired, plus the post-fix report.
+pub struct FixReport {
+    pub summary: fix::FixSummary,
+    pub report: Report,
+}
+
+/// Run analysis with fix collection, write the repairs into the analyzed
+/// sources, and repeat: each round's added types sharpen inference, which can
+/// make previously-unfixable findings fixable (a `@return` written in round 1
+/// becomes call-site evidence in round 2). Iterates until a round writes
+/// nothing (monotone — a repaired declaration stops reporting — so this
+/// terminates; `MAX_ROUNDS` is a backstop), then re-runs once so the returned
+/// report reflects the repaired code. The result cache is bypassed throughout —
+/// files change mid-run.
+pub fn run_fix(config: &Config, root: &Path, options: RunOptions) -> FixReport {
+    const MAX_ROUNDS: usize = 5;
+    let fix_options = RunOptions {
+        use_result_cache: false,
+        collect_fixes: true,
+        ..options.clone()
+    };
+    let mut summary = fix::FixSummary::default();
+    for round in 0..MAX_ROUNDS {
+        let (report, parsed) = run_pipeline(config, root, fix_options.clone());
+        let sources: HashMap<String, String> = parsed
+            .into_iter()
+            .map(|f| (f.path, f.source))
+            .collect();
+        let round_summary = fix::apply_fixes(&report.findings, &sources, root);
+        summary.findings_fixed += round_summary.findings_fixed;
+        for path in round_summary.changed_paths.iter() {
+            if !summary.changed_paths.contains(path) {
+                summary.changed_paths.push(path.clone());
+            }
+        }
+        summary.files_changed = summary.changed_paths.len();
+        // Skip reasons are terminal (non-UTF-8, conflicts): report them once.
+        if round == 0 {
+            summary.files_skipped = round_summary.files_skipped;
+        }
+        if round_summary.files_changed == 0 {
+            // Converged without writing this round: this report is already
+            // accurate (fixes don't alter findings, only annotate them).
+            let mut report = report;
+            for f in &mut report.findings {
+                f.fix = None;
+            }
+            return FixReport { summary, report };
+        }
+    }
+    let rerun_options = RunOptions {
+        use_result_cache: false,
+        collect_fixes: false,
+        ..options
+    };
+    let report = run_with_options(config, root, rerun_options);
+    FixReport { summary, report }
+}
+
+/// The full single-shot pipeline. Returns the post-suppression report plus the
+/// parsed files (empty on a result-cache hit) so callers that need the analyzed
+/// sources afterwards — `--fix`'s disk-byte verification — can keep them.
+fn run_pipeline(config: &Config, root: &Path, options: RunOptions) -> (Report, Vec<ParsedFile>) {
     let mut timings = options.collect_timings.then(AnalysisTimings::default);
     let progress = Progress::new(options.progress);
     let started = Instant::now();
@@ -239,12 +353,12 @@ pub fn run_with_options(config: &Config, root: &Path, options: RunOptions) -> Re
         treat_phpdoc_types_as_certain: config.treat_phpdoc_types_as_certain,
         infer_untyped_signatures: config.infer_untyped_signatures,
         rule_options,
+        collect_fixes: options.collect_fixes,
+        debug: options.debug,
+        terminators: terminators_from_config(config),
     };
-    let cache = options.use_result_cache.then(|| {
-        let cache_dir = options
-            .cache_dir
-            .clone()
-            .unwrap_or_else(|| result_cache::default_cache_dir(root));
+    let cache = (options.use_result_cache && !options.debug).then(|| {
+        let cache_dir = result_cache_dir(config, root, options.cache_dir.as_deref());
         let cache_files: Vec<_> = inputs
             .iter()
             .map(|(path, source, analyze)| result_cache::CacheFileInput {
@@ -262,7 +376,7 @@ pub fn run_with_options(config: &Config, root: &Path, options: RunOptions) -> Re
                 t.cache_hit = true;
                 report.timings = Some(t);
             }
-            return report;
+            return (report, Vec::new());
         }
     }
     let started = Instant::now();
@@ -291,7 +405,7 @@ pub fn run_with_options(config: &Config, root: &Path, options: RunOptions) -> Re
     if let Some((cache_dir, key)) = &cache {
         result_cache::store(cache_dir, key, &report);
     }
-    report
+    (report, parsed)
 }
 
 /// Analyze already-parsed files at `level`. Pure over its inputs (no disk I/O) —
@@ -314,13 +428,16 @@ pub fn analyze_parsed(
             // disables untyped-signature inference for batch tooling / audits.
             infer_untyped_signatures: std::env::var_os("PHPXRAY_NO_INFER").is_none(),
             rule_options: Level(level).rule_options(),
+            collect_fixes: false,
+            debug: false,
+            terminators: Default::default(),
         },
         &Progress::hidden(),
         None,
     )
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct AnalyzeParsedOptions {
     level: u8,
     php_version: php_rules::PhpVersion,
@@ -328,6 +445,12 @@ struct AnalyzeParsedOptions {
     /// Run whole-project signature inference for untyped functions before rules.
     infer_untyped_signatures: bool,
     rule_options: RuleOptions,
+    /// Attach machine-applicable fixes to supported diagnostics (`--fix` runs).
+    collect_fixes: bool,
+    /// Print each analyzed file to stderr as analysis reaches it (`--debug`).
+    debug: bool,
+    /// User-configured always-terminating calls (`earlyTerminating*` config).
+    terminators: std::sync::Arc<php_rules::Terminators>,
 }
 
 fn analyze_parsed_progress(
@@ -383,6 +506,13 @@ fn analyze_parsed_progress(
         }
     }
 
+    // `--fix` only: call-site evidence for explicitly-`array`-typed params (a
+    // side map consumed by fix rendering — never applied to the reflection).
+    let iterable_param_evidence = options.collect_fixes.then(|| {
+        let programs: Vec<&php_ast::Program> = parsed.iter().map(|f| &f.program).collect();
+        php_infer::explicit_iterable_param_evidence(&reflection, &programs, interner)
+    });
+
     let analyzed_count = parsed.iter().filter(|f| f.analyze).count();
     let workers = rayon::current_num_threads();
     let analyzing = progress.counter(
@@ -395,6 +525,9 @@ fn analyze_parsed_progress(
         php_version: options.php_version,
         treat_phpdoc_types_as_certain: options.treat_phpdoc_types_as_certain,
         rule_options: options.rule_options,
+        collect_fixes: options.collect_fixes,
+        terminators: options.terminators.clone(),
+        iterable_param_evidence: iterable_param_evidence.as_ref(),
         project: &project,
         reflection: &reflection,
         sources: parsed
@@ -409,6 +542,9 @@ fn analyze_parsed_progress(
         .enumerate()
         .filter(|(_, f)| f.analyze)
         .map(|(idx, f)| {
+            if options.debug {
+                eprintln!("{}", f.path);
+            }
             let (findings, file_timings) = analyze_one_file(f, &ctx);
             analyzing.inc(1);
             (idx, findings, file_timings)
@@ -440,6 +576,9 @@ struct AnalysisContext<'a> {
     php_version: php_rules::PhpVersion,
     treat_phpdoc_types_as_certain: bool,
     rule_options: RuleOptions,
+    collect_fixes: bool,
+    terminators: std::sync::Arc<php_rules::Terminators>,
+    iterable_param_evidence: Option<&'a php_infer::ExplicitParamEvidence>,
     project: &'a ProjectIndex,
     reflection: &'a ReflectionIndex,
     sources: HashMap<&'a str, &'a str>,
@@ -458,6 +597,7 @@ fn analyze_one_file(f: &ParsedFile, ctx: &AnalysisContext<'_>) -> (Vec<Finding>,
             message: d.message.clone(),
             identifier: d.code,
             severity: d.severity,
+            fix: None,
         });
     }
 
@@ -471,11 +611,12 @@ fn analyze_one_file(f: &ParsedFile, ctx: &AnalysisContext<'_>) -> (Vec<Finding>,
     // One faceted inference pass. The native facet is computed only when
     // `treatPhpDocTypesAsCertain` is off (otherwise nothing consults it), so the
     // common case is a single pass.
-    let types = php_rules::type_map(
+    let types = php_rules::type_map_with(
         ctx.reflection,
         &f.program,
         ctx.interner,
         !ctx.treat_phpdoc_types_as_certain,
+        &ctx.terminators,
     );
     timings.type_map = started.elapsed();
     let fa = FileAnalysis {
@@ -494,6 +635,9 @@ fn analyze_one_file(f: &ParsedFile, ctx: &AnalysisContext<'_>) -> (Vec<Finding>,
         check_nullables: ctx.rule_options.check_nullables,
         check_explicit_mixed: ctx.rule_options.check_explicit_mixed,
         check_implicit_mixed: ctx.rule_options.check_implicit_mixed,
+        collect_fixes: ctx.collect_fixes,
+        iterable_param_evidence: ctx.iterable_param_evidence,
+        terminators: ctx.terminators.clone(),
         reflect_cache: Default::default(),
     };
     let mut target_line_indices: HashMap<String, LineIndex> = HashMap::new();
@@ -506,6 +650,7 @@ fn analyze_one_file(f: &ParsedFile, ctx: &AnalysisContext<'_>) -> (Vec<Finding>,
         let target_line_index = target_line_indices
             .entry(target_path.to_string())
             .or_insert_with(|| LineIndex::new(target_source));
+        let local = located.path.is_none();
         let d = located.diagnostic;
         let lc = target_line_index.line_col(d.primary.range().start as u32);
         findings.push(Finding {
@@ -515,6 +660,9 @@ fn analyze_one_file(f: &ParsedFile, ctx: &AnalysisContext<'_>) -> (Vec<Finding>,
             message: d.message,
             identifier: d.code,
             severity: d.severity,
+            // Cross-file located diagnostics carry spans for *this* file's
+            // source, not the target's — never apply them there.
+            fix: if local { d.fix } else { None },
         });
     }
     timings.rules = started.elapsed();

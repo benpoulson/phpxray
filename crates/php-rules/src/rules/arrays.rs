@@ -396,7 +396,7 @@ fn definitely_invalid_key(t: &Type) -> bool {
 fn definitely_string_offset_base(t: &Type) -> bool {
     matches!(
         t,
-        Type::String | Type::LiteralString(_) | Type::ClassString(_)
+        Type::String | Type::StringOf(_) | Type::LiteralString(_) | Type::ClassString(_)
     )
 }
 
@@ -422,7 +422,7 @@ fn definitely_invalid_string_write_offset(dim: Option<&Type>) -> bool {
 fn definitely_offset_accessible(fa: &FileAnalysis, t: &Type) -> bool {
     match t {
         Type::Array(_) | Type::List(_) | Type::Shape { .. } => true,
-        Type::String | Type::LiteralString(_) | Type::ClassString(_) => true,
+        Type::String | Type::StringOf(_) | Type::LiteralString(_) | Type::ClassString(_) => true,
         Type::Named { fqn, .. } => {
             fqn.trim_start_matches('\\')
                 .eq_ignore_ascii_case("ArrayAccess")
@@ -542,7 +542,7 @@ fn combine_string_key_statuses(statuses: impl Iterator<Item = StringKeyStatus>) 
 
 fn key_type_string_status(t: &Type) -> StringKeyStatus {
     match t {
-        Type::String | Type::LiteralString(_) | Type::ClassString(_) => StringKeyStatus::Yes,
+        Type::String | Type::StringOf(_) | Type::LiteralString(_) | Type::ClassString(_) => StringKeyStatus::Yes,
         Type::Union(parts) => combine_string_key_statuses(parts.iter().map(key_type_string_status)),
         Type::Nullable(inner) => match key_type_string_status(inner) {
             StringKeyStatus::No => StringKeyStatus::No,

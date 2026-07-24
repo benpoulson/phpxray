@@ -355,6 +355,7 @@ fn definitely_not_callable_type(t: &Type) -> bool {
         | Type::Object
         | Type::Resource
         | Type::String
+        | Type::StringOf(_)
         | Type::LiteralString(_)
         | Type::Array(_)
         | Type::Iterable(_)
@@ -362,6 +363,7 @@ fn definitely_not_callable_type(t: &Type) -> bool {
         | Type::Shape { .. }
         | Type::ClassString(_)
         | Type::Named { .. }
+        | Type::EnumCase { .. }
         | Type::SelfType
         | Type::StaticType
         | Type::Parent

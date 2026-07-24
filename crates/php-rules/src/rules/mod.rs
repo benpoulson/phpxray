@@ -151,7 +151,9 @@ pub(crate) fn nullable_type_display(t: &Type) -> String {
 
 pub(crate) fn known_objectish_type(fa: &FileAnalysis, t: &Type) -> bool {
     match t {
-        Type::Named { fqn, .. } => fa.project.has_class(fqn) || fa.reflection.class(fqn).is_some(),
+        Type::Named { fqn, .. } | Type::EnumCase { fqn, .. } => {
+            fa.project.has_class(fqn) || fa.reflection.class(fqn).is_some()
+        }
         Type::Union(parts) => {
             !parts.is_empty() && parts.iter().all(|p| known_objectish_type(fa, p))
         }

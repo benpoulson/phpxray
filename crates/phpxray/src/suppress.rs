@@ -148,6 +148,7 @@ pub(crate) fn apply_compiled(
                 message: format!("Parse error in @phpstan-ignore: {message}"),
                 identifier: Some("ignore.parseError"),
                 severity: Severity::Error,
+                fix: None,
             });
         }
     }
@@ -170,6 +171,7 @@ pub(crate) fn apply_compiled(
                     ),
                     identifier: Some("ignore.unmatched"),
                     severity: Severity::Error,
+                    fix: None,
                 });
             } else if let Some(expected) = m.count {
                 if matched[i] < expected {
@@ -184,6 +186,7 @@ pub(crate) fn apply_compiled(
                         ),
                         identifier: Some("ignore.unmatched"),
                         severity: Severity::Error,
+                        fix: None,
                     });
                 }
             }
@@ -200,8 +203,12 @@ pub(crate) fn apply_compiled(
 
 /// A compiled config ignore entry.
 struct Matcher {
-    message: Option<Regex>,
-    identifier: Option<String>,
+    /// Message regexes (`message` + `messages`); any may match.
+    messages: Vec<Regex>,
+    /// Literal messages (`rawMessage` + `rawMessages`), compared by equality.
+    raw_messages: Vec<String>,
+    /// Identifiers (`identifier` + `identifiers`); any may match.
+    identifiers: Vec<String>,
     /// Path constraint (subtree-aware, like excludes); `None` = any path.
     paths: Option<ExcludeMatcher>,
     /// Maximum number of findings this entry may suppress. `None` means unlimited.
@@ -216,16 +223,39 @@ struct Matcher {
 }
 
 impl Matcher {
-    /// Compile an entry; `None` for a degenerate entry (no message and no
-    /// identifier — too broad to honor safely).
+    /// Compile an entry; `None` for a degenerate entry (no message, no raw
+    /// message, and no identifier — too broad to honor safely).
     fn compile(e: &IgnoreEntry) -> Option<Matcher> {
-        if e.message.is_none() && e.identifier.is_none() {
+        if e.message.is_none()
+            && e.messages.is_empty()
+            && e.raw_message.is_none()
+            && e.raw_messages.is_empty()
+            && e.identifier.is_none()
+            && e.identifiers.is_empty()
+        {
             return None;
         }
-        let message = e.message.as_ref().map(|m| {
-            let body = strip_delims(m);
-            Regex::new(body).unwrap_or_else(|_| Regex::new(&regex::escape(body)).unwrap())
-        });
+        let messages: Vec<Regex> = e
+            .message
+            .iter()
+            .chain(e.messages.iter())
+            .map(|m| {
+                let body = strip_delims(m);
+                Regex::new(body).unwrap_or_else(|_| Regex::new(&regex::escape(body)).unwrap())
+            })
+            .collect();
+        let raw_messages: Vec<String> = e
+            .raw_message
+            .iter()
+            .chain(e.raw_messages.iter())
+            .cloned()
+            .collect();
+        let identifiers: Vec<String> = e
+            .identifier
+            .iter()
+            .chain(e.identifiers.iter())
+            .cloned()
+            .collect();
         let path_patterns: Vec<String> = e.path.iter().chain(e.paths.iter()).cloned().collect();
         let paths = (!path_patterns.is_empty()).then(|| ExcludeMatcher::new(&path_patterns));
         // Bucketable iff every pattern is glob-free and multi-segment (a bare
@@ -244,11 +274,16 @@ impl Matcher {
         let desc = e
             .message
             .clone()
+            .or_else(|| e.messages.first().cloned())
+            .or_else(|| e.raw_message.clone())
+            .or_else(|| e.raw_messages.first().cloned())
             .or_else(|| e.identifier.clone())
+            .or_else(|| e.identifiers.first().cloned())
             .unwrap_or_default();
         Some(Matcher {
-            message,
-            identifier: e.identifier.clone(),
+            messages,
+            raw_messages,
+            identifiers,
             paths,
             count: e.count,
             bucket_paths,
@@ -258,15 +293,21 @@ impl Matcher {
     }
 
     fn matches(&self, f: &Finding) -> bool {
-        if let Some(re) = &self.message {
-            if !re.is_match(&f.message) {
-                return false;
-            }
+        if !self.messages.is_empty() && !self.messages.iter().any(|re| re.is_match(&f.message)) {
+            return false;
         }
-        if let Some(id) = &self.identifier {
-            if f.identifier != Some(id.as_str()) {
-                return false;
-            }
+        if !self.raw_messages.is_empty()
+            && !self.raw_messages.iter().any(|m| m == &f.message)
+        {
+            return false;
+        }
+        if !self.identifiers.is_empty()
+            && !self
+                .identifiers
+                .iter()
+                .any(|id| f.identifier == Some(id.as_str()))
+        {
+            return false;
         }
         if let Some(pm) = &self.paths {
             if !pm.is_excluded(&f.path) {
@@ -590,6 +631,7 @@ mod tests {
             message: msg.into(),
             identifier: Some(id),
             severity: Severity::Error,
+            fix: None,
         }
     }
 
@@ -760,6 +802,41 @@ mod tests {
         let out = apply(r, &[], false, &sources);
         assert_eq!(out.findings.len(), 1);
         assert_eq!(out.findings[0].identifier, Some("class.notFound"));
+    }
+
+    #[test]
+    fn plural_ignore_forms_match_any() {
+        let r = report(vec![
+            finding("src/A.php", 1, "message one", "return.type"),
+            finding("src/A.php", 2, "message two", "argument.type"),
+            finding("src/A.php", 3, "kept", "cast.unset"),
+        ]);
+        let entries = php_config::Config::from_yaml(
+            "ignore:\n  - messages:\n      - '#^message one$#'\n      - '#^message two$#'\n    identifiers:\n      - return.type\n      - argument.type\n",
+        )
+        .unwrap()
+        .ignore;
+        let out = apply(r, &entries, false, &HashMap::new());
+        let kept: Vec<&str> = out.findings.iter().map(|f| f.message.as_str()).collect();
+        assert_eq!(kept, ["kept"]);
+    }
+
+    #[test]
+    fn raw_message_matches_literally_not_as_regex() {
+        let r = report(vec![
+            finding("src/A.php", 1, "calling f() is bad", "function.notFound"),
+            finding("src/A.php", 2, "calling fX) is bad", "function.notFound"),
+        ]);
+        // As a regex, `f()` would match `fX` too (empty group); rawMessage
+        // must match only the literal message.
+        let entries = php_config::Config::from_yaml(
+            "ignore:\n  - rawMessage: \"calling f() is bad\"\n",
+        )
+        .unwrap()
+        .ignore;
+        let out = apply(r, &entries, false, &HashMap::new());
+        let kept: Vec<&str> = out.findings.iter().map(|f| f.message.as_str()).collect();
+        assert_eq!(kept, ["calling fX) is bad"]);
     }
 
     #[test]

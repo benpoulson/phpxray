@@ -84,6 +84,11 @@ pub enum Type {
     },
     Float,
     String,
+    /// A refined string (`non-empty-string`, `numeric-string`, …) — a strict
+    /// subtype of `string` carrying one accessory refinement (phpstan models
+    /// these as accessory intersection types; a single refinement covers the
+    /// forms real code declares).
+    StringOf(StringRefinement),
     /// Bare `object`.
     Object,
     Resource,
@@ -101,6 +106,13 @@ pub enum Type {
     Named {
         fqn: std::sync::Arc<str>,
         args: Vec<Type>,
+    },
+    /// A single enum case (`Suit::Hearts`) — a unit subtype of its enum
+    /// (phpstan's `EnumCaseObjectType`). Enables case-level narrowing, per-case
+    /// `->value`/`->name` literals, and match exhaustiveness.
+    EnumCase {
+        fqn: std::sync::Arc<str>,
+        case: std::sync::Arc<str>,
     },
     /// `self` / `static` / `parent` — resolved against the class context later.
     SelfType,
@@ -131,6 +143,67 @@ pub enum Type {
     },
     /// A type we couldn't resolve or don't model; analysis treats it as `mixed`.
     Unknown(std::sync::Arc<str>),
+}
+
+/// A string accessory refinement. Ordered from weakest to strongest is not
+/// meaningful — subtyping goes through [`StringRefinement::implies`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StringRefinement {
+    /// `non-empty-string` — at least one byte.
+    NonEmpty,
+    /// `non-falsy-string` (`truthy-string`) — non-empty and not `"0"`.
+    NonFalsy,
+    /// `numeric-string` — passes `is_numeric`.
+    Numeric,
+    /// `literal-string` — built only from literals in the program text.
+    Literal,
+    /// `callable-string` — names an existing callable.
+    Callable,
+}
+
+impl StringRefinement {
+    /// Whether a string satisfying `self` necessarily satisfies `other`
+    /// (the refinement subtype lattice): every refinement implies itself;
+    /// `non-falsy`/`numeric`/`callable` imply `non-empty` (the empty string is
+    /// falsy, non-numeric, and not callable). `numeric` does **not** imply
+    /// `non-falsy` (`"0"` is numeric and falsy); `literal` implies nothing
+    /// (the empty literal exists).
+    pub fn implies(self, other: StringRefinement) -> bool {
+        use StringRefinement::*;
+        self == other || matches!((self, other), (NonFalsy | Numeric | Callable, NonEmpty))
+    }
+
+    /// Whether the literal string `s` satisfies this refinement (used for
+    /// `LiteralString <: StringOf` checks). `Callable` is not statically
+    /// checkable here — lenient `true`.
+    pub fn admits_literal(self, s: &str) -> bool {
+        match self {
+            StringRefinement::NonEmpty => !s.is_empty(),
+            StringRefinement::NonFalsy => !s.is_empty() && s != "0",
+            StringRefinement::Numeric => is_numeric_literal(s),
+            // Every literal in the program text is a literal-string.
+            StringRefinement::Literal => true,
+            StringRefinement::Callable => true,
+        }
+    }
+
+    /// The phpstan-canonical display name.
+    pub fn name(self) -> &'static str {
+        match self {
+            StringRefinement::NonEmpty => "non-empty-string",
+            StringRefinement::NonFalsy => "non-falsy-string",
+            StringRefinement::Numeric => "numeric-string",
+            StringRefinement::Literal => "literal-string",
+            StringRefinement::Callable => "callable-string",
+        }
+    }
+}
+
+/// `is_numeric`-style check for a literal (int/float syntax, leading/trailing
+/// whitespace tolerated like PHP's leading-ws rule — kept strict: no ws).
+fn is_numeric_literal(s: &str) -> bool {
+    let t = s.trim_start();
+    !t.is_empty() && (t.parse::<f64>().is_ok() || t.parse::<i64>().is_ok())
 }
 
 /// A callable signature.
@@ -387,6 +460,7 @@ impl fmt::Display for Type {
             }
             Type::Float => f.write_str("float"),
             Type::String => f.write_str("string"),
+            Type::StringOf(r) => f.write_str(r.name()),
             Type::Object => f.write_str("object"),
             Type::Resource => f.write_str("resource"),
             Type::Array(None) => f.write_str("array"),
@@ -406,6 +480,7 @@ impl fmt::Display for Type {
             }
             Type::ClassString(None) => f.write_str("class-string"),
             Type::ClassString(Some(t)) => write!(f, "class-string<{t}>"),
+            Type::EnumCase { fqn, case } => write!(f, "{fqn}::{case}"),
             Type::Named { fqn, args } if args.is_empty() => f.write_str(fqn),
             Type::Named { fqn, args } => {
                 let a = args

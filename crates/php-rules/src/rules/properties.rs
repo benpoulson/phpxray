@@ -891,7 +891,9 @@ fn native_hook_type_is_checkable(ty: &Type, fa: &FileAnalysis) -> bool {
         | Type::Shape { .. }
         | Type::ClassString(_)
         | Type::LiteralInt(_)
-        | Type::LiteralString(_) => false,
+        | Type::LiteralString(_)
+        | Type::StringOf(_)
+        | Type::EnumCase { .. } => false,
         Type::Named { fqn, args } => args.is_empty() && fa.reflection.class(fqn).is_some(),
         Type::Nullable(inner) => native_hook_type_is_checkable(inner, fa),
         Type::Union(parts) => {
@@ -2764,7 +2766,9 @@ fn walk_expr_local(e: &Expr, on_expr: &mut impl FnMut(&Expr)) {
 /// receiver whose class is unambiguous.
 fn sole_class(ty: &Type) -> Option<String> {
     match ty {
-        Type::Named { fqn, .. } => Some(fqn.trim_start_matches('\\').to_string()),
+        Type::Named { fqn, .. } | Type::EnumCase { fqn, .. } => {
+            Some(fqn.trim_start_matches('\\').to_string())
+        }
         // `?C` / `C|null`: the access itself is a *different* (nullable) problem;
         // for member existence we still know the non-null part is exactly `C`.
         Type::Nullable(inner) => sole_class(inner),
@@ -3446,23 +3450,44 @@ fn type_mentions_callable(ty: &php_ast::Type) -> bool {
 /// of not being `Member::Property`.
 fn run_missing_property_typehint(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    for_each_property(fa, &mut |class, pd| {
-        if pd.ty.is_some() {
-            return; // has a native type.
-        }
-        if doc_has_var(pd.doc.as_deref()) {
-            return; // an `@var` PHPDoc type counts as "specified".
-        }
-        let cname = class_name(class, fa);
-        for elem in &pd.props {
-            let prop = fa.interner.resolve(elem.name);
-            out.push(
-                Diagnostic::error(
+    decls::for_each_class_like(fa, |scope, fqn, class| {
+        for m in &class.members {
+            let Member::Property(pd) = m else { continue };
+            if pd.ty.is_some() {
+                continue; // has a native type.
+            }
+            if doc_has_var(pd.doc.as_deref()) {
+                continue; // an `@var` PHPDoc type counts as "specified".
+            }
+            let cname = class_name(class, fa);
+            for elem in &pd.props {
+                let prop = fa.interner.resolve(elem.name);
+                let mut d = Diagnostic::error(
                     span_of(elem),
                     format!("Property {cname}::${prop} has no type specified."),
                 )
-                .with_code("missingType.property"),
-            );
+                .with_code("missingType.property");
+                // `--fix`: a `@var` from the default value + the own-class
+                // `$this->prop = …` assignment evidence (private props only).
+                if fa.collect_fixes && pd.props.len() == 1 && elem.hooks.is_none() {
+                    if let Some(fix) = crate::fix::infer_property_type(fa, scope, fqn, class, pd, elem)
+                        .and_then(|ty| {
+                            crate::fix::typed_tag_fix(
+                                fa,
+                                scope,
+                                &ty,
+                                crate::fix::first_attr_span(&pd.attrs).unwrap_or(span_of(elem)),
+                                pd.doc.as_deref(),
+                                php_diagnostics::DocTagKind::Var,
+                                None,
+                            )
+                        })
+                    {
+                        d = d.with_fix(fix);
+                    }
+                }
+                out.push(d);
+            }
         }
     });
     out
@@ -3837,7 +3862,7 @@ pub(crate) static RULES: &[RuleEntry] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{codes, codes_with};
+    use crate::testutil::{codes, codes_with, fixes, run_fixes};
 
     // --- ReadOnlyByPhpDocPropertyRule -----------------------------------
 
@@ -5338,5 +5363,128 @@ mod tests {
             codes(src, run_missing_property_typehint),
             ["missingType.property", "missingType.property"]
         );
+    }
+
+    // --- `--fix` repairs (missingType.property) ---------------------------
+
+    fn property_fix_tags(src: &str) -> Vec<String> {
+        fixes(src, run_missing_property_typehint)
+            .into_iter()
+            .map(|(tag, _, _)| tag)
+            .collect()
+    }
+
+    #[test]
+    fn fix_var_from_default_value() {
+        let src = "<?php\nclass C {\n    private $rows = [];\n    public function add(string $r): void { $this->rows[] = $r; }\n}\n";
+        // An index-write (`$this->rows[] =`) bails: the element type evolves in a
+        // way the collector doesn't model. No fix, finding still reports.
+        assert!(property_fix_tags(src).is_empty());
+    }
+
+    #[test]
+    fn fix_var_from_assignments_and_default() {
+        let src = "<?php\nclass C {\n    private $rows = [];\n    public function set(): void { $this->rows = ['a', 'b']; }\n}\n";
+        assert_eq!(property_fix_tags(src), ["@var list<string>"]);
+    }
+
+    #[test]
+    fn fix_var_unions_default_and_assignment() {
+        let src = "<?php\nclass C {\n    private $v = null;\n    public function set(): void { $this->v = 1; }\n}\n";
+        assert_eq!(property_fix_tags(src), ["@var null|int"]);
+    }
+
+    #[test]
+    fn fix_var_coalesce_assign_contributes_evidence() {
+        let src = "<?php\nclass C {\n    private $n;\n    public function init(): void { $this->n ??= 5; }\n}\n";
+        // No default and `??=` only: evidence is the RHS.
+        assert_eq!(property_fix_tags(src), ["@var int"]);
+    }
+
+    #[test]
+    fn no_fix_for_public_or_static_property() {
+        // Public props can be written from other files; static writes use
+        // `self::$p` which the collector doesn't model.
+        for src in [
+            "<?php class C { public $x = 1; }",
+            "<?php class C { private static $x = 1; }",
+        ] {
+            for d in run_fixes(src, run_missing_property_typehint) {
+                assert!(d.fix.is_none(), "{src}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_fix_on_compound_assign_or_byref_alias() {
+        for src in [
+            "<?php class C { private $n = 0; public function f(): void { $this->n += 1; } }",
+            "<?php class C { private $n = 0; public function f(): void { $r =& $this->n; } }",
+            "<?php class C { private $m = []; public function f(): void { preg_match('/x/', 'y', $this->m); } }",
+            "<?php class C { private $d = 1; public function f($k): void { $this->{$k} = 'x'; } }",
+        ] {
+            for d in run_fixes(src, run_missing_property_typehint) {
+                assert!(d.fix.is_none(), "{src}");
+            }
+        }
+    }
+
+    #[test]
+    fn fix_survives_safe_builtin_reads() {
+        // `count()` takes its argument by value — not an invisible write.
+        let src = "<?php\nclass C {\n    private $rows = [];\n    public function set(): void { $this->rows = ['a']; }\n    public function n(): int { return count($this->rows); }\n}\n";
+        assert_eq!(property_fix_tags(src), ["@var list<string>"]);
+    }
+
+    #[test]
+    fn no_fix_when_evidence_is_only_a_bare_array() {
+        // `[]` alone would render `@var array` — a type the missing-typehint
+        // family itself reports. Skip rather than trade one finding for another.
+        let src = "<?php class C { private $rows = []; }";
+        for d in run_fixes(src, run_missing_property_typehint) {
+            assert!(d.fix.is_none());
+        }
+    }
+
+    #[test]
+    fn fix_protected_property_on_leaf_class() {
+        let src = "<?php\nclass C {\n    protected $n = 0;\n    public function bump(): void { $this->n = 5; }\n}\n";
+        assert_eq!(property_fix_tags(src), ["@var int"]);
+    }
+
+    #[test]
+    fn no_fix_for_protected_property_on_extended_class() {
+        let src = "<?php class B { protected $n = 0; } class C extends B {}";
+        for d in run_fixes(src, run_missing_property_typehint) {
+            assert!(d.fix.is_none(), "subclass exists: protected prop must not be fixed");
+        }
+    }
+
+    #[test]
+    fn no_fix_when_parent_or_trait_writes_the_property() {
+        for src in [
+            // The parent's method writes the child's protected prop via $this.
+            "<?php class B { public function reset(): void { $this->n = 'x'; } }              class C extends B { protected $n = 0; }",
+            // A used trait writes a private prop (traits flatten into the class).
+            "<?php trait T { public function reset(): void { $this->n = 'x'; } }              class C { use T; private $n = 0; }",
+        ] {
+            for d in run_fixes(src, run_missing_property_typehint) {
+                assert!(d.fix.is_none(), "{src}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_fix_for_multi_element_declaration() {
+        let src = "<?php class C { private $a = 1, $b = 2; }";
+        for d in run_fixes(src, run_missing_property_typehint) {
+            assert!(d.fix.is_none());
+        }
+    }
+
+    #[test]
+    fn fix_var_object_type_short_name() {
+        let src = "<?php\nnamespace App;\nclass User {}\nclass C {\n    private $u;\n    public function set(): void { $this->u = new User(); }\n}\n";
+        assert_eq!(property_fix_tags(src), ["@var User"]);
     }
 }

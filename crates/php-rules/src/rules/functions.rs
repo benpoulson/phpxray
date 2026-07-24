@@ -1920,10 +1920,7 @@ fn anonymous_expr_has_yield(e: &Expr) -> bool {
 /// closures/arrow-fns/methods belong to other categories.)
 fn run_missing_function_return_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    crate::walk::for_each_stmt(fa.program, &mut |s| {
-        let StmtKind::Function(fd) = &s.kind else {
-            return;
-        };
+    crate::decls::for_each_named_function(fa, |scope, fd| {
         if fd.return_type.is_some() {
             return;
         }
@@ -1931,13 +1928,35 @@ fn run_missing_function_return_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
             return;
         }
         let name = fa.interner.resolve(fd.name);
-        out.push(
-            Diagnostic::error(
-                s.span,
-                format!("Function {name}() has no return type specified."),
-            )
-            .with_code("missingType.return"),
-        );
+        let mut d = Diagnostic::error(
+            fd.name_span,
+            format!("Function {name}() has no return type specified."),
+        )
+        .with_code("missingType.return");
+        // `--fix`: signature inference (§8q) already synthesized the return
+        // type from the body when it had confident evidence.
+        if fa.collect_fixes {
+            let refl = fa.reflect_function(scope, fd);
+            if let Some(fix) = fa
+                .reflection
+                .function(&refl.fqn)
+                .filter(|f| f.inferred_return)
+                .and_then(|f| {
+                    crate::fix::typed_tag_fix(
+                        fa,
+                        scope,
+                        &f.return_type,
+                        crate::fix::first_attr_span(&fd.attrs).unwrap_or(fd.name_span),
+                        fd.doc.as_deref(),
+                        php_diagnostics::DocTagKind::Return,
+                        None,
+                    )
+                })
+            {
+                d = d.with_fix(fix);
+            }
+        }
+        out.push(d);
     });
     out
 }
@@ -1946,12 +1965,9 @@ fn run_missing_function_return_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// native type and no `@param $name` PHPDoc tag.
 fn run_missing_function_parameter_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    crate::walk::for_each_stmt(fa.program, &mut |s| {
-        let StmtKind::Function(fd) = &s.kind else {
-            return;
-        };
+    crate::decls::for_each_named_function(fa, |scope, fd| {
         let name = fa.interner.resolve(fd.name);
-        for p in &fd.params {
+        for (idx, p) in fd.params.iter().enumerate() {
             if p.ty.is_some() {
                 continue;
             }
@@ -1959,13 +1975,36 @@ fn run_missing_function_parameter_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
             if doc_has_param(fd.doc.as_deref(), pname) {
                 continue;
             }
-            out.push(
-                Diagnostic::error(
-                    p_span(p),
-                    format!("Function {name}() has parameter ${pname} with no type specified."),
-                )
-                .with_code("missingType.parameter"),
-            );
+            let mut d = Diagnostic::error(
+                p_span(p),
+                format!("Function {name}() has parameter ${pname} with no type specified."),
+            )
+            .with_code("missingType.parameter");
+            // `--fix`: signature inference (§8q) synthesized the type from
+            // call-site arguments when it had confident evidence.
+            if fa.collect_fixes {
+                let refl = fa.reflect_function(scope, fd);
+                if let Some(fix) = fa
+                    .reflection
+                    .function(&refl.fqn)
+                    .and_then(|f| f.params.get(idx))
+                    .filter(|pr| pr.inferred)
+                    .and_then(|pr| {
+                        crate::fix::typed_tag_fix(
+                            fa,
+                            scope,
+                            &pr.ty,
+                            crate::fix::first_attr_span(&fd.attrs).unwrap_or(fd.name_span),
+                            fd.doc.as_deref(),
+                            php_diagnostics::DocTagKind::Param,
+                            Some(pname),
+                        )
+                    })
+                {
+                    d = d.with_fix(fix);
+                }
+            }
+            out.push(d);
         }
     });
     out
@@ -1985,33 +2024,70 @@ fn run_missing_function_iterable_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
             };
             let refl = fa.reflect_function(scope, fd);
             let name = refl.fqn.trim_start_matches('\\');
-            for (p, pr) in fd.params.iter().zip(refl.params.iter()) {
+            for (idx, (p, pr)) in fd.params.iter().zip(refl.params.iter()).enumerate() {
                 if let Some(word) = bare_iterable_word(&pr.ty) {
                     let pname = fa.interner.resolve(p.name);
-                    out.push(
-                        Diagnostic::error(
-                            p_span(p),
-                            format!(
-                                "Function {name}() has parameter ${pname} with no value type \
-                                 specified in iterable type {word}."
-                            ),
-                        )
-                        .with_code("missingType.iterableValue"),
-                    );
+                    let mut d = Diagnostic::error(
+                        p_span(p),
+                        format!(
+                            "Function {name}() has parameter ${pname} with no value type \
+                             specified in iterable type {word}."
+                        ),
+                    )
+                    .with_code("missingType.iterableValue");
+                    // `--fix`: cross-file call-site evidence for the
+                    // explicitly-`array`-typed parameter (side map, §8q).
+                    if fa.collect_fixes {
+                        if let Some(fix) = fa
+                            .iterable_param_evidence
+                            .and_then(|ev| ev.get(&php_infer::evidence_key(&refl.fqn, None, idx)))
+                            .and_then(|ty| {
+                                crate::fix::typed_tag_fix(
+                                    fa,
+                                    scope,
+                                    ty,
+                                    crate::fix::first_attr_span(&fd.attrs).unwrap_or(fd.name_span),
+                                    fd.doc.as_deref(),
+                                    php_diagnostics::DocTagKind::Param,
+                                    Some(pname),
+                                )
+                            })
+                        {
+                            d = d.with_fix(fix);
+                        }
+                    }
+                    out.push(d);
                 }
             }
             if let Some(rt) = &fd.return_type {
                 if let Some(word) = bare_iterable_word(&refl.return_type) {
-                    out.push(
-                        Diagnostic::error(
-                            rt.span,
-                            format!(
-                                "Function {name}() return type has no value type specified in \
-                                 iterable type {word}."
-                            ),
-                        )
-                        .with_code("missingType.iterableValue"),
-                    );
+                    let mut d = Diagnostic::error(
+                        rt.span,
+                        format!(
+                            "Function {name}() return type has no value type specified in \
+                             iterable type {word}."
+                        ),
+                    )
+                    .with_code("missingType.iterableValue");
+                    // `--fix`: refine from the body's own return expressions.
+                    if fa.collect_fixes {
+                        if let Some(fix) = crate::fix::iterable_return_evidence(fa, &fd.body)
+                            .and_then(|ty| {
+                                crate::fix::typed_tag_fix(
+                                    fa,
+                                    scope,
+                                    &ty,
+                                    crate::fix::first_attr_span(&fd.attrs).unwrap_or(fd.name_span),
+                                    fd.doc.as_deref(),
+                                    php_diagnostics::DocTagKind::Return,
+                                    None,
+                                )
+                            })
+                        {
+                            d = d.with_fix(fix);
+                        }
+                    }
+                    out.push(d);
                 }
             }
         }
@@ -3575,7 +3651,7 @@ pub(crate) static RULES: &[RuleEntry] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{codes, codes_version, run};
+    use crate::testutil::{codes, codes_version, fixes, run, run_fixes};
     use crate::PhpVersion;
 
     // --- first-class-callable version gate (callable.notSupported) --------
@@ -4524,6 +4600,106 @@ mod tests {
             codes(src, run_missing_function_parameter_type),
             ["missingType.parameter"]
         );
+    }
+
+    #[test]
+    fn conditional_nested_function_still_flagged() {
+        // Coverage check for the region-based traversal: a conditionally
+        // declared function is still visited.
+        let src = "<?php if (true) { function nested() { return 1; } }";
+        assert_eq!(
+            codes(src, run_missing_function_return_type),
+            ["missingType.return"]
+        );
+    }
+
+    // --- `--fix` repairs for the missing-typehint rules -------------------
+
+    #[test]
+    fn fix_attached_for_inferred_function_return() {
+        let src = "<?php\nfunction f() {\n    return 'x';\n}\n";
+        let fx = fixes(src, run_missing_function_return_type);
+        let line_start = src.find("function f").unwrap() as u32;
+        assert_eq!(
+            fx,
+            [(
+                "@return string".to_string(),
+                php_diagnostics::FixAnchor::NewDocAt(line_start),
+                String::new()
+            )]
+        );
+    }
+
+    #[test]
+    fn fix_function_param_from_call_sites() {
+        let src = "<?php\nfunction g($x): void {}\ng(1);\ng(2);\n";
+        let fx = fixes(src, run_missing_function_parameter_type);
+        assert_eq!(fx.len(), 1);
+        assert_eq!(fx[0].0, "@param int $x");
+    }
+
+    #[test]
+    fn fix_function_return_in_namespace_uses_short_class_name() {
+        let src = "<?php\nnamespace App;\nclass User {}\nfunction u() {\n    return new User();\n}\n";
+        let fx = fixes(src, run_missing_function_return_type);
+        assert_eq!(fx.len(), 1);
+        assert_eq!(fx[0].0, "@return User");
+    }
+
+    #[test]
+    fn fix_param_iterable_value_from_call_sites() {
+        // Explicitly-`array`-typed param refined from observed arguments.
+        let src = "<?php\nfunction f(array $rows): void {}\nf(['a', 'b']);\nf(['c']);\n";
+        let fx = fixes(src, run_missing_function_iterable_value);
+        assert_eq!(fx.len(), 1, "{fx:?}");
+        assert_eq!(fx[0].0, "@param list<string> $rows");
+    }
+
+    #[test]
+    fn no_param_iterable_fix_without_refining_call_sites() {
+        for src in [
+            // Never called: no evidence.
+            "<?php function f(array $rows): void {}",
+            // Called with an unrefined array: doesn't refine.
+            "<?php function g(): array { return []; } function f(array $rows): void {} f(g());",
+        ] {
+            for d in run_fixes(src, run_missing_function_iterable_value) {
+                assert!(d.fix.is_none(), "{src}");
+            }
+        }
+    }
+
+    #[test]
+    fn fix_return_iterable_value_from_body() {
+        let src = "<?php\nfunction f(): array {\n    return ['a' => 1];\n}\n";
+        let fx = fixes(src, run_missing_function_iterable_value);
+        assert_eq!(fx.len(), 1, "{fx:?}");
+        assert_eq!(fx[0].0, "@return array{a: int}");
+    }
+
+    #[test]
+    fn no_iterable_fix_for_generator_or_unrefined_body() {
+        for src in [
+            // The helper's own return is bare `array`: no refinement.
+            "<?php function h(): array { return one(); } function one(): array { return []; }",
+            // A bare `return;` leaves a path untyped.
+            "<?php function f(): array { if (true) { return; } return [1]; }",
+        ] {
+            for d in run_fixes(src, run_missing_function_iterable_value) {
+                assert!(d.fix.is_none(), "{src}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_function_fix_without_evidence() {
+        let src = "<?php function f($x) {}";
+        for d in run_fixes(src, run_missing_function_parameter_type)
+            .into_iter()
+            .chain(run_fixes(src, run_missing_function_return_type))
+        {
+            assert!(d.fix.is_none(), "{:?}", d.message);
+        }
     }
 
     // --- call statement with no side effects -----------------------------

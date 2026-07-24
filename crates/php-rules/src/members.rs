@@ -251,7 +251,9 @@ impl<'a> MemberAccessResolver<'a> {
 
 pub(crate) fn sole_class(ty: &Type) -> Option<String> {
     match ty {
-        Type::Named { fqn, .. } => Some(fqn.trim_start_matches('\\').to_string()),
+        Type::Named { fqn, .. } | Type::EnumCase { fqn, .. } => {
+            Some(fqn.trim_start_matches('\\').to_string())
+        }
         Type::Nullable(inner) => sole_class(inner),
         _ => None,
     }

@@ -78,6 +78,15 @@ pub struct FileAnalysis<'a> {
     pub check_explicit_mixed: bool,
     /// phpstan's implicit `mixed` strictness gate (`max`).
     pub check_implicit_mixed: bool,
+    /// When `true` (`--fix` runs only), rules that know a machine-applicable
+    /// repair attach a [`php_diagnostics::DocTagFix`] to their diagnostics.
+    /// Default `false`: normal runs pay nothing for fix computation.
+    pub collect_fixes: bool,
+    /// Call-site evidence for explicitly-typed bare `array` params (`--fix`
+    /// runs only; see [`php_infer::ExplicitParamEvidence`]). `None` otherwise.
+    pub iterable_param_evidence: Option<&'a php_infer::ExplicitParamEvidence>,
+    /// User-configured always-terminating calls (`earlyTerminating*` config).
+    pub terminators: std::sync::Arc<php_infer::Terminators>,
     /// Per-file memo of declared reflections (see [`ReflectCache`]). Default-init
     /// at every construction site; consume via [`FileAnalysis::reflect_class`] /
     /// [`FileAnalysis::reflect_function`].
@@ -893,6 +902,9 @@ mod tests {
             check_nullables: true,
             check_explicit_mixed: true,
             check_implicit_mixed: true,
+            collect_fixes: false,
+            iterable_param_evidence: None,
+            terminators: Default::default(),
             reflect_cache: Default::default(),
         };
 

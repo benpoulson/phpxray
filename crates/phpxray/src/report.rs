@@ -1,24 +1,75 @@
-//! Output formatting for a [`Report`]: `table` (human), `json` (phpstan-style
-//! schema for tooling), `github` (Actions annotations), and `checkstyle` (XML).
+//! Output formatting for a [`Report`]: `table` (human), `json`/`prettyJson`
+//! (phpstan-style schema for tooling), `raw` (grep-friendly lines), `github`
+//! (Actions annotations), `checkstyle` (XML), `gitlab` (Code Quality JSON),
+//! and `junit` (JUnit XML). Non-table formats mirror phpstan's ErrorFormatter
+//! output shapes so existing CI integrations keep working.
 
 use crate::Report;
 use php_diagnostics::Severity;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+
+/// The synthetic path suppression bookkeeping findings are reported at
+/// (phpstan's "not file specific" errors).
+const NON_FILE_PATH: &str = "(ignore)";
+
+/// Presentation-only options (from config, not part of analysis).
+#[derive(Debug, Clone, Default)]
+pub struct RenderOptions {
+    /// Editor link template shown under each table finding; `%file%`,
+    /// `%relFile%`, `%line%` and `%column%` placeholders are substituted
+    /// (phpstan's `editorUrl`).
+    pub editor_url: Option<String>,
+    /// Display text for the editor link (phpstan's `editorUrlTitle`); the
+    /// substituted URL itself when unset.
+    pub editor_url_title: Option<String>,
+}
 
 /// Render a report in the named format. Returns `None` for an unknown format.
 pub fn render(report: &Report, format: &str) -> Option<String> {
+    render_with(report, format, &RenderOptions::default())
+}
+
+/// [`render`] with presentation options (editor links in the table format).
+pub fn render_with(report: &Report, format: &str, opts: &RenderOptions) -> Option<String> {
     Some(match format {
-        "table" => render_table(report),
+        "table" => render_table_with(report, opts),
         "json" => render_json(report),
+        "prettyJson" => render_json_pretty(report),
+        "raw" => render_raw(report),
         "github" => render_github(report),
         "checkstyle" => render_checkstyle(report),
+        "gitlab" => render_gitlab(report),
+        "junit" => render_junit(report),
         _ => return None,
     })
 }
 
 /// Render a report as a human-readable, file-grouped table.
 pub fn render_table(report: &Report) -> String {
+    render_table_with(report, &RenderOptions::default())
+}
+
+/// The editor link line for one finding, when `editorUrl` is configured.
+/// With an `editorUrlTitle` the link is emitted as an OSC-8 terminal
+/// hyperlink showing the title; without one, the substituted URL itself.
+fn editor_line(opts: &RenderOptions, f: &crate::Finding) -> Option<String> {
+    let subst = |template: &str| {
+        template
+            .replace("%file%", &f.path)
+            .replace("%relFile%", &f.path)
+            .replace("%line%", &f.line.to_string())
+            .replace("%column%", &f.column.to_string())
+    };
+    let url = subst(opts.editor_url.as_deref()?);
+    Some(match opts.editor_url_title.as_deref() {
+        Some(title) => format!("\u{1b}]8;;{url}\u{1b}\\{}\u{1b}]8;;\u{1b}\\", subst(title)),
+        None => url,
+    })
+}
+
+fn render_table_with(report: &Report, opts: &RenderOptions) -> String {
     let mut out = String::new();
     // Group findings by file, preserving first-seen file order.
     let mut files: Vec<&str> = Vec::new();
@@ -41,6 +92,9 @@ pub fn render_table(report: &Report) -> String {
                 "  {}:{} {}  {}{}\n",
                 f.line, f.column, marker, f.message, id
             ));
+            if let Some(link) = editor_line(opts, f) {
+                out.push_str(&format!("    {link}\n"));
+            }
         }
         out.push('\n');
     }
@@ -73,8 +127,19 @@ pub fn render_table(report: &Report) -> String {
     out
 }
 
-/// phpstan-style JSON: `{ totals, files: { path: { errors, messages } }, errors }`.
+/// phpstan-style JSON, compact (phpstan's `json`). See [`render_json_pretty`]
+/// for the indented variant.
 pub fn render_json(report: &Report) -> String {
+    render_json_impl(report, false)
+}
+
+/// phpstan-style JSON, indented (phpstan's `prettyJson`).
+pub fn render_json_pretty(report: &Report) -> String {
+    render_json_impl(report, true)
+}
+
+/// phpstan-style JSON: `{ totals, files: { path: { errors, messages } }, errors }`.
+fn render_json_impl(report: &Report, pretty: bool) -> String {
     #[derive(Serialize)]
     struct Out {
         totals: Totals,
@@ -105,7 +170,7 @@ pub fn render_json(report: &Report) -> String {
     // top-level `errors` array and `totals.errors`, not `files`.
     let mut errors: Vec<String> = Vec::new();
     for f in &report.findings {
-        if f.path == "(ignore)" {
+        if f.path == NON_FILE_PATH {
             errors.push(f.message.clone());
             continue;
         }
@@ -129,7 +194,95 @@ pub fn render_json(report: &Report) -> String {
         files,
         errors,
     };
-    serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string())
+    let rendered = if pretty {
+        serde_json::to_string_pretty(&out)
+    } else {
+        serde_json::to_string(&out)
+    };
+    rendered.unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Grep-friendly `path:line:message` lines (phpstan's `raw`). Non-file
+/// findings render as `?:?:message`, first, matching phpstan's order.
+pub fn render_raw(report: &Report) -> String {
+    let mut out = String::new();
+    for f in report.findings.iter().filter(|f| f.path == NON_FILE_PATH) {
+        out.push_str(&format!("?:?:{}\n", f.message));
+    }
+    for f in report.findings.iter().filter(|f| f.path != NON_FILE_PATH) {
+        out.push_str(&format!("{}:{}:{}\n", f.path, f.line, f.message));
+    }
+    out
+}
+
+/// GitLab Code Quality report JSON (phpstan's `gitlab`): an array of
+/// `{description, check_name, fingerprint, severity, location}` objects.
+/// The fingerprint is `sha256(path + line + message)` like phpstan's, so
+/// GitLab treats findings as the same issue across runs.
+pub fn render_gitlab(report: &Report) -> String {
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    for f in report.findings.iter().filter(|f| f.path != NON_FILE_PATH) {
+        let fingerprint = sha256_hex(&format!("{}{}{}", f.path, f.line, f.message));
+        // phpstan: ignorable errors are "major", non-ignorable "blocker".
+        let severity = if f.identifier == Some("ignore.parseError") {
+            "blocker"
+        } else {
+            "major"
+        };
+        items.push(serde_json::json!({
+            "description": f.message,
+            "check_name": f.identifier,
+            "fingerprint": fingerprint,
+            "severity": severity,
+            "location": { "path": f.path, "lines": { "begin": f.line } },
+        }));
+    }
+    for f in report.findings.iter().filter(|f| f.path == NON_FILE_PATH) {
+        items.push(serde_json::json!({
+            "description": f.message,
+            "fingerprint": sha256_hex(&f.message),
+            "severity": "major",
+            "location": { "path": "", "lines": { "begin": 0 } },
+        }));
+    }
+    serde_json::to_string_pretty(&items).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// JUnit XML (phpstan's `junit`): one `<testcase>` per finding with a
+/// `<failure>` child; a single passing `phpstan` case when clean.
+pub fn render_junit(report: &Report) -> String {
+    let failures = report.error_count();
+    let tests = if failures == 0 { 1 } else { failures };
+    let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    out.push_str(&format!(
+        "<testsuite failures=\"{failures}\" name=\"phpstan\" tests=\"{tests}\" \
+         xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" \
+         xsi:noNamespaceSchemaLocation=\"https://raw.githubusercontent.com/junit-team/junit5/r5.5.1/platform-tests/src/test/resources/jenkins-junit.xsd\">"
+    ));
+    for f in report.findings.iter().filter(|f| f.path != NON_FILE_PATH) {
+        out.push_str(&format!(
+            "<testcase name=\"{}:{}\"><failure type=\"ERROR\" message=\"{}\" /></testcase>",
+            xml_escape(&f.path),
+            f.line,
+            xml_escape(&f.message)
+        ));
+    }
+    for f in report.findings.iter().filter(|f| f.path == NON_FILE_PATH) {
+        out.push_str(&format!(
+            "<testcase name=\"General error\"><failure type=\"ERROR\" message=\"{}\" /></testcase>",
+            xml_escape(&f.message)
+        ));
+    }
+    if failures == 0 {
+        out.push_str("<testcase name=\"phpstan\"></testcase>");
+    }
+    out.push_str("</testsuite>");
+    out
+}
+
+fn sha256_hex(input: &str) -> String {
+    let digest = Sha256::digest(input.as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// GitHub Actions annotations: one `::error` workflow command per finding.
@@ -204,6 +357,7 @@ mod tests {
             message: msg.into(),
             identifier: Some(id),
             severity: Severity::Error,
+            fix: None,
         }
     }
 
@@ -323,6 +477,118 @@ mod tests {
         };
         assert!(render(&report, "table").is_some());
         assert!(render(&report, "json").is_some());
+        assert!(render(&report, "prettyJson").is_some());
+        assert!(render(&report, "raw").is_some());
+        assert!(render(&report, "gitlab").is_some());
+        assert!(render(&report, "junit").is_some());
         assert!(render(&report, "nope").is_none());
+    }
+
+    #[test]
+    fn table_editor_url_line() {
+        let report = Report {
+            findings: vec![finding("src/A.php", 4, "bad return", "return.type")],
+            files_analyzed: 1,
+            files_scanned: 0,
+            timings: None,
+        };
+        let opts = RenderOptions {
+            editor_url: Some("editor://open?file=%file%&line=%line%&col=%column%".into()),
+            editor_url_title: None,
+        };
+        let out = render_with(&report, "table", &opts).unwrap();
+        assert!(
+            out.contains("editor://open?file=src/A.php&line=4&col=1"),
+            "{out}"
+        );
+        // A title wraps the URL in an OSC-8 hyperlink showing the title text.
+        let titled = RenderOptions {
+            editor_url_title: Some("open %relFile%".into()),
+            ..opts
+        };
+        let out = render_with(&report, "table", &titled).unwrap();
+        assert!(out.contains("open src/A.php"), "{out}");
+        assert!(out.contains("\u{1b}]8;;editor://open"), "{out}");
+    }
+
+    #[test]
+    fn json_is_compact_and_pretty_json_indented() {
+        let report = Report {
+            findings: vec![finding("src/A.php", 4, "bad return", "return.type")],
+            files_analyzed: 1,
+            files_scanned: 0,
+            timings: None,
+        };
+        let compact = render_json(&report);
+        let pretty = render_json_pretty(&report);
+        assert!(!compact.contains('\n'));
+        assert!(pretty.contains('\n'));
+        // Same data either way.
+        let a: serde_json::Value = serde_json::from_str(&compact).unwrap();
+        let b: serde_json::Value = serde_json::from_str(&pretty).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn raw_lines_and_non_file_ordering() {
+        let mut report = Report {
+            findings: vec![finding("src/A.php", 4, "bad return", "return.type")],
+            files_analyzed: 1,
+            files_scanned: 0,
+            timings: None,
+        };
+        report
+            .findings
+            .push(finding("(ignore)", 0, "stale ignore", "ignore.unmatched"));
+        assert_eq!(
+            render_raw(&report),
+            "?:?:stale ignore\nsrc/A.php:4:bad return\n"
+        );
+    }
+
+    #[test]
+    fn gitlab_code_quality_shape() {
+        let report = Report {
+            findings: vec![finding("src/A.php", 4, "bad return", "return.type")],
+            files_analyzed: 1,
+            files_scanned: 0,
+            timings: None,
+        };
+        let v: serde_json::Value = serde_json::from_str(&render_gitlab(&report)).unwrap();
+        assert_eq!(v[0]["description"], "bad return");
+        assert_eq!(v[0]["check_name"], "return.type");
+        assert_eq!(v[0]["severity"], "major");
+        assert_eq!(v[0]["location"]["path"], "src/A.php");
+        assert_eq!(v[0]["location"]["lines"]["begin"], 4);
+        // Deterministic sha256 of path+line+message.
+        assert_eq!(
+            v[0]["fingerprint"],
+            sha256_hex("src/A.php4bad return").as_str()
+        );
+    }
+
+    #[test]
+    fn junit_failure_and_clean_shapes() {
+        let report = Report {
+            findings: vec![finding("src/A.php", 4, "bad \"return\"", "return.type")],
+            files_analyzed: 1,
+            files_scanned: 0,
+            timings: None,
+        };
+        let xml = render_junit(&report);
+        assert!(xml.contains("<testsuite failures=\"1\" name=\"phpstan\" tests=\"1\""));
+        assert!(
+            xml.contains("<testcase name=\"src/A.php:4\"><failure type=\"ERROR\" message=\"bad &quot;return&quot;\" /></testcase>")
+        );
+        let clean = Report {
+            findings: vec![],
+            files_analyzed: 1,
+            files_scanned: 0,
+            timings: None,
+        };
+        let xml = render_junit(&clean);
+        assert!(xml.contains("failures=\"0\""));
+        assert!(xml.contains("tests=\"1\""));
+        assert!(xml.contains("<testcase name=\"phpstan\"></testcase>"));
     }
 }

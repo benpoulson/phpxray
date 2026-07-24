@@ -507,7 +507,7 @@ fn category(t: &Type) -> Option<Cat> {
         Type::False => Some(Cat::BoolFalse),
         Type::Int | Type::LiteralInt(_) => Some(Cat::Int),
         Type::Float => Some(Cat::Float),
-        Type::String | Type::LiteralString(_) => Some(Cat::Str),
+        Type::String | Type::StringOf(_) | Type::LiteralString(_) => Some(Cat::Str),
         // `bool` (non-constant), arrays, objects, unions, mixed, unknown, etc.
         // could overlap with the other side — not provably disjoint.
         _ => None,
@@ -1304,6 +1304,177 @@ fn check_match_arms(_fa: &FileAnalysis, e: &Expr, out: &mut Vec<Diagnostic>) {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Match enum exhaustiveness  (MatchExpressionRule, match.unhandled)
+
+/// `match.unhandled`: a `match` without a `default` arm over an enum(-case)
+/// subject whose arms don't cover every case throws `\UnhandledMatchError` at
+/// runtime. Faithful to phpstan's guards: suppressed inside a `try` whose
+/// catches include `UnhandledMatchError` (or `Error`/`Throwable`) and inside
+/// functions declaring `@throws UnhandledMatchError`.
+fn run_match_unhandled(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    let guards = unhandled_guard_spans(fa);
+    walk::for_each_expr(fa.program, &mut |e| {
+        let ExprKind::Match { subject, arms } = &e.kind else {
+            return;
+        };
+        if arms.iter().any(|a| a.conds.is_none()) {
+            return; // has a default arm
+        }
+        if guards
+            .iter()
+            .any(|(s, t)| e.span.start >= *s && e.span.end <= *t)
+        {
+            return;
+        }
+        let subj_ty = fa.type_of(subject);
+        let Some((fqn, mut remaining, mut null_remaining)) = enum_case_set(fa, &subj_ty) else {
+            return;
+        };
+        for arm in arms {
+            for c in arm.conds.iter().flatten() {
+                match fa.type_of(c) {
+                    Type::EnumCase { fqn: cf, case } if cf.eq_ignore_ascii_case(&fqn) => {
+                        remaining.retain(|r| *r != *case);
+                    }
+                    Type::Null => null_remaining = false,
+                    // A dynamic/unknown arm may match anything — can't prove.
+                    _ => return,
+                }
+            }
+        }
+        let mut names: Vec<String> = remaining
+            .iter()
+            .map(|c| format!("{}::{c}", fqn.trim_start_matches('\\')))
+            .collect();
+        if null_remaining {
+            names.push("null".into());
+        }
+        if names.is_empty() {
+            return;
+        }
+        let noun = if names.len() == 1 { "value" } else { "values" };
+        out.push(diag(
+            e.span,
+            format!(
+                "Match expression does not handle remaining {noun}: {}",
+                names.join("|")
+            ),
+            "match.unhandled",
+        ));
+    });
+    out
+}
+
+/// Decompose a match subject type into `(enum fqn, remaining case names,
+/// null-remaining)`. `None` when the subject isn't provably an enum(-case) set
+/// (bail — never guess exhaustiveness).
+fn enum_case_set(fa: &FileAnalysis, ty: &Type) -> Option<(String, Vec<String>, bool)> {
+    match ty {
+        Type::Named { fqn, .. } => {
+            // §8p guard: the enum and its whole hierarchy must be reflected.
+            if !fa.class_fully_known(fqn) {
+                return None;
+            }
+            let refl = fa.reflection.class(fqn)?;
+            if !matches!(refl.kind, php_ast::ClassKind::Enum) {
+                return None;
+            }
+            let cases: Vec<String> = refl
+                .constants
+                .iter()
+                .filter(|k| matches!(k.ty, Type::EnumCase { .. }))
+                .map(|k| k.name.clone())
+                .collect();
+            if cases.is_empty() {
+                return None;
+            }
+            Some((fqn.to_string(), cases, false))
+        }
+        Type::EnumCase { fqn, case } => {
+            Some((fqn.to_string(), vec![case.to_string()], false))
+        }
+        Type::Nullable(inner) => {
+            let (fqn, cases, _) = enum_case_set(fa, inner)?;
+            Some((fqn, cases, true))
+        }
+        Type::Union(parts) => {
+            let mut fqn: Option<String> = None;
+            let mut cases = Vec::new();
+            let mut has_null = false;
+            for p in parts.iter() {
+                match p {
+                    Type::EnumCase { fqn: f, case } => {
+                        match &fqn {
+                            Some(existing) if !existing.eq_ignore_ascii_case(f) => return None,
+                            None => fqn = Some(f.to_string()),
+                            _ => {}
+                        }
+                        cases.push(case.to_string());
+                    }
+                    Type::Null => has_null = true,
+                    _ => return None,
+                }
+            }
+            Some((fqn?, cases, has_null))
+        }
+        _ => None,
+    }
+}
+
+/// Byte-span regions in which `match.unhandled` is suppressed: `try` bodies
+/// catching `UnhandledMatchError`-compatible types, and bodies of functions/
+/// methods declaring `@throws UnhandledMatchError`.
+fn unhandled_guard_spans(fa: &FileAnalysis) -> Vec<(u32, u32)> {
+    fn body_span(body: &[php_ast::Stmt]) -> Option<(u32, u32)> {
+        Some((body.first()?.span.start, body.last()?.span.end))
+    }
+    fn catches_match_error(name: &str) -> bool {
+        let last = name.rsplit('\\').next().unwrap_or(name);
+        last.eq_ignore_ascii_case("UnhandledMatchError")
+            || last.eq_ignore_ascii_case("Error")
+            || last.eq_ignore_ascii_case("Throwable")
+    }
+    fn doc_declares_throw(doc: Option<&str>) -> bool {
+        doc.is_some_and(|d| d.contains("UnhandledMatchError"))
+    }
+    let mut spans = Vec::new();
+    walk::for_each_stmt(fa.program, &mut |s| match &s.kind {
+        StmtKind::Try { body, catches, .. } => {
+            if catches
+                .iter()
+                .flat_map(|c| c.types.iter())
+                .any(|n| catches_match_error(&n.text))
+            {
+                if let Some(span) = body_span(body) {
+                    spans.push(span);
+                }
+            }
+        }
+        StmtKind::Function(f) => {
+            if doc_declares_throw(f.doc.as_deref()) {
+                if let Some(span) = body_span(&f.body) {
+                    spans.push(span);
+                }
+            }
+        }
+        StmtKind::Class(c) => {
+            for m in &c.members {
+                if let php_ast::Member::Method(m) = m {
+                    if doc_declares_throw(m.doc.as_deref()) {
+                        if let Some(span) = m.body.as_deref().and_then(body_span) {
+                            spans.push(span);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    });
+    spans
 }
 
 // ---------------------------------------------------------------------------
@@ -2205,6 +2376,11 @@ pub(crate) static RULES: &[RuleEntry] = &[
         run: run_match_arms,
     },
     RuleEntry {
+        name: "match.unhandled",
+        level: 4,
+        run: run_match_unhandled,
+    },
+    RuleEntry {
         name: "comparison.voidMatch",
         level: 2,
         run: run_void_match,
@@ -2825,6 +3001,118 @@ mod tests {
     fn void_match_assigned_is_flagged() {
         let src = "<?php function v(): void {} $x = match (1) { default => v() };";
         assert_eq!(codes(src, run_void_match), ["match.void"]);
+    }
+
+    #[test]
+    fn match_unhandled_reports_missing_enum_cases() {
+        let src = r#"<?php
+            enum Suit { case Hearts; case Spades; case Clubs; }
+            function f(Suit $s): string {
+                return match ($s) {
+                    Suit::Hearts => 'h',
+                    Suit::Spades => 's',
+                };
+            }
+        "#;
+        let ds = crate::testutil::run(src, run_match_unhandled);
+        assert_eq!(ds.len(), 1, "{ds:?}");
+        assert_eq!(
+            ds[0].message,
+            "Match expression does not handle remaining value: Suit::Clubs"
+        );
+
+        // Two missing cases → plural, pipe-joined.
+        let src = r#"<?php
+            enum Suit { case Hearts; case Spades; case Clubs; }
+            function f(Suit $s): string {
+                return match ($s) { Suit::Hearts => 'h' };
+            }
+        "#;
+        let ds = crate::testutil::run(src, run_match_unhandled);
+        assert_eq!(
+            ds[0].message,
+            "Match expression does not handle remaining values: Suit::Spades|Suit::Clubs"
+        );
+    }
+
+    #[test]
+    fn match_unhandled_clean_cases() {
+        // All cases handled (multi-cond arm) → clean.
+        let all = r#"<?php
+            enum Suit { case Hearts; case Spades; case Clubs; }
+            function f(Suit $s): string {
+                return match ($s) {
+                    Suit::Hearts, Suit::Spades => 'a',
+                    Suit::Clubs => 'c',
+                };
+            }
+        "#;
+        assert!(codes(all, run_match_unhandled).is_empty());
+
+        // A default arm → clean.
+        let with_default = r#"<?php
+            enum Suit { case Hearts; case Spades; }
+            function f(Suit $s): string {
+                return match ($s) { Suit::Hearts => 'h', default => 'x' };
+            }
+        "#;
+        assert!(codes(with_default, run_match_unhandled).is_empty());
+
+        // A dynamic arm condition → can't prove, stay silent.
+        let dynamic = r#"<?php
+            enum Suit { case Hearts; case Spades; }
+            function f(Suit $s, Suit $t): string {
+                return match ($s) { $t => 'x' };
+            }
+        "#;
+        assert!(codes(dynamic, run_match_unhandled).is_empty());
+
+        // Non-enum subject → not this rule's business.
+        let non_enum = r#"<?php
+            function f(int $n): string {
+                return match ($n) { 1 => 'a' };
+            }
+        "#;
+        assert!(codes(non_enum, run_match_unhandled).is_empty());
+    }
+
+    #[test]
+    fn match_unhandled_guards_suppress() {
+        // Caught UnhandledMatchError → suppressed (phpstan behavior).
+        let caught = r#"<?php
+            enum Suit { case Hearts; case Spades; }
+            function f(Suit $s): void {
+                try {
+                    $x = match ($s) { Suit::Hearts => 'h' };
+                } catch (\UnhandledMatchError $e) {
+                }
+            }
+        "#;
+        assert!(codes(caught, run_match_unhandled).is_empty());
+
+        // Declared @throws → suppressed.
+        let declared = r#"<?php
+            enum Suit { case Hearts; case Spades; }
+            /** @throws \UnhandledMatchError */
+            function f(Suit $s): string {
+                return match ($s) { Suit::Hearts => 'h' };
+            }
+        "#;
+        assert!(codes(declared, run_match_unhandled).is_empty());
+    }
+
+    #[test]
+    fn match_unhandled_narrowed_subject() {
+        // A guard narrows the subject to a single case: matching that case is
+        // exhaustive even though the enum has more.
+        let src = r#"<?php
+            enum Suit { case Hearts; case Spades; }
+            function f(Suit $s): string {
+                if ($s !== Suit::Hearts) { return ''; }
+                return match ($s) { Suit::Hearts => 'h' };
+            }
+        "#;
+        assert!(codes(src, run_match_unhandled).is_empty());
     }
 
     #[test]

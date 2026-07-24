@@ -67,8 +67,8 @@ pub fn native_shape(t: &Type) -> Type {
         Iterable(_) => Iterable(None),
         ClassString(_) => ClassString(None),
         LiteralInt(_) | IntRange { .. } => Int,
-        LiteralString(_) => String,
-        Named { fqn, .. } => Named {
+        LiteralString(_) | StringOf(_) => String,
+        Named { fqn, .. } | EnumCase { fqn, .. } => Named {
             fqn: fqn.clone(),
             args: Vec::new(),
         },
@@ -274,12 +274,22 @@ fn assignable_atom(index: &ReflectionIndex, value: &Type, target: &Type) -> bool
         (Bool | True | False, Bool) => true,
         (True, True) | (False, False) => true,
         (LiteralInt(a), LiteralInt(b)) => a == b,
-        (String | LiteralString(_) | ClassString(_), String) => true,
+        (String | LiteralString(_) | ClassString(_) | StringOf(_), String) => true,
         (LiteralString(a), LiteralString(b)) => a == b,
+        // --- refined strings ---
+        // Refinement → refinement follows the implication lattice; a literal
+        // fits iff its value satisfies the refinement; a `class-string` is a
+        // real non-empty name. A *plain* `string` toward a refined target stays
+        // lenient (can't disprove non-emptiness) — the report-maybe machinery
+        // is where "string might not be non-empty" belongs.
+        (StringOf(a), StringOf(b)) => a.implies(*b),
+        (LiteralString(v), StringOf(r)) => r.admits_literal(v),
+        (ClassString(_), StringOf(_)) => true,
+        (String, StringOf(_)) => true,
         // A plain string may hold a class name — lenient toward `class-string`
         // (phpstan allows `string`/literal → `class-string`, e.g. a name built by
         // concatenation returned where `class-string` is declared).
-        (String | LiteralString(_) | ClassString(_), ClassString(_)) => true,
+        (String | LiteralString(_) | ClassString(_) | StringOf(_), ClassString(_)) => true,
         (Null, Null) => true,
 
         // --- arrays / iterables (covariant; lenient on bare forms) ---
@@ -346,12 +356,30 @@ fn assignable_atom(index: &ReflectionIndex, value: &Type, target: &Type) -> bool
             }
         }
         (Named { .. } | Object, Object) => true,
+
+        // --- enum cases (unit subtypes of their enum) ---
+        (
+            EnumCase { fqn: a, case: ca },
+            EnumCase { fqn: b, case: cb },
+        ) => a.eq_ignore_ascii_case(b) && ca == cb,
+        // A case is an instance of its enum (and whatever the enum implements).
+        (EnumCase { fqn, .. }, Named { .. } | Object) => is_assignable(
+            index,
+            &Named {
+                fqn: fqn.clone(),
+                args: Vec::new(),
+            },
+            target,
+        ),
+        // An enum-typed value *might* be the target case — lenient maybe.
+        (Named { fqn: a, .. }, EnumCase { fqn: b, .. }) => a.eq_ignore_ascii_case(b),
         // A callable may be a Closure, an object (`__invoke`), a function-name
         // string, or an `[$obj, 'method']` array — all accepted leniently (PHP's
         // `callable` is structural; rejecting a `string`/`array` would false-flag
         // `array_map('trim', …)` and `[$this, 'm']`).
         (
-            Callable(_) | Named { .. } | Object | String | LiteralString(_) | Array(_) | List(_),
+            Callable(_) | Named { .. } | Object | String | LiteralString(_) | StringOf(_)
+            | Array(_) | List(_),
             Callable(_),
         ) => true,
 
@@ -420,6 +448,36 @@ mod tests {
                 Type::TemplateVar("TValue".into())
             )
         ));
+    }
+
+    #[test]
+    fn refined_string_lattice() {
+        use php_types::StringRefinement::*;
+        let ne = Type::StringOf(NonEmpty);
+        let nf = Type::StringOf(NonFalsy);
+        let num = Type::StringOf(Numeric);
+        let lit = Type::StringOf(Literal);
+        // Refined → string always.
+        assert!(ok(ne.clone(), Type::String));
+        assert!(ok(num.clone(), Type::String));
+        // Implication lattice: numeric/non-falsy → non-empty; not vice versa.
+        assert!(ok(num.clone(), ne.clone()));
+        assert!(ok(nf.clone(), ne.clone()));
+        assert!(!ok(ne.clone(), num.clone()));
+        assert!(!ok(num.clone(), nf.clone())); // "0" is numeric and falsy
+        assert!(!ok(lit.clone(), ne.clone())); // '' is a literal
+        // Literals satisfy refinements by value.
+        assert!(ok(Type::LiteralString("abc".into()), ne.clone()));
+        assert!(!ok(Type::LiteralString("".into()), ne.clone()));
+        assert!(ok(Type::LiteralString("42".into()), num.clone()));
+        assert!(!ok(Type::LiteralString("x".into()), num));
+        assert!(!ok(Type::LiteralString("0".into()), nf));
+        // A class-string is a real, non-empty name.
+        assert!(ok(Type::ClassString(None), ne.clone()));
+        // Plain string toward a refinement stays lenient (maybe, not error).
+        assert!(ok(Type::String, ne));
+        // Refined strings are not ints.
+        assert!(!ok(Type::StringOf(NonEmpty), Type::Int));
     }
 
     #[test]

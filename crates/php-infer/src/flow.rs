@@ -12,13 +12,13 @@
 //! approximation is sound enough to drive diagnostics and never panics.
 
 use crate::{
-    arrays, collection_method,
+    arrays, collection_method, is_first_class_callable,
     refine::{strip_false, strip_falsy, strip_null_strict},
     CallableAlias, TypeCtx,
 };
 use php_ast::{
-    Arg, ArrowFn, BinOp, ClosureExpr, Expr, ExprKind, FunctionDecl, Name, Param, Stmt, StmtKind,
-    UnOp,
+    Arg, ArrowFn, BinOp, ClosureExpr, Expr, ExprKind, FunctionDecl, MemberName, Name, Param, Stmt,
+    StmtKind, UnOp,
 };
 use php_types::Type;
 use std::collections::{HashMap, HashSet};
@@ -96,8 +96,55 @@ impl TypeCtx<'_> {
                 self.bind_target(target, &t);
                 t
             }
+            // A match's result is the union of its arm bodies *with the
+            // subject narrowed per arm* — only possible on the mutable flow
+            // path (the pure `infer` can't adjust the environment).
+            ExprKind::Match { .. } => self.match_type_narrowed(e),
             _ => self.infer(e),
         }
+    }
+
+    /// The type of a `match` expression with per-arm subject narrowing:
+    /// each singleton-condition arm's body is inferred with the subject pinned
+    /// to those conditions (`Suit::Hearts => $s->value` sees `'H'`).
+    fn match_type_narrowed(&mut self, e: &Expr) -> Type {
+        let ExprKind::Match { subject, arms } = &e.kind else {
+            return self.infer(e);
+        };
+        let place = self.place_key(subject);
+        let mut parts = Vec::with_capacity(arms.len());
+        for arm in arms {
+            match (&place, self.match_arm_narrowing(arm)) {
+                (Some(place), Some(t)) => {
+                    let saved = self.vars.clone();
+                    self.apply_facts(&[(place.clone(), t)]);
+                    parts.push(self.infer(&arm.body));
+                    self.vars = saved;
+                }
+                _ => parts.push(self.infer(&arm.body)),
+            }
+        }
+        Type::union(parts)
+    }
+
+    /// The union of an arm's conditions when they are all singleton types
+    /// (enum cases / scalar literals) — the fact a matching arm implies.
+    fn match_arm_narrowing(&self, arm: &php_ast::MatchArm) -> Option<Type> {
+        let conds = arm.conds.as_ref()?;
+        let tys: Vec<Type> = conds.iter().map(|c| self.infer(c)).collect();
+        tys.iter()
+            .all(|t| {
+                matches!(
+                    t,
+                    Type::EnumCase { .. }
+                        | Type::LiteralInt(_)
+                        | Type::LiteralString(_)
+                        | Type::True
+                        | Type::False
+                        | Type::Null
+                )
+            })
+            .then(|| Type::union(tys))
     }
 
     /// Record an assignment target's new type. Simple `$var` targets are stored;
@@ -238,8 +285,20 @@ impl TypeCtx<'_> {
                     }
                 }
                 // `$x === null` true ⇒ $x is null; false ⇒ null stripped.
-                BinOp::Identical | BinOp::Eq => self.null_cmp(lhs, rhs, truthy, out),
-                BinOp::NotIdentical | BinOp::NotEq => self.null_cmp(lhs, rhs, !truthy, out),
+                BinOp::Identical | BinOp::Eq => {
+                    self.null_cmp(lhs, rhs, truthy, out);
+                    if matches!(op, BinOp::Identical) {
+                        self.fn_result_cmp(lhs, rhs, truthy, out);
+                        self.fn_result_cmp(rhs, lhs, truthy, out);
+                    }
+                }
+                BinOp::NotIdentical | BinOp::NotEq => {
+                    self.null_cmp(lhs, rhs, !truthy, out);
+                    if matches!(op, BinOp::NotIdentical) {
+                        self.fn_result_cmp(lhs, rhs, !truthy, out);
+                        self.fn_result_cmp(rhs, lhs, !truthy, out);
+                    }
+                }
                 // Integer-range narrowing: `$x < 2` false ⇒ `$x: int<2, max>`, etc.
                 BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
                     self.int_cmp_facts(*op, lhs, rhs, truthy, out)
@@ -270,7 +329,8 @@ impl TypeCtx<'_> {
                         if let Some(place) = self.place_key(&arg0.value) {
                             if truthy {
                                 if let Some(t) = predicate_type(&fname) {
-                                    out.push((place, t));
+                                    let cur = self.infer(&arg0.value);
+                                    out.push((place, narrow_to_predicate(&cur, &t)));
                                 }
                             } else if fname == "is_null" {
                                 // `!is_null($x)` ⇒ null stripped from $x's type.
@@ -287,13 +347,416 @@ impl TypeCtx<'_> {
                             }
                         }
                     }
+                    self.builtin_specifier_facts(&fname, args, truthy, out);
+                    self.assert_facts_fn(n, args, Some(truthy), out);
                 }
+            }
+            ExprKind::StaticCall {
+                class,
+                method,
+                args,
+            } => {
+                self.assert_facts_static(class, method, args, Some(truthy), out);
+                self.bare_truthy_fact(cond, truthy, out);
+            }
+            ExprKind::MethodCall {
+                recv,
+                method,
+                args,
+                nullsafe: false,
+                ..
+            } => {
+                self.assert_facts_method(recv, method, args, Some(truthy), out);
+                self.bare_truthy_fact(cond, truthy, out);
             }
             // A bare truthy place (`if ($x)`, `if ($this->x)`) is non-null *and*
             // non-false in the then-branch.
             _ if truthy => {
                 if let Some(place) = self.place_key(cond) {
                     out.push((place, strip_falsy(&self.infer(cond))));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The catch-all bare-truthy fact (a call expression used as a condition
+    /// is non-falsy in the then-branch), shared by the call-shaped arms.
+    fn bare_truthy_fact(&self, cond: &Expr, truthy: bool, out: &mut Vec<Fact>) {
+        if truthy {
+            if let Some(place) = self.place_key(cond) {
+                out.push((place, strip_falsy(&self.infer(cond))));
+            }
+        }
+    }
+
+    // -- `@phpstan-assert*` application --------------------------------------
+    //
+    // A callee's assert declarations narrow the matching argument (or the
+    // receiver's `$this->prop` path). `truthy: Some(b)` is a condition site
+    // (IfTrue/IfFalse gate on the branch, Always applies to both); `None` is
+    // the statement path, where only Always applies.
+
+    fn assert_facts_fn(
+        &self,
+        n: &Name,
+        args: &[Arg],
+        truthy: Option<bool>,
+        out: &mut Vec<Fact>,
+    ) {
+        let Some(f) = self.function_reflection(n) else {
+            return;
+        };
+        if f.asserts.is_empty() {
+            return;
+        }
+        self.push_assert_facts(&f.asserts, &f.params, args, None, truthy, out);
+    }
+
+    fn assert_facts_static(
+        &self,
+        class: &Expr,
+        method: &MemberName,
+        args: &[Arg],
+        truthy: Option<bool>,
+        out: &mut Vec<Fact>,
+    ) {
+        let Some(name) = self.member_ident(method) else {
+            return;
+        };
+        let Some(fqn) = self.class_type(class).and_then(|t| self.type_class_fqn(&t)) else {
+            return;
+        };
+        let Some(found) = self.index.find_method(&fqn, &name) else {
+            return;
+        };
+        if found.member.asserts.is_empty() {
+            return;
+        }
+        self.push_assert_facts(&found.member.asserts, &found.member.params, args, None, truthy, out);
+    }
+
+    fn assert_facts_method(
+        &self,
+        recv: &Expr,
+        method: &MemberName,
+        args: &[Arg],
+        truthy: Option<bool>,
+        out: &mut Vec<Fact>,
+    ) {
+        let Some(name) = self.member_ident(method) else {
+            return;
+        };
+        let recv_ty = self.infer(recv);
+        let Some(fqn) = self.type_class_fqn(&recv_ty) else {
+            return;
+        };
+        let Some(found) = self.find_method_for_receiver(&recv_ty, &fqn, &name) else {
+            return;
+        };
+        if found.member.asserts.is_empty() {
+            return;
+        }
+        let recv_place = self.invalidation_base(recv);
+        self.push_assert_facts(
+            &found.member.asserts,
+            &found.member.params,
+            args,
+            recv_place.as_deref(),
+            truthy,
+            out,
+        );
+    }
+
+    fn push_assert_facts(
+        &self,
+        asserts: &[php_reflect::AssertReflection],
+        params: &[php_reflect::ParamReflection],
+        args: &[Arg],
+        recv_place: Option<&str>,
+        truthy: Option<bool>,
+        out: &mut Vec<Fact>,
+    ) {
+        use php_phpdoc::AssertWhen;
+        for a in asserts {
+            let applies = match (a.when, truthy) {
+                (AssertWhen::Always, _) => true,
+                (AssertWhen::IfTrue, Some(t)) => t,
+                (AssertWhen::IfFalse, Some(t)) => !t,
+                (_, None) => false,
+            };
+            if !applies {
+                continue;
+            }
+            let (place, cur) = if let Some(path) = a.param.strip_prefix("this->") {
+                let Some(base) = recv_place else { continue };
+                let place = format!("{base}->{path}");
+                let cur = self.vars.get(&place).cloned();
+                (place, cur)
+            } else {
+                let Some(idx) = params.iter().position(|p| p.name == a.param) else {
+                    continue;
+                };
+                // Named/spread args break positional mapping.
+                if args.iter().any(|x| x.name.is_some() || x.spread || x.placeholder) {
+                    continue;
+                }
+                let Some(arg) = args.get(idx) else { continue };
+                let Some(place) = self.place_key(&arg.value) else {
+                    continue;
+                };
+                let cur = self.infer(&arg.value);
+                (place, Some(cur))
+            };
+            if a.negated {
+                let Some(cur) = cur else { continue };
+                let narrowed = match &a.ty {
+                    Type::Null => strip_null_strict(&cur),
+                    Type::False => strip_false(&cur),
+                    ty => subtract_union(&cur, |m| confidently_in(self.index, m, ty)),
+                };
+                if narrowed != cur {
+                    out.push((place, narrowed));
+                }
+            } else {
+                out.push((place, a.ty.clone()));
+            }
+        }
+    }
+
+    /// `get_class($x) === C::class` / `gettype($x) === 'string'` narrowing
+    /// (strict comparisons only; `eq` is the branch's truth for equality).
+    fn fn_result_cmp(&self, call: &Expr, lit: &Expr, eq: bool, out: &mut Vec<Fact>) {
+        let ExprKind::Call { callee, args } = &peel_paren(call).kind else {
+            return;
+        };
+        let ExprKind::Name(n) = &callee.kind else {
+            return;
+        };
+        let fname = last_segment(&n.text).to_ascii_lowercase();
+        let Some(arg0) = args.first() else { return };
+        let Some(place) = self.place_key(&arg0.value) else {
+            return;
+        };
+        match fname.as_str() {
+            "get_class" => {
+                let Some(fqn) = class_name_arg(&self.infer(lit)) else {
+                    return;
+                };
+                let named = Type::Named {
+                    fqn: fqn.into(),
+                    args: Vec::new(),
+                };
+                if eq {
+                    out.push((place, named));
+                } else {
+                    // `get_class($x) !== C::class` ⇒ drop the *exact* class from
+                    // an explicit union (subclasses have a different get_class).
+                    let cur = self.infer(&arg0.value);
+                    let narrowed = subtract_union(&cur, |m| *m == named);
+                    if narrowed != cur {
+                        out.push((place, narrowed));
+                    }
+                }
+            }
+            "gettype" => {
+                let Type::LiteralString(s) = self.infer(lit) else {
+                    return;
+                };
+                let t = match &*s {
+                    "integer" => Type::Int,
+                    "string" => Type::String,
+                    "boolean" => Type::Bool,
+                    "double" => Type::Float,
+                    "array" => Type::Array(None),
+                    "object" => Type::Object,
+                    "NULL" => Type::Null,
+                    _ => return,
+                };
+                let cur = self.infer(&arg0.value);
+                if eq {
+                    out.push((place, narrow_to_predicate(&cur, &t)));
+                } else {
+                    let narrowed = subtract_union(&cur, |m| predicate_matches(m, &t));
+                    if narrowed != cur {
+                        out.push((place, narrowed));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Builtin condition specifiers beyond the `is_*` family (phpstan's
+    /// TypeSpecifyingExtensions): each is a *sound* refinement the branch
+    /// guarantees; anything unprovable stays un-narrowed.
+    fn builtin_specifier_facts(
+        &self,
+        fname: &str,
+        args: &[Arg],
+        truthy: bool,
+        out: &mut Vec<Fact>,
+    ) {
+        match fname {
+            // `in_array($x, $set, true)` (strict): true ⇒ $x is one of the
+            // set's values — precise when they are all singletons.
+            "in_array" => {
+                if args.len() < 3 || !expr_is_true(&args[2].value) {
+                    return;
+                }
+                let Some(place) = self.place_key(&args[0].value) else {
+                    return;
+                };
+                let Some(values) = singleton_values(&self.infer(&args[1].value)) else {
+                    return;
+                };
+                if truthy {
+                    out.push((place, Type::union(values)));
+                } else {
+                    let cur = self.infer(&args[0].value);
+                    let narrowed = subtract_union(&cur, |m| values.contains(m));
+                    if narrowed != cur {
+                        out.push((place, narrowed));
+                    }
+                }
+            }
+            // `array_key_exists($k, $arr)` true ⇒ a shape's optional key is
+            // definitely present.
+            "array_key_exists" | "key_exists" => {
+                if !truthy || args.len() < 2 {
+                    return;
+                }
+                let Some(key) = literal_string_of(&self.infer(&args[0].value)) else {
+                    return;
+                };
+                let Some(place) = self.place_key(&args[1].value) else {
+                    return;
+                };
+                let cur = self.infer(&args[1].value);
+                if let Type::Shape { fields, sealed } = &cur {
+                    let mut fields = fields.clone();
+                    let mut changed = false;
+                    for f in &mut fields {
+                        if f.key.as_deref() == Some(key.as_str()) && f.optional {
+                            f.optional = false;
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        out.push((
+                            place,
+                            Type::Shape {
+                                fields,
+                                sealed: *sealed,
+                            },
+                        ));
+                    }
+                }
+            }
+            // `is_a($x, C::class)` / `is_subclass_of($x, C::class)` true ⇒ an
+            // object $x is an instance of C. Only when $x is already known to
+            // be an object — both functions also accept class-*strings*.
+            "is_a" | "is_subclass_of" => {
+                if !truthy || args.len() < 2 {
+                    return;
+                }
+                let Some(place) = self.place_key(&args[0].value) else {
+                    return;
+                };
+                let cur = self.infer(&args[0].value);
+                if !definitely_object_type(&cur) {
+                    return;
+                }
+                let Some(fqn) = class_name_arg(&self.infer(&args[1].value)) else {
+                    return;
+                };
+                out.push((
+                    place,
+                    Type::Named {
+                        fqn: fqn.into(),
+                        args: Vec::new(),
+                    },
+                ));
+            }
+            // `str_contains/starts/ends($h, $n)` true with a provably
+            // non-empty needle ⇒ the haystack is non-empty.
+            "str_contains" | "str_starts_with" | "str_ends_with" => {
+                if !truthy || args.len() < 2 {
+                    return;
+                }
+                let needle_non_empty = match self.infer(&args[1].value) {
+                    Type::LiteralString(s) => !s.is_empty(),
+                    Type::StringOf(r) => r.implies(php_types::StringRefinement::NonEmpty),
+                    _ => false,
+                };
+                if !needle_non_empty {
+                    return;
+                }
+                let Some(place) = self.place_key(&args[0].value) else {
+                    return;
+                };
+                if matches!(self.infer(&args[0].value), Type::String) {
+                    out.push((place, Type::StringOf(php_types::StringRefinement::NonEmpty)));
+                }
+            }
+            // `ctype_digit($s)` true on a string ⇒ digits only ⇒ numeric-string.
+            "ctype_digit" => {
+                if !truthy {
+                    return;
+                }
+                let Some(arg0) = args.first() else { return };
+                let Some(place) = self.place_key(&arg0.value) else {
+                    return;
+                };
+                if matches!(
+                    self.infer(&arg0.value),
+                    Type::String | Type::StringOf(_)
+                ) {
+                    out.push((place, Type::StringOf(php_types::StringRefinement::Numeric)));
+                }
+            }
+            // `class_exists($s)` true on a string ⇒ it names a class.
+            "class_exists" | "interface_exists" | "enum_exists" => {
+                if !truthy {
+                    return;
+                }
+                let Some(arg0) = args.first() else { return };
+                let Some(place) = self.place_key(&arg0.value) else {
+                    return;
+                };
+                if matches!(
+                    self.infer(&arg0.value),
+                    Type::String | Type::StringOf(_)
+                ) {
+                    out.push((place, Type::ClassString(None)));
+                }
+            }
+            // `function_exists($s)` true on a string ⇒ it names a callable.
+            "function_exists" => {
+                if !truthy {
+                    return;
+                }
+                let Some(arg0) = args.first() else { return };
+                let Some(place) = self.place_key(&arg0.value) else {
+                    return;
+                };
+                if matches!(self.infer(&arg0.value), Type::String) {
+                    out.push((place, Type::StringOf(php_types::StringRefinement::Callable)));
+                }
+            }
+            // `array_is_list($a)` true ⇒ the array is a list.
+            "array_is_list" => {
+                if !truthy {
+                    return;
+                }
+                let Some(arg0) = args.first() else { return };
+                let Some(place) = self.place_key(&arg0.value) else {
+                    return;
+                };
+                match self.infer(&arg0.value) {
+                    Type::Array(Some(kv)) => out.push((place, Type::List(Box::new(kv.1.clone())))),
+                    Type::Array(None) => out.push((place, Type::List(Box::new(Type::Mixed)))),
+                    _ => {}
                 }
             }
             _ => {}
@@ -352,16 +815,32 @@ impl TypeCtx<'_> {
             (Type::Null, false) => strip_null_strict(&self.infer(operand)),
             (Type::False, true) => Type::False,
             (Type::False, false) => strip_false(&self.infer(operand)),
+            // `$x === Suit::Hearts` pins the case; `!==` subtracts it from an
+            // explicit union of cases (sound: only narrows, never to empty).
+            (lit @ Type::EnumCase { .. }, true) => lit,
+            (lit @ Type::EnumCase { .. }, false) => {
+                let cur = self.infer(operand);
+                let narrowed = subtract_union(&cur, |m| *m == lit);
+                if narrowed == cur {
+                    return;
+                }
+                narrowed
+            }
             _ => return,
         };
         out.push((place, t));
     }
 
-    /// If `e` is a `null` or `false` literal, the corresponding [`Type`].
+    /// If `e` is a `null`/`false` literal or an enum case (`Suit::Hearts`),
+    /// the corresponding singleton [`Type`].
     fn cmp_lit(&self, e: &Expr) -> Option<Type> {
         match &e.kind {
             ExprKind::Name(n) if n.text.eq_ignore_ascii_case("null") => Some(Type::Null),
             ExprKind::Name(n) if n.text.eq_ignore_ascii_case("false") => Some(Type::False),
+            ExprKind::ClassConst { .. } => match self.infer(e) {
+                t @ Type::EnumCase { .. } => Some(t),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -409,6 +888,230 @@ impl TypeCtx<'_> {
                 Some(format!("{base}->{}()", self.interner.resolve(*m)))
             }
             _ => None,
+        }
+    }
+
+    // -- Call side-effect invalidation --------------------------------------
+    //
+    // A narrowed object-state place (`$this->prop`, `$obj->prop`, `$obj->m()`)
+    // stays narrowed across a call only when the callee is not known to mutate
+    // reachable object state. Mirrors phpstan's `hasSideEffects` semantics:
+    // a callee has side effects iff it is explicitly `@phpstan-impure`, returns
+    // `void`, or is a fluent setter (returns `$this`-flavoured `static`/`self`);
+    // an unmarked value-returning callee keeps narrowing. A fluent callee (not
+    // explicitly impure) mutates its receiver but spares its *arguments*, and a
+    // constructor spares arguments unless explicitly impure. Built-in functions
+    // never invalidate through their arguments (curated — the overwhelming
+    // majority are object-transparent); by-ref parameters are widened for every
+    // resolved callee, builtin or not.
+
+    /// After `$recv->m(...)`: invalidate the receiver's derived places when the
+    /// method has side effects, and object arguments unless it is fluent.
+    fn invalidate_after_method_call(&mut self, recv: &Expr, method: &MemberName, args: &[Arg]) {
+        if is_first_class_callable(args) {
+            return;
+        }
+        let mut facts = (SE_YES, None);
+        if let Some(name) = self.member_ident(method) {
+            let recv_ty = self.infer(recv);
+            if let Some(fqn) = self.type_class_fqn(&recv_ty) {
+                if let Some(found) = self.find_method_for_receiver(&recv_ty, &fqn, &name) {
+                    facts = (
+                        method_side_effects(&found.member),
+                        Some(param_ref_info(&found.member.params)),
+                    );
+                }
+            }
+        }
+        let (se, params) = facts;
+        if se.yes {
+            if let Some(base) = self.invalidation_base(recv) {
+                self.invalidate_derived_places(&base);
+            }
+            if !se.fluent {
+                self.invalidate_object_args(args);
+            }
+        }
+        self.widen_by_ref_args(params, args);
+    }
+
+    /// After `f(...)` / `$f(...)`.
+    fn invalidate_after_fn_call(&mut self, callee: &Expr, args: &[Arg]) {
+        if is_first_class_callable(args) {
+            return;
+        }
+        let facts = match &callee.kind {
+            ExprKind::Name(n) => match self.function_reflection(n) {
+                Some(f) => {
+                    let se = if f.impure {
+                        SE_YES
+                    } else if f.builtin || f.pure {
+                        SE_NO
+                    } else if matches!(f.return_type, Type::Void) {
+                        SE_YES
+                    } else {
+                        SE_NO
+                    };
+                    let mut info = param_ref_info(&f.params);
+                    info.builtin = f.builtin;
+                    (se, Some(info))
+                }
+                // Unknown function — assume the worst.
+                None => (SE_YES, None),
+            },
+            // Dynamic callee (`$f(...)`, an inline closure call, …).
+            _ => (SE_YES, None),
+        };
+        let (se, params) = facts;
+        if se.yes {
+            self.invalidate_object_args(args);
+        }
+        self.widen_by_ref_args(params, args);
+    }
+
+    /// After `C::m(...)`. A `self::`/`parent::`/`static::` call to an instance
+    /// method runs on `$this`, so it invalidates `$this`'s derived places like a
+    /// method call would.
+    fn invalidate_after_static_call(&mut self, class: &Expr, method: &MemberName, args: &[Arg]) {
+        if is_first_class_callable(args) {
+            return;
+        }
+        let this_class = matches!(&class.kind, ExprKind::Name(n)
+            if matches!(last_segment(&n.text).to_ascii_lowercase().as_str(), "self" | "parent" | "static"));
+        let mut facts = (SE_YES, None);
+        let mut on_this = this_class;
+        if let Some(name) = self.member_ident(method) {
+            if let Some(fqn) = self.class_type(class).and_then(|t| self.type_class_fqn(&t)) {
+                if let Some(found) = self.index.find_method(&fqn, &name) {
+                    on_this = this_class && !found.member.is_static;
+                    facts = (
+                        method_side_effects(&found.member),
+                        Some(param_ref_info(&found.member.params)),
+                    );
+                }
+            }
+        }
+        let (se, params) = facts;
+        if se.yes {
+            if on_this {
+                self.invalidate_derived_places("this");
+            }
+            if !se.fluent {
+                self.invalidate_object_args(args);
+            }
+        }
+        self.widen_by_ref_args(params, args);
+    }
+
+    /// After `new C(...)`: constructors spare argument narrowing unless
+    /// explicitly `@phpstan-impure` (phpstan's `impure-constructor` semantics).
+    fn invalidate_after_new(&mut self, class: &Expr, args: &[Arg]) {
+        let Some(fqn) = self.class_type(class).and_then(|t| self.type_class_fqn(&t)) else {
+            return;
+        };
+        let Some(found) = self.index.find_method(&fqn, "__construct") else {
+            return;
+        };
+        let impure = found.member.impure;
+        let params = Some(param_ref_info(&found.member.params));
+        if impure {
+            self.invalidate_object_args(args);
+        }
+        self.widen_by_ref_args(params, args);
+    }
+
+    /// The env key whose *derived* places a call through `e` invalidates:
+    /// unlike [`place_key`], `$this` itself is a valid base here.
+    fn invalidation_base(&self, e: &Expr) -> Option<String> {
+        match &e.kind {
+            ExprKind::Paren(inner) => self.invalidation_base(inner),
+            ExprKind::Variable(sym) => Some(self.interner.resolve(*sym).to_string()),
+            _ => self.place_key(e),
+        }
+    }
+
+    /// Remove narrowed places derived from `base` (`base->prop`, `base->m()`,
+    /// and deeper chains). The base itself keeps its type — a call can mutate
+    /// the object's state, not rebind the caller's variable.
+    fn invalidate_derived_places(&mut self, base: &str) {
+        let prefix = format!("{base}->");
+        self.vars.retain(|k, _| !k.starts_with(prefix.as_str()));
+    }
+
+    /// Invalidate the derived places of every argument that may be an object
+    /// (objects travel by handle; scalars/arrays are copied and can't be
+    /// mutated by the callee — their narrowing survives).
+    fn invalidate_object_args(&mut self, args: &[Arg]) {
+        for a in args {
+            if a.placeholder {
+                continue;
+            }
+            let Some(base) = self.invalidation_base(&a.value) else {
+                continue;
+            };
+            if !type_may_be_object(&self.infer(&a.value)) {
+                continue;
+            }
+            self.invalidate_derived_places(&base);
+        }
+    }
+
+    /// A by-ref parameter may rebind its argument entirely: reset the argument
+    /// variable to the parameter's declared type (phpstan's virtual-assign).
+    /// Builtin exception: when the argument's current type already fits the
+    /// declared parameter type, keep it — phpstan regains that precision via
+    /// per-function ParameterOut extensions (`usort` keeps `array<string,User>`,
+    /// not bare `array`); an in-fit builtin by-ref arg is mutated-in-kind, not
+    /// re-typed. An out-of-fit arg (e.g. a string `$matches` before
+    /// `preg_match`) still widens to the declared type.
+    fn widen_by_ref_args(&mut self, params: Option<ParamRefInfo>, args: &[Arg]) {
+        let Some(ParamRefInfo {
+            params,
+            variadic_last,
+            builtin,
+        }) = params
+        else {
+            return;
+        };
+        for (i, a) in args.iter().enumerate() {
+            // Named/spread args break positional mapping; skip (sound: no widening).
+            if a.placeholder || a.spread || a.name.is_some() {
+                continue;
+            }
+            let idx = if i < params.len() {
+                i
+            } else if variadic_last && !params.is_empty() {
+                params.len() - 1
+            } else {
+                continue;
+            };
+            let (by_ref, ref ty, explicit_out) = params[idx];
+            if !by_ref {
+                continue;
+            }
+            let ExprKind::Variable(sym) = &a.value.kind else {
+                continue;
+            };
+            let name = self.interner.resolve(*sym).to_string();
+            if name == "this" {
+                continue;
+            }
+            // The builtin keep-current heuristic never overrides an explicit
+            // `@param-out` contract.
+            if builtin && !explicit_out {
+                if let Some(cur) = self.vars.get(&name) {
+                    if crate::is_assignable(self.index, cur, ty) {
+                        continue;
+                    }
+                }
+            }
+            self.invalidate_derived_places(&name);
+            self.callables.remove(&name);
+            if matches!(ty, Type::Mixed) {
+                self.vars.remove(&name);
+            } else {
+                self.vars.insert(name, ty.clone());
+            }
         }
     }
 
@@ -507,6 +1210,12 @@ impl TypeCtx<'_> {
                 self.rec_here(callee, map);
                 self.rec_args(args, map);
                 self.rec_builtin_callback_args(callee, args, map);
+                self.invalidate_after_fn_call(callee, args);
+                if let ExprKind::Name(n) = &callee.kind {
+                    let mut facts = Vec::new();
+                    self.assert_facts_fn(n, args, None, &mut facts);
+                    self.apply_facts(&facts);
+                }
             }
             ExprKind::MethodCall {
                 recv, method, args, ..
@@ -515,6 +1224,10 @@ impl TypeCtx<'_> {
                 self.rec_member(method, map);
                 self.rec_args(args, map);
                 self.rec_collection_callback_args(recv, method, args, map);
+                self.invalidate_after_method_call(recv, method, args);
+                let mut facts = Vec::new();
+                self.assert_facts_method(recv, method, args, None, &mut facts);
+                self.apply_facts(&facts);
             }
             ExprKind::StaticCall {
                 class,
@@ -524,10 +1237,15 @@ impl TypeCtx<'_> {
                 self.rec_here(class, map);
                 self.rec_member(method, map);
                 self.rec_args(args, map);
+                self.invalidate_after_static_call(class, method, args);
+                let mut facts = Vec::new();
+                self.assert_facts_static(class, method, args, None, &mut facts);
+                self.apply_facts(&facts);
             }
             ExprKind::New { class, args } => {
                 self.rec_here(class, map);
                 self.rec_args(args, map);
+                self.invalidate_after_new(class, args);
             }
             ExprKind::NewAnon { args, .. } => self.rec_args(args, map),
             ExprKind::Array { items, .. } => {
@@ -542,13 +1260,28 @@ impl TypeCtx<'_> {
             }
             ExprKind::Match { subject, arms } => {
                 self.rec_here(subject, map);
+                let place = self.place_key(subject);
                 for arm in arms {
                     if let Some(conds) = &arm.conds {
                         for c in conds {
                             self.rec_here(c, map);
                         }
                     }
-                    self.rec_here(&arm.body, map);
+                    // When every arm condition is a singleton (enum case or
+                    // scalar literal), the arm body sees the subject narrowed
+                    // to their union (`match ($s) { Suit::Hearts => …`).
+                    let narrowed = place
+                        .as_ref()
+                        .and_then(|_| self.match_arm_narrowing(arm));
+                    match (&place, narrowed) {
+                        (Some(place), Some(t)) => {
+                            let saved = self.vars.clone();
+                            self.apply_facts(&[(place.clone(), t)]);
+                            self.rec_here(&arm.body, map);
+                            self.vars = saved;
+                        }
+                        _ => self.rec_here(&arm.body, map),
+                    }
                 }
             }
             ExprKind::Isset(es) => {
@@ -1082,7 +1815,7 @@ impl TypeCtx<'_> {
         self.set_flow_state(base.clone());
         self.apply_facts(&then_facts);
         self.record_stmt(then, map);
-        if !always_terminates(then) {
+        if !self.always_terminates(then) {
             envs.push(self.take_flow_state());
         }
 
@@ -1095,7 +1828,7 @@ impl TypeCtx<'_> {
             self.apply_facts(&pos);
             self.apply_expr(&ei.cond);
             self.record_stmt(&ei.body, map);
-            if !always_terminates(&ei.body) {
+            if !self.always_terminates(&ei.body) {
                 envs.push(self.take_flow_state());
             }
             else_facts.extend(neg);
@@ -1106,7 +1839,7 @@ impl TypeCtx<'_> {
                 self.set_flow_state(base.clone());
                 self.apply_facts(&else_facts);
                 self.record_stmt(e, map);
-                if !always_terminates(e) {
+                if !self.always_terminates(e) {
                     envs.push(self.take_flow_state());
                 }
             }
@@ -1235,7 +1968,7 @@ impl TypeCtx<'_> {
 
         self.set_flow_state(base.clone());
         self.record_block(body, map);
-        if !block_always_terminates(body) {
+        if !self.block_always_terminates(body) {
             exits.push(self.take_flow_state());
         }
 
@@ -1248,7 +1981,7 @@ impl TypeCtx<'_> {
                 self.callables.remove(&name);
             }
             self.record_block(&catch.body, map);
-            if !block_always_terminates(&catch.body) {
+            if !self.block_always_terminates(&catch.body) {
                 exits.push(self.take_flow_state());
             }
         }
@@ -1262,7 +1995,7 @@ impl TypeCtx<'_> {
         if let Some(finally) = finally {
             self.set_flow_state(merged);
             self.record_block(finally, map);
-            if block_always_terminates(finally) {
+            if self.block_always_terminates(finally) {
                 self.set_flow_state(base);
             }
         } else {
@@ -1449,15 +2182,39 @@ fn subtract_union(cur: &Type, mut remove: impl FnMut(&Type) -> bool) -> Type {
 /// Whether union member `m` is *definitely* of the kind asserted by a type
 /// predicate `t` (from [`predicate_type`]) — so `!is_<kind>` removes it. Matches
 /// on concrete kind, not lenient assignability, to avoid over-removing.
+/// The positive-branch fact for `is_*($x)`: keep the parts of the current type
+/// that already satisfy the predicate (they are *narrower* than the predicate's
+/// broad type — `'a'|'b'` under `is_string` stays `'a'|'b'`, `non-empty-string`
+/// is not widened to `string`); fall back to the predicate type otherwise.
+fn narrow_to_predicate(cur: &Type, t: &Type) -> Type {
+    match cur {
+        Type::Union(parts) => {
+            let kept: Vec<Type> = parts
+                .iter()
+                .filter(|m| predicate_matches(m, t))
+                .cloned()
+                .collect();
+            if kept.is_empty() {
+                t.clone()
+            } else {
+                Type::union(kept)
+            }
+        }
+        Type::Nullable(inner) if !matches!(t, Type::Null) => narrow_to_predicate(inner, t),
+        _ if predicate_matches(cur, t) => cur.clone(),
+        _ => t.clone(),
+    }
+}
+
 fn predicate_matches(m: &Type, t: &Type) -> bool {
     use Type::*;
     match t {
-        String => matches!(m, String | LiteralString(_) | ClassString(_)),
+        String => matches!(m, String | StringOf(_) | LiteralString(_) | ClassString(_)),
         Int => matches!(m, Int | LiteralInt(_)),
         Float => matches!(m, Float),
         Bool => matches!(m, Bool | True | False),
         Array(_) => matches!(m, Array(_) | List(_) | Shape { .. }),
-        Object => matches!(m, Object | Named { .. } | SelfType | StaticType),
+        Object => matches!(m, Object | Named { .. } | EnumCase { .. } | SelfType | StaticType),
         Iterable(_) => matches!(m, Iterable(_) | Array(_) | List(_) | Shape { .. }),
         Callable(_) => matches!(m, Callable(_)),
         Null => matches!(m, Null),
@@ -1587,35 +2344,213 @@ fn callable_env_same(a: &CallableEnv, b: &CallableEnv) -> bool {
 }
 
 /// The last `\`-separated segment of a (possibly-qualified) name.
+/// phpstan `hasSideEffects` verdict for one call, plus the fluent-receiver
+/// refinement (fluent setters invalidate their receiver but spare arguments).
+#[derive(Clone, Copy)]
+struct SideEffects {
+    yes: bool,
+    fluent: bool,
+}
+
+const SE_YES: SideEffects = SideEffects {
+    yes: true,
+    fluent: false,
+};
+const SE_NO: SideEffects = SideEffects {
+    yes: false,
+    fluent: false,
+};
+
+/// Side-effect classification of a resolved method: explicitly `@phpstan-impure`
+/// → yes; explicitly pure → no; `void` return or a fluent `$this`-flavoured
+/// return (`static`/`self`) → yes; anything else (unmarked, value-returning)
+/// → no, narrowing survives (phpstan's `impure-method` fixture semantics).
+fn method_side_effects(m: &php_reflect::MethodReflection) -> SideEffects {
+    if m.impure {
+        return SE_YES;
+    }
+    if m.pure {
+        return SE_NO;
+    }
+    let fluent = matches!(m.return_type, Type::StaticType | Type::SelfType);
+    if fluent || matches!(m.return_type, Type::Void) {
+        SideEffects { yes: true, fluent }
+    } else {
+        SE_NO
+    }
+}
+
+/// The minimal owned callee-parameter view [`TypeCtx::widen_by_ref_args`]
+/// needs: `(by_ref, declared type)` per positional parameter, whether the last
+/// is variadic, and whether the callee is a builtin (`Type` clones are
+/// Arc-cheap).
+struct ParamRefInfo {
+    /// `(by_ref, post-call type, explicit @param-out)` per positional param.
+    params: Vec<(bool, Type, bool)>,
+    variadic_last: bool,
+    builtin: bool,
+}
+
+fn param_ref_info(params: &[php_reflect::ParamReflection]) -> ParamRefInfo {
+    ParamRefInfo {
+        params: params
+            .iter()
+            .map(|p| match &p.out_ty {
+                // An explicit `@param-out` is the post-call contract.
+                Some(out) => (p.by_ref, out.clone(), true),
+                None => (p.by_ref, p.ty.clone(), false),
+            })
+            .collect(),
+        variadic_last: params.last().is_some_and(|p| p.variadic),
+        builtin: false,
+    }
+}
+
+/// Whether a value of type `t` may be an object (travel by handle, so a
+/// side-effecting callee could mutate it). Scalars and arrays are copied;
+/// anything unknown/object-flavoured conservatively may.
+fn type_may_be_object(t: &Type) -> bool {
+    match t {
+        Type::Null
+        | Type::Bool
+        | Type::True
+        | Type::False
+        | Type::Int
+        | Type::IntRange { .. }
+        | Type::LiteralInt(_)
+        | Type::Float
+        | Type::String
+        | Type::LiteralString(_)
+        | Type::Array(_)
+        | Type::List(_)
+        | Type::Shape { .. }
+        | Type::ClassString(_)
+        | Type::Void
+        | Type::Never => false,
+        Type::Nullable(inner) => type_may_be_object(inner),
+        Type::Union(ms) => ms.iter().any(type_may_be_object),
+        _ => true,
+    }
+}
+
+fn expr_is_true(e: &Expr) -> bool {
+    matches!(&peel_paren(e).kind, ExprKind::Name(n) if n.text.eq_ignore_ascii_case("true"))
+}
+
+/// A singleton type — one exact runtime value (`===`-comparable).
+fn is_singleton(t: &Type) -> bool {
+    matches!(
+        t,
+        Type::LiteralInt(_)
+            | Type::LiteralString(_)
+            | Type::EnumCase { .. }
+            | Type::True
+            | Type::False
+            | Type::Null
+    )
+}
+
+/// The value set of an array-ish type when *every* value is a singleton —
+/// what strict `in_array` narrowing needs to be exact.
+fn singleton_values(t: &Type) -> Option<Vec<Type>> {
+    let value_ty = match t {
+        Type::Array(Some(kv)) => kv.1.clone(),
+        Type::List(inner) => (**inner).clone(),
+        Type::Shape {
+            fields,
+            sealed: true,
+        } => Type::union(fields.iter().map(|f| f.ty.clone()).collect()),
+        _ => return None,
+    };
+    let parts: Vec<Type> = match value_ty {
+        Type::Union(p) => p.to_vec(),
+        single => vec![single],
+    };
+    (!parts.is_empty() && parts.iter().all(is_singleton)).then_some(parts)
+}
+
+fn literal_string_of(t: &Type) -> Option<String> {
+    match t {
+        Type::LiteralString(s) => Some(s.to_string()),
+        _ => None,
+    }
+}
+
+/// Definitely an object value (`is_a`-style narrowing is only sound then —
+/// those functions also accept class-name strings).
+fn definitely_object_type(t: &Type) -> bool {
+    match t {
+        Type::Named { .. }
+        | Type::EnumCase { .. }
+        | Type::Object
+        | Type::SelfType
+        | Type::StaticType
+        | Type::Parent => true,
+        Type::Union(parts) => !parts.is_empty() && parts.iter().all(definitely_object_type),
+        Type::Intersection(parts) => parts.iter().any(definitely_object_type),
+        _ => false,
+    }
+}
+
+/// Whether union member `m` is *confidently* within `ty` — concrete and
+/// assignable. Used for negated asserts (`!T`): removing a member requires
+/// certainty it is in `T` (the lenient `is_assignable` says yes to `mixed`,
+/// which must never be subtracted).
+fn confidently_in(index: &php_reflect::ReflectionIndex, m: &Type, ty: &Type) -> bool {
+    !matches!(
+        m,
+        Type::Mixed | Type::ExplicitMixed | Type::Unknown(_) | Type::TemplateVar(_)
+    ) && crate::is_assignable(index, m, ty)
+}
+
+/// A class name carried by a comparison operand: `C::class`
+/// (`class-string<C>`) or a literal class-name string.
+fn class_name_arg(t: &Type) -> Option<String> {
+    match t {
+        Type::ClassString(Some(inner)) => match &**inner {
+            Type::Named { fqn, .. } => Some(fqn.to_string()),
+            _ => None,
+        },
+        Type::LiteralString(s) if !s.is_empty() => Some(s.trim_start_matches('\\').to_string()),
+        _ => None,
+    }
+}
+
 fn last_segment(name: &str) -> &str {
     name.rsplit('\\').next().unwrap_or(name)
 }
 
 /// Does executing `s` always leave the current block (so its environment never
 /// flows past it)? Conservative — only unconditional terminators count.
-fn always_terminates(s: &Stmt) -> bool {
-    match &s.kind {
-        StmtKind::Return(_) | StmtKind::Break(_) | StmtKind::Continue(_) | StmtKind::Goto(_) => {
-            true
+impl TypeCtx<'_> {
+    fn always_terminates(&self, s: &Stmt) -> bool {
+        match &s.kind {
+            StmtKind::Return(_)
+            | StmtKind::Break(_)
+            | StmtKind::Continue(_)
+            | StmtKind::Goto(_) => true,
+            StmtKind::Expr(e) => {
+                matches!(&e.kind, ExprKind::Throw(_) | ExprKind::Exit(_))
+                    || self.terminators.expr_terminates(e, self.interner)
+            }
+            StmtKind::Block(b) => b.last().is_some_and(|s| self.always_terminates(s)),
+            StmtKind::If {
+                then,
+                elseifs,
+                els: Some(els),
+                ..
+            } => {
+                self.always_terminates(then)
+                    && elseifs.iter().all(|ei| self.always_terminates(&ei.body))
+                    && self.always_terminates(els)
+            }
+            _ => false,
         }
-        StmtKind::Expr(e) => matches!(&e.kind, ExprKind::Throw(_) | ExprKind::Exit(_)),
-        StmtKind::Block(b) => b.last().is_some_and(always_terminates),
-        StmtKind::If {
-            then,
-            elseifs,
-            els: Some(els),
-            ..
-        } => {
-            always_terminates(then)
-                && elseifs.iter().all(|ei| always_terminates(&ei.body))
-                && always_terminates(els)
-        }
-        _ => false,
     }
-}
 
-fn block_always_terminates(stmts: &[Stmt]) -> bool {
-    stmts.last().is_some_and(always_terminates)
+    fn block_always_terminates(&self, stmts: &[Stmt]) -> bool {
+        stmts.last().is_some_and(|s| self.always_terminates(s))
+    }
 }
 
 /// Merge several branch environments: a variable's merged type is the union of
@@ -1694,10 +2629,57 @@ mod tests {
             .unwrap_or_else(|| "<unset>".into())
     }
 
+    /// Analyse the method named `method` of the first class in `src` (class
+    /// context + `$this` seeded) and return the end-of-body env entry for
+    /// `place` (e.g. `this->p`) — `<unset>` when absent/invalidated.
+    fn place_after(src: &str, method: &str, place: &str) -> String {
+        let full = format!("<?php {src}");
+        let r = php_parser::parse(&full);
+        assert!(!r.has_errors(), "parse errors in: {src}");
+        let mut index = ReflectionIndex::new();
+        index.add_file(&r.program, &r.interner);
+        let scope = Scope::global();
+        // Pick the class that declares `method` (fixtures may list helper
+        // classes first).
+        let (class_name, body) = r
+            .program
+            .stmts
+            .iter()
+            .find_map(|s| {
+                let StmtKind::Class(c) = &s.kind else {
+                    return None;
+                };
+                let body = c.members.iter().find_map(|m| match m {
+                    php_ast::Member::Method(m)
+                        if r.interner.resolve(m.name).eq_ignore_ascii_case(method) =>
+                    {
+                        m.body.as_deref()
+                    }
+                    _ => None,
+                })?;
+                Some((r.interner.resolve(c.name?).to_string(), body))
+            })
+            .expect("a class declaring the method");
+        let mut ctx = TypeCtx::new(&index, &scope, &r.interner);
+        ctx.class = Some(class_name.clone());
+        ctx.vars.insert(
+            "this".into(),
+            Type::Named {
+                fqn: class_name.into(),
+                args: Vec::new(),
+            },
+        );
+        ctx.exec_block(body);
+        ctx.vars
+            .get(place)
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "<unset>".into())
+    }
+
     #[test]
     fn simple_assignment_chain() {
-        assert_eq!(var_after("$x = 1; $y = $x + 2;", "y"), "int");
-        assert_eq!(var_after("$x = 'a' . 'b';", "x"), "string");
+        assert_eq!(var_after("$x = 1; $y = $x + 2;", "y"), "3"); // literal arithmetic folds
+        assert_eq!(var_after("$x = 'a' . 'b';", "x"), "'ab'"); // literal concat folds
         assert_eq!(var_after("$a = $b = 5;", "a"), "5");
         assert_eq!(var_after("$a = $b = 5;", "b"), "5");
     }
@@ -1712,8 +2694,8 @@ mod tests {
 
     #[test]
     fn compound_assignment() {
-        assert_eq!(var_after("$x = 1; $x += 2;", "x"), "int");
-        assert_eq!(var_after("$s = 'a'; $s .= 'b';", "s"), "string");
+        assert_eq!(var_after("$x = 1; $x += 2;", "x"), "3");
+        assert_eq!(var_after("$s = 'a'; $s .= 'b';", "s"), "'ab'");
     }
 
     #[test]
@@ -1749,6 +2731,454 @@ mod tests {
             }
         "#;
         assert_eq!(var_after(src, "x"), "1|'two'");
+    }
+
+    // --- M-P0 call side-effect invalidation --------------------------------
+
+    /// The shared fixture: a nullable property narrowed by an early-return
+    /// guard, then one call whose side-effect classification is under test.
+    fn guarded_class(call: &str) -> String {
+        format!(
+            r#"
+            class X {{}}
+            class C {{
+                public ?X $p;
+                public function reload(): void {{}}
+                public function calc(): int {{ return 1; }}
+                /** @phpstan-impure */
+                public function calcImpure(): int {{ return 1; }}
+                public function fluent(): self {{ return $this; }}
+                public function initLegacy(): void {{}}
+                public static function svoid(): void {{}}
+                public function m() {{
+                    if ($this->p === null) {{ return; }}
+                    {call}
+                }}
+            }}
+            "#
+        )
+    }
+
+    #[test]
+    fn void_method_on_this_invalidates_property_narrowing() {
+        assert_eq!(
+            place_after(&guarded_class("$this->reload();"), "m", "this->p"),
+            "<unset>"
+        );
+    }
+
+    #[test]
+    fn value_returning_method_keeps_property_narrowing() {
+        assert_eq!(
+            place_after(&guarded_class("$this->calc();"), "m", "this->p"),
+            "X"
+        );
+    }
+
+    #[test]
+    fn impure_tagged_method_invalidates_property_narrowing() {
+        assert_eq!(
+            place_after(&guarded_class("$this->calcImpure();"), "m", "this->p"),
+            "<unset>"
+        );
+    }
+
+    #[test]
+    fn fluent_method_invalidates_receiver_narrowing() {
+        assert_eq!(
+            place_after(&guarded_class("$this->fluent();"), "m", "this->p"),
+            "<unset>"
+        );
+    }
+
+    #[test]
+    fn self_call_to_instance_method_invalidates_this() {
+        assert_eq!(
+            place_after(&guarded_class("self::initLegacy();"), "m", "this->p"),
+            "<unset>"
+        );
+    }
+
+    #[test]
+    fn self_call_to_static_method_keeps_this_narrowing() {
+        assert_eq!(
+            place_after(&guarded_class("self::svoid();"), "m", "this->p"),
+            "X"
+        );
+    }
+
+    #[test]
+    fn void_function_invalidates_object_argument() {
+        let src = r#"
+            function f(P $p) { if ($p->name === null) { return; } mutate($p); }
+            function mutate(P $p): void {}
+            class P { public ?string $name; }
+        "#;
+        assert_eq!(var_after(src, "p->name"), "<unset>");
+    }
+
+    #[test]
+    fn value_returning_function_keeps_object_argument_narrowing() {
+        let src = r#"
+            function f(P $p) { if ($p->name === null) { return; } probe($p); }
+            function probe(P $p): int { return 1; }
+            class P { public ?string $name; }
+        "#;
+        assert_eq!(var_after(src, "p->name"), "string");
+    }
+
+    #[test]
+    fn unknown_function_invalidates_object_argument() {
+        let src = r#"
+            function f(P $p) { if ($p->name === null) { return; } no_such_function($p); }
+            class P { public ?string $name; }
+        "#;
+        assert_eq!(var_after(src, "p->name"), "<unset>");
+    }
+
+    #[test]
+    fn scalar_argument_narrowing_survives_side_effecting_call() {
+        // $n is an int — copied, not mutable by the callee; and $p is not
+        // passed, so its narrowing survives too.
+        let src = r#"
+            function f(P $p, int $n) { if ($p->name === null) { return; } touch1($n); }
+            function touch1(int $n): void {}
+            class P { public ?string $name; }
+        "#;
+        assert_eq!(var_after(src, "p->name"), "string");
+    }
+
+    #[test]
+    fn fluent_call_spares_argument_narrowing() {
+        let src = r#"
+            function f(B $b, P $p) { if ($p->name === null) { return; } $b->with($p); }
+            class B { public function with(P $p): self { return $this; } }
+            class P { public ?string $name; }
+        "#;
+        assert_eq!(var_after(src, "p->name"), "string");
+    }
+
+    #[test]
+    fn unmarked_constructor_spares_argument_narrowing() {
+        let src = r#"
+            function f(P $p) { if ($p->name === null) { return; } new H($p); }
+            class H { public function __construct(P $p) {} }
+            class P { public ?string $name; }
+        "#;
+        assert_eq!(var_after(src, "p->name"), "string");
+    }
+
+    #[test]
+    fn impure_constructor_invalidates_argument_narrowing() {
+        let src = r#"
+            function f(P $p) { if ($p->name === null) { return; } new H($p); }
+            class H {
+                /** @phpstan-impure */
+                public function __construct(P $p) {}
+            }
+            class P { public ?string $name; }
+        "#;
+        assert_eq!(var_after(src, "p->name"), "<unset>");
+    }
+
+    #[test]
+    fn by_ref_argument_widens_to_declared_param_type() {
+        let src = r#"
+            function f() { $m = 'seed'; fill($m); }
+            function fill(array &$out): void {}
+        "#;
+        assert_eq!(var_after(src, "m"), "array");
+    }
+
+    #[test]
+    fn param_out_sets_post_call_type() {
+        // `@param-out` beats the declared param type for the post-call value.
+        let src = r#"
+            function f() { $m = null; fill($m); }
+            /** @param-out list<string> $out */
+            function fill(?array &$out): void {}
+        "#;
+        assert_eq!(var_after(src, "m"), "list<string>");
+    }
+
+    #[test]
+    fn enum_case_types_and_narrowing() {
+        // `Suit::Hearts` is the case type; `->name`/`->value` are per-case
+        // literals; `===` pins a union member and `!==` subtracts it.
+        let src = r#"
+            enum Suit: string {
+                case Hearts = 'H';
+                case Spades = 'S';
+            }
+            function f(Suit $s) {
+                $a = Suit::Hearts;
+                $n = Suit::Hearts->name;
+                $v = Suit::Hearts->value;
+            }
+        "#;
+        assert_eq!(var_after(src, "a"), "Suit::Hearts");
+        assert_eq!(var_after(src, "n"), "'Hearts'");
+        assert_eq!(var_after(src, "v"), "'H'");
+
+        let src = r#"
+            enum Suit {
+                case Hearts;
+                case Spades;
+            }
+            function f(Suit $s) {
+                if ($s === Suit::Hearts) { $x = $s; }
+                if ($s !== Suit::Hearts) { return; }
+                $y = $s;
+            }
+        "#;
+        assert_eq!(var_after(src, "x"), "Suit::Hearts|mixed");
+        // The `!==` guard's fall-through pins the case too.
+        assert_eq!(var_after(src, "y"), "Suit::Hearts");
+    }
+
+    // --- M-P2 @phpstan-assert ----------------------------------------------
+
+    #[test]
+    fn assert_tag_narrows_after_statement_call() {
+        // webmozart-style: a statement-level assertion helper narrows its arg.
+        let src = r#"
+            function f(mixed $x) {
+                assertString($x);
+                $y = $x;
+            }
+            /** @phpstan-assert string $value */
+            function assertString(mixed $value): void {}
+        "#;
+        assert_eq!(var_after(src, "y"), "string");
+    }
+
+    #[test]
+    fn assert_if_true_narrows_condition_branch() {
+        let src = r#"
+            function f(?string $x) {
+                if (notNull($x)) { $y = $x; }
+            }
+            /** @phpstan-assert-if-true !null $value */
+            function notNull(mixed $value): bool { return $value !== null; }
+        "#;
+        assert_eq!(var_after(src, "y"), "string|mixed");
+    }
+
+    #[test]
+    fn assert_if_false_narrows_else_path() {
+        let src = r#"
+            function f(?int $x) {
+                if (hasValue($x)) { return; }
+                $y = $x;
+            }
+            /** @phpstan-assert-if-false null $value */
+            function hasValue(?int $value): bool { return $value !== null; }
+        "#;
+        assert_eq!(var_after(src, "y"), "null");
+    }
+
+    #[test]
+    fn static_method_assert_narrows() {
+        // The webmozart/assert shape: static Assert::string().
+        let src = r#"
+            class Assert {
+                /** @phpstan-assert string $value */
+                public static function string(mixed $value): void {}
+            }
+            function f(mixed $x) {
+                Assert::string($x);
+                $y = $x;
+            }
+        "#;
+        assert_eq!(var_after(src, "y"), "string");
+    }
+
+    #[test]
+    fn negated_assert_subtracts_from_union() {
+        let src = r#"
+            /** @param int|string $x */
+            function f($x) {
+                notString($x);
+                $y = $x;
+            }
+            /** @phpstan-assert !string $value */
+            function notString(mixed $value): void {}
+        "#;
+        assert_eq!(var_after(src, "y"), "int");
+    }
+
+    // --- M-P2 condition specifiers ------------------------------------------
+
+    #[test]
+    fn in_array_strict_narrows_to_value_set() {
+        let src = r#"
+            function f(string $x) {
+                if (in_array($x, ['a', 'b'], true)) { $y = $x; }
+            }
+        "#;
+        assert_eq!(var_after(src, "y"), "'a'|'b'|mixed");
+        // Negative branch subtracts from an explicit union.
+        let src = r#"
+            /** @param 'a'|'b'|'c' $x */
+            function f(string $x) {
+                if (in_array($x, ['a', 'b'], true)) { return; }
+                $y = $x;
+            }
+        "#;
+        assert_eq!(var_after(src, "y"), "'c'");
+        // Loose (no strict flag) narrows nothing.
+        let src = r#"
+            function f(string $x) {
+                if (in_array($x, ['a', 'b'])) { $y = $x; }
+            }
+        "#;
+        assert_eq!(var_after(src, "y"), "string|mixed");
+    }
+
+    #[test]
+    fn array_key_exists_pins_optional_shape_key() {
+        let src = r#"
+            /** @param array{id: int, name?: string} $a */
+            function f(array $a) {
+                if (array_key_exists('name', $a)) { $y = $a; }
+            }
+        "#;
+        assert_eq!(
+            var_after(src, "y"),
+            "array{id: int, name: string}|mixed"
+        );
+    }
+
+    #[test]
+    fn get_class_comparison_narrows() {
+        let src = r#"
+            class A {}
+            class B {}
+            function f(object $o) {
+                if (get_class($o) === A::class) { $y = $o; }
+            }
+        "#;
+        assert_eq!(var_after(src, "y"), "A|mixed");
+    }
+
+    #[test]
+    fn gettype_comparison_narrows() {
+        let src = r#"
+            function f(int|string $x) {
+                if (gettype($x) === 'string') { $y = $x; }
+                if (gettype($x) !== 'integer') { return; }
+                $z = $x;
+            }
+        "#;
+        assert_eq!(var_after(src, "y"), "string|mixed");
+        assert_eq!(var_after(src, "z"), "int");
+    }
+
+    #[test]
+    fn is_a_narrows_known_objects_only() {
+        let src = r#"
+            class A {}
+            function f(object $o) {
+                if (is_a($o, A::class)) { $y = $o; }
+            }
+        "#;
+        assert_eq!(var_after(src, "y"), "A|mixed");
+        // A string operand could be a class name — not narrowed to an object.
+        let src = r#"
+            class A {}
+            function f(string $s) {
+                if (is_a($s, A::class, true)) { $y = $s; }
+            }
+        "#;
+        assert_eq!(var_after(src, "y"), "string|mixed");
+    }
+
+    #[test]
+    fn string_refinement_specifiers() {
+        let probe = |guard: &str| {
+            format!("function f(string $s) {{ if ({guard}) {{ $y = $s; }} }}")
+        };
+        assert_eq!(
+            var_after(&probe("str_contains($s, '@')"), "y"),
+            "non-empty-string|mixed"
+        );
+        assert_eq!(
+            var_after(&probe("ctype_digit($s)"), "y"),
+            "numeric-string|mixed"
+        );
+        assert_eq!(
+            var_after(&probe("class_exists($s)"), "y"),
+            "class-string|mixed"
+        );
+        assert_eq!(
+            var_after(&probe("function_exists($s)"), "y"),
+            "callable-string|mixed"
+        );
+        // An empty-able needle proves nothing.
+        assert_eq!(
+            var_after(&probe("str_contains($s, '')"), "y"),
+            "string|mixed"
+        );
+    }
+
+    #[test]
+    fn array_is_list_narrows_bare_array() {
+        // A bare `array` gains list-ness; a typed `array<K,V>` keeps its more
+        // precise element info (narrow_to prefers the finer side — sound).
+        let src = r#"
+            function f(array $a) {
+                if (array_is_list($a)) { $y = $a; }
+            }
+        "#;
+        assert_eq!(var_after(src, "y"), "list<mixed>|mixed");
+    }
+
+    #[test]
+    fn match_arm_bodies_see_narrowed_subject() {
+        // Inside an arm, the subject is the matched case — `->value` is the
+        // per-case literal, not the whole backing type.
+        let src = r#"
+            enum Suit: string {
+                case Hearts = 'H';
+                case Spades = 'S';
+            }
+            function f(Suit $s) {
+                $v = match ($s) {
+                    Suit::Hearts => $s->value,
+                    Suit::Spades => 'other',
+                };
+            }
+        "#;
+        assert_eq!(var_after(src, "v"), "'H'|'other'");
+    }
+
+    #[test]
+    fn range_arithmetic_propagates_bounds() {
+        // Guard gives $n: int<2, max>; +1 shifts to int<3, max>.
+        let src = "function f(int $n) { if ($n < 2) { return; } $m = $n + 1; }";
+        assert_eq!(var_after(src, "m"), "int<3, max>");
+        // Doc range + literal: int<0,10> * 2 = int<0,20>.
+        let src = r#"
+            /** @param int<0, 10> $n */
+            function f(int $n) { $m = $n * 2; }
+        "#;
+        assert_eq!(var_after(src, "m"), "int<0, 20>");
+        // Subtraction flips the bound pairing.
+        let src = r#"
+            /** @param int<0, 10> $n */
+            function f(int $n) { $m = 5 - $n; }
+        "#;
+        assert_eq!(var_after(src, "m"), "int<-5, 5>");
+    }
+
+    #[test]
+    fn is_string_guard_keeps_string_refinement() {
+        // `is_string` must not widen an already-refined string place.
+        let src = r#"
+            /** @param non-empty-string|int $x */
+            function f($x) { if (is_string($x)) { $y = $x; } }
+        "#;
+        assert_eq!(var_after(src, "y"), "non-empty-string|mixed");
     }
 
     // --- M-T9 condition narrowing -----------------------------------------
@@ -1861,8 +3291,9 @@ mod tests {
 
     #[test]
     fn truthy_guard_strips_false_and_null() {
+        // A truthy string is additionally non-falsy (not "" and not "0").
         let src = "function f(string|false|null $x) { if (!$x) { return; } $y = $x; }";
-        assert_eq!(var_after(src, "y"), "string");
+        assert_eq!(var_after(src, "y"), "non-falsy-string");
     }
 
     #[test]

@@ -66,10 +66,76 @@ pub(crate) fn run_version_with(
         check_nullables: true,
         check_explicit_mixed: true,
         check_implicit_mixed: true,
+        collect_fixes: false,
+        iterable_param_evidence: None,
+        terminators: Default::default(),
         reflect_cache: Default::default(),
     };
     configure(&mut fa);
     rule(&fa)
+}
+
+/// Like [`run`], but with whole-project untyped-signature inference applied to
+/// the reflection index and `collect_fixes` enabled — the `--fix` environment.
+/// For fix tests on the `missingType.*` rules.
+pub(crate) fn run_fixes(src: &str, rule: fn(&FileAnalysis) -> Vec<Diagnostic>) -> Vec<Diagnostic> {
+    let r = php_parser::parse(src);
+    assert!(!r.has_errors(), "parse errors in test source: {src}");
+    let mut project = ProjectIndex::with_builtins();
+    project.add_file("test.php", &index_file(&r.program, &r.interner));
+    let mut reflection = ReflectionIndex::with_builtins_for(PhpVersion::default());
+    reflection.add_file_labeled_as(
+        Some("test.php"),
+        &r.program,
+        &r.interner,
+        php_reflect::SourceKind::Analyzed,
+    );
+    php_infer::infer_and_apply(
+        &mut reflection,
+        &[&r.program],
+        &r.interner,
+        php_infer::InferOpts::default(),
+    );
+    let evidence =
+        php_infer::explicit_iterable_param_evidence(&reflection, &[&r.program], &r.interner);
+    let refs = resolve_references(&r.program, &r.interner);
+    let types = type_map(&reflection, &r.program, &r.interner, true);
+    let facts = FileFacts::new(&r.program, &r.interner);
+    let fa = FileAnalysis {
+        path: "test.php",
+        source: src,
+        program: &r.program,
+        interner: &r.interner,
+        project: &project,
+        reflection: &reflection,
+        resolved_refs: &refs,
+        types: &types,
+        facts,
+        php_version: PhpVersion::default(),
+        treat_phpdoc_types_as_certain: true,
+        report_maybes: true,
+        check_nullables: true,
+        check_explicit_mixed: true,
+        check_implicit_mixed: true,
+        collect_fixes: true,
+        iterable_param_evidence: Some(&evidence),
+        terminators: Default::default(),
+        reflect_cache: Default::default(),
+    };
+    rule(&fa)
+}
+
+/// The `(tag, anchor, indent)` triples of the fixes [`run_fixes`] produced
+/// (diagnostics without a fix are skipped).
+pub(crate) fn fixes(
+    src: &str,
+    rule: fn(&FileAnalysis) -> Vec<Diagnostic>,
+) -> Vec<(String, php_diagnostics::FixAnchor, String)> {
+    run_fixes(src, rule)
+        .into_iter()
+        .filter_map(|d| d.fix)
+        .map(|f| (f.tag, f.anchor, f.indent))
+        .collect()
 }
 
 pub(crate) fn run_located(
@@ -114,6 +180,9 @@ pub(crate) fn run_located_version(
         check_nullables: true,
         check_explicit_mixed: true,
         check_implicit_mixed: true,
+        collect_fixes: false,
+        iterable_param_evidence: None,
+        terminators: Default::default(),
         reflect_cache: Default::default(),
     };
     rule(&fa)

@@ -33,6 +33,7 @@ pub(crate) fn refine_return(
         depth: caller.depth + 1,
         native: caller.native,
         generator_send: None,
+        terminators: caller.terminators.clone(),
     };
     for (name, arg) in params.iter().zip(args) {
         sub.vars.insert(name.clone(), caller.infer(&arg.value));
