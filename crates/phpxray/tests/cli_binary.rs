@@ -102,6 +102,32 @@ fn json_output_uses_phpstan_like_shape() {
 }
 
 #[test]
+fn check_too_wide_return_public_config_enables_override_check() {
+    let p = TempProject::new("toowide");
+    p.write(
+        "src/app.php",
+        "<?php\nclass Base { public function m(): ?int { return null; } }\nclass C extends Base { public function m(): ?int { return 1; } }\n",
+    );
+
+    write_config(
+        &p,
+        "level: 4\npaths:\n  - src\ncheckTooWideReturnTypesInProtectedAndPublicMethods: true\n",
+    );
+    let on = p.run(["--error-format", "json"]);
+    assert!(!on.status.success(), "{}", stdout(&on));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&on)).unwrap();
+    assert_eq!(
+        json["files"]["src/app.php"]["messages"][0]["identifier"],
+        "return.unusedType"
+    );
+
+    // Off by default: non-final public overrides stay unchecked.
+    write_config(&p, "level: 4\npaths:\n  - src\n");
+    let off = p.run([] as [&str; 0]);
+    assert!(off.status.success(), "{}", stdout(&off));
+}
+
+#[test]
 fn check_uninitialized_properties_config_enables_the_rule() {
     let p = TempProject::new("uninit");
     p.write(

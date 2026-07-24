@@ -119,6 +119,7 @@ struct AnalysisFingerprint {
     check_explicit_mixed: Option<bool>,
     check_implicit_mixed: Option<bool>,
     check_uninitialized_properties: bool,
+    check_too_wide_return_public: bool,
     early_terminating_function_calls: Vec<String>,
     early_terminating_method_calls: Vec<(String, Vec<String>)>,
     type_aliases: Vec<(String, String)>,
@@ -144,6 +145,7 @@ impl AnalysisFingerprint {
             check_explicit_mixed: config.check_explicit_mixed,
             check_implicit_mixed: config.check_implicit_mixed,
             check_uninitialized_properties: config.check_uninitialized_properties,
+            check_too_wide_return_public: config.check_too_wide_return_public,
             type_aliases: {
                 let mut entries: Vec<(String, String)> = config
                     .type_aliases

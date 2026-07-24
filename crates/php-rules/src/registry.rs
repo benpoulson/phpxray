@@ -81,6 +81,9 @@ pub struct FileAnalysis<'a> {
     /// phpstan's `checkUninitializedProperties` gate (default off) — enables the
     /// `property.uninitialized` rule.
     pub check_uninitialized_properties: bool,
+    /// phpstan's `checkTooWideReturnTypesInProtectedAndPublicMethods` gate
+    /// (default off) — extends `return.unusedType` to final non-private methods.
+    pub check_too_wide_return_public: bool,
     /// When `true` (`--fix` runs only), rules that know a machine-applicable
     /// repair attach a [`php_diagnostics::DocTagFix`] to their diagnostics.
     /// Default `false`: normal runs pay nothing for fix computation.
@@ -911,6 +914,7 @@ mod tests {
             check_explicit_mixed: true,
             check_implicit_mixed: true,
             check_uninitialized_properties: true,
+            check_too_wide_return_public: true,
             collect_fixes: false,
             iterable_param_evidence: None,
             terminators: Default::default(),

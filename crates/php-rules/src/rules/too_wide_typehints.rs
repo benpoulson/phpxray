@@ -423,35 +423,64 @@ fn check_class_methods(c: &ClassDecl, fa: &FileAnalysis, scope: &Scope, out: &mu
     if c.kind == php_ast::ClassKind::Trait {
         return;
     }
-    let class_desc = c
+    let class_fqn = c
         .name
         .map(|n| scope.qualify(fa.interner.resolve(n)))
         .unwrap_or_else(|| "class@anonymous".to_string());
+    let class_desc = class_fqn.trim_start_matches('\\').to_string();
     for m in &c.members {
         let Member::Method(md) = m else { continue };
-        check_method(md, &class_desc, fa, scope, out);
+        check_method(md, c, &class_fqn, &class_desc, fa, scope, out);
     }
 }
 
 fn check_method(
     md: &MethodDecl,
+    class: &ClassDecl,
+    class_fqn: &str,
     class_desc: &str,
     fa: &FileAnalysis,
     scope: &Scope,
     out: &mut Vec<Diagnostic>,
 ) {
-    // Only private methods are FP-safe without the full inheritance chain:
-    // a protected/public method's prototype may be wider in an ancestor, and
-    // phpstan gates those behind `checkProtectedAndPublicMethods` /
-    // `isFirstDeclaration`. Private methods can't be overridden ⇒ always safe.
+    // Private methods can't be overridden ⇒ always FP-safe (a wider return has
+    // no justification). For non-private methods, matching phpstan:
+    //   - a **final** method (or a method of a **final** class) can't be
+    //     overridden either, so it's checked unconditionally.
+    //   - otherwise the wider type may be justified by a subclass override, so
+    //     phpstan gates it behind `checkTooWideReturnTypesInProtectedAndPublicMethods`
+    //     *and* the method being an override. We require the flag AND a
+    //     *known-ancestor* override (FP-safe: an unindexed ancestor ⇒ skip).
     if md.modifiers.visibility != Some(php_ast::Visibility::Private) {
-        return;
+        let is_final = class.modifiers.is_final || md.modifiers.is_final;
+        if !is_final {
+            let name = fa.interner.resolve(md.name);
+            if !fa.check_too_wide_return_public || !method_overrides_ancestor(fa, class_fqn, name) {
+                return;
+            }
+        }
     }
     let Some(body) = &md.body else { return }; // abstract/interface — nothing to analyze
     let Some(ret) = &md.return_type else { return };
     let name = fa.interner.resolve(md.name);
     let desc = format!("Method {class_desc}::{name}()");
     out.extend(check_returns(fa, scope, ret, body, &desc, ret.span));
+}
+
+/// Whether `class_fqn` declares `name` as an override of a method already
+/// declared by a *known* (indexed) ancestor class or interface. FP-safe: an
+/// unindexed ancestor yields `false` (we can't confirm the override).
+fn method_overrides_ancestor(fa: &FileAnalysis, class_fqn: &str, name: &str) -> bool {
+    let Some(refl) = fa.reflection.class(class_fqn) else {
+        return false;
+    };
+    refl.parents
+        .iter()
+        .chain(refl.interfaces.iter())
+        .any(|t| match t {
+            Type::Named { fqn, .. } => fa.reflection.find_method(fqn, name).is_some(),
+            _ => false,
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -1663,7 +1692,7 @@ pub(crate) static RULES: &[RuleEntry] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{codes, run};
+    use crate::testutil::{codes, codes_with, run};
 
     fn msgs(src: &str, rule: fn(&FileAnalysis) -> Vec<Diagnostic>) -> Vec<String> {
         run(src, rule).into_iter().map(|d| d.message).collect()
@@ -1908,6 +1937,44 @@ mod tests {
     #[test]
     fn abstract_method_is_skipped() {
         let src = "<?php abstract class C { abstract private function m(): ?int; }";
+        assert!(codes(src, run_method_return).is_empty());
+    }
+
+    #[test]
+    fn final_public_method_flagged_regardless_of_flag() {
+        // A final method can't be overridden, so phpstan checks it by default.
+        let src = "<?php class C { final public function m(): ?int { return 1; } }";
+        assert_eq!(codes(src, run_method_return), ["return.unusedType"]);
+        // Still flagged with the public-methods flag off (final is unconditional).
+        assert_eq!(
+            codes_with(src, run_method_return, |fa| fa.check_too_wide_return_public = false),
+            ["return.unusedType"]
+        );
+    }
+
+    #[test]
+    fn public_method_in_final_class_flagged() {
+        let src = "<?php final class C { public function m(): ?int { return 1; } }";
+        assert_eq!(codes(src, run_method_return), ["return.unusedType"]);
+    }
+
+    #[test]
+    fn non_final_override_flagged_only_with_flag() {
+        let src = "<?php
+            class Base { public function m(): ?int { return null; } }
+            class C extends Base { public function m(): ?int { return 1; } }";
+        // With the flag on, the override (narrowing a known ancestor) is checked.
+        assert_eq!(codes(src, run_method_return), ["return.unusedType"]);
+        // With the flag off, non-final public methods stay skipped.
+        assert!(codes_with(src, run_method_return, |fa| fa
+            .check_too_wide_return_public = false)
+        .is_empty());
+    }
+
+    #[test]
+    fn non_final_first_declaration_skipped_even_with_flag() {
+        // No ancestor declares m(), so a subclass could justify the wider type.
+        let src = "<?php class C { public function m(): ?int { return 1; } }";
         assert!(codes(src, run_method_return).is_empty());
     }
 

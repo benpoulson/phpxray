@@ -75,6 +75,12 @@ pub struct Config {
     /// properties without a default that are never assigned by a constructor
     /// (`property.uninitialized`). Off unless explicitly enabled.
     pub check_uninitialized_properties: bool,
+    /// phpstan's `checkTooWideReturnTypesInProtectedAndPublicMethods` (default
+    /// `false`): extend the `return.unusedType` too-wide-return check to
+    /// non-private methods. We apply the FP-safe subset (final methods / final
+    /// classes, which can't be overridden).
+    #[serde(rename = "checkTooWideReturnTypesInProtectedAndPublicMethods")]
+    pub check_too_wide_return_public: bool,
     /// Infer signatures for fully untyped functions/methods from their bodies and
     /// call sites (default `true`). Treated as PHPDoc-grade: refines inference for
     /// legacy untyped code without affecting native-level (`treatPhpDocTypesAsCertain:
@@ -117,6 +123,7 @@ impl Default for Config {
             check_explicit_mixed: None,
             check_implicit_mixed: None,
             check_uninitialized_properties: false,
+            check_too_wide_return_public: false,
             infer_untyped_signatures: true,
             stub_files: Vec::new(),
             type_aliases: std::collections::HashMap::new(),
@@ -139,6 +146,7 @@ impl Config {
             opts.check_implicit_mixed = v;
         }
         opts.check_uninitialized_properties = self.check_uninitialized_properties;
+        opts.check_too_wide_return_public = self.check_too_wide_return_public;
         opts
     }
 
@@ -206,6 +214,7 @@ impl Level {
             check_implicit_mixed: self.0 >= Self::MAX.0,
             // Not level-derived — off unless `checkUninitializedProperties` is set.
             check_uninitialized_properties: false,
+            check_too_wide_return_public: false,
         }
     }
 }
@@ -218,6 +227,7 @@ pub struct RuleOptions {
     pub check_explicit_mixed: bool,
     pub check_implicit_mixed: bool,
     pub check_uninitialized_properties: bool,
+    pub check_too_wide_return_public: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
