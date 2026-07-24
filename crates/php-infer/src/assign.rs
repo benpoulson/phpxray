@@ -273,6 +273,11 @@ fn assignable_atom(index: &ReflectionIndex, value: &Type, target: &Type) -> bool
         (LiteralInt(n), IntRange { min, max }) => {
             min.is_none_or(|lo| *n >= lo) && max.is_none_or(|hi| *n <= hi)
         }
+        // A plain `int` of unknown value toward an int-range target stays lenient:
+        // we can't prove it falls outside the range (mirrors plain `string` →
+        // refined string). Report-maybe strictness, not a hard assignability error
+        // — keeps e.g. `usleep($positiveIshInt)` from a false `argument.type`.
+        (Int, IntRange { .. }) => true,
         (Float, Float) => true,
         (Bool | True | False, Bool) => true,
         (True, True) | (False, False) => true,
@@ -434,6 +439,14 @@ mod tests {
         assert!(ok(Type::Int, Type::Mixed));
         assert!(ok(Type::Never, Type::Int));
         assert!(ok(Type::Mixed, Type::Int)); // lenient
+    }
+
+    #[test]
+    fn plain_int_is_lenient_toward_int_range() {
+        let pos = Type::int_range(Some(0), None); // int<0, max>
+        assert!(ok(Type::Int, pos.clone())); // unknown int — lenient
+        assert!(ok(Type::LiteralInt(5), pos.clone())); // in range
+        assert!(!ok(Type::LiteralInt(-1), pos)); // known out of range still fails
     }
 
     #[test]
