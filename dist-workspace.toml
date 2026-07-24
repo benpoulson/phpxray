@@ -13,8 +13,10 @@ installers = ["shell", "homebrew"]
 tap = "benpoulson/homebrew-tap"
 # Actually push the formula to the tap on release
 publish-jobs = ["homebrew"]
-# Target platforms to build apps for (Rust target-triple syntax) — Mac + Linux only
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# Target platforms to build apps for (Rust target-triple syntax) — Mac + Linux.
+# Linux uses musl for fully-static, dependency-free binaries that run on any
+# distro (Alpine, old glibc, scratch/distroless containers) unchanged.
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-musl", "x86_64-apple-darwin", "x86_64-unknown-linux-musl"]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Where to host releases
