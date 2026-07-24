@@ -92,16 +92,30 @@ pub fn resolve_doc_type(scope: &Scope, templates: &[String], t: &DocType) -> Typ
                 .collect(),
             sealed: *sealed,
         },
-        DocType::Callable { params, ret, .. } => Type::Callable(Some(Box::new(CallableSig {
-            params: params
-                .iter()
-                .map(|p| resolve_doc_type(scope, templates, p))
-                .collect(),
-            ret: ret
-                .as_ref()
-                .map(|r| resolve_doc_type(scope, templates, r))
-                .unwrap_or(Type::Mixed),
-        }))),
+        DocType::Callable { base, params, ret } => {
+            // `callable(Args): Ret` is a structural callable. `Closure(Args): Ret`
+            // (or any explicit class base carrying a call signature) instead names
+            // a concrete class — a *subtype* of native `Closure` — so resolve the
+            // base as a class name, matching how the native `Closure` hint
+            // resolves. Assignability needs the class identity, not the signature,
+            // which we don't carry on named types; the signature is dropped. This
+            // still lets a bare `@param callable $x` on a native `Closure $x` be
+            // flagged (base `callable` stays broad), matching phpstan.
+            if base.eq_ignore_ascii_case("callable") {
+                Type::Callable(Some(Box::new(CallableSig {
+                    params: params
+                        .iter()
+                        .map(|p| resolve_doc_type(scope, templates, p))
+                        .collect(),
+                    ret: ret
+                        .as_ref()
+                        .map(|r| resolve_doc_type(scope, templates, r))
+                        .unwrap_or(Type::Mixed),
+                })))
+            } else {
+                doc_named(scope, templates, base)
+            }
+        }
         DocType::ConstString(s) => Type::LiteralString(s.as_str().into()),
         DocType::ConstInt(s) => match s.parse::<i64>() {
             Ok(n) => Type::LiteralInt(n),
@@ -539,6 +553,27 @@ mod tests {
         assert_eq!(doc(&s, &[], "numeric").to_string(), "int|float");
         assert_eq!(doc(&s, &[], "$this"), Type::StaticType);
         assert_eq!(doc(&s, &[], "resource"), Type::Resource);
+    }
+
+    #[test]
+    fn doc_closure_signature_resolves_to_closure_class() {
+        // `Closure(Args): Ret` names the `Closure` class (a subtype of native
+        // `Closure`), not a bare structural callable — otherwise a valid
+        // `@param Closure(...): X` on a native `Closure` param is a false
+        // `parameter.phpDocType`. `callable(...)` stays structural.
+        let s = Scope::global();
+        assert_eq!(
+            doc(&s, &[], "Closure(int): string"),
+            Type::Named {
+                fqn: "Closure".into(),
+                args: vec![]
+            }
+        );
+        assert_eq!(doc(&s, &[], "Closure(): void").to_string(), "Closure");
+        assert!(matches!(
+            doc(&s, &[], "callable(int): string"),
+            Type::Callable(Some(_))
+        ));
     }
 
     #[test]

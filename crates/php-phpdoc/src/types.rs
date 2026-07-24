@@ -523,8 +523,13 @@ impl Parser {
         if !self.eat(Tk::RParen) {
             return None;
         }
+        // The return type binds tighter than a top-level `|`: `Closure(): A|B`
+        // means `(Closure(): A) | B`, not `Closure(): (A|B)` (matching phpstan's
+        // phpdoc grammar). Parse at intersection precedence so `A` and `A&B`
+        // returns are captured but a trailing union arm is left for the caller.
+        // A genuine union return must be parenthesised: `Closure(): (A|B)`.
         let ret = if self.eat(Tk::Colon) {
-            Some(Box::new(self.union()?))
+            Some(Box::new(self.intersection()?))
         } else {
             None
         };
@@ -733,6 +738,41 @@ mod tests {
                 base: "Closure".into(),
                 params: vec![],
                 ret: Some(Box::new(named("void")))
+            }
+        );
+    }
+
+    #[test]
+    fn callable_return_type_stops_at_top_level_union() {
+        // `Closure(A): B|C` is `(Closure(A): B) | C`, not `Closure(A): (B|C)`
+        // (phpstan precedence). A genuine union return needs parens.
+        assert_eq!(
+            p("Closure(int): string|int"),
+            Union(vec![
+                Callable {
+                    base: "Closure".into(),
+                    params: vec![named("int")],
+                    ret: Some(Box::new(named("string"))),
+                },
+                named("int"),
+            ])
+        );
+        // An intersection return is still captured whole.
+        assert_eq!(
+            p("Closure(): A&B"),
+            Callable {
+                base: "Closure".into(),
+                params: vec![],
+                ret: Some(Box::new(Intersection(vec![named("A"), named("B")]))),
+            }
+        );
+        // Parenthesised union return is preserved.
+        assert_eq!(
+            p("Closure(): (string|int)"),
+            Callable {
+                base: "Closure".into(),
+                params: vec![],
+                ret: Some(Box::new(Union(vec![named("string"), named("int")]))),
             }
         );
     }
