@@ -310,7 +310,7 @@ mod tests {
             .iter()
             .find(|f| f.fqn.eq_ignore_ascii_case("strlen"))
             .unwrap();
-        assert_eq!(strlen.return_type, Type::Int);
+        assert_eq!(strlen.return_type, Type::int_range(Some(0), None));
         assert_eq!(strlen.params.len(), 1);
         assert_eq!(strlen.params[0].ty, Type::String);
 
@@ -318,7 +318,7 @@ mod tests {
             .iter()
             .find(|f| f.fqn.eq_ignore_ascii_case("count"))
             .unwrap();
-        assert_eq!(count.return_type, Type::Int);
+        assert_eq!(count.return_type, Type::int_range(Some(0), None));
         // mode param is optional.
         assert!(count.params.last().unwrap().optional);
     }

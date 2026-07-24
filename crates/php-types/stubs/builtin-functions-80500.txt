@@ -170,7 +170,7 @@ bzerror	array	bz#resource#
 bzerrstr	string	bz#resource#
 bzflush	bool	bz#resource#
 bzopen	resource|false	file#string#;mode#string#
-bzread	string|false	bz#resource#;length#int#o
+bzread	string|false	bz#resource#;length#int<1024, 8192>#o
 bzwrite	int|false	bz#resource#;data#string#;length#int|null#
 cal_days_in_month	int	calendar#int#;month#int#;year#int#
 cal_from_jd	array	julian_day#int#;calendar#int#
@@ -243,7 +243,7 @@ Couchbase\passthruDecoder	string	bytes#string#;flags#int#;datatype#int#
 Couchbase\passthruEncoder	array	value#string#
 Couchbase\zlibCompress	string	data#string#
 Couchbase\zlibDecompress	string	data#string#
-count	int	value#array|Countable#;mode#int#o
+count	int<0, max>	value#array|Countable#;mode#int#o
 count_chars	array<int|string, int>|string	string#string#;mode#int#o
 crc32	int	string#string#
 create_function	string|false	args#string#;code#string#
@@ -560,8 +560,8 @@ DDTrace\flush	void
 DDTrace\generate_distributed_tracing_headers	array{x-datadog-sampling-priority: string, x-datadog-origin: string, x-datadog-trace-id: string, x-datadog-parent-id: string, traceparent: string, tracestate: string}	inject#null|array<int|string, string>#o
 DDTrace\get_priority_sampling	int|null	global#bool#o
 DDTrace\get_sanitized_exception_trace	string	exception#Exception|Throwable#;skipFrames#int#o
-DDTrace\hook_function	bool	functionName#string#;prehookOrConfigArray#callable(object): void|null|array{prehook?: Closure, posthook?: Closure, instrument_when_limited?: int, recurse?: bool}#o;posthook#callable(array, mixed, Exception|null): void|null#o
-DDTrace\hook_method	bool	className#string#;methodName#string#;prehookOrConfigArray#callable(mixed): void|null|array{prehook?: Closure, posthook?: Closure, instrument_when_limited?: int, recurse?: bool}#o;posthook#callable(object, string, array, mixed, Exception|null): void|null#o
+DDTrace\hook_function	bool	functionName#string#;prehookOrConfigArray#Closure|null|array{prehook?: Closure, posthook?: Closure, instrument_when_limited?: int, recurse?: bool}#o;posthook#Closure|null#o
+DDTrace\hook_method	bool	className#string#;methodName#string#;prehookOrConfigArray#Closure|null|array{prehook?: Closure, posthook?: Closure, instrument_when_limited?: int, recurse?: bool}#o;posthook#Closure|null#o
 DDTrace\Internal\add_span_flag	void	span#DDTrace\SpanData#;flag#int#
 DDTrace\Internal\handle_fork	void	
 DDTrace\logs_correlation_trace_id	string	
@@ -575,9 +575,9 @@ DDTrace\startup_logs	string
 DDTrace\switch_stack	null|false|DDTrace\SpanStack	newStack#DDTrace\SpanData|DDTrace\SpanStack|null#o
 DDTrace\System\container_id	string|null	
 DDTrace\Testing\trigger_error	void	message#string#;errorType#int#
-DDTrace\trace_function	bool	functionName#string#;tracingClosureOrConfigArray#null|callable(DDTrace\SpanData, array, mixed, Exception|null): void|array{prehook?: Closure, posthook?: Closure, instrument_when_limited?: int, recurse?: bool}#
+DDTrace\trace_function	bool	functionName#string#;tracingClosureOrConfigArray#null|Closure|array{prehook?: Closure, posthook?: Closure, instrument_when_limited?: int, recurse?: bool}#
 DDTrace\trace_id	string	
-DDTrace\trace_method	bool	className#string#;methodName#string#;tracingClosureOrConfigArray#null|callable(DDTrace\SpanData, array, mixed, Exception|null): void|array{prehook?: Closure, posthook?: Closure, instrument_when_limited?: int, recurse?: bool}#
+DDTrace\trace_method	bool	className#string#;methodName#string#;tracingClosureOrConfigArray#null|Closure|array{prehook?: Closure, posthook?: Closure, instrument_when_limited?: int, recurse?: bool}#
 DDTrace\update_span_duration	false|null	span#DDTrace\SpanData#;finishTime#float#o
 DDTrace\UserRequest\has_listeners	bool	
 DDTrace\UserRequest\notify_commit	array|null	span#DDTrace\RootSpanData#;status#int#;headers#array#;body#string|resource|null#o
@@ -633,7 +633,7 @@ dom_import_simplexml	DOMAttr|DOMElement	node#SimpleXMLElement#
 doubleval	float	value#mixed#
 each	array	array#array|ArrayObject#r
 easter_date	int	year#int|null#;mode#int#o
-easter_days	int	year#int|null#;mode#int#o
+easter_days	int	year#int<1, max>|null#;mode#int#o
 eio_busy	resource|false	delay#int#;pri#int#o;callback#mixed#o;data#mixed#o
 eio_cancel	void	req#resource#
 eio_chmod	resource|false	path#string#;mode#int#;pri#int#o;callback#mixed#o;data#mixed#o
@@ -1284,15 +1284,15 @@ gmp_or	resource|GMP	num1#resource|string|GMP#;num2#resource|string|GMP#
 gmp_perfect_power	bool	num#GMP|string|float|int#
 gmp_perfect_square	bool	num#resource|string|GMP#
 gmp_popcount	int	num#resource|string|GMP#
-gmp_pow	resource|GMP	num#resource|string|GMP#;exponent#int#
+gmp_pow	resource|GMP	num#resource|string|GMP#;exponent#int<1, max>#
 gmp_powm	resource|GMP	num#resource|string|GMP#;exponent#resource|string|GMP#;modulus#resource|string|GMP#
 gmp_prob_prime	int	num#resource|string|GMP#;repetitions#int#o
 gmp_random	resource|GMP	limiter#int#o
 gmp_random_bits	GMP	bits#int#
 gmp_random_range	GMP	min#GMP|string|int#;max#GMP|string|int#
 gmp_random_seed	void|null|false	seed#resource|string|int|GMP#
-gmp_root	GMP	num#GMP|string|int#;nth#int#
-gmp_rootrem	array|array<int|string, GMP>	num#GMP|string|int#;nth#int#
+gmp_root	GMP	num#GMP|string|int#;nth#int<1, max>#
+gmp_rootrem	array|array<int|string, GMP>	num#GMP|string|int#;nth#int<1, max>#
 gmp_scan0	int	num1#resource|string|GMP#;start#int#
 gmp_scan1	int	num1#resource|string|GMP#;start#int#
 gmp_setbit	void	num#resource|string|GMP#;index#int#;value#bool#o
@@ -1503,7 +1503,7 @@ iconv_mime_decode_headers	array|false	headers#string#;mode#int#o;encoding#string
 iconv_mime_encode	string|false	field_name#string#;field_value#string#;options#array#o
 iconv_set_encoding	bool	type#string#;encoding#string#
 iconv_strlen	int|false	string#string#;encoding#string|null#o
-iconv_strpos	int|false	haystack#string#;needle#string#;offset#int#o;encoding#string|null#o
+iconv_strpos	int<0, max>|false	haystack#string#;needle#string#;offset#int#o;encoding#string|null#o
 iconv_strrpos	int|false	haystack#string#;needle#string#;encoding#string|null#o
 iconv_substr	string|false	string#string#;offset#int#;length#int|null#;encoding#string|null#o
 idate	int|false	format#string#;timestamp#int|null#
@@ -2254,7 +2254,7 @@ mb_strimwidth	string	string#string#;start#int#;width#int#;trim_marker#string#o;e
 mb_stripos	int|false	haystack#string#;needle#string#;offset#int#o;encoding#string|null#
 mb_stristr	string|false	haystack#string#;needle#string#;before_needle#bool#o;encoding#string|null#
 mb_strlen	int	string#string#;encoding#string|null#
-mb_strpos	int|false	haystack#string#;needle#string#;offset#int#o;encoding#string|null#
+mb_strpos	int<0, max>|false	haystack#string#;needle#string#;offset#int<0, max>#o;encoding#string|null#
 mb_strrchr	string|false	haystack#string#;needle#string#;before_needle#bool#o;encoding#string|null#
 mb_strrichr	string|false	haystack#string#;needle#string#;before_needle#bool#o;encoding#string|null#
 mb_strripos	int|false	haystack#string#;needle#string#;offset#int#o;encoding#string|null#
@@ -2352,7 +2352,7 @@ mercure_publish	string	topics#string|array<int|string, string>#;data#string#o;pr
 metaphone	string	string#string#;max_phonemes#int#o
 method_exists	bool	object_or_class#object|string#;method#string#
 mhash	string|false	algo#int#;data#string#;key#string|null#
-mhash_count	int	
+mhash_count	int<0, max>	
 mhash_get_block_size	int|false	algo#int#
 mhash_get_hash_name	string|false	algo#int#
 mhash_keygen_s2k	string|false	algo#int#;password#string#;salt#string#;length#int#
@@ -3082,7 +3082,7 @@ openssl_private_decrypt	bool	data#string#;decrypted_data#string#r;private_key#Op
 openssl_private_encrypt	bool	data#string#;encrypted_data#string#r;private_key#OpenSSLAsymmetricKey|OpenSSLCertificate|array|string#;padding#int#o
 openssl_public_decrypt	bool	data#string#;decrypted_data#string#r;public_key#OpenSSLAsymmetricKey|OpenSSLCertificate|array|string#;padding#int#o
 openssl_public_encrypt	bool	data#string#;encrypted_data#string#r;public_key#OpenSSLAsymmetricKey|OpenSSLCertificate|array|string#;padding#int#o;digest_algo#?string#o
-openssl_random_pseudo_bytes	string	length#int#;strong_result#bool#r
+openssl_random_pseudo_bytes	string	length#int<1, max>#;strong_result#bool#r
 openssl_seal	int|false	data#string#;sealed_data#string#r;encrypted_keys#array#r;public_key#array#;cipher_algo#string#o;cipher_algo#string#;iv#string#ro
 openssl_sign	bool	data#string#;signature#string#r;private_key#OpenSSLAsymmetricKey|OpenSSLCertificate|array|string#;algorithm#string|int#o;padding#int#o
 openssl_spki_export	string|false	spki#string#
@@ -3100,7 +3100,7 @@ openssl_x509_parse	array|false	certificate#OpenSSLCertificate|string#;shortname#
 openssl_x509_read	OpenSSLCertificate|false	certificate#OpenSSLCertificate|string#
 openssl_x509_verify	int	certificate#OpenSSLCertificate|string#;public_key#OpenSSLAsymmetricKey|OpenSSLCertificate|array|string#
 OpenTelemetry\Instrumentation\hook	bool	class#string|null#;function#string#;pre#Closure|null#o;post#Closure|null#o
-ord	int	character#string#
+ord	int<0, 255>	character#string#
 output_add_rewrite_var	bool	name#string#;value#string#
 output_cache_disable	void	
 output_cache_disable_compression	void	
@@ -3600,7 +3600,7 @@ radius_create_request	bool	radius_handle#resource#;type#int#
 rand	int	min#int#;max#int#
 random_bytes	string	length#int#
 random_int	int	min#int#;max#int#
-range	array	start#string|int|float#;end#string|int|float#;step#int|float#o
+range	array	start#string|int|float#;end#string|int|float#;step#int<1, max>|float#o
 rawurldecode	string	string#string#
 rawurlencode	string	string#string#
 rd_kafka_err2str	string	err#int#
@@ -3754,8 +3754,8 @@ simplexml_load_file	SimpleXMLElement|false	filename#string#;class_name#string|nu
 simplexml_load_string	SimpleXMLElement|false	data#string#;class_name#string|null#o;options#int#o;namespace_or_prefix#string#o;is_prefix#bool#o
 sin	float	num#float#
 sinh	float	num#float#
-sizeof	int	value#array|Countable#;mode#int#o
-sleep	int	seconds#int#
+sizeof	int<0, max>	value#array|Countable#;mode#int#o
+sleep	int	seconds#int<0, max>#
 snappy_compress	string|false	data#string#
 snappy_uncompress	string|false	data#string#
 snmp2_get	string|false	host#string#;community#string#;object_id#string#;timeout#int#o;retries#int#o
@@ -4286,13 +4286,13 @@ stripcslashes	string	string#string#
 stripos	int|false	haystack#string#;needle#string#;offset#int#o
 stripslashes	string	string#string#
 stristr	string|false	haystack#string#;needle#string#;before_needle#bool#o
-strlen	int	string#string#
+strlen	int<0, max>	string#string#
 strnatcasecmp	int	string1#string#;string2#string#
 strnatcmp	int	string1#string#;string2#string#
 strncasecmp	int	string1#string#;string2#string#;length#int#
 strncmp	int	string1#string#;string2#string#;length#int#
 strpbrk	string|false	string#string#;char_list##o;characters#string#
-strpos	int|false	haystack#string#;needle#string#;offset#int#o
+strpos	int<0, max>|false	haystack#string#;needle#string#;offset#int<0, max>#o
 strptime	array|false	timestamp#string#;format#string#
 strrchr	string|false	haystack#string#;needle#string#;before_needle#bool#o
 strrev	string	string#string#
@@ -4308,7 +4308,7 @@ strtr	string	str#string#;replace_pairs#array#
 strval	string	value#mixed#
 substr	string	string#string#;offset#int#;length#int|null#
 substr_compare	int	haystack#string#;needle#string#;offset#int#;length#int|null#;case_insensitive#bool#o
-substr_count	int	haystack#string#;needle#string#;offset#int#o;length#int|null#
+substr_count	int<0, max>	haystack#string#;needle#string#;offset#int#o;length#int|null#
 substr_replace	string|array<int|string, string>	string#array<int|string, string>|string#;replace#array<int|string, string>|string#;offset#array<int|string, int>|int#;length#array<int|string, int>|int#o
 suhosin_encrypt_cookie	string|false	name#string#;value#string#
 suhosin_get_raw_cookies	array	
@@ -4483,7 +4483,7 @@ tidy_repair_file	string|false	filename#string#;config#mixed#o;encoding#string|nu
 tidy_repair_string	string|false	string#string#;config#mixed#o;encoding#string|null#o
 tidy_warning_count	int	tidy#tidy#
 time	int	
-time_nanosleep	bool|array	seconds#int#;nanoseconds#int#
+time_nanosleep	bool|array	seconds#int<1, max>#;nanoseconds#int<1, max>#
 time_sleep_until	bool	timestamp#float#
 timezone_abbreviations_list	array	
 timezone_identifiers_list	array	timezoneGroup#int#o;countryCode#string|null#
@@ -4550,7 +4550,7 @@ urldecode	string	string#string#
 urlencode	string	string#string#
 use_soap_error_handler	bool	enable#bool#o
 user_error	true	message#string#;error_level#int#o
-usleep	void	microseconds#int#
+usleep	void	microseconds#int<0, max>#
 usort	true	array#array#r;callback#callable#
 utf8_decode	string	string#string#
 utf8_encode	string	string#string#

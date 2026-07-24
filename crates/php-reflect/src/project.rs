@@ -1965,6 +1965,9 @@ mod tests {
         assert!(!r.has_errors(), "parse errors");
         let mut idx = ReflectionIndex::with_builtins();
         idx.add_file_as(&r.program, &r.interner, SourceKind::Scan);
-        assert_eq!(idx.function("strlen").unwrap().return_type, Type::Int);
+        assert_eq!(
+            idx.function("strlen").unwrap().return_type,
+            Type::int_range(Some(0), None)
+        );
     }
 }
