@@ -78,6 +78,9 @@ pub struct FileAnalysis<'a> {
     pub check_explicit_mixed: bool,
     /// phpstan's implicit `mixed` strictness gate (`max`).
     pub check_implicit_mixed: bool,
+    /// phpstan's `checkUninitializedProperties` gate (default off) — enables the
+    /// `property.uninitialized` rule.
+    pub check_uninitialized_properties: bool,
     /// When `true` (`--fix` runs only), rules that know a machine-applicable
     /// repair attach a [`php_diagnostics::DocTagFix`] to their diagnostics.
     /// Default `false`: normal runs pay nothing for fix computation.
@@ -907,6 +910,7 @@ mod tests {
             check_nullables: true,
             check_explicit_mixed: true,
             check_implicit_mixed: true,
+            check_uninitialized_properties: true,
             collect_fixes: false,
             iterable_param_evidence: None,
             terminators: Default::default(),

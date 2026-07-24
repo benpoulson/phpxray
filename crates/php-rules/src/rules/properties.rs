@@ -3441,6 +3441,203 @@ fn type_mentions_callable(ty: &php_ast::Type) -> bool {
     }
 }
 
+// --- UninitializedPropertyRule (property.uninitialized) --------------------
+
+/// phpstan `UninitializedPropertyRule` (`property.uninitialized`), gated on
+/// `checkUninitializedProperties` (off by default). A **deliberately
+/// conservative, FP-safe** subset: a typed, non-readonly property with no
+/// default that is never assigned via `$this->prop = …` in any of the class's
+/// own method bodies is reported. To stay false-positive-free without full
+/// cross-hierarchy constructor flow, the check skips a class that extends
+/// another class or uses a trait (either could initialize the property), and
+/// bails on any method that writes `$this` dynamically, uses variable-variables,
+/// or passes the property somewhere it might be initialized by reference. This
+/// under-reports (e.g. a leaf class only) but never false-positives.
+fn run_uninitialized_properties(fa: &FileAnalysis) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    if !fa.check_uninitialized_properties {
+        return out;
+    }
+    crate::decls::for_each_class_like(fa, |_scope, fqn, class| {
+        check_uninitialized_class(fa, fqn, class, &mut out);
+    });
+    out
+}
+
+struct UninitCandidate {
+    sym: php_intern::Symbol,
+    name: String,
+    span: Span,
+}
+
+fn check_uninitialized_class(
+    fa: &FileAnalysis,
+    class_fqn: &str,
+    class: &ClassDecl,
+    out: &mut Vec<Diagnostic>,
+) {
+    if class.kind != ClassKind::Class || class.modifiers.is_abstract {
+        return;
+    }
+    // A parent or trait could initialize the property outside this class body.
+    if !class.extends.is_empty()
+        || class
+            .members
+            .iter()
+            .any(|m| matches!(m, Member::TraitUse(_)))
+    {
+        return;
+    }
+
+    let mut candidates: Vec<UninitCandidate> = Vec::new();
+    for m in &class.members {
+        let Member::Property(pd) = m else { continue };
+        if pd.modifiers.is_static
+            || pd.modifiers.is_abstract
+            || pd.modifiers.is_readonly
+            || pd.ty.is_none()
+        {
+            continue;
+        }
+        // `@readonly`/`@psalm-readonly` props are the readonly rule's domain.
+        if pd
+            .doc
+            .as_deref()
+            .is_some_and(|d| has_readonly_doc(d, "readonly"))
+        {
+            continue;
+        }
+        for elem in &pd.props {
+            if elem.default.is_some() || elem.hooks.as_ref().is_some_and(|h| !h.is_empty()) {
+                continue;
+            }
+            candidates.push(UninitCandidate {
+                sym: elem.name,
+                name: fa.interner.resolve(elem.name).to_string(),
+                span: span_of(elem),
+            });
+        }
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    let cand_syms: std::collections::HashSet<php_intern::Symbol> =
+        candidates.iter().map(|c| c.sym).collect();
+
+    let mut assigned: std::collections::HashSet<php_intern::Symbol> =
+        std::collections::HashSet::new();
+    let mut bail = false;
+    for m in &class.members {
+        let Member::Method(md) = m else { continue };
+        let Some(body) = &md.body else { continue };
+        for st in body {
+            walk::for_each_expr_in_scope(st, &mut |e| {
+                scan_uninit_expr(fa, e, &cand_syms, &mut assigned, &mut bail);
+            });
+        }
+    }
+    if bail {
+        return;
+    }
+
+    let class_display = class_fqn.trim_start_matches('\\');
+    for cand in &candidates {
+        if !assigned.contains(&cand.sym) {
+            out.push(
+                Diagnostic::error(
+                    cand.span,
+                    format!(
+                        "Class {class_display} has an uninitialized property ${}. Give it default value or assign it in the constructor.",
+                        cand.name
+                    ),
+                )
+                .with_code("property.uninitialized"),
+            );
+        }
+    }
+}
+
+/// Whether `e` is the `$this` variable.
+fn is_this_var(e: &Expr, fa: &FileAnalysis) -> bool {
+    matches!(&e.kind, ExprKind::Variable(s) if fa.interner.resolve(*s) == "this")
+}
+
+/// A `$this->NAME` property access with an identifier name (not dynamic).
+fn this_prop_name(e: &Expr, fa: &FileAnalysis) -> Option<php_intern::Symbol> {
+    match &e.kind {
+        ExprKind::Prop {
+            base,
+            nullsafe: false,
+            name: MemberName::Ident(s),
+        } if is_this_var(base, fa) => Some(*s),
+        _ => None,
+    }
+}
+
+/// Record `$this->prop` writes into `assigned`; set `bail` on any hazard that
+/// could hide an initialization (dynamic `$this` member, variable-variable, or
+/// a candidate property passed as a possibly-by-reference call argument).
+fn scan_uninit_expr(
+    fa: &FileAnalysis,
+    e: &Expr,
+    cand_syms: &std::collections::HashSet<php_intern::Symbol>,
+    assigned: &mut std::collections::HashSet<php_intern::Symbol>,
+    bail: &mut bool,
+) {
+    match &e.kind {
+        ExprKind::Assign { target, .. } | ExprKind::AssignRef { target, .. } => {
+            note_uninit_target(fa, target, cand_syms, assigned, bail)
+        }
+        ExprKind::AssignOp { target, .. } => note_uninit_target(fa, target, cand_syms, assigned, bail),
+        ExprKind::VariableVariable(_) => *bail = true,
+        // Dynamic `$this->{$x}` / `$this->$v` could name any property.
+        ExprKind::Prop {
+            base,
+            name: MemberName::Var(_) | MemberName::Expr(_),
+            ..
+        } if is_this_var(base, fa) => *bail = true,
+        // A candidate `$this->prop` passed as a call argument might be an
+        // out-parameter (by-reference) that initializes it — stay safe.
+        ExprKind::Call { args, .. }
+        | ExprKind::MethodCall { args, .. }
+        | ExprKind::StaticCall { args, .. }
+        | ExprKind::New { args, .. } => {
+            for a in args {
+                if this_prop_name(&a.value, fa).is_some_and(|s| cand_syms.contains(&s)) {
+                    *bail = true;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Mark every candidate `$this->NAME` written by assignment `target` (handles
+/// list-destructure and `$this->prop[…]` append targets); bail on dynamic `$this`.
+fn note_uninit_target(
+    fa: &FileAnalysis,
+    target: &Expr,
+    cand_syms: &std::collections::HashSet<php_intern::Symbol>,
+    assigned: &mut std::collections::HashSet<php_intern::Symbol>,
+    bail: &mut bool,
+) {
+    crate::walk::for_each_subexpr(target, &mut |sub| match &sub.kind {
+        ExprKind::Prop {
+            base,
+            name: MemberName::Ident(s),
+            ..
+        } if is_this_var(base, fa) && cand_syms.contains(s) => {
+            assigned.insert(*s);
+        }
+        ExprKind::Prop {
+            base,
+            name: MemberName::Var(_) | MemberName::Expr(_),
+            ..
+        } if is_this_var(base, fa) => *bail = true,
+        _ => {}
+    });
+}
+
 // --- MissingPropertyTypehintRule (level 6) ---------------------------------
 
 /// phpstan `MissingPropertyTypehintRule` (`missingType.property`): a property with
@@ -3698,6 +3895,13 @@ fn is_array_or_iterable_type(t: &Type) -> bool {
 }
 
 pub(crate) static RULES: &[RuleEntry] = &[
+    // Gated on `checkUninitializedProperties` (off by default); registered at
+    // level 0 so the config flag — not level — controls it.
+    RuleEntry {
+        name: "property.uninitialized",
+        level: 0,
+        run: run_uninitialized_properties,
+    },
     RuleEntry {
         name: "property.readOnly",
         level: 0,
@@ -3863,7 +4067,126 @@ pub(crate) static RULES: &[RuleEntry] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{codes, codes_with, fixes, run_fixes};
+    use crate::testutil::{codes, codes_with, fixes, run, run_fixes};
+
+    // --- UninitializedPropertyRule (property.uninitialized) -------------
+
+    #[test]
+    fn uninitialized_typed_property_without_constructor_is_flagged() {
+        let src = r#"<?php
+            class C {
+                public int $x;
+            }"#;
+        assert_eq!(codes(src, run_uninitialized_properties), ["property.uninitialized"]);
+    }
+
+    #[test]
+    fn uninitialized_property_message_matches_phpstan() {
+        let src = r#"<?php
+            namespace App;
+            class Widget {
+                public int $size;
+            }"#;
+        let diags = run(src, run_uninitialized_properties);
+        assert_eq!(
+            diags[0].message,
+            "Class App\\Widget has an uninitialized property $size. Give it default value or assign it in the constructor."
+        );
+    }
+
+    #[test]
+    fn property_assigned_in_constructor_is_clean() {
+        let src = r#"<?php
+            class C {
+                public int $x;
+                public function __construct() { $this->x = 1; }
+            }"#;
+        assert!(codes(src, run_uninitialized_properties).is_empty());
+    }
+
+    #[test]
+    fn property_not_assigned_in_constructor_is_flagged() {
+        let src = r#"<?php
+            class C {
+                public int $x;
+                public int $y;
+                public function __construct() { $this->x = 1; }
+            }"#;
+        assert_eq!(codes(src, run_uninitialized_properties), ["property.uninitialized"]);
+    }
+
+    #[test]
+    fn property_with_default_or_readonly_or_nullable_default_is_clean() {
+        let src = r#"<?php
+            class C {
+                public int $withDefault = 0;
+                public readonly int $ro;
+                public ?int $nullableDefault = null;
+                public function __construct(public int $promoted) {}
+            }"#;
+        assert!(codes(src, run_uninitialized_properties).is_empty());
+    }
+
+    #[test]
+    fn class_with_parent_or_trait_is_skipped_conservatively() {
+        let parent = r#"<?php
+            class Base {}
+            class C extends Base {
+                public int $x;
+            }"#;
+        assert!(codes(parent, run_uninitialized_properties).is_empty());
+
+        let traituse = r#"<?php
+            trait T {}
+            class C {
+                use T;
+                public int $x;
+            }"#;
+        assert!(codes(traituse, run_uninitialized_properties).is_empty());
+    }
+
+    #[test]
+    fn property_assigned_in_any_method_is_clean() {
+        // Conservative: assignment in a non-constructor method also counts as
+        // initialized (under-reports vs phpstan, never false-positives).
+        let src = r#"<?php
+            class C {
+                public int $x;
+                public function init(): void { $this->x = 1; }
+            }"#;
+        assert!(codes(src, run_uninitialized_properties).is_empty());
+    }
+
+    #[test]
+    fn dynamic_this_write_bails_the_class() {
+        let src = r#"<?php
+            class C {
+                public int $x;
+                public function __construct(string $k) { $this->$k = 1; }
+            }"#;
+        assert!(codes(src, run_uninitialized_properties).is_empty());
+    }
+
+    #[test]
+    fn property_passed_by_possible_ref_bails() {
+        let src = r#"<?php
+            class C {
+                public int $x;
+                public function __construct() { settype($this->x, 'integer'); }
+            }"#;
+        assert!(codes(src, run_uninitialized_properties).is_empty());
+    }
+
+    #[test]
+    fn uninitialized_rule_off_by_default_flag() {
+        let src = r#"<?php
+            class C { public int $x; }"#;
+        // With the gate disabled the rule stays silent.
+        assert!(codes_with(src, run_uninitialized_properties, |fa| {
+            fa.check_uninitialized_properties = false;
+        })
+        .is_empty());
+    }
 
     // --- ReadOnlyByPhpDocPropertyRule -----------------------------------
 

@@ -71,6 +71,10 @@ pub struct Config {
     /// — untyped values). `None` uses the level default (level max); `Some(b)`
     /// forces it independently of level.
     pub check_implicit_mixed: Option<bool>,
+    /// phpstan's `checkUninitializedProperties` (default `false`): report typed
+    /// properties without a default that are never assigned by a constructor
+    /// (`property.uninitialized`). Off unless explicitly enabled.
+    pub check_uninitialized_properties: bool,
     /// Infer signatures for fully untyped functions/methods from their bodies and
     /// call sites (default `true`). Treated as PHPDoc-grade: refines inference for
     /// legacy untyped code without affecting native-level (`treatPhpDocTypesAsCertain:
@@ -112,6 +116,7 @@ impl Default for Config {
             treat_phpdoc_types_as_certain: true,
             check_explicit_mixed: None,
             check_implicit_mixed: None,
+            check_uninitialized_properties: false,
             infer_untyped_signatures: true,
             stub_files: Vec::new(),
             type_aliases: std::collections::HashMap::new(),
@@ -133,6 +138,7 @@ impl Config {
         if let Some(v) = self.check_implicit_mixed {
             opts.check_implicit_mixed = v;
         }
+        opts.check_uninitialized_properties = self.check_uninitialized_properties;
         opts
     }
 
@@ -198,6 +204,8 @@ impl Level {
             // Strict mixed checks turn on after nullable checks.
             check_explicit_mixed: self.0 >= 9,
             check_implicit_mixed: self.0 >= Self::MAX.0,
+            // Not level-derived — off unless `checkUninitializedProperties` is set.
+            check_uninitialized_properties: false,
         }
     }
 }
@@ -209,6 +217,7 @@ pub struct RuleOptions {
     pub check_nullables: bool,
     pub check_explicit_mixed: bool,
     pub check_implicit_mixed: bool,
+    pub check_uninitialized_properties: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

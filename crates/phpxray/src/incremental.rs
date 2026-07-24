@@ -118,6 +118,7 @@ struct AnalysisFingerprint {
     infer_untyped_signatures: bool,
     check_explicit_mixed: Option<bool>,
     check_implicit_mixed: Option<bool>,
+    check_uninitialized_properties: bool,
     early_terminating_function_calls: Vec<String>,
     early_terminating_method_calls: Vec<(String, Vec<String>)>,
     type_aliases: Vec<(String, String)>,
@@ -142,6 +143,7 @@ impl AnalysisFingerprint {
             infer_untyped_signatures: config.infer_untyped_signatures,
             check_explicit_mixed: config.check_explicit_mixed,
             check_implicit_mixed: config.check_implicit_mixed,
+            check_uninitialized_properties: config.check_uninitialized_properties,
             type_aliases: {
                 let mut entries: Vec<(String, String)> = config
                     .type_aliases

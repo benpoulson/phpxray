@@ -102,6 +102,32 @@ fn json_output_uses_phpstan_like_shape() {
 }
 
 #[test]
+fn check_uninitialized_properties_config_enables_the_rule() {
+    let p = TempProject::new("uninit");
+    p.write(
+        "src/app.php",
+        "<?php\nclass Widget {\n    public int $size;\n}\n",
+    );
+
+    write_config(
+        &p,
+        "level: 0\npaths:\n  - src\ncheckUninitializedProperties: true\n",
+    );
+    let on = p.run(["--error-format", "json"]);
+    assert!(!on.status.success(), "{}", stdout(&on));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&on)).unwrap();
+    assert_eq!(
+        json["files"]["src/app.php"]["messages"][0]["identifier"],
+        "property.uninitialized"
+    );
+
+    // Off by default.
+    write_config(&p, "level: max\npaths:\n  - src\n");
+    let off = p.run([] as [&str; 0]);
+    assert!(off.status.success(), "{}", stdout(&off));
+}
+
+#[test]
 fn check_explicit_mixed_config_enables_strict_mixed_at_low_level() {
     // `checkExplicitMixed: true` turns on strict-mixed reporting independently of
     // level — a method call on an explicit `mixed` is flagged even at level 0.

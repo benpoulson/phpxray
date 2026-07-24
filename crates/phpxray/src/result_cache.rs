@@ -48,6 +48,7 @@ pub(crate) fn key(
     h.write_bool(rule_options.check_nullables);
     h.write_bool(rule_options.check_explicit_mixed);
     h.write_bool(rule_options.check_implicit_mixed);
+    h.write_bool(rule_options.check_uninitialized_properties);
     h.write_bool(config.treat_phpdoc_types_as_certain);
     h.write_bool(config.infer_untyped_signatures);
     for f in &config.early_terminating_function_calls {
