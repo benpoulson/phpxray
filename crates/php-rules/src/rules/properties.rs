@@ -2780,8 +2780,19 @@ fn sole_class(ty: &Type) -> Option<String> {
 /// Does `class_fqn` (or its hierarchy) declare a magic `__get`/`__set` that would
 /// make any property access legal? If so we never flag undefined properties.
 fn has_magic_accessor(fqn: &str, fa: &FileAnalysis, write: bool) -> bool {
+    if is_dynamic_property_class(fqn) {
+        return true;
+    }
     let getset = if write { "__set" } else { "__get" };
     fa.reflection.find_method(fqn, getset).is_some()
+}
+
+/// A class that legally accepts *any* property, so undefined-property access must
+/// never be reported. `stdClass` is the canonical case — objects from
+/// `json_decode()`, `(object) [...]` casts, and DB row fetches are `stdClass` and
+/// idiomatically carry dynamic properties (phpstan never flags these).
+fn is_dynamic_property_class(fqn: &str) -> bool {
+    fqn.trim_start_matches('\\').eq_ignore_ascii_case("stdClass")
 }
 
 // --- AccessPropertiesRule (level 0, general receiver) ----------------------
@@ -3080,6 +3091,9 @@ fn check_property_access(
     let Some(class) = sole_class(&base_ty) else {
         return;
     };
+    if is_dynamic_property_class(&class) {
+        return;
+    }
     if matches!(
         MemberAccessResolver::new(fa).instance_property(&base_ty, prop, write),
         ResolveStatus::Unknown
@@ -5351,6 +5365,14 @@ mod tests {
     fn access_property_on_this_not_double_reported() {
         // $this is handled by run_access_properties, not the general rule.
         let src = "<?php class C { public int $a; function f() { return $this->b; } }";
+        assert!(codes(src, run_access_properties_general).is_empty());
+    }
+
+    #[test]
+    fn access_arbitrary_property_on_stdclass_is_clean() {
+        // stdClass legally carries dynamic properties (json_decode, (object) casts,
+        // DB rows) — never report undefined-property access on it.
+        let src = "<?php function f(): \\stdClass { return new \\stdClass(); } f()->anything;";
         assert!(codes(src, run_access_properties_general).is_empty());
     }
 
