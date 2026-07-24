@@ -199,7 +199,7 @@ pub struct Finding {
     pub severity: Severity,
     /// A machine-applicable repair (`--fix` runs only). Byte offsets are valid
     /// in `path`'s analyzed source; only kept for findings local to their file.
-    pub fix: Option<php_diagnostics::DocTagFix>,
+    pub fix: Option<php_diagnostics::Fix>,
 }
 
 /// The result of an analysis run.

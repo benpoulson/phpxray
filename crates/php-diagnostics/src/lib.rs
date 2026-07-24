@@ -63,6 +63,37 @@ pub struct DocTagFix {
     pub indent: String,
 }
 
+/// A machine-applicable repair: replace a byte range of the analyzed source
+/// verbatim (an empty replacement deletes it). Used to rewrite or remove
+/// *existing* text — a provably-wrong doc type, an unused closure capture.
+/// Identical replacements from several findings dedup at application.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplaceFix {
+    pub span: Span,
+    pub replacement: String,
+}
+
+/// A machine-applicable repair carried by a [`Diagnostic`].
+#[derive(Clone, Debug)]
+pub enum Fix {
+    /// Add one PHPDoc tag (fixes sharing an anchor merge into one docblock).
+    DocTag(DocTagFix),
+    /// Replace/delete a byte range of the source.
+    Replace(ReplaceFix),
+}
+
+impl From<DocTagFix> for Fix {
+    fn from(f: DocTagFix) -> Fix {
+        Fix::DocTag(f)
+    }
+}
+
+impl From<ReplaceFix> for Fix {
+    fn from(f: ReplaceFix) -> Fix {
+        Fix::Replace(f)
+    }
+}
+
 /// A single problem found in the source. The parser is error-recovering: it
 /// pushes diagnostics and synthesizes error nodes rather than aborting.
 #[derive(Clone, Debug)]
@@ -75,7 +106,7 @@ pub struct Diagnostic {
     pub primary: Span,
     pub labels: Vec<Label>,
     /// A machine-applicable repair, when the producing rule knows one.
-    pub fix: Option<DocTagFix>,
+    pub fix: Option<Fix>,
 }
 
 impl Diagnostic {
@@ -111,8 +142,8 @@ impl Diagnostic {
         self
     }
 
-    pub fn with_fix(mut self, fix: DocTagFix) -> Diagnostic {
-        self.fix = Some(fix);
+    pub fn with_fix(mut self, fix: impl Into<Fix>) -> Diagnostic {
+        self.fix = Some(fix.into());
         self
     }
 

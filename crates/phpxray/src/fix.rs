@@ -9,7 +9,7 @@
 //! fix.
 
 use crate::Finding;
-use php_diagnostics::{DocTagFix, FixAnchor};
+use php_diagnostics::{DocTagFix, Fix, FixAnchor};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -36,7 +36,7 @@ pub fn apply_fixes(
     sources: &HashMap<String, String>,
     root: &Path,
 ) -> FixSummary {
-    let mut by_file: HashMap<&str, Vec<&DocTagFix>> = HashMap::new();
+    let mut by_file: HashMap<&str, Vec<&Fix>> = HashMap::new();
     for f in findings {
         if let Some(fix) = &f.fix {
             by_file.entry(f.path.as_str()).or_default().push(fix);
@@ -87,20 +87,39 @@ pub fn apply_fixes(
 
 /// Apply `fixes` to one file's source. Pure; `None` when any materialized edits
 /// would overlap (apply nothing for the file rather than guess).
-pub(crate) fn apply_to_source(source: &str, fixes: &[&DocTagFix]) -> Option<String> {
+pub(crate) fn apply_to_source(source: &str, fixes: &[&Fix]) -> Option<String> {
     let eol = if source.contains("\r\n") { "\r\n" } else { "\n" };
 
-    // Group by anchor; each group becomes one edit. Keyed on the anchor's
-    // byte position; the group keeps the first-seen anchor/indent.
+    // Group doc-tag fixes by anchor; each group becomes one edit. Keyed on the
+    // anchor's byte position; the group keeps the first-seen anchor/indent.
     let mut groups: Vec<(&DocTagFix, Vec<&DocTagFix>)> = Vec::new();
+    // Replace fixes are direct edits; several findings on one declaration may
+    // carry the *same* replacement (e.g. per-return-statement findings all
+    // rewriting one `@return` tag) — identical edits dedup, distinct
+    // overlapping ones conflict below.
+    let mut replaces: Vec<&php_diagnostics::ReplaceFix> = Vec::new();
     for fix in fixes {
-        match groups.iter_mut().find(|(g, _)| g.anchor == fix.anchor) {
-            Some((_, members)) => members.push(fix),
-            None => groups.push((fix, vec![fix])),
+        match fix {
+            Fix::DocTag(fix) => {
+                match groups.iter_mut().find(|(g, _)| g.anchor == fix.anchor) {
+                    Some((_, members)) => members.push(fix),
+                    None => groups.push((fix, vec![fix])),
+                }
+            }
+            Fix::Replace(r) => {
+                if !replaces.contains(&r) {
+                    replaces.push(r);
+                }
+            }
         }
     }
 
     let mut edits: Vec<(u32, u32, String)> = Vec::new();
+    for r in replaces {
+        // Out-of-bounds/non-boundary span: never guess.
+        source.get(r.span.start as usize..r.span.end as usize)?;
+        edits.push((r.span.start, r.span.end, r.replacement.clone()));
+    }
     for (head, mut members) in groups {
         // Param < Return < Var; stable, so same-kind tags keep emission order
         // (the parameter rule emits in declaration order).
@@ -191,13 +210,13 @@ mod tests {
     use php_diagnostics::DocTagKind;
     use php_span::Span;
 
-    fn fix(anchor: FixAnchor, kind: DocTagKind, tag: &str, indent: &str) -> DocTagFix {
-        DocTagFix {
+    fn fix(anchor: FixAnchor, kind: DocTagKind, tag: &str, indent: &str) -> Fix {
+        Fix::DocTag(DocTagFix {
             anchor,
             kind,
             tag: tag.to_string(),
             indent: indent.to_string(),
-        }
+        })
     }
 
     #[test]
@@ -315,6 +334,55 @@ mod tests {
             "",
         );
         assert_eq!(apply_to_source(src, &[&f1, &f2]), None);
+    }
+
+    fn replace(start: u32, end: u32, text: &str) -> Fix {
+        Fix::Replace(php_diagnostics::ReplaceFix {
+            span: Span::new(start, end),
+            replacement: text.to_string(),
+        })
+    }
+
+    #[test]
+    fn replace_fix_rewrites_range() {
+        let src = "<?php\n/** @return true */\nfunction f(): bool {}\n";
+        let at = src.find("true").unwrap() as u32;
+        let f = replace(at, at + 4, "bool");
+        let out = apply_to_source(src, &[&f]).unwrap();
+        assert_eq!(out, "<?php\n/** @return bool */\nfunction f(): bool {}\n");
+    }
+
+    #[test]
+    fn identical_replace_fixes_dedup() {
+        // Two findings on one method carrying the same tag rewrite.
+        let src = "<?php\n/** @return true */\nfunction f(): bool {}\n";
+        let at = src.find("true").unwrap() as u32;
+        let f1 = replace(at, at + 4, "bool");
+        let f2 = replace(at, at + 4, "bool");
+        let out = apply_to_source(src, &[&f1, &f2]).unwrap();
+        assert_eq!(out, "<?php\n/** @return bool */\nfunction f(): bool {}\n");
+    }
+
+    #[test]
+    fn distinct_overlapping_replaces_conflict() {
+        let src = "<?php // abcdef\n";
+        let f1 = replace(9, 12, "x");
+        let f2 = replace(10, 13, "y");
+        assert_eq!(apply_to_source(src, &[&f1, &f2]), None);
+    }
+
+    #[test]
+    fn replace_and_doc_tag_fixes_compose() {
+        let src = "<?php\n/** @return true */\nfunction f(): bool {}\nfunction g() {}\n";
+        let at = src.find("true").unwrap() as u32;
+        let r = replace(at, at + 4, "bool");
+        let g_off = src.find("function g").unwrap() as u32;
+        let d = fix(FixAnchor::NewDocAt(g_off), DocTagKind::Return, "@return void", "");
+        let out = apply_to_source(src, &[&r, &d]).unwrap();
+        assert_eq!(
+            out,
+            "<?php\n/** @return bool */\nfunction f(): bool {}\n/** @return void */\nfunction g() {}\n"
+        );
     }
 
     #[test]

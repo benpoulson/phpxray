@@ -138,7 +138,25 @@ pub(crate) fn fixes(
     run_fixes(src, rule)
         .into_iter()
         .filter_map(|d| d.fix)
-        .map(|f| (f.tag, f.anchor, f.indent))
+        .filter_map(|f| match f {
+            php_diagnostics::Fix::DocTag(f) => Some((f.tag, f.anchor, f.indent)),
+            php_diagnostics::Fix::Replace(_) => None,
+        })
+        .collect()
+}
+
+/// The `Replace` fixes [`run_fixes`] produced, as `(span, replacement)` pairs.
+pub(crate) fn replace_fixes(
+    src: &str,
+    rule: fn(&FileAnalysis) -> Vec<Diagnostic>,
+) -> Vec<(php_span::Span, String)> {
+    run_fixes(src, rule)
+        .into_iter()
+        .filter_map(|d| d.fix)
+        .filter_map(|f| match f {
+            php_diagnostics::Fix::Replace(r) => Some((r.span, r.replacement)),
+            php_diagnostics::Fix::DocTag(_) => None,
+        })
         .collect()
 }
 
