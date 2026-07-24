@@ -1094,9 +1094,14 @@ fn null_verdict(ty: &Type) -> Truth {
         Type::Null => Truth::Yes,
         Type::Nullable(_) => Truth::Maybe,
         Type::Union(parts) => combine_truth(parts.iter().map(null_verdict)),
-        Type::Mixed | Type::Unknown(_) | Type::TemplateVar(_) | Type::Conditional { .. } => {
-            Truth::Maybe
-        }
+        // `mixed` — explicit or implicit — includes `null`, so its null-ness is
+        // unknown (never "definitely not null"). Omitting `ExplicitMixed` here
+        // false-flagged `mixed $x ?? …` as a redundant coalesce.
+        Type::Mixed
+        | Type::ExplicitMixed
+        | Type::Unknown(_)
+        | Type::TemplateVar(_)
+        | Type::Conditional { .. } => Truth::Maybe,
         _ => Truth::No,
     }
 }
@@ -2220,6 +2225,14 @@ mod tests {
     #[test]
     fn null_coalesce_nullable_variable_is_clean() {
         let src = "<?php function f(?int $x) { return $x ?? 2; }";
+        assert!(codes(src, run_null_coalesce).is_empty());
+    }
+
+    #[test]
+    fn null_coalesce_explicit_mixed_variable_is_clean() {
+        // `mixed` includes null, so `$x ?? …` is meaningful — not a redundant
+        // coalesce (e.g. `data_get()` returns `mixed`).
+        let src = "<?php function f(mixed $x) { return $x ?? 2; }";
         assert!(codes(src, run_null_coalesce).is_empty());
     }
 
