@@ -48,12 +48,26 @@ pub(crate) fn refine_return(
     }
 }
 
+/// The inferred type of a `return <expr>` value. A bare `return $this;` is a
+/// late-static return (`static`), not the concrete enclosing class: inferring it
+/// as `Named{class}` binds it to the *declaring* class — wrong for a trait method
+/// (`$this` is the using class) and imprecise for a subclass. `static` binds to
+/// the actual receiver at the call site instead.
+fn return_type_of(ctx: &TypeCtx<'_>, e: &Expr) -> Type {
+    if let ExprKind::Variable(sym) = &e.kind {
+        if ctx.interner.resolve(*sym) == "this" {
+            return Type::StaticType;
+        }
+    }
+    ctx.infer(e)
+}
+
 /// Collect the types of reachable `return <expr>` statements, pruning branches
 /// whose conditions are statically known from bound parameter types.
 pub(crate) fn collect_returns(ctx: &mut TypeCtx<'_>, stmts: &[Stmt], out: &mut Vec<Type>) {
     for s in stmts {
         match &s.kind {
-            StmtKind::Return(Some(e)) => out.push(ctx.infer(e)),
+            StmtKind::Return(Some(e)) => out.push(return_type_of(ctx, e)),
             StmtKind::Block(b) => collect_returns(ctx, b, out),
             StmtKind::If {
                 cond,

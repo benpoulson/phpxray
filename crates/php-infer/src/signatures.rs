@@ -581,6 +581,15 @@ mod tests {
     }
 
     #[test]
+    fn bare_return_this_infers_static() {
+        // `return $this;` is a late-static return: in a trait method it must not
+        // bind to the trait, and in a class it must not lose subclass identity.
+        let idx = run("trait T { public function chain() { return $this; } }");
+        let m = idx.find_method("T", "chain").expect("method");
+        assert_eq!(m.member.return_type.to_string(), "static");
+    }
+
+    #[test]
     fn return_union_of_branches() {
         let idx = run(r#"function g($c) { if ($c) { return 1; } return "x"; }"#);
         assert_eq!(fret(&idx, "g"), "1|'x'");
