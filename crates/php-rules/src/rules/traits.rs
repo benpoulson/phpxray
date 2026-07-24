@@ -428,6 +428,12 @@ mod tests {
         assert!(codes(src, run_not_analysed_trait).is_empty());
     }
 
+    #[test]
+    fn used_trait_in_global_namespace_is_clean() {
+        let src = "<?php trait A { public function a() {} } class C { use A; }";
+        assert!(codes(src, run_not_analysed_trait).is_empty());
+    }
+
     // --- ConflictingTraitConstantsRule ---
 
     #[test]
