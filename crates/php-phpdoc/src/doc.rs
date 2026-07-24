@@ -36,6 +36,10 @@ pub struct Doc {
     /// `@param-out Type $name` — the type a by-ref parameter holds *after*
     /// the call returns.
     pub param_outs: Vec<Param>,
+    /// `@phpstan-self-out Type` (`@phpstan-this-out`) — the type `$this` (the
+    /// receiver) holds *after* the method returns, for fluent APIs that mutate
+    /// the receiver's generic type.
+    pub self_out: Option<DocType>,
     pub deprecated: bool,
 }
 
@@ -156,6 +160,15 @@ pub fn parse(raw: &str) -> Doc {
             }
             "var" => doc.vars.push(parse_var(&tag.value)),
             "param-out" => doc.param_outs.push(parse_param(&tag.value)),
+            // `@phpstan-self-out`/`-this-out` carry type effect only in their
+            // prefixed forms (a bare `@self-out` is not a standard tag).
+            "self-out" | "this-out" if pri > 0 => {
+                if doc.self_out.is_none() {
+                    if let Some((ty, _)) = parse_type_prefix(&tag.value) {
+                        doc.self_out = Some(ty);
+                    }
+                }
+            }
             "throws" => {
                 if let Some((ty, _)) = parse_type_prefix(&tag.value) {
                     doc.throws.push(ty);

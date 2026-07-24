@@ -982,6 +982,7 @@ impl TypeCtx<'_> {
             return;
         }
         let mut facts = (SE_YES, None);
+        let mut self_out: Option<Type> = None;
         if let Some(name) = self.member_ident(method) {
             let recv_ty = self.infer(recv);
             if let Some(fqn) = self.type_class_fqn(&recv_ty) {
@@ -990,6 +991,13 @@ impl TypeCtx<'_> {
                         method_side_effects(&found.member),
                         Some(param_ref_info(&found.member.params)),
                     );
+                    // `@phpstan-self-out T` retypes the receiver after the call
+                    // (`self`/`static`/`self<…>` bound to the receiver class).
+                    self_out = found
+                        .member
+                        .self_out
+                        .clone()
+                        .map(|t| self.bind_relative(t, &fqn));
                 }
             }
         }
@@ -1003,6 +1011,14 @@ impl TypeCtx<'_> {
             }
         }
         self.widen_by_ref_args(params, args);
+        // Apply `@phpstan-self-out` to a simple `$var` receiver after widening.
+        if let (Some(out), ExprKind::Variable(sym)) = (self_out, &recv.kind) {
+            let recv_name = self.interner.resolve(*sym).to_string();
+            if recv_name != "this" {
+                self.callables.remove(&recv_name);
+                self.vars.insert(recv_name, out);
+            }
+        }
     }
 
     /// After `f(...)` / `$f(...)`.
@@ -3019,6 +3035,39 @@ mod tests {
             function fill(array &$out): void {}
         "#;
         assert_eq!(var_after(src, "m"), "array");
+    }
+
+    #[test]
+    fn self_out_retypes_receiver() {
+        // `@phpstan-self-out self<int>` mutates the receiver's generic arg.
+        let src = r#"
+            /** @template T */
+            class Builder {
+                /** @phpstan-self-out self<int> */
+                public function asInt(): void {}
+            }
+            function f() {
+                $b = new Builder();
+                $b->asInt();
+                $y = $b;
+            }
+        "#;
+        assert_eq!(var_after(src, "y"), "Builder<int>");
+
+        // A concrete self-out retypes to a different class.
+        let src = r#"
+            class Draft {}
+            class Published {
+                /** @phpstan-self-out \Draft */
+                public function unpublish(): void {}
+            }
+            function f() {
+                $p = new Published();
+                $p->unpublish();
+                $y = $p;
+            }
+        "#;
+        assert_eq!(var_after(src, "y"), "Draft");
     }
 
     #[test]

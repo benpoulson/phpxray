@@ -279,6 +279,18 @@ fn doc_generic(scope: &Scope, templates: &[String], base: &str, args: &[DocType]
             _ => Type::Mixed,
         },
         "int-mask-of" | "int-mask" => Type::Int,
+        // `self<...>` / `static<...>` / `$this<...>` — the receiver's own class
+        // with generic args (used by `@phpstan-self-out`). Represented as a
+        // `Named{"self"/"static"}` sentinel that late-static binding rewrites to
+        // the actual receiver class at the call site (SelfType can't carry args).
+        "self" | "$this" => Type::Named {
+            fqn: "self".into(),
+            args: resolved,
+        },
+        "static" => Type::Named {
+            fqn: "static".into(),
+            args: resolved,
+        },
         // A user/class generic, e.g. `Collection<int, User>`.
         _ => match doc_named(scope, templates, base) {
             Type::Named { fqn, .. } => Type::Named {

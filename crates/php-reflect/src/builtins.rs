@@ -117,6 +117,7 @@ pub(crate) fn builtin_classes_for(version: PhpVersion) -> Vec<ClassReflection> {
                     pure: flags.contains('p'),
                     impure: false,
                     asserts: Vec::new(),
+                    self_out: None,
                     must_use_return_value: flags.contains('u'),
                     magic: false,
                 });

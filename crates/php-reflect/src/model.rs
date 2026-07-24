@@ -22,6 +22,7 @@ use php_ast::{
 };
 use php_intern::Interner;
 use php_phpdoc::{Doc, DocType, MethodParam, PropertyAccess};
+use std::collections::HashMap;
 use php_resolve::{Resolution, Scope};
 use php_types::Type;
 
@@ -138,6 +139,10 @@ pub struct MethodReflection {
     pub impure: bool,
     /// `@phpstan-assert*` declarations; see [`FunctionReflection::asserts`].
     pub asserts: Vec<AssertReflection>,
+    /// `@phpstan-self-out Type` — the type `$this` (the receiver) holds after
+    /// this method returns (`self`/`static` bound to the receiver at the call
+    /// site). `None` = unannotated.
+    pub self_out: Option<Type>,
     /// Declared with PHP 8.5's `#[NoDiscard]`; call-as-statement should report
     /// that the return value is discarded.
     pub must_use_return_value: bool,
@@ -449,6 +454,12 @@ pub fn reflect_class(
         .flatten()
         .collect();
 
+    // Expand local `@phpstan-type` aliases in every reflected member type.
+    let aliases = class_type_aliases(scope, &class_templates, c.doc.as_deref());
+    if !aliases.is_empty() {
+        expand_member_aliases(&mut methods, &mut properties, &mut constants, &aliases);
+    }
+
     ClassReflection {
         fqn: fqn.to_string(),
         kind: c.kind,
@@ -548,6 +559,7 @@ fn synthetic_method(
         pure: true,
         impure: false,
         asserts: Vec::new(),
+        self_out: None,
         must_use_return_value: false,
         magic: false,
     }
@@ -614,6 +626,10 @@ fn reflect_method(
     let doc = parse_doc(m.doc.as_deref());
     let templates = combine_templates(class_templates, &doc);
     let asserts = reflect_asserts(scope, &templates, &doc);
+    let self_out = doc
+        .self_out
+        .as_ref()
+        .map(|t| resolve_doc_type(scope, &templates, t));
     MethodReflection {
         name: interner.resolve(m.name).to_string(),
         visibility: m.modifiers.visibility.unwrap_or(Visibility::Public),
@@ -635,6 +651,7 @@ fn reflect_method(
         pure: doc_is_pure(m.doc.as_deref()),
         impure: doc_is_impure(m.doc.as_deref()),
         asserts,
+        self_out,
         must_use_return_value: has_nodiscard_attr(&m.attrs),
         magic: false,
     }
@@ -778,6 +795,7 @@ fn magic_method(
         pure: false,
         impure: false,
         asserts: Vec::new(),
+        self_out: None,
         must_use_return_value: false,
         magic: true,
     }
@@ -969,6 +987,129 @@ fn reflect_asserts(
         .collect()
 }
 
+/// Collect a class's local `@phpstan-type`/`@psalm-type` aliases, keyed by the
+/// FQN the alias *name* resolves to (so a member reference to the bare alias
+/// name — which resolves to the same phantom FQN — matches, while a
+/// fully-qualified real class of the same short name does not). Alias bodies
+/// are expanded against one another to a bounded fixpoint (alias-references-
+/// alias). Only local `@phpstan-type` is handled here; `@phpstan-import-type`
+/// (cross-class) and global config aliases are follow-ups.
+fn class_type_aliases(
+    scope: &Scope,
+    templates: &[String],
+    raw: Option<&str>,
+) -> HashMap<String, Type> {
+    let Some(raw) = raw else {
+        return HashMap::new();
+    };
+    let mut map: HashMap<String, Type> = HashMap::new();
+    for tag in &php_phpdoc::parse_block(raw).tags {
+        let base = tag
+            .name
+            .strip_prefix("phpstan-")
+            .or_else(|| tag.name.strip_prefix("psalm-"))
+            .unwrap_or(tag.name.as_str());
+        if base != "type" {
+            continue;
+        }
+        let rest = tag.value.trim_start();
+        let name_len = rest
+            .char_indices()
+            .find_map(|(i, ch)| {
+                (!(ch == '_' || ch.is_ascii_alphanumeric())).then_some(i)
+            })
+            .unwrap_or(rest.len());
+        if name_len == 0 {
+            continue;
+        }
+        let name = &rest[..name_len];
+        let mut body = rest[name_len..].trim_start();
+        if let Some(after_eq) = body.strip_prefix('=') {
+            body = after_eq.trim_start();
+        }
+        // The alias's identity FQN is what the bare name resolves to as a class;
+        // skip names that resolve to a reserved keyword type (invalid aliases).
+        let Type::Named { fqn: key_fqn, .. } =
+            resolve_doc_type(scope, &[], &DocType::Named(name.to_string()))
+        else {
+            continue;
+        };
+        let Some((dt, _)) = php_phpdoc::parse_type_prefix(body) else {
+            continue;
+        };
+        let ty = resolve_doc_type(scope, templates, &dt);
+        map.insert(key_fqn.trim_start_matches('\\').to_ascii_lowercase(), ty);
+    }
+    if map.len() > 1 {
+        // Fixpoint: expand aliases that reference other aliases (bounded).
+        for _ in 0..map.len().min(8) {
+            let mut changed = false;
+            for key in map.keys().cloned().collect::<Vec<_>>() {
+                let cur = map[&key].clone();
+                let next = expand_aliases_excluding(&cur, &map, &key);
+                if next != cur {
+                    map.insert(key, next);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+    map
+}
+
+/// Replace `Named` nodes whose resolved FQN keys `aliases` with the alias body.
+fn expand_aliases(ty: &Type, aliases: &HashMap<String, Type>) -> Type {
+    expand_aliases_excluding(ty, aliases, "")
+}
+
+fn expand_aliases_excluding(ty: &Type, aliases: &HashMap<String, Type>, exclude: &str) -> Type {
+    ty.clone().map(&mut |part| match part {
+        Type::Named { fqn, args } if args.is_empty() => {
+            let key = fqn.trim_start_matches('\\').to_ascii_lowercase();
+            if key != exclude {
+                if let Some(t) = aliases.get(&key) {
+                    return t.clone();
+                }
+            }
+            Type::Named { fqn, args }
+        }
+        other => other,
+    })
+}
+
+fn expand_member_aliases(
+    methods: &mut [MethodReflection],
+    properties: &mut [PropertyReflection],
+    constants: &mut [ConstReflection],
+    aliases: &HashMap<String, Type>,
+) {
+    let ex = |t: &mut Type| *t = expand_aliases(t, aliases);
+    for m in methods.iter_mut() {
+        ex(&mut m.return_type);
+        ex(&mut m.native_return);
+        for p in &mut m.params {
+            ex(&mut p.ty);
+            ex(&mut p.native_ty);
+            if let Some(o) = &mut p.out_ty {
+                ex(o);
+            }
+        }
+        for a in &mut m.asserts {
+            ex(&mut a.ty);
+        }
+    }
+    for p in properties.iter_mut() {
+        ex(&mut p.ty);
+        ex(&mut p.native_ty);
+    }
+    for k in constants.iter_mut() {
+        ex(&mut k.ty);
+    }
+}
+
 /// Whether a docblock explicitly declares the symbol side-effect-having: a
 /// `@phpstan-impure`/`@psalm-impure`/`@impure` tag is present.
 fn doc_is_impure(raw: Option<&str>) -> bool {
@@ -1129,6 +1270,44 @@ mod tests {
         // Constructor-promoted param shows up as a param on __construct.
         let ctor = c.methods.iter().find(|m| m.name == "__construct").unwrap();
         assert!(ctor.params[0].promoted && ctor.params[0].ty == Type::Int);
+    }
+
+    #[test]
+    fn local_type_aliases_expand_in_members() {
+        let (c, _) = reflect_first_class(
+            r#"<?php
+            /**
+             * @phpstan-type UserId = int
+             * @phpstan-type UserData = array{id: UserId, name: string}
+             */
+            class Service {
+                /** @param UserData $data */
+                public function save($data): void {}
+                /** @return UserData */
+                public function load() { return []; }
+            }"#,
+        );
+        let want = "array{id: int, name: string}";
+        let save = c.methods.iter().find(|m| m.name == "save").unwrap();
+        // The alias (and its nested alias UserId → int) is fully expanded.
+        assert_eq!(save.params[0].ty.to_string(), want);
+        let load = c.methods.iter().find(|m| m.name == "load").unwrap();
+        assert_eq!(load.return_type.to_string(), want);
+    }
+
+    #[test]
+    fn alias_does_not_shadow_fully_qualified_class() {
+        // A local alias `Data` must not replace a fully-qualified `\Other\Data`.
+        let (c, _) = reflect_first_class(
+            r#"<?php
+            /** @phpstan-type Data = array{x: int} */
+            class Service {
+                /** @param \Other\Data $d */
+                public function m($d): void {}
+            }"#,
+        );
+        let m = c.methods.iter().find(|m| m.name == "m").unwrap();
+        assert_eq!(m.params[0].ty.to_string(), "Other\\Data");
     }
 
     #[test]

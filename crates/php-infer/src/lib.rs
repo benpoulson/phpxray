@@ -1624,6 +1624,16 @@ impl<'a> TypeCtx<'a> {
                 fqn: bound.into(),
                 args: vec![],
             },
+            // The `self<...>`/`static<...>` sentinels (from `@phpstan-self-out`)
+            // keep their generic args, binding the base to the receiver class.
+            Type::Named { fqn, args }
+                if !args.is_empty() && matches!(&*fqn, "self" | "static") =>
+            {
+                Type::Named {
+                    fqn: bound.into(),
+                    args,
+                }
+            }
             Type::Parent => self
                 .index
                 .class(bound)
