@@ -82,6 +82,8 @@ pub(crate) fn builtin_classes_for(version: PhpVersion) -> Vec<ClassReflection> {
                     deprecated: false,
                     attribute: builtin_attribute(flags),
                     consistent_constructor: false,
+                    type_aliases: std::collections::HashMap::new(),
+                    imported_types: Vec::new(),
                     builtin: true,
                 });
             }
@@ -271,6 +273,8 @@ fn ensure_class<'a>(
         deprecated: false,
         attribute: None,
         consistent_constructor: false,
+        type_aliases: std::collections::HashMap::new(),
+        imported_types: Vec::new(),
         builtin: true,
     });
     classes.last_mut()

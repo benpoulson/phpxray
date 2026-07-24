@@ -381,6 +381,46 @@ impl ReflectionIndex {
         self.class_by_key_ref(fqn)
     }
 
+    /// Resolve every class's `@phpstan-import-type` declarations now that all
+    /// classes are indexed: look up each imported alias in its source class's
+    /// exported `type_aliases`, then re-expand the importing class's member
+    /// types. Call once after all files/artifacts are added; idempotent and
+    /// deterministic (safe to re-run per incremental pass). A missing source
+    /// class or alias is silently skipped (graceful — the reference stays a
+    /// lenient unresolved `Named`).
+    pub fn resolve_type_imports(&mut self) {
+        // Collect substitutions first (immutable borrow), then apply.
+        let mut updates: Vec<(String, std::collections::HashMap<String, php_types::Type>)> =
+            Vec::new();
+        for (key, cls) in &self.classes {
+            if cls.imported_types.is_empty() {
+                continue;
+            }
+            let mut import_map = std::collections::HashMap::new();
+            for imp in &cls.imported_types {
+                if let Some(src) = self.classes.get(&class_key(&imp.source_class)) {
+                    if let Some(ty) = src.type_aliases.get(&imp.source_name) {
+                        import_map.insert(imp.local_fqn.clone(), ty.clone());
+                    }
+                }
+            }
+            if !import_map.is_empty() {
+                updates.push((key.clone(), import_map));
+            }
+        }
+        for (key, import_map) in updates {
+            if let Some(cls_arc) = self.classes.get_mut(&key) {
+                let cls = Arc::make_mut(cls_arc);
+                crate::model::expand_member_aliases(
+                    &mut cls.methods,
+                    &mut cls.properties,
+                    &mut cls.constants,
+                    &import_map,
+                );
+            }
+        }
+    }
+
     /// Look up a function by FQN (case-insensitive, leading `\` ignored).
     pub fn function(&self, fqn: &str) -> Option<&FunctionReflection> {
         depsrec::note_surface(fqn);
@@ -1543,6 +1583,57 @@ mod tests {
                 .return_type,
             Type::String
         );
+    }
+
+    #[test]
+    fn phpstan_import_type_resolves_cross_class() {
+        let r = php_parser::parse(
+            r#"<?php
+            /** @phpstan-type UserData = array{id: int, name: string} */
+            class Shapes {}
+            /** @phpstan-import-type UserData from Shapes */
+            class Service {
+                /** @param UserData $data */
+                public function save($data): void {}
+            }
+            "#,
+        );
+        assert!(!r.has_errors(), "parse errors");
+        let mut idx = ReflectionIndex::new();
+        idx.add_file(&r.program, &r.interner);
+        // Before resolution, the imported alias is an unresolved Named phantom.
+        let before = idx.find_method("Service", "save").unwrap();
+        assert_ne!(
+            before.member.params[0].ty.to_string(),
+            "array{id: int, name: string}"
+        );
+        idx.resolve_type_imports();
+        let after = idx.find_method("Service", "save").unwrap();
+        assert_eq!(
+            after.member.params[0].ty.to_string(),
+            "array{id: int, name: string}"
+        );
+    }
+
+    #[test]
+    fn phpstan_import_type_with_alias_rename() {
+        let r = php_parser::parse(
+            r#"<?php
+            /** @phpstan-type Row = array{n: int} */
+            class Repo {}
+            /** @phpstan-import-type Row from Repo as Record */
+            class Uses {
+                /** @return Record */
+                public function one() { return []; }
+            }
+            "#,
+        );
+        assert!(!r.has_errors(), "parse errors");
+        let mut idx = ReflectionIndex::new();
+        idx.add_file(&r.program, &r.interner);
+        idx.resolve_type_imports();
+        let one = idx.find_method("Uses", "one").unwrap();
+        assert_eq!(one.member.return_type.to_string(), "array{n: int}");
     }
 
     #[test]

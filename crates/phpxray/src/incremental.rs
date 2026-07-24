@@ -356,6 +356,8 @@ impl Session {
             project.add_file_as(rel, &e.file_index, kind);
             reflection.add_artifact(&e.reflect_artifact);
         }
+        // Cross-class `@phpstan-import-type` (needs every class indexed first).
+        reflection.resolve_type_imports();
 
         // Whole-project signature inference (untyped functions). It needs every
         // file's call sites, so each pass re-parses the whole tree (in parallel)

@@ -480,6 +480,8 @@ fn analyze_parsed_progress(
         reflection.add_file_labeled_as(Some(&f.path), &f.program, interner, reflect_kind);
         indexing.inc(1);
     }
+    // Cross-class `@phpstan-import-type` needs every class indexed first.
+    reflection.resolve_type_imports();
     indexing.finish();
     if let Some(t) = &mut timings {
         t.index = started.elapsed();

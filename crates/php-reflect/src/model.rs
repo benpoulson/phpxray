@@ -233,8 +233,29 @@ pub struct ClassReflection {
     /// The class (or a parent) declares `@phpstan-consistent-constructor`, which
     /// makes `new static()` safe (subclasses can't change the constructor).
     pub consistent_constructor: bool,
+    /// Local `@phpstan-type` aliases this class *exports* (for other classes to
+    /// `@phpstan-import-type`), keyed by the alias's short name (lowercased).
+    /// Already expanded among the class's own aliases.
+    pub type_aliases: HashMap<String, Type>,
+    /// `@phpstan-import-type Name from Other [as Alias]` declarations, resolved
+    /// at the [`ReflectionIndex`] level (which has every class) — see
+    /// `ReflectionIndex::resolve_type_imports`.
+    pub imported_types: Vec<ImportedType>,
     /// Loaded from the built-in stub manifest rather than project source.
     pub builtin: bool,
+}
+
+/// A resolved `@phpstan-import-type Name from Other [as Alias]` declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedType {
+    /// The FQN the *local* alias name resolves to in this class's scope (the
+    /// phantom class FQN a member reference to the bare name also resolves to —
+    /// so we can substitute by FQN, not the shadow-prone short name).
+    pub local_fqn: String,
+    /// The FQN of the class the alias is imported from.
+    pub source_class: String,
+    /// The alias's short name in the source class (lowercased).
+    pub source_name: String,
 }
 
 /// `#[Attribute(...)]` metadata on an attribute class: which targets it may be
@@ -459,6 +480,14 @@ pub fn reflect_class(
     if !aliases.is_empty() {
         expand_member_aliases(&mut methods, &mut properties, &mut constants, &aliases);
     }
+    // Export aliases keyed by short name (for `@phpstan-import-type`); cross-
+    // class imports are resolved later at the index level.
+    let type_aliases: HashMap<String, Type> = aliases
+        .into_iter()
+        .map(|(fqn, ty)| (fqn.rsplit('\\').next().unwrap_or("").to_string(), ty))
+        .filter(|(name, _)| !name.is_empty())
+        .collect();
+    let imported_types = class_imported_types(scope, c.doc.as_deref());
 
     ClassReflection {
         fqn: fqn.to_string(),
@@ -484,6 +513,8 @@ pub fn reflect_class(
             .doc
             .as_deref()
             .is_some_and(|d| d.contains("consistent-constructor")),
+        type_aliases,
+        imported_types,
         builtin: false,
     }
 }
@@ -1060,6 +1091,54 @@ fn class_type_aliases(
     map
 }
 
+/// Parse a class's `@phpstan-import-type Name from Other [as Alias]` tags into
+/// resolved [`ImportedType`]s (the cross-class lookup happens later, at the
+/// index level). `local_fqn` is the FQN the *local* alias name resolves to in
+/// this scope (matching how member references to it resolve).
+fn class_imported_types(scope: &Scope, raw: Option<&str>) -> Vec<ImportedType> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for tag in &php_phpdoc::parse_block(raw).tags {
+        let base = tag
+            .name
+            .strip_prefix("phpstan-")
+            .or_else(|| tag.name.strip_prefix("psalm-"))
+            .unwrap_or(tag.name.as_str());
+        if base != "import-type" {
+            continue;
+        }
+        // `Name from Other` or `Name from Other as Alias`.
+        let toks: Vec<&str> = tag.value.split_whitespace().collect();
+        let (Some(&name), Some(&kw), Some(&other)) =
+            (toks.first(), toks.get(1), toks.get(2))
+        else {
+            continue;
+        };
+        if !kw.eq_ignore_ascii_case("from") {
+            continue;
+        }
+        let local = match (toks.get(3), toks.get(4)) {
+            (Some(a), Some(alias)) if a.eq_ignore_ascii_case("as") => *alias,
+            _ => name,
+        };
+        let fqn_of = |n: &str| match resolve_doc_type(scope, &[], &DocType::Named(n.to_string())) {
+            Type::Named { fqn, .. } => Some(fqn.trim_start_matches('\\').to_ascii_lowercase()),
+            _ => None,
+        };
+        let (Some(source_class), Some(local_fqn)) = (fqn_of(other), fqn_of(local)) else {
+            continue;
+        };
+        out.push(ImportedType {
+            local_fqn,
+            source_class,
+            source_name: name.trim_start_matches('\\').to_ascii_lowercase(),
+        });
+    }
+    out
+}
+
 /// Replace `Named` nodes whose resolved FQN keys `aliases` with the alias body.
 fn expand_aliases(ty: &Type, aliases: &HashMap<String, Type>) -> Type {
     expand_aliases_excluding(ty, aliases, "")
@@ -1080,7 +1159,7 @@ fn expand_aliases_excluding(ty: &Type, aliases: &HashMap<String, Type>, exclude:
     })
 }
 
-fn expand_member_aliases(
+pub(crate) fn expand_member_aliases(
     methods: &mut [MethodReflection],
     properties: &mut [PropertyReflection],
     constants: &mut [ConstReflection],
