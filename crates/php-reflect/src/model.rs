@@ -626,7 +626,7 @@ fn synthetic_param(name: &str, ty: Type) -> ParamReflection {
 }
 
 /// Append the constructor's promoted parameters as class properties. A parameter
-/// is promoted iff it carries a visibility modifier (PHP requires one); its type
+/// is promoted iff it carries a visibility modifier *or* `readonly`; its type
 /// is the native hint refined by a matching `@param` on the constructor docblock.
 fn promoted_properties(
     scope: &Scope,
@@ -639,8 +639,13 @@ fn promoted_properties(
     let doc = parse_doc(ctor.doc.as_deref());
     let templates = combine_templates(class_templates, &doc);
     for p in &ctor.params {
-        let Some(visibility) = p.modifiers.visibility else {
-            continue;
+        // A parameter is promoted when it carries a visibility modifier OR
+        // `readonly` alone (PHP promotes `readonly X $y` with implicit `public`
+        // visibility). Without the `readonly` arm, such a property was invisible.
+        let visibility = match p.modifiers.visibility {
+            Some(v) => v,
+            None if p.modifiers.is_readonly => Visibility::Public,
+            None => continue,
         };
         let pname = interner.resolve(p.name);
         let doc_ty = doc
@@ -1286,6 +1291,22 @@ mod tests {
         assert_eq!(count.visibility, Visibility::Public);
         assert_eq!(count.ty, Type::Int);
         assert!(count.has_default);
+    }
+
+    #[test]
+    fn readonly_only_promoted_param_is_a_property() {
+        // `readonly X $y` (no explicit visibility) is promoted by PHP as an
+        // implicitly-public readonly property.
+        let (c, _) = reflect_first_class(
+            r#"<?php class E { public function __construct(readonly \Foo\Bar $campaign) {} }"#,
+        );
+        let p = c
+            .properties
+            .iter()
+            .find(|p| p.name == "campaign")
+            .expect("$campaign property");
+        assert_eq!(p.visibility, Visibility::Public);
+        assert!(p.is_readonly);
     }
 
     #[test]
