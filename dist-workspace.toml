@@ -7,12 +7,11 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
-# The installers to generate for each app
-installers = ["shell", "homebrew"]
-# The Homebrew tap to publish the generated formula into
-tap = "benpoulson/homebrew-tap"
-# Actually push the formula to the tap on release
-publish-jobs = ["homebrew"]
+# The installers to generate for each app. Homebrew is intentionally omitted for
+# now: it needs a separate tap repo + HOMEBREW_TAP_TOKEN secret. The shell
+# installer (curl | sh) covers macOS + Linux with zero extra setup; add
+# "homebrew" back (plus `tap`/`publish-jobs`) once the tap is ready.
+installers = ["shell"]
 # Target platforms to build apps for (Rust target-triple syntax) — Mac + Linux.
 # Linux uses musl for fully-static, dependency-free binaries that run on any
 # distro (Alpine, old glibc, scratch/distroless containers) unchanged.
