@@ -5,16 +5,14 @@
 //! it does not replace flow-sensitive per-scope walkers.
 
 use php_ast::{
-    Arg, ArrayItem, ArraySyntax, BinOp, CastKind, Catch, ClassDecl, Expr, ExprKind, FunctionDecl,
-    IncludeKind, Member, MemberName, MethodDecl, Program, PropElem, PropertyDecl, Stmt, StmtKind,
-    UnOp,
+    Arg, ArrayItem, BinOp, CastKind, ClassDecl, Expr, ExprKind, FunctionDecl, Member, MemberName,
+    MethodDecl, Program, PropElem, PropertyDecl, Stmt, StmtKind, UnOp,
 };
 use php_intern::Interner;
 use php_resolve::{for_each_region, Scope};
 
 /// Borrowed facts collected once for an analyzed file.
 pub struct FileFacts<'a> {
-    regions: Vec<RegionFact<'a>>,
     statements: Vec<&'a Stmt>,
     expressions: Vec<&'a Expr>,
     functions: Vec<FunctionDeclFact<'a>>,
@@ -28,52 +26,34 @@ pub struct FileFacts<'a> {
     scoped_method_calls: Vec<ScopedMethodCallFact<'a>>,
     static_calls: Vec<StaticCallFact<'a>>,
     property_fetches: Vec<PropertyFetchFact<'a>>,
-    static_property_fetches: Vec<StaticPropertyFetchFact<'a>>,
     class_consts: Vec<ClassConstFact<'a>>,
     indexes: Vec<IndexFact<'a>>,
     binaries: Vec<BinaryFact<'a>>,
     unaries: Vec<UnaryFact<'a>>,
     casts: Vec<CastFact<'a>>,
-    includes: Vec<IncludeFact<'a>>,
-    throws: Vec<ThrowFact<'a>>,
-    yields: Vec<YieldFact<'a>>,
-    yield_froms: Vec<YieldFromFact<'a>>,
-    exits: Vec<ExitFact<'a>>,
     prints: Vec<PrintFact<'a>>,
     arrays: Vec<ArrayFact<'a>>,
     assignments: Vec<AssignmentFact<'a>>,
     news: Vec<NewFact<'a>>,
     clones: Vec<CloneFact<'a>>,
     echoes: Vec<EchoFact<'a>>,
-    returns: Vec<ReturnFact<'a>>,
     foreaches: Vec<ForeachFact<'a>>,
-    tries: Vec<TryFact<'a>>,
-    catches: Vec<CatchFact<'a>>,
     issets: Vec<IssetFact<'a>>,
     empties: Vec<EmptyFact<'a>>,
     coalesces: Vec<CoalesceFact<'a>>,
 }
 
-#[allow(dead_code)]
-pub(crate) struct RegionFact<'a> {
-    pub(crate) scope: Scope,
-    pub(crate) statements: Vec<&'a Stmt>,
-}
-
-#[allow(dead_code)]
 pub(crate) struct FunctionDeclFact<'a> {
     pub(crate) scope: Scope,
     pub(crate) decl: &'a FunctionDecl,
 }
 
-#[allow(dead_code)]
 pub(crate) struct ClassDeclFact<'a> {
     pub(crate) scope: Scope,
     pub(crate) fqn: String,
     pub(crate) decl: &'a ClassDecl,
 }
 
-#[allow(dead_code)]
 pub(crate) struct MethodDeclFact<'a> {
     pub(crate) scope: Scope,
     pub(crate) class_fqn: String,
@@ -81,14 +61,12 @@ pub(crate) struct MethodDeclFact<'a> {
     pub(crate) decl: &'a MethodDecl,
 }
 
-#[allow(dead_code)]
 pub(crate) struct PropertyDeclFact<'a> {
     pub(crate) class_fqn: String,
     pub(crate) class: &'a ClassDecl,
     pub(crate) decl: &'a PropertyDecl,
 }
 
-#[allow(dead_code)]
 pub(crate) struct PropertyElemFact<'a> {
     pub(crate) class_fqn: String,
     pub(crate) class: &'a ClassDecl,
@@ -96,14 +74,12 @@ pub(crate) struct PropertyElemFact<'a> {
     pub(crate) elem: &'a PropElem,
 }
 
-#[allow(dead_code)]
 pub(crate) struct CallFact<'a> {
     pub(crate) expr: &'a Expr,
     pub(crate) callee: &'a Expr,
     pub(crate) args: &'a [Arg],
 }
 
-#[allow(dead_code)]
 pub(crate) struct MethodCallFact<'a> {
     pub(crate) expr: &'a Expr,
     pub(crate) recv: &'a Expr,
@@ -112,25 +88,19 @@ pub(crate) struct MethodCallFact<'a> {
     pub(crate) nullsafe: bool,
 }
 
-#[allow(dead_code)]
 pub(crate) struct ScopedCallFact<'a> {
     pub(crate) scope: Scope,
-    pub(crate) expr: &'a Expr,
     pub(crate) callee: &'a Expr,
     pub(crate) args: &'a [Arg],
 }
 
-#[allow(dead_code)]
 pub(crate) struct ScopedMethodCallFact<'a> {
     pub(crate) scope: Scope,
-    pub(crate) expr: &'a Expr,
     pub(crate) recv: &'a Expr,
     pub(crate) method: &'a MemberName,
     pub(crate) args: &'a [Arg],
-    pub(crate) nullsafe: bool,
 }
 
-#[allow(dead_code)]
 pub(crate) struct StaticCallFact<'a> {
     pub(crate) expr: &'a Expr,
     pub(crate) class: &'a Expr,
@@ -138,7 +108,6 @@ pub(crate) struct StaticCallFact<'a> {
     pub(crate) args: &'a [Arg],
 }
 
-#[allow(dead_code)]
 pub(crate) struct PropertyFetchFact<'a> {
     pub(crate) expr: &'a Expr,
     pub(crate) base: &'a Expr,
@@ -146,28 +115,17 @@ pub(crate) struct PropertyFetchFact<'a> {
     pub(crate) nullsafe: bool,
 }
 
-#[allow(dead_code)]
-pub(crate) struct StaticPropertyFetchFact<'a> {
-    pub(crate) expr: &'a Expr,
-    pub(crate) class: &'a Expr,
-    pub(crate) name: &'a MemberName,
-}
-
-#[allow(dead_code)]
 pub(crate) struct ClassConstFact<'a> {
     pub(crate) expr: &'a Expr,
-    pub(crate) class: &'a Expr,
     pub(crate) name: &'a MemberName,
 }
 
-#[allow(dead_code)]
 pub(crate) struct IndexFact<'a> {
     pub(crate) expr: &'a Expr,
     pub(crate) base: &'a Expr,
     pub(crate) index: Option<&'a Expr>,
 }
 
-#[allow(dead_code)]
 pub(crate) struct BinaryFact<'a> {
     pub(crate) expr: &'a Expr,
     pub(crate) op: BinOp,
@@ -175,63 +133,25 @@ pub(crate) struct BinaryFact<'a> {
     pub(crate) rhs: &'a Expr,
 }
 
-#[allow(dead_code)]
 pub(crate) struct UnaryFact<'a> {
     pub(crate) expr: &'a Expr,
     pub(crate) op: UnOp,
     pub(crate) inner: &'a Expr,
 }
 
-#[allow(dead_code)]
 pub(crate) struct CastFact<'a> {
     pub(crate) expr: &'a Expr,
     pub(crate) kind: CastKind,
     pub(crate) inner: &'a Expr,
 }
 
-#[allow(dead_code)]
-pub(crate) struct IncludeFact<'a> {
-    pub(crate) expr: &'a Expr,
-    pub(crate) kind: IncludeKind,
-    pub(crate) inner: &'a Expr,
-}
-
-#[allow(dead_code)]
-pub(crate) struct ThrowFact<'a> {
-    pub(crate) expr: &'a Expr,
-    pub(crate) inner: &'a Expr,
-}
-
-#[allow(dead_code)]
-pub(crate) struct YieldFact<'a> {
-    pub(crate) expr: &'a Expr,
-    pub(crate) key: Option<&'a Expr>,
-    pub(crate) value: Option<&'a Expr>,
-}
-
-#[allow(dead_code)]
-pub(crate) struct YieldFromFact<'a> {
-    pub(crate) expr: &'a Expr,
-    pub(crate) inner: &'a Expr,
-}
-
-#[allow(dead_code)]
-pub(crate) struct ExitFact<'a> {
-    pub(crate) expr: &'a Expr,
-    pub(crate) inner: Option<&'a Expr>,
-}
-
-#[allow(dead_code)]
 pub(crate) struct PrintFact<'a> {
-    pub(crate) expr: &'a Expr,
     pub(crate) inner: &'a Expr,
 }
 
-#[allow(dead_code)]
 pub(crate) struct ArrayFact<'a> {
     pub(crate) expr: &'a Expr,
     pub(crate) items: &'a [ArrayItem],
-    pub(crate) syntax: ArraySyntax,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,7 +161,6 @@ pub(crate) enum AssignmentKind {
     Ref,
 }
 
-#[allow(dead_code)]
 pub(crate) struct AssignmentFact<'a> {
     pub(crate) expr: &'a Expr,
     pub(crate) kind: AssignmentKind,
@@ -249,80 +168,41 @@ pub(crate) struct AssignmentFact<'a> {
     pub(crate) rhs: &'a Expr,
 }
 
-#[allow(dead_code)]
 pub(crate) struct NewFact<'a> {
     pub(crate) expr: &'a Expr,
-    pub(crate) class: &'a Expr,
     pub(crate) args: &'a [Arg],
 }
 
-#[allow(dead_code)]
 pub(crate) struct CloneFact<'a> {
     pub(crate) expr: &'a Expr,
     pub(crate) inner: &'a Expr,
 }
 
-#[allow(dead_code)]
 pub(crate) struct EchoFact<'a> {
-    pub(crate) stmt: &'a Stmt,
     pub(crate) exprs: &'a [Expr],
 }
 
-#[allow(dead_code)]
-pub(crate) struct ReturnFact<'a> {
-    pub(crate) stmt: &'a Stmt,
-    pub(crate) expr: Option<&'a Expr>,
-}
-
-#[allow(dead_code)]
 pub(crate) struct ForeachFact<'a> {
-    pub(crate) stmt: &'a Stmt,
     pub(crate) subject: &'a Expr,
     pub(crate) key: Option<&'a Expr>,
     pub(crate) value: &'a Expr,
-    pub(crate) by_ref: bool,
-    pub(crate) key_by_ref: bool,
-    pub(crate) body: &'a Stmt,
 }
 
-#[allow(dead_code)]
-pub(crate) struct TryFact<'a> {
-    pub(crate) stmt: &'a Stmt,
-    pub(crate) body: &'a [Stmt],
-    pub(crate) catches: &'a [Catch],
-    pub(crate) finally: Option<&'a [Stmt]>,
-}
-
-#[allow(dead_code)]
-pub(crate) struct CatchFact<'a> {
-    pub(crate) try_stmt: &'a Stmt,
-    pub(crate) catch: &'a Catch,
-}
-
-#[allow(dead_code)]
 pub(crate) struct IssetFact<'a> {
-    pub(crate) expr: &'a Expr,
     pub(crate) vars: &'a [Expr],
 }
 
-#[allow(dead_code)]
 pub(crate) struct EmptyFact<'a> {
-    pub(crate) expr: &'a Expr,
     pub(crate) inner: &'a Expr,
 }
 
-#[allow(dead_code)]
 pub(crate) struct CoalesceFact<'a> {
-    pub(crate) expr: &'a Expr,
     pub(crate) lhs: &'a Expr,
-    pub(crate) rhs: &'a Expr,
 }
 
-#[allow(dead_code)]
 impl<'a> FileFacts<'a> {
     pub fn new(program: &'a Program, interner: &'a Interner) -> Self {
         let mut facts = Self {
-            regions: Vec::new(),
             statements: Vec::new(),
             expressions: Vec::new(),
             functions: Vec::new(),
@@ -336,37 +216,24 @@ impl<'a> FileFacts<'a> {
             scoped_method_calls: Vec::new(),
             static_calls: Vec::new(),
             property_fetches: Vec::new(),
-            static_property_fetches: Vec::new(),
             class_consts: Vec::new(),
             indexes: Vec::new(),
             binaries: Vec::new(),
             unaries: Vec::new(),
             casts: Vec::new(),
-            includes: Vec::new(),
-            throws: Vec::new(),
-            yields: Vec::new(),
-            yield_froms: Vec::new(),
-            exits: Vec::new(),
             prints: Vec::new(),
             arrays: Vec::new(),
             assignments: Vec::new(),
             news: Vec::new(),
             clones: Vec::new(),
             echoes: Vec::new(),
-            returns: Vec::new(),
             foreaches: Vec::new(),
-            tries: Vec::new(),
-            catches: Vec::new(),
             issets: Vec::new(),
             empties: Vec::new(),
             coalesces: Vec::new(),
         };
 
         for_each_region(&program.stmts, interner, |scope, region| {
-            facts.regions.push(RegionFact {
-                scope: scope.clone(),
-                statements: region.iter().collect(),
-            });
             for st in region {
                 facts.collect_decls(interner, scope, st);
                 php_ast::walk::for_each_expr_in_stmt(st, &mut |expr| {
@@ -378,10 +245,6 @@ impl<'a> FileFacts<'a> {
         php_ast::walk::for_each_stmt(program, &mut |stmt| facts.collect_stmt(stmt));
         php_ast::walk::for_each_expr(program, &mut |expr| facts.collect_expr(expr));
         facts
-    }
-
-    pub(crate) fn regions(&self) -> &[RegionFact<'a>] {
-        &self.regions
     }
 
     pub(crate) fn statements(&self) -> &[&'a Stmt] {
@@ -436,10 +299,6 @@ impl<'a> FileFacts<'a> {
         &self.property_fetches
     }
 
-    pub(crate) fn static_property_fetches(&self) -> &[StaticPropertyFetchFact<'a>] {
-        &self.static_property_fetches
-    }
-
     pub(crate) fn class_consts(&self) -> &[ClassConstFact<'a>] {
         &self.class_consts
     }
@@ -458,26 +317,6 @@ impl<'a> FileFacts<'a> {
 
     pub(crate) fn casts(&self) -> &[CastFact<'a>] {
         &self.casts
-    }
-
-    pub(crate) fn includes(&self) -> &[IncludeFact<'a>] {
-        &self.includes
-    }
-
-    pub(crate) fn throws(&self) -> &[ThrowFact<'a>] {
-        &self.throws
-    }
-
-    pub(crate) fn yields(&self) -> &[YieldFact<'a>] {
-        &self.yields
-    }
-
-    pub(crate) fn yield_froms(&self) -> &[YieldFromFact<'a>] {
-        &self.yield_froms
-    }
-
-    pub(crate) fn exits(&self) -> &[ExitFact<'a>] {
-        &self.exits
     }
 
     pub(crate) fn prints(&self) -> &[PrintFact<'a>] {
@@ -504,20 +343,8 @@ impl<'a> FileFacts<'a> {
         &self.echoes
     }
 
-    pub(crate) fn returns(&self) -> &[ReturnFact<'a>] {
-        &self.returns
-    }
-
     pub(crate) fn foreaches(&self) -> &[ForeachFact<'a>] {
         &self.foreaches
-    }
-
-    pub(crate) fn tries(&self) -> &[TryFact<'a>] {
-        &self.tries
-    }
-
-    pub(crate) fn catches(&self) -> &[CatchFact<'a>] {
-        &self.catches
     }
 
     pub(crate) fn issets(&self) -> &[IssetFact<'a>] {
@@ -535,47 +362,17 @@ impl<'a> FileFacts<'a> {
     fn collect_stmt(&mut self, stmt: &'a Stmt) {
         self.statements.push(stmt);
         match &stmt.kind {
-            StmtKind::Echo(exprs) => self.echoes.push(EchoFact { stmt, exprs }),
-            StmtKind::Return(expr) => {
-                self.returns.push(ReturnFact {
-                    stmt,
-                    expr: expr.as_ref(),
-                });
-            }
+            StmtKind::Echo(exprs) => self.echoes.push(EchoFact { exprs }),
             StmtKind::Foreach {
                 subject,
                 key,
                 value,
-                by_ref,
-                key_by_ref,
-                body,
+                ..
             } => self.foreaches.push(ForeachFact {
-                stmt,
                 subject,
                 key: key.as_ref(),
                 value,
-                by_ref: *by_ref,
-                key_by_ref: *key_by_ref,
-                body,
             }),
-            StmtKind::Try {
-                body,
-                catches,
-                finally,
-            } => {
-                self.tries.push(TryFact {
-                    stmt,
-                    body,
-                    catches,
-                    finally: finally.as_deref(),
-                });
-                for catch in catches {
-                    self.catches.push(CatchFact {
-                        try_stmt: stmt,
-                        catch,
-                    });
-                }
-            }
             _ => {}
         }
     }
@@ -624,12 +421,8 @@ impl<'a> FileFacts<'a> {
                     nullsafe: *nullsafe,
                 });
             }
-            ExprKind::StaticProp { class, name } => {
-                self.static_property_fetches
-                    .push(StaticPropertyFetchFact { expr, class, name });
-            }
-            ExprKind::ClassConst { class, name } => {
-                self.class_consts.push(ClassConstFact { expr, class, name });
+            ExprKind::ClassConst { name, .. } => {
+                self.class_consts.push(ClassConstFact { expr, name });
             }
             ExprKind::Index { base, index } => {
                 self.indexes.push(IndexFact {
@@ -660,41 +453,11 @@ impl<'a> FileFacts<'a> {
                     inner,
                 });
             }
-            ExprKind::Include { kind, expr: inner } => {
-                self.includes.push(IncludeFact {
-                    expr,
-                    kind: *kind,
-                    inner,
-                });
-            }
-            ExprKind::Throw(inner) => {
-                self.throws.push(ThrowFact { expr, inner });
-            }
-            ExprKind::Yield { key, value } => {
-                self.yields.push(YieldFact {
-                    expr,
-                    key: key.as_deref(),
-                    value: value.as_deref(),
-                });
-            }
-            ExprKind::YieldFrom(inner) => {
-                self.yield_froms.push(YieldFromFact { expr, inner });
-            }
-            ExprKind::Exit(inner) => {
-                self.exits.push(ExitFact {
-                    expr,
-                    inner: inner.as_deref(),
-                });
-            }
             ExprKind::Print(inner) => {
-                self.prints.push(PrintFact { expr, inner });
+                self.prints.push(PrintFact { inner });
             }
-            ExprKind::Array { items, syntax } => {
-                self.arrays.push(ArrayFact {
-                    expr,
-                    items,
-                    syntax: *syntax,
-                });
+            ExprKind::Array { items, .. } => {
+                self.arrays.push(ArrayFact { expr, items });
             }
             ExprKind::Assign { target, rhs } => {
                 self.assignments.push(AssignmentFact {
@@ -720,20 +483,20 @@ impl<'a> FileFacts<'a> {
                     rhs,
                 });
             }
-            ExprKind::New { class, args } => {
-                self.news.push(NewFact { expr, class, args });
+            ExprKind::New { args, .. } => {
+                self.news.push(NewFact { expr, args });
             }
             ExprKind::Clone(inner) => {
                 self.clones.push(CloneFact { expr, inner });
             }
             ExprKind::Isset(vars) => {
-                self.issets.push(IssetFact { expr, vars });
+                self.issets.push(IssetFact { vars });
             }
             ExprKind::Empty(inner) => {
-                self.empties.push(EmptyFact { expr, inner });
+                self.empties.push(EmptyFact { inner });
             }
-            ExprKind::Coalesce { lhs, rhs } => {
-                self.coalesces.push(CoalesceFact { expr, lhs, rhs });
+            ExprKind::Coalesce { lhs, .. } => {
+                self.coalesces.push(CoalesceFact { lhs });
             }
             _ => {}
         }
@@ -744,7 +507,6 @@ impl<'a> FileFacts<'a> {
             ExprKind::Call { callee, args } => {
                 self.scoped_function_calls.push(ScopedCallFact {
                     scope: scope.clone(),
-                    expr,
                     callee,
                     args,
                 });
@@ -753,15 +515,13 @@ impl<'a> FileFacts<'a> {
                 recv,
                 method,
                 args,
-                nullsafe,
+                ..
             } => {
                 self.scoped_method_calls.push(ScopedMethodCallFact {
                     scope: scope.clone(),
-                    expr,
                     recv,
                     method,
                     args,
-                    nullsafe: *nullsafe,
                 });
             }
             _ => {}
@@ -919,7 +679,6 @@ mod tests {
             class User { public function go(): void { helper(); } }
             "#,
         );
-        assert_eq!(facts.regions()[0].scope.namespace(), Some("App"));
         assert_eq!(facts.functions()[0].scope.namespace(), Some("App"));
         assert_eq!(facts.classes()[0].fqn, "App\\User");
         assert!(facts
@@ -1012,15 +771,7 @@ mod tests {
             .casts()
             .iter()
             .any(|c| matches!(c.kind, php_ast::CastKind::Int)));
-        assert!(facts
-            .includes()
-            .iter()
-            .any(|i| matches!(i.kind, php_ast::IncludeKind::Include)));
-        assert_eq!(facts.throws().len(), 1);
         assert_eq!(facts.prints().len(), 1);
-        assert_eq!(facts.exits().len(), 1);
-        assert_eq!(facts.yields().len(), 1);
-        assert_eq!(facts.yield_froms().len(), 1);
     }
 
     #[test]
@@ -1036,11 +787,5 @@ mod tests {
         assert_eq!(facts.echoes().len(), 4);
         let foreach = facts.foreaches().first().unwrap();
         assert!(foreach.key.is_some());
-        assert!(foreach.by_ref);
-        assert!(!foreach.key_by_ref);
-        assert_eq!(facts.tries().len(), 1);
-        assert_eq!(facts.catches().len(), 1);
-        assert_eq!(facts.tries()[0].catches.len(), 1);
-        assert!(facts.tries()[0].finally.is_some());
     }
 }

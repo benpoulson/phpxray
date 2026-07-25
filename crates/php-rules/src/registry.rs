@@ -286,30 +286,6 @@ pub struct LocatedRuleEntry {
     pub run: fn(&FileAnalysis) -> Vec<LocatedDiagnostic>,
 }
 
-/// Coarse input families used by the internal rule scheduler. V2 keeps rule
-/// execution order stable, but recording the input shape makes the next
-/// node-dispatch/caching step mechanical.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum RuleInputKind {
-    Declarations,
-    Expressions,
-    ScopedCalls,
-    TypeMapSensitive,
-    LocalBodyFlow,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct ScheduledRule {
-    pub(crate) input: RuleInputKind,
-    pub(crate) rule: &'static RuleEntry,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct ScheduledLocatedRule {
-    pub(crate) input: RuleInputKind,
-    pub(crate) rule: &'static LocatedRuleEntry,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum FactKind {
     FunctionCall,
@@ -448,77 +424,6 @@ fn fact_rule_for_name(name: &str, level: u8) -> Option<&'static FactRuleEntry> {
         .find(|r| r.name == name && r.level <= level)
 }
 
-/// Scheduled ordinary rules, preserving the registry's diagnostic order.
-pub(crate) fn scheduled_rules_for_level(level: u8) -> Vec<ScheduledRule> {
-    rules_for_level(level)
-        .map(|rule| ScheduledRule {
-            input: classify_rule_input(rule.name),
-            rule,
-        })
-        .collect()
-}
-
-/// Scheduled located rules, preserving the located registry's diagnostic order.
-pub(crate) fn scheduled_located_rules_for_level(level: u8) -> Vec<ScheduledLocatedRule> {
-    located_rules_for_level(level)
-        .map(|rule| ScheduledLocatedRule {
-            input: classify_located_rule_input(rule.name),
-            rule,
-        })
-        .collect()
-}
-
-fn classify_located_rule_input(_name: &str) -> RuleInputKind {
-    RuleInputKind::ScopedCalls
-}
-
-fn classify_rule_input(name: &str) -> RuleInputKind {
-    if name == "unknown-symbol"
-        || name.starts_with("class.")
-        || name.starts_with("method.")
-        || name.starts_with("property.")
-        || name.starts_with("constant.")
-        || name.starts_with("enumCase.")
-        || name.starts_with("trait.")
-        || name.starts_with("namespace.")
-        || name.starts_with("name.")
-        || name.starts_with("phpdoc.")
-        || name.starts_with("generics.")
-        || name.starts_with("missing.")
-        || name.starts_with("pure.")
-    {
-        return RuleInputKind::Declarations;
-    }
-
-    if name == "return-type"
-        || name.starts_with("deadCode.")
-        || name.starts_with("variables.defined")
-        || name.starts_with("variables.maybeUndefined")
-        || name.contains("paramOut")
-        || name.contains("tooWide")
-        || name.contains("missingReturn")
-    {
-        return RuleInputKind::LocalBodyFlow;
-    }
-
-    if name.contains("argument")
-        || name.contains("type")
-        || name.contains("Type")
-        || name.contains("nullable")
-        || name.contains("union")
-        || name.contains("assign")
-        || name.contains("access")
-        || name.contains("call")
-        || name.contains("clone")
-        || name.contains("iterable")
-        || name.contains("mixed")
-    {
-        return RuleInputKind::TypeMapSensitive;
-    }
-
-    RuleInputKind::Expressions
-}
-
 /// Run every rule active at `level` over one file and collect the diagnostics.
 /// Pure over `fa` + the borrowed indexes — the engine's parallelizable unit.
 pub fn analyze_file(fa: &FileAnalysis, level: u8) -> Vec<Diagnostic> {
@@ -531,17 +436,18 @@ pub fn analyze_file(fa: &FileAnalysis, level: u8) -> Vec<Diagnostic> {
 /// Run every rule active at `level`, preserving path-aware diagnostics for the
 /// rules that can analyze context-specific bodies outside the current file.
 pub fn analyze_file_located(fa: &FileAnalysis, level: u8) -> Vec<LocatedDiagnostic> {
-    let scheduled = scheduled_rules_for_level(level);
-    let mut slots: Vec<Vec<Diagnostic>> = vec![Vec::new(); scheduled.len()];
+    // One slot per rule, filled in registry order so diagnostic order is stable
+    // regardless of which dispatch path a rule takes.
+    let active: Vec<&'static RuleEntry> = rules_for_level(level).collect();
+    let mut slots: Vec<Vec<Diagnostic>> = vec![Vec::new(); active.len()];
     let mut fact_rules: Vec<(usize, &'static FactRuleEntry)> = Vec::new();
 
-    for (idx, scheduled) in scheduled.iter().enumerate() {
-        if let Some(fact_rule) = fact_rule_for_name(scheduled.rule.name, level) {
+    for (idx, rule) in active.iter().enumerate() {
+        if let Some(fact_rule) = fact_rule_for_name(rule.name, level) {
             debug_assert_eq!(fact_rule.kind, fact_rule.handler.kind());
             fact_rules.push((idx, fact_rule));
         } else {
-            let _input = scheduled.input;
-            slots[idx].extend((scheduled.rule.run)(fa));
+            slots[idx].extend((rule.run)(fa));
         }
     }
 
@@ -552,9 +458,8 @@ pub fn analyze_file_located(fa: &FileAnalysis, level: u8) -> Vec<LocatedDiagnost
         .flatten()
         .map(LocatedDiagnostic::local)
         .collect();
-    for scheduled in scheduled_located_rules_for_level(level) {
-        let _input = scheduled.input;
-        out.extend((scheduled.rule.run)(fa));
+    for rule in located_rules_for_level(level) {
+        out.extend((rule.run)(fa));
     }
     out
 }
@@ -795,32 +700,6 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_preserves_order_and_records_input_kinds() {
-        let raw: Vec<_> = rules_for_level(10).map(|r| r.name).collect();
-        let scheduled = scheduled_rules_for_level(10);
-        let scheduled_names: Vec<_> = scheduled.iter().map(|r| r.rule.name).collect();
-        assert_eq!(scheduled_names, raw);
-        assert!(scheduled
-            .iter()
-            .any(|r| r.input == RuleInputKind::Declarations));
-        assert!(scheduled
-            .iter()
-            .any(|r| r.input == RuleInputKind::Expressions));
-        assert!(scheduled
-            .iter()
-            .any(|r| r.input == RuleInputKind::TypeMapSensitive));
-        assert!(scheduled
-            .iter()
-            .any(|r| r.input == RuleInputKind::LocalBodyFlow));
-
-        let located = scheduled_located_rules_for_level(10);
-        assert!(!located.is_empty());
-        assert!(located
-            .iter()
-            .all(|r| r.input == RuleInputKind::ScopedCalls));
-    }
-
-    #[test]
     fn fact_rules_are_registry_compatible_and_scheduled_in_registry_order() {
         let registry: Vec<_> = rules_for_level(10).map(|r| r.name).collect();
         for fact_rule in crate::rules::FACT_CATEGORY_RULES
@@ -833,13 +712,26 @@ mod tests {
                 fact_rule.name
             );
             assert_eq!(fact_rule.kind, fact_rule.handler.kind());
+            // A fact rule declares its level TWICE — once on its `RuleEntry`,
+            // once on its `FactRuleEntry` — and the dispatcher joins them by
+            // name. If the two disagree, the rule runs at one level and is
+            // dispatched at another: it silently vanishes below the higher level
+            // or fires below the lower one. Nothing but this assertion catches it.
+            let entry = crate::rules::CATEGORY_RULES
+                .iter()
+                .flat_map(|cat| cat.iter())
+                .find(|r| r.name == fact_rule.name)
+                .expect("checked above");
+            assert_eq!(
+                entry.level, fact_rule.level,
+                "fact rule {} is registered at level {} but dispatched at level {}",
+                fact_rule.name, entry.level, fact_rule.level
+            );
         }
 
-        let scheduled = scheduled_rules_for_level(10);
-        let dispatched_names: Vec<_> = scheduled
-            .iter()
-            .filter(|scheduled| fact_rule_for_name(scheduled.rule.name, 10).is_some())
-            .map(|scheduled| scheduled.rule.name)
+        let dispatched_names: Vec<_> = rules_for_level(10)
+            .filter(|rule| fact_rule_for_name(rule.name, 10).is_some())
+            .map(|rule| rule.name)
             .collect();
         let registry_filtered: Vec<_> = registry
             .into_iter()
