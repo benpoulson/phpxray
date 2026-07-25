@@ -110,7 +110,10 @@ fn renderable_in(ty: &Type, container_mixed: bool, in_container: bool) -> bool {
 fn plain_shape_key(key: &str) -> bool {
     !key.is_empty()
         && (key.chars().all(|c| c.is_ascii_digit())
-            || (key.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            || (key
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
                 && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')))
 }
 
@@ -159,7 +162,8 @@ pub(crate) fn doc_anchor(
     // — skip rather than splice a docblock mid-statement.
     let rest = line_prefix[indent_len..].trim_end();
     let decl_prefix = rest.chars().all(|c| {
-        c.is_ascii_alphanumeric() || matches!(c, '_' | '\\' | '|' | '&' | '?' | '(' | ')' | ' ' | '\t')
+        c.is_ascii_alphanumeric()
+            || matches!(c, '_' | '\\' | '|' | '&' | '?' | '(' | ')' | ' ' | '\t')
     });
     if !(decl_prefix || rest == "#[") {
         return None;
@@ -523,7 +527,9 @@ pub(crate) fn return_narrowing_fix(
     let type_start = doc_span.start as usize + tag_off + "@return".len() + ws;
     let rest_of_line = operand[consumed..].split(['\n', '\r']).next().unwrap_or("");
     let only_type_on_line = rest_of_line.trim_start_matches([' ', '\t']).is_empty()
-        || rest_of_line.trim_start_matches([' ', '\t']).starts_with("*/");
+        || rest_of_line
+            .trim_start_matches([' ', '\t'])
+            .starts_with("*/");
     let multi_line = doc_text.contains('\n');
     if union == *native && multi_line && only_type_on_line && !rest_of_line.contains("*/") {
         // The tag would just restate the native hint: delete its whole line,
@@ -541,10 +547,14 @@ pub(crate) fn return_narrowing_fix(
             .unwrap_or(doc_text.len());
         // When the tag was the last content — next line closes the block —
         // absorb a now-dangling blank ` * ` separator line above it.
-        if doc_text[line_end..].trim_start_matches([' ', '\t']).starts_with("*/") {
+        if doc_text[line_end..]
+            .trim_start_matches([' ', '\t'])
+            .starts_with("*/")
+        {
             if let Some(prev_nl) = doc_text[..line_start.saturating_sub(1)].rfind('\n') {
                 let prev_line = &doc_text[prev_nl + 1..line_start - 1];
-                let bare_star = prev_line.trim_matches([' ', '\t']) == "*";
+                // '\r' too: in a CRLF file the previous line carries it.
+                let bare_star = prev_line.trim_matches([' ', '\t', '\r']) == "*";
                 if bare_star {
                     line_start = prev_nl + 1;
                 }
@@ -624,9 +634,7 @@ pub(crate) fn var_generic_completion_fix(
     let Type::Named { fqn, args } = &rhs_ty else {
         return None;
     };
-    if args.is_empty()
-        || !crate::missing_type::check_type(fa.reflection, &rhs_ty).is_empty()
-    {
+    if args.is_empty() || !crate::missing_type::check_type(fa.reflection, &rhs_ty).is_empty() {
         return None;
     }
     let written_fqn = match scope.resolve_class(&crate::missing_type::name_from_doc(written)) {
@@ -703,10 +711,7 @@ pub(crate) fn closure_use_removal_fix(
         let at = search + rel;
         search = at + 3;
         // Keyword boundary on both sides.
-        if at > 0
-            && text.as_bytes()[at - 1]
-                .is_ascii_alphanumeric()
-        {
+        if at > 0 && text.as_bytes()[at - 1].is_ascii_alphanumeric() {
             continue;
         }
         let after = &text[at + 3..];
@@ -734,8 +739,7 @@ pub(crate) fn closure_use_removal_fix(
                 None => (false, trimmed),
             };
             match (rest.strip_prefix('$'), expected.get(i)) {
-                (Some(name), Some((want, want_ref)))
-                    if name == want && by_ref == *want_ref => {}
+                (Some(name), Some((want, want_ref))) if name == want && by_ref == *want_ref => {}
                 _ => {
                     ok = false;
                     break;
@@ -845,14 +849,18 @@ fn own_write_evidence(
     }
     let mut bail = false;
     for m in &c.members {
-        let php_ast::Member::Method(md) = m else { continue };
+        let php_ast::Member::Method(md) = m else {
+            continue;
+        };
         let Some(body) = &md.body else { continue };
         for st in body {
             crate::walk::for_each_stmt_in_stmt(st, &mut |s| {
                 // A foreach key/value target is a write we don't type.
                 if let php_ast::StmtKind::Foreach { key, value, .. } = &s.kind {
                     if contains_prop(value, elem.name, fa)
-                        || key.as_ref().is_some_and(|k| contains_prop(k, elem.name, fa))
+                        || key
+                            .as_ref()
+                            .is_some_and(|k| contains_prop(k, elem.name, fa))
                     {
                         bail = true;
                     }
@@ -943,11 +951,7 @@ pub(crate) fn inherited_property_type(
 /// with a write-shaped use of `$this->{name}`. Unknown non-builtin ancestors
 /// count as writes (can't verify). Bodies share the run-wide interner, so the
 /// `Symbol` compares across files.
-fn ancestors_write_property(
-    fa: &FileAnalysis,
-    class_fqn: &str,
-    name: php_intern::Symbol,
-) -> bool {
+fn ancestors_write_property(fa: &FileAnalysis, class_fqn: &str, name: php_intern::Symbol) -> bool {
     let Some(start) = fa.reflection.class(class_fqn) else {
         return true;
     };
@@ -967,9 +971,10 @@ fn ancestors_write_property(
         // An ancestor that declares its own *private* property of this name
         // has a separate per-class slot — its `$this->{name}` accesses can
         // never touch the child's property.
-        let shadowed_private = cr.properties.iter().any(|p| {
-            p.name == prop_str && p.visibility == php_ast::Visibility::Private
-        });
+        let shadowed_private = cr
+            .properties
+            .iter()
+            .any(|p| p.name == prop_str && p.visibility == php_ast::Visibility::Private);
         if !shadowed_private {
             for m in &cr.methods {
                 if m.magic {
@@ -1056,10 +1061,9 @@ fn stmt_writes_prop(
         } => {
             for (idx, arg) in args.iter().enumerate() {
                 if !arg.spread && is_this_prop(&arg.value, name, fa) {
-                    let known_safe = static_class_fqn(scope, class, class_fqn)
-                        .is_some_and(|fqn| {
-                            method_param_not_by_ref(fa, &fqn, fa.interner.resolve(*m), idx)
-                        });
+                    let known_safe = static_class_fqn(scope, class, class_fqn).is_some_and(|fqn| {
+                        method_param_not_by_ref(fa, &fqn, fa.interner.resolve(*m), idx)
+                    });
                     if !known_safe {
                         found = true;
                     }
@@ -1149,12 +1153,13 @@ impl Evidence {
         let mut types = self.types;
         if self.empty_array_literals > 0 {
             // Subsumed only when every other member already accepts `[]`.
-            let all_iterable = !types.is_empty() && types.iter().all(|t| {
-                matches!(
-                    t,
-                    Type::Array(_) | Type::List(_) | Type::Iterable(_) | Type::Shape { .. }
-                )
-            });
+            let all_iterable = !types.is_empty()
+                && types.iter().all(|t| {
+                    matches!(
+                        t,
+                        Type::Array(_) | Type::List(_) | Type::Iterable(_) | Type::Shape { .. }
+                    )
+                });
             if !all_iterable {
                 types.push(Type::Array(None));
             }
@@ -1472,8 +1477,7 @@ mod tests {
     fn anchors_on_the_declaration_line() {
         let src = "<?php\nclass C {\n    public function f() {}\n}\n";
         let name_at = src.find("f()").unwrap() as u32;
-        let (anchor, indent) =
-            doc_anchor(src, Span::new(name_at, name_at + 1), None).unwrap();
+        let (anchor, indent) = doc_anchor(src, Span::new(name_at, name_at + 1), None).unwrap();
         let line_start = src.find("    public").unwrap() as u32;
         assert_eq!(anchor, FixAnchor::NewDocAt(line_start));
         assert_eq!(indent, "    ");
@@ -1486,7 +1490,10 @@ mod tests {
         let (anchor, indent) =
             doc_anchor(src, Span::new(name_at, name_at + 1), Some("/** hi */")).unwrap();
         let doc_at = src.find("/** hi */").unwrap() as u32;
-        assert_eq!(anchor, FixAnchor::ExistingDoc(Span::new(doc_at, doc_at + 9)));
+        assert_eq!(
+            anchor,
+            FixAnchor::ExistingDoc(Span::new(doc_at, doc_at + 9))
+        );
         assert_eq!(indent, "\t");
     }
 
@@ -1498,7 +1505,10 @@ mod tests {
         let (anchor, indent) =
             doc_anchor(src, Span::new(attr_at, attr_at + 4), Some("/** d */")).unwrap();
         let doc_at = src.find("/** d */").unwrap() as u32;
-        assert_eq!(anchor, FixAnchor::ExistingDoc(Span::new(doc_at, doc_at + 8)));
+        assert_eq!(
+            anchor,
+            FixAnchor::ExistingDoc(Span::new(doc_at, doc_at + 8))
+        );
         assert_eq!(indent, "    ");
         // And with no doc, the new block goes above the attribute line.
         let (anchor, _) = doc_anchor(src, Span::new(attr_at, attr_at + 4), None).unwrap();

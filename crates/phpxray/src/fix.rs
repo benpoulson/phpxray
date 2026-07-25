@@ -48,7 +48,9 @@ pub fn apply_fixes(
     for path in paths {
         let fixes = &by_file[*path];
         let Some(analyzed) = sources.get(*path) else {
-            summary.files_skipped.push(((*path).to_string(), "source not retained"));
+            summary
+                .files_skipped
+                .push(((*path).to_string(), "source not retained"));
             continue;
         };
         let abs = root.join(*path);
@@ -64,7 +66,9 @@ pub fn apply_fixes(
                 continue;
             }
             Err(_) => {
-                summary.files_skipped.push(((*path).to_string(), "unreadable"));
+                summary
+                    .files_skipped
+                    .push(((*path).to_string(), "unreadable"));
                 continue;
             }
         }
@@ -75,7 +79,9 @@ pub fn apply_fixes(
             continue;
         };
         if std::fs::write(&abs, &rewritten).is_err() {
-            summary.files_skipped.push(((*path).to_string(), "write failed"));
+            summary
+                .files_skipped
+                .push(((*path).to_string(), "write failed"));
             continue;
         }
         summary.findings_fixed += fixes.len();
@@ -88,7 +94,11 @@ pub fn apply_fixes(
 /// Apply `fixes` to one file's source. Pure; `None` when any materialized edits
 /// would overlap (apply nothing for the file rather than guess).
 pub(crate) fn apply_to_source(source: &str, fixes: &[&Fix]) -> Option<String> {
-    let eol = if source.contains("\r\n") { "\r\n" } else { "\n" };
+    let eol = if source.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
 
     // Group doc-tag fixes by anchor; each group becomes one edit. Keyed on the
     // anchor's byte position; the group keeps the first-seen anchor/indent.
@@ -100,12 +110,10 @@ pub(crate) fn apply_to_source(source: &str, fixes: &[&Fix]) -> Option<String> {
     let mut replaces: Vec<&php_diagnostics::ReplaceFix> = Vec::new();
     for fix in fixes {
         match fix {
-            Fix::DocTag(fix) => {
-                match groups.iter_mut().find(|(g, _)| g.anchor == fix.anchor) {
-                    Some((_, members)) => members.push(fix),
-                    None => groups.push((fix, vec![fix])),
-                }
-            }
+            Fix::DocTag(fix) => match groups.iter_mut().find(|(g, _)| g.anchor == fix.anchor) {
+                Some((_, members)) => members.push(fix),
+                None => groups.push((fix, vec![fix])),
+            },
             Fix::Replace(r) => {
                 if !replaces.contains(&r) {
                     replaces.push(r);
@@ -173,10 +181,14 @@ fn insert_tags_into_doc(doc: &str, tags: &[&str], indent: &str, eol: &str) -> Op
     if !doc.starts_with("/**") || !doc.ends_with("*/") {
         return None;
     }
-    if let Some((before_close, _)) = doc.rsplit_once('\n') {
+    if let Some((before_close, close_line)) = doc.rsplit_once('\n') {
         // Multi-line: re-use the closing line's leading whitespace for the new
         // tag lines (it aligns the existing ` * ` column, tabs included).
-        let close_line = &doc[before_close.len() + 1..];
+        //
+        // Splitting on the bare LF leaves the CR on the left half in a CRLF
+        // file; appending `eol` (`"\r\n"`) there would write `\r\r\n`.
+        let before_close = before_close.strip_suffix('\r').unwrap_or(before_close);
+
         let close_ws = &close_line[..close_line.len() - close_line.trim_start().len()];
         let mut out = String::with_capacity(doc.len() + tags.len() * 32);
         out.push_str(before_close);
@@ -223,7 +235,12 @@ mod tests {
     fn single_tag_inserts_single_line_block() {
         let src = "<?php\nclass C {\n    public function f() {}\n}\n";
         let off = src.find("    public").unwrap() as u32;
-        let f = fix(FixAnchor::NewDocAt(off), DocTagKind::Return, "@return int", "    ");
+        let f = fix(
+            FixAnchor::NewDocAt(off),
+            DocTagKind::Return,
+            "@return int",
+            "    ",
+        );
         let out = apply_to_source(src, &[&f]).unwrap();
         assert_eq!(
             out,
@@ -236,9 +253,24 @@ mod tests {
         let src = "<?php\nclass C {\n    public function f($a, $b) {}\n}\n";
         let off = src.find("    public").unwrap() as u32;
         // Deliberately emitted out of order: return first, then params.
-        let r = fix(FixAnchor::NewDocAt(off), DocTagKind::Return, "@return int", "    ");
-        let a = fix(FixAnchor::NewDocAt(off), DocTagKind::Param, "@param string $a", "    ");
-        let b = fix(FixAnchor::NewDocAt(off), DocTagKind::Param, "@param bool $b", "    ");
+        let r = fix(
+            FixAnchor::NewDocAt(off),
+            DocTagKind::Return,
+            "@return int",
+            "    ",
+        );
+        let a = fix(
+            FixAnchor::NewDocAt(off),
+            DocTagKind::Param,
+            "@param string $a",
+            "    ",
+        );
+        let b = fix(
+            FixAnchor::NewDocAt(off),
+            DocTagKind::Param,
+            "@param bool $b",
+            "    ",
+        );
         let out = apply_to_source(src, &[&r, &a, &b]).unwrap();
         assert_eq!(
             out,
@@ -285,7 +317,12 @@ mod tests {
     fn tab_indentation_is_preserved() {
         let src = "<?php\nclass C {\n\tpublic function f() {}\n}\n";
         let off = src.find("\tpublic").unwrap() as u32;
-        let f = fix(FixAnchor::NewDocAt(off), DocTagKind::Return, "@return int", "\t");
+        let f = fix(
+            FixAnchor::NewDocAt(off),
+            DocTagKind::Return,
+            "@return int",
+            "\t",
+        );
         let out = apply_to_source(src, &[&f]).unwrap();
         assert_eq!(
             out,
@@ -297,9 +334,55 @@ mod tests {
     fn crlf_files_get_crlf_blocks() {
         let src = "<?php\r\nfunction f() {}\r\n";
         let off = src.find("function").unwrap() as u32;
-        let f = fix(FixAnchor::NewDocAt(off), DocTagKind::Return, "@return int", "");
+        let f = fix(
+            FixAnchor::NewDocAt(off),
+            DocTagKind::Return,
+            "@return int",
+            "",
+        );
         let out = apply_to_source(src, &[&f]).unwrap();
         assert_eq!(out, "<?php\r\n/** @return int */\r\nfunction f() {}\r\n");
+    }
+
+    /// Regression: `insert_tags_into_doc` split the existing block on the bare
+    /// LF, so the left half kept its CR and appending `eol` wrote `\r\r\n`.
+    #[test]
+    fn crlf_existing_multiline_doc_keeps_crlf() {
+        let src = "<?php\r\n/**\r\n * Does a thing.\r\n */\r\nfunction f() {}\r\n";
+        let doc_start = src.find("/**").unwrap() as u32;
+        let doc_end = src.find("*/").unwrap() as u32 + 2;
+        let f = fix(
+            FixAnchor::ExistingDoc(php_span::Span::new(doc_start, doc_end)),
+            DocTagKind::Return,
+            "@return int",
+            "",
+        );
+        let out = apply_to_source(src, &[&f]).unwrap();
+        assert!(!out.contains("\r\r"), "wrote a doubled CR: {out:?}");
+        assert_eq!(
+            out,
+            "<?php\r\n/**\r\n * Does a thing.\r\n * @return int\r\n */\r\nfunction f() {}\r\n"
+        );
+    }
+
+    /// The single-line `/** body */` expansion path under CRLF.
+    #[test]
+    fn crlf_single_line_doc_expands_with_crlf() {
+        let src = "<?php\r\n/** Does a thing. */\r\nfunction f() {}\r\n";
+        let doc_start = src.find("/**").unwrap() as u32;
+        let doc_end = src.find("*/").unwrap() as u32 + 2;
+        let f = fix(
+            FixAnchor::ExistingDoc(php_span::Span::new(doc_start, doc_end)),
+            DocTagKind::Return,
+            "@return int",
+            "",
+        );
+        let out = apply_to_source(src, &[&f]).unwrap();
+        assert!(!out.contains("\r\r"), "wrote a doubled CR: {out:?}");
+        assert_eq!(
+            out,
+            "<?php\r\n/**\r\n * Does a thing.\r\n * @return int\r\n */\r\nfunction f() {}\r\n"
+        );
     }
 
     #[test]
@@ -307,8 +390,18 @@ mod tests {
         let src = "<?php\nfunction a() {}\nfunction b() {}\n";
         let a_off = src.find("function a").unwrap() as u32;
         let b_off = src.find("function b").unwrap() as u32;
-        let fa = fix(FixAnchor::NewDocAt(a_off), DocTagKind::Return, "@return int", "");
-        let fb = fix(FixAnchor::NewDocAt(b_off), DocTagKind::Return, "@return bool", "");
+        let fa = fix(
+            FixAnchor::NewDocAt(a_off),
+            DocTagKind::Return,
+            "@return int",
+            "",
+        );
+        let fb = fix(
+            FixAnchor::NewDocAt(b_off),
+            DocTagKind::Return,
+            "@return bool",
+            "",
+        );
         let out = apply_to_source(src, &[&fa, &fb]).unwrap();
         assert_eq!(
             out,
@@ -377,7 +470,12 @@ mod tests {
         let at = src.find("true").unwrap() as u32;
         let r = replace(at, at + 4, "bool");
         let g_off = src.find("function g").unwrap() as u32;
-        let d = fix(FixAnchor::NewDocAt(g_off), DocTagKind::Return, "@return void", "");
+        let d = fix(
+            FixAnchor::NewDocAt(g_off),
+            DocTagKind::Return,
+            "@return void",
+            "",
+        );
         let out = apply_to_source(src, &[&r, &d]).unwrap();
         assert_eq!(
             out,
@@ -389,8 +487,18 @@ mod tests {
     fn duplicate_tags_for_one_anchor_dedup() {
         let src = "<?php\nfunction f() {}\n";
         let off = src.find("function").unwrap() as u32;
-        let f1 = fix(FixAnchor::NewDocAt(off), DocTagKind::Return, "@return int", "");
-        let f2 = fix(FixAnchor::NewDocAt(off), DocTagKind::Return, "@return int", "");
+        let f1 = fix(
+            FixAnchor::NewDocAt(off),
+            DocTagKind::Return,
+            "@return int",
+            "",
+        );
+        let f2 = fix(
+            FixAnchor::NewDocAt(off),
+            DocTagKind::Return,
+            "@return int",
+            "",
+        );
         let out = apply_to_source(src, &[&f1, &f2]).unwrap();
         assert_eq!(out, "<?php\n/** @return int */\nfunction f() {}\n");
     }
