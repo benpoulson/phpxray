@@ -404,7 +404,10 @@ impl TypeCtx<'_> {
             ExprKind::Call { callee, args } => {
                 if let ExprKind::Name(n) = &callee.kind {
                     let fname = last_segment(&n.text).to_ascii_lowercase();
-                    if let Some(arg0) = args.first() {
+                    // A userland function shadowing a builtin name says nothing
+                    // about its argument's type.
+                    let builtin = self.narrows_as_builtin(n);
+                    if let Some(arg0) = args.first().filter(|_| builtin) {
                         if let Some(place) = self.place_key(&arg0.value) {
                             if truthy {
                                 if let Some(t) = predicate_type(&fname) {
@@ -426,7 +429,9 @@ impl TypeCtx<'_> {
                             }
                         }
                     }
-                    self.builtin_specifier_facts(&fname, args, truthy, out);
+                    if builtin {
+                        self.builtin_specifier_facts(&fname, args, truthy, out);
+                    }
                     self.assert_facts_fn(n, args, Some(truthy), out);
                 }
             }
@@ -476,13 +481,41 @@ impl TypeCtx<'_> {
     // (IfTrue/IfFalse gate on the branch, Always applies to both); `None` is
     // the statement path, where only Always applies.
 
-    fn assert_facts_fn(
-        &self,
-        n: &Name,
-        args: &[Arg],
-        truthy: Option<bool>,
-        out: &mut Vec<Fact>,
-    ) {
+    /// May a call to `n` be narrowed as the **global builtin** of that name?
+    ///
+    /// PHP's unqualified-function fallback means a namespaced
+    /// `function is_int(): bool` shadows the global one for unqualified calls in
+    /// that namespace, with entirely different semantics — narrowing on it would
+    /// be unsound (the contract in this module's header: never over-narrow). A
+    /// fully-qualified `\is_int` always resolves to the builtin. A name that
+    /// resolves to nothing stays permissive: an incomplete index must not
+    /// silently switch narrowing off. Same posture as `apply_preg_match_out` /
+    /// `rec_builtin_callback_args`, which already guarded this way.
+    fn narrows_as_builtin(&self, n: &Name) -> bool {
+        !self.function_reflection(n).is_some_and(|f| !f.builtin)
+    }
+
+    /// The sole argument of a `count($x)` / `sizeof($x)` call, when it is the
+    /// global builtin (a userland `count()` proves nothing about emptiness).
+    fn count_call_arg<'e>(&self, e: &'e Expr) -> Option<&'e Expr> {
+        let ExprKind::Call { callee, args } = &peel_paren(e).kind else {
+            return None;
+        };
+        let ExprKind::Name(n) = &callee.kind else {
+            return None;
+        };
+        let last = n.text.rsplit('\\').next().unwrap_or(&n.text);
+        if !last.eq_ignore_ascii_case("count") && !last.eq_ignore_ascii_case("sizeof") {
+            return None;
+        }
+        if !self.narrows_as_builtin(n) {
+            return None;
+        }
+        let arg = args.first()?;
+        (!arg.spread && !arg.placeholder && arg.name.is_none()).then_some(&arg.value)
+    }
+
+    fn assert_facts_fn(&self, n: &Name, args: &[Arg], truthy: Option<bool>, out: &mut Vec<Fact>) {
         let Some(f) = self.function_reflection(n) else {
             return;
         };
@@ -612,6 +645,9 @@ impl TypeCtx<'_> {
         let ExprKind::Name(n) = &callee.kind else {
             return;
         };
+        if !self.narrows_as_builtin(n) {
+            return;
+        }
         let fname = last_segment(&n.text).to_ascii_lowercase();
         let Some(arg0) = args.first() else { return };
         let Some(place) = self.place_key(&arg0.value) else {
@@ -863,7 +899,7 @@ impl TypeCtx<'_> {
         } else {
             return;
         };
-        let Some(arg) = count_call_arg(call) else {
+        let Some(arg) = self.count_call_arg(call) else {
             return;
         };
         let Some(place) = self.place_key(arg) else {
@@ -890,7 +926,7 @@ impl TypeCtx<'_> {
         } else {
             return;
         };
-        let Some(arg) = count_call_arg(call) else {
+        let Some(arg) = self.count_call_arg(call) else {
             return;
         };
         let Some(place) = self.place_key(arg) else {
@@ -1892,7 +1928,7 @@ impl TypeCtx<'_> {
         let ExprKind::Name(n) = &callee.kind else {
             return;
         };
-        if !last_segment(&n.text).eq_ignore_ascii_case("assert") {
+        if !last_segment(&n.text).eq_ignore_ascii_case("assert") || !self.narrows_as_builtin(n) {
             return;
         }
         let Some(cond) = args.first() else { return };
@@ -2671,22 +2707,6 @@ fn type_may_be_object(t: &Type) -> bool {
         Type::Union(ms) => ms.iter().any(type_may_be_object),
         _ => true,
     }
-}
-
-/// The counted argument of a `count($x)`/`sizeof($x)` call expression.
-fn count_call_arg(e: &Expr) -> Option<&Expr> {
-    let ExprKind::Call { callee, args } = &peel_paren(e).kind else {
-        return None;
-    };
-    let ExprKind::Name(n) = &callee.kind else {
-        return None;
-    };
-    let last = n.text.rsplit('\\').next().unwrap_or(&n.text);
-    if !last.eq_ignore_ascii_case("count") && !last.eq_ignore_ascii_case("sizeof") {
-        return None;
-    }
-    let arg = args.first()?;
-    (!arg.spread && !arg.placeholder && arg.name.is_none()).then_some(&arg.value)
 }
 
 fn expr_is_true(e: &Expr) -> bool {

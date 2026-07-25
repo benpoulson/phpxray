@@ -1841,4 +1841,79 @@ mod tests {
         "#;
         assert_eq!(ty_of_last_method(src, "getBoundary"), "string");
     }
+
+    /// The type recorded for the *last* `$name` read in `src`.
+    fn last_var(src: &str, name: &str) -> String {
+        let r = php_parser::parse(src);
+        assert!(!r.has_errors(), "parse errors: {src}");
+        let mut reflection = ReflectionIndex::with_builtins();
+        reflection.add_file(&r.program, &r.interner);
+        let map = type_map(&reflection, &r.program, &r.interner, false);
+        let mut found = "<not found>".to_string();
+        walk::for_each_expr(&r.program, &mut |e| {
+            if matches!(&e.kind, ExprKind::Variable(s) if r.interner.resolve(*s) == name) {
+                found = map
+                    .get(&key(e.span))
+                    .map(|f| f.merged.to_string())
+                    .unwrap_or_else(|| "<unmapped>".into());
+            }
+        });
+        found
+    }
+
+    /// Regression: `is_*`/`in_array`/`count`/`get_class`/`assert` narrowing
+    /// matched the bare last name segment, so a namespaced userland function
+    /// shadowing a builtin narrowed with the builtin's semantics — unsound, and
+    /// a false-positive source downstream.
+    #[test]
+    fn userland_shadow_of_a_builtin_does_not_narrow() {
+        // Unqualified call in a namespace with no shadow: narrows (PHP's
+        // global-function fallback resolves to the builtin).
+        assert_eq!(
+            last_var(
+                "<?php namespace App; function f(int|string $v) { if (is_int($v)) { echo $v; } }",
+                "v"
+            ),
+            "int"
+        );
+        // A namespaced userland `is_int` shadows the global for unqualified
+        // calls in that namespace — it proves nothing about `$v`.
+        assert_eq!(
+            last_var(
+                "<?php namespace App; function is_int($x) { return true; } \
+                 function f(int|string $v) { if (is_int($v)) { echo $v; } }",
+                "v"
+            ),
+            "int|string"
+        );
+        // A fully-qualified call always reaches the builtin, shadow or not.
+        assert_eq!(
+            last_var(
+                "<?php namespace App; function is_int($x) { return true; } \
+                 function f(int|string $v) { if (\\is_int($v)) { echo $v; } }",
+                "v"
+            ),
+            "int"
+        );
+    }
+
+    /// The same guard on the non-`is_*` specifiers.
+    #[test]
+    fn userland_shadow_of_count_does_not_narrow() {
+        assert_eq!(
+            last_var(
+                "<?php namespace App; function g(array $a) { if (count($a) > 0) { echo $a; } }",
+                "a"
+            ),
+            "non-empty-array"
+        );
+        assert_eq!(
+            last_var(
+                "<?php namespace App; function count($x) { return 0; } \
+                 function g(array $a) { if (count($a) > 0) { echo $a; } }",
+                "a"
+            ),
+            "array"
+        );
+    }
 }
