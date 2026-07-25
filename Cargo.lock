@@ -1107,6 +1107,7 @@ name = "php-rules"
 version = "0.1.0"
 dependencies = [
  "php-ast",
+ "php-config",
  "php-diagnostics",
  "php-index",
  "php-infer",
