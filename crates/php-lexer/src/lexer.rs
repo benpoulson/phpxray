@@ -552,12 +552,41 @@ impl<'a> Lexer<'a> {
         self.states.pop();
     }
 
+    /// Scan one `T_NUM_STRING` inside `ST_VAR_OFFSET` (`"$a[...]"`).
+    ///
+    /// Zend matches `{LNUM}|{HNUM}|{BNUM}|{ONUM}` here — a radix's digits are
+    /// only consumed *after* its prefix, and a `_` separator is only valid
+    /// strictly between two digits of that radix. Anything else ends the token
+    /// and the caller lexes the rest (`"$a[12ef]"` → `T_NUM_STRING "12"` then
+    /// `T_STRING "ef"`). Note there is no float/exponent form in an offset:
+    /// `"$a[1e3]"` is `1` then `e3`.
     fn scan_offset_number(&mut self) {
-        if self.at(0) == b'0' && matches!(self.at(1), b'x' | b'X' | b'b' | b'B' | b'o' | b'O') {
-            self.pos += 2;
-        }
-        while self.pos < self.len() && (self.at(0).is_ascii_hexdigit() || self.at(0) == b'_') {
-            self.pos += 1;
+        let radix: Option<fn(u8) -> bool> = match (self.at(0), self.at(1)) {
+            (b'0', b'x' | b'X') => Some(|b: u8| b.is_ascii_hexdigit()),
+            (b'0', b'b' | b'B') => Some(|b: u8| matches!(b, b'0' | b'1')),
+            (b'0', b'o' | b'O') => Some(|b: u8| b.is_ascii_digit() && b != b'8' && b != b'9'),
+            _ => None,
+        };
+        // A prefix with no valid digit after it is not a radix literal: `0x`
+        // scans as the decimal `0`, leaving `x` to the label rule.
+        let is_digit: fn(u8) -> bool = match radix {
+            Some(f) if f(self.at(2)) => {
+                self.pos += 2;
+                f
+            }
+            _ => |b: u8| b.is_ascii_digit(),
+        };
+        while self.pos < self.len() {
+            let b = self.at(0);
+            if is_digit(b) {
+                self.pos += 1;
+            } else if b == b'_' && is_digit(self.at(1)) {
+                // Separator: valid only between two digits, and the byte before
+                // is a digit because we only get here after consuming one.
+                self.pos += 2;
+            } else {
+                break;
+            }
         }
     }
 
@@ -1311,5 +1340,77 @@ mod heredoc_utf8_tests {
         // Indented body line with a multibyte char right where the label would sit.
         let src = "<?php $x = <<<EOT\n  ─\nEOT;\n";
         let (_tokens, _diags) = tokenize(src);
+    }
+}
+
+#[cfg(test)]
+mod var_offset_number_tests {
+    use super::tokenize;
+    use crate::token::TokenKind;
+
+    /// The `T_NUM_STRING`/`T_STRING` sequence for the offset in `"$a[<off>]"`,
+    /// as `(php_name, text)` pairs.
+    fn offset_tokens(off: &str) -> Vec<(&'static str, String)> {
+        let src = format!("<?php \"$a[{off}]\";");
+        let (tokens, _) = tokenize(&src);
+        tokens
+            .iter()
+            .skip_while(|t| t.kind != TokenKind::LBracket)
+            .skip(1)
+            .take_while(|t| t.kind != TokenKind::RBracket)
+            .map(|t| {
+                (
+                    t.kind.php_name().unwrap_or("?"),
+                    src[t.span.start as usize..t.span.end as usize].to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn num(text: &str) -> (&'static str, String) {
+        ("T_NUM_STRING", text.to_string())
+    }
+
+    fn label(text: &str) -> (&'static str, String) {
+        ("T_STRING", text.to_string())
+    }
+
+    /// Regression: the offset scanner consumed hex digits and `_` regardless of
+    /// any radix prefix, so `"$a[12ef]"` lexed as one `T_NUM_STRING "12ef"`.
+    /// Zend matches `{LNUM}|{HNUM}|{BNUM}|{ONUM}` here. Every expectation below
+    /// is PHP 8's own `token_get_all` output (see the committed golden fixture
+    /// `test-fixtures/tokens/varoffset_numbers.php`).
+    #[test]
+    fn offset_numbers_match_the_zend_alternatives() {
+        // Decimal, with `_` only strictly between two digits.
+        assert_eq!(offset_tokens("0"), [num("0")]);
+        assert_eq!(offset_tokens("9"), [num("9")]);
+        assert_eq!(offset_tokens("00"), [num("00")]);
+        assert_eq!(offset_tokens("012"), [num("012")]);
+        assert_eq!(offset_tokens("1_2"), [num("1_2")]);
+        assert_eq!(offset_tokens("1_"), [num("1"), label("_")]);
+        assert_eq!(offset_tokens("1__2"), [num("1"), label("__2")]);
+        // Hex/binary/octal only after a valid prefix.
+        assert_eq!(offset_tokens("0x1f"), [num("0x1f")]);
+        assert_eq!(offset_tokens("0X1F"), [num("0X1F")]);
+        assert_eq!(offset_tokens("0xAB_CD"), [num("0xAB_CD")]);
+        assert_eq!(offset_tokens("0o7"), [num("0o7")]);
+        // A binary literal stops at the first non-binary digit; the rest starts
+        // a fresh decimal run (two T_NUM_STRINGs, not a T_STRING).
+        assert_eq!(offset_tokens("0b12"), [num("0b1"), num("2")]);
+        // A prefix with no valid digit after it is not a radix literal.
+        assert_eq!(offset_tokens("0x"), [num("0"), label("x")]);
+        assert_eq!(offset_tokens("0x_1"), [num("0"), label("x_1")]);
+        // Hex digits are NOT consumed without a prefix, and there is no
+        // float/exponent form in an offset.
+        assert_eq!(offset_tokens("12ef"), [num("12"), label("ef")]);
+        assert_eq!(offset_tokens("12_ef"), [num("12"), label("_ef")]);
+        assert_eq!(offset_tokens("1e3"), [num("1"), label("e3")]);
+    }
+
+    /// A leading `-` is its own token, then the number.
+    #[test]
+    fn negative_offset_is_minus_then_number() {
+        assert_eq!(offset_tokens("-5"), [("-", "-".to_string()), num("5")]);
     }
 }
