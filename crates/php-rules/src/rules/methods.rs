@@ -73,6 +73,7 @@
 //!   `ConsistentConstructorRule` (param/visibility comparison vs parent constructor —
 //!   the `consistentConstructor` *attribute* requires a custom PHPDoc tag we don't model).
 
+use crate::members;
 use crate::{
     compat, decls,
     members::{MemberAccessResolver, ResolveStatus},
@@ -1376,39 +1377,39 @@ fn run_method_argument_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
         {
             continue;
         }
-        let Some(fqn) = named_fqn(&fa.type_of(call.recv)) else {
-            continue;
-        };
+        let recv_ty = fa.type_of(call.recv);
         let mname = fa.interner.resolve(*name);
-        let Some(found) = fa.reflection.find_method(&fqn, mname) else {
+        // Generic-aware resolution first (`ArrayObject<int, User>::offsetGet()`
+        // must see `User`, not `TValue`), falling back to the plain class lookup.
+        // This path used to resolve by FQN only, so the same call checked in a
+        // callback context and in normal code could disagree.
+        let Some(found) = fa
+            .reflection
+            .find_method_on_type(&recv_ty, mname)
+            .or_else(|| {
+                members::sole_class(&recv_ty).and_then(|fqn| fa.reflection.find_method(&fqn, mname))
+            })
+        else {
             continue;
         };
-        let mr = &found.member;
-        if mr.magic {
+        if found.member.magic {
             continue;
         }
-        let short = fqn.trim_start_matches('\\');
-        for (i, arg) in call.args.iter().enumerate() {
-            let Some(param) = mr.params.get(i) else { break };
-            if param.variadic {
-                break;
-            }
-            let given = fa.type_of(&arg.value);
-            if !fa.accepts(&arg.value, &param.ty, &param.native_ty) {
-                out.push(
-                    Diagnostic::error(
-                        arg.value.span,
-                        format!(
-                            "Parameter #{} ${} of method {short}::{mname}() expects {}, {given} given.",
-                            i + 1,
-                            param.name,
-                            param.ty
-                        ),
-                    )
-                    .with_code("argument.type"),
-                );
-            }
-        }
+        let class =
+            members::sole_class(&recv_ty).unwrap_or_else(|| found.declaring_class.to_string());
+        let callee = crate::function_like::ResolvedCallable::method(
+            &class,
+            mname,
+            &found.member.params,
+            fa.reflection.class(&class).is_some_and(|c| c.builtin),
+        );
+        crate::function_like::check_call_args(
+            call.args,
+            &callee,
+            &|e| fa.type_of(e),
+            &|e, t, nt| fa.accepts(e, t, nt),
+            &mut out,
+        );
     }
     out
 }
@@ -4031,6 +4032,29 @@ mod tests {
 
     /// The method twin must use the exact same phpstan arity vocabulary as the
     /// function rule ("R-M required" / "at least R required", never "expected").
+    /// Behavioural pin for the shared `function_like::check_call_args` core.
+    ///
+    /// Item 5 Part B unified four copies of this loop. Two documented drifts —
+    /// the built-in overload guard missing from the method paths, and method
+    /// resolution being generic-aware on the callback path only — both measured
+    /// **corpus-neutral**, so this asserts the behaviour rather than claiming to
+    /// catch a regression: the resolution paths happen to agree here.
+    #[test]
+    fn method_argument_checking_is_generic_aware() {
+        // A concrete generic receiver must bind its type argument: `Box<int>`'s
+        // `set(TValue)` takes `int`, so a string argument is a real mismatch.
+        let src = "<?php /** @template T */ class Box { /** @param T $v */ \
+                   public function set($v): void {} } \
+                   /** @param Box<int> $b */ function f(Box $b) { $b->set('x'); }";
+        assert_eq!(codes(src, run_method_argument_types), ["argument.type"]);
+
+        // ...and a matching argument is accepted.
+        let ok = "<?php /** @template T */ class Box { /** @param T $v */ \
+                  public function set($v): void {} } \
+                  /** @param Box<int> $b */ function f(Box $b) { $b->set(1); }";
+        assert!(codes(ok, run_method_argument_types).is_empty());
+    }
+
     #[test]
     fn method_argument_count_messages_match_phpstan() {
         let msg = |src: &str, want: &str| {

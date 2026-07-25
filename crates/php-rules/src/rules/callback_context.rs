@@ -560,33 +560,15 @@ fn check_function_call_args(
     let Some(func) = function_from_name(overlay.fa, overlay.scope, name) else {
         return;
     };
-    if func.builtin && !func.params.iter().any(|p| p.variadic) && args.len() > func.params.len() {
-        return;
-    }
-    for (i, arg) in args.iter().enumerate() {
-        let Some(param) = func.params.get(i) else {
-            break;
-        };
-        if param.variadic {
-            break;
-        }
-        let given = overlay.type_of(&arg.value);
-        if !overlay.accepts(&arg.value, &param.ty, &param.native_ty) {
-            out.push(
-                Diagnostic::error(
-                    arg.value.span,
-                    format!(
-                        "Parameter #{} ${} of function {} expects {}, {given} given.",
-                        i + 1,
-                        param.name,
-                        func.fqn,
-                        param.ty
-                    ),
-                )
-                .with_code("argument.type"),
-            );
-        }
-    }
+    let callee =
+        crate::function_like::ResolvedCallable::function(&func.fqn, &func.params, func.builtin);
+    crate::function_like::check_call_args(
+        args,
+        &callee,
+        &|e| overlay.type_of(e),
+        &|e, t, nt| overlay.accepts(e, t, nt),
+        out,
+    );
 }
 
 fn check_method_call_args(
@@ -618,30 +600,24 @@ fn check_method_call_args(
     if found.member.magic {
         return;
     }
-    let short = members::sole_class(&recv_ty).unwrap_or_else(|| found.declaring_class.to_string());
-    for (i, arg) in args.iter().enumerate() {
-        let Some(param) = found.member.params.get(i) else {
-            break;
-        };
-        if param.variadic {
-            break;
-        }
-        let given = overlay.type_of(&arg.value);
-        if !overlay.accepts(&arg.value, &param.ty, &param.native_ty) {
-            out.push(
-                Diagnostic::error(
-                    arg.value.span,
-                    format!(
-                        "Parameter #{} ${} of method {short}::{method_name}() expects {}, {given} given.",
-                        i + 1,
-                        param.name,
-                        param.ty
-                    ),
-                )
-                .with_code("argument.type"),
-            );
-        }
-    }
+    let class = members::sole_class(&recv_ty).unwrap_or_else(|| found.declaring_class.to_string());
+    let callee = crate::function_like::ResolvedCallable::method(
+        &class,
+        method_name,
+        &found.member.params,
+        overlay
+            .fa
+            .reflection
+            .class(&class)
+            .is_some_and(|c| c.builtin),
+    );
+    crate::function_like::check_call_args(
+        args,
+        &callee,
+        &|e| overlay.type_of(e),
+        &|e, t, nt| overlay.accepts(e, t, nt),
+        out,
+    );
 }
 
 fn check_return_type(overlay: &Overlay, body: &CallbackBody, out: &mut Vec<Diagnostic>) {

@@ -1196,38 +1196,18 @@ fn run_argument_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
         let Some(func) = fa.reflection.function(&fqn) else {
             return;
         };
-        // Built-in stubs carry only one signature; a call with more positional args
-        // than the stub declares (and no variadic) is an *overload* the stub doesn't
-        // capture (`strtr($s, $from, $to)` vs `strtr(string, array)`). Don't trust
-        // the stub's parameter types for such a call (avoids false `argument.type`).
-        if func.builtin && !func.params.iter().any(|p| p.variadic) && args.len() > func.params.len()
-        {
-            return;
-        }
-        let display = members::primary_name(r);
-        for (i, arg) in args.iter().enumerate() {
-            let Some(param) = func.params.get(i) else {
-                break;
-            };
-            if param.variadic {
-                break; // variadic absorbs the rest; element-type checking is later
-            }
-            let given = fa.type_of(&arg.value);
-            if !fa.accepts(&arg.value, &param.ty, &param.native_ty) {
-                out.push(
-                    Diagnostic::error(
-                        arg.value.span,
-                        format!(
-                            "Parameter #{} ${} of function {display} expects {}, {given} given.",
-                            i + 1,
-                            param.name,
-                            param.ty
-                        ),
-                    )
-                    .with_code("argument.type"),
-                );
-            }
-        }
+        let callee = crate::function_like::ResolvedCallable::function(
+            &members::primary_name(r),
+            &func.params,
+            func.builtin,
+        );
+        crate::function_like::check_call_args(
+            args,
+            &callee,
+            &|e| fa.type_of(e),
+            &|e, t, nt| fa.accepts(e, t, nt),
+            &mut out,
+        );
     });
     out
 }
