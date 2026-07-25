@@ -67,17 +67,19 @@ impl<'a> Parser<'a> {
 
     /// The doc-comment immediately preceding `offset` (only whitespace between),
     /// if any.
+    ///
+    /// `docs` is sorted by end offset (the lexer emits in source order), so the
+    /// candidate is found by binary search. The previous reverse linear scan
+    /// walked past every doc-comment *after* `offset` on each call, which is
+    /// quadratic in the number of docblocks per file — paid heavily by
+    /// doc-dense sources like the stubs.
     fn doc_before(&self, offset: u32) -> Option<String> {
-        for (end, text) in self.docs.iter().rev() {
-            if *end <= offset {
-                let gap = &self.src[*end as usize..offset as usize];
-                return gap
-                    .bytes()
-                    .all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
-                    .then(|| text.clone());
-            }
-        }
-        None
+        let idx = self.docs.partition_point(|(end, _)| *end <= offset);
+        let (end, text) = self.docs.get(idx.checked_sub(1)?)?;
+        let gap = &self.src[*end as usize..offset as usize];
+        gap.bytes()
+            .all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+            .then(|| text.clone())
     }
 
     /// Parse the token stream into a program + diagnostics. The interner is the
