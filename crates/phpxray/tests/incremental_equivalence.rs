@@ -181,7 +181,79 @@ fn stub_file_edit_stays_equivalent() {
     );
     let hint = p.hint(&["src/app.php"]);
     let after = p.check("stub edit", Some(&hint));
-    assert!(after.is_empty(), "widened stub param should clear the finding");
+    assert!(
+        after.is_empty(),
+        "widened stub param should clear the finding"
+    );
+}
+
+#[test]
+fn laravel_alias_change_stays_equivalent() {
+    // Regression: the session never registered `laravelAliases`, so a facade
+    // name that batch resolved produced a `class.notFound` storm under --watch.
+    let mut p = Project::new_with_config(
+        "level: 0\npaths:\n  - src\nlaravelAliases: true\n",
+        &[
+            (
+                "src/app.php",
+                "<?php\nfunction go(): void { Str::of('x'); }\n",
+            ),
+            (
+                "src/support.php",
+                "<?php\nnamespace Illuminate\\Support;\nclass Str { public static function of($v) {} }\n",
+            ),
+            (
+                "src/other.php",
+                "<?php\nfunction unrelated(): int { return 1; }\n",
+            ),
+            (
+                "config/app.php",
+                "<?php\nreturn ['aliases' => ['Str' => Illuminate\\Support\\Str::class]];\n",
+            ),
+        ],
+    );
+    // (a) Initially the alias resolves — no class.notFound, and batch agrees.
+    let before = p.check("initial", None);
+    assert!(
+        !before.iter().any(|f| f.contains("class.notFound")),
+        "registered facade alias should resolve: {before:?}"
+    );
+
+    // (b) Removing the alias from the map makes `Str` unknown again. The file
+    //     that consulted it must be invalidated even though it did not change.
+    p.write("config/app.php", "<?php\nreturn ['aliases' => []];\n");
+    let hint = p.hint(&["config/app.php"]);
+    let after = p.check("alias removed", Some(&hint));
+    assert!(
+        after.iter().any(|f| f.contains("class.notFound")),
+        "dropping the alias should surface class.notFound: {after:?}"
+    );
+
+    // (c) Restoring it clears the finding again.
+    p.write(
+        "config/app.php",
+        "<?php\nreturn ['aliases' => ['Str' => Illuminate\\Support\\Str::class]];\n",
+    );
+    let hint = p.hint(&["config/app.php"]);
+    let restored = p.check("alias restored", Some(&hint));
+    assert_eq!(
+        restored, before,
+        "restoring the alias should restore the report"
+    );
+
+    // (d) Selectivity: an unrelated body edit must not fan out just because the
+    //     alias map is re-collected every pass.
+    p.write(
+        "src/other.php",
+        "<?php\nfunction unrelated(): int { return 2; }\n",
+    );
+    let hint = p.hint(&["src/other.php"]);
+    p.check("unrelated edit", Some(&hint));
+    assert_eq!(
+        p.session.last_pass().files_reanalyzed,
+        1,
+        "unchanged alias map must not invalidate other files"
+    );
 }
 
 #[test]

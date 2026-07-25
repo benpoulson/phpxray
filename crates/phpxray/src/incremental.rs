@@ -120,6 +120,7 @@ struct AnalysisFingerprint {
     check_implicit_mixed: Option<bool>,
     check_uninitialized_properties: bool,
     check_too_wide_return_public: bool,
+    laravel_aliases: bool,
     early_terminating_function_calls: Vec<String>,
     early_terminating_method_calls: Vec<(String, Vec<String>)>,
     type_aliases: Vec<(String, String)>,
@@ -146,6 +147,7 @@ impl AnalysisFingerprint {
             check_implicit_mixed: config.check_implicit_mixed,
             check_uninitialized_properties: config.check_uninitialized_properties,
             check_too_wide_return_public: config.check_too_wide_return_public,
+            laravel_aliases: config.laravel_aliases,
             type_aliases: {
                 let mut entries: Vec<(String, String)> = config
                     .type_aliases
@@ -182,6 +184,12 @@ pub struct Session {
     /// source); when their content changes, every analyzed file is re-checked
     /// (a stub edit can affect any symbol), keeping the session batch-equivalent.
     stub_sources: Vec<(String, String)>,
+    /// The Laravel facade aliases (`alias` -> target FQN) as of the last pass.
+    /// Re-collected every pass when `laravelAliases` is on (two small JSON/PHP
+    /// files); diffing it feeds changed alias names into `changed_surface`, so a
+    /// file that looked the alias up — including a *negative* lookup that
+    /// produced `class.notFound` — is invalidated when the alias map moves.
+    facade_aliases: Vec<(String, String)>,
     first_pass: bool,
     stats: PassStats,
 }
@@ -217,6 +225,7 @@ impl Session {
             analysis_fingerprint: AnalysisFingerprint::of(config),
             prev_inferred: None,
             stub_sources: Vec::new(),
+            facade_aliases: Vec::new(),
             first_pass: true,
             stats: PassStats::default(),
         }
@@ -406,6 +415,34 @@ impl Session {
             let artifact = php_reflect::reflect_stub_artifact(Some(path), program, &self.interner);
             project.add_file_as(path, &file_index, php_index::SourceKind::Scan);
             reflection.add_artifact(&artifact);
+        }
+        // Laravel facade aliases (opt-in): register each as a known class so
+        // facade references resolve. After every real declaration, which always
+        // wins — matching the batch engine (`analyze_parsed_progress`).
+        let aliases_now = if config.laravel_aliases {
+            crate::laravel::collect_facade_aliases(root)
+        } else {
+            Vec::new()
+        };
+        for (alias, target) in &aliases_now {
+            project.add_alias(alias, target);
+        }
+        // Any alias name that appeared, vanished, or changed target invalidates
+        // the files that consulted it (alias lookups go through `ProjectIndex`,
+        // so they are recorded surface deps like any other class lookup).
+        if aliases_now != self.facade_aliases {
+            for (alias, _) in aliases_now
+                .iter()
+                .filter(|e| !self.facade_aliases.contains(e))
+                .chain(
+                    self.facade_aliases
+                        .iter()
+                        .filter(|e| !aliases_now.contains(e)),
+                )
+            {
+                changed_surface.insert(depsrec::symbol_hash(alias));
+            }
+            self.facade_aliases = aliases_now;
         }
         // Cross-class `@phpstan-import-type` (needs every class indexed first).
         reflection.resolve_type_imports();
