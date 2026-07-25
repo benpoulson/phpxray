@@ -1961,13 +1961,15 @@ fn run_private_const_through_static(fa: &FileAnalysis) -> Vec<Diagnostic> {
 // MixinRule — `@mixin` PHPDoc tag pointing at a non-object / a trait
 // ---------------------------------------------------------------------------
 
-/// A class `@mixin` PHPDoc tag whose type is a non-object (`mixin.nonObject`) or
-/// a trait (`mixin.trait`).
+/// A class `@mixin` PHPDoc tag whose type is a non-object (`mixin.nonObject`),
+/// an unknown class (`class.notFound`) or a trait (`mixin.trait`).
 ///
 /// Mirrors the statically-checkable subset of phpstan's `MixinRule`/`MixinCheck`.
-/// An *unknown* mixin class is left to `class.notFound`. The `@mixin` targets
-/// are taken from the reflection layer (which resolves the class docblock's
-/// `@mixin` tags).
+/// phpstan has a single `MixinRule` that merges its trait-definition context
+/// (`mixin.nonObject` + the `missingType.*` family) with its trait-use context
+/// (`class.notFound` + `mixin.trait`); this is the sole emitter of all four.
+/// The `@mixin` targets are taken from the reflection layer (which resolves the
+/// class docblock's `@mixin` tags).
 fn run_mixin(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for_each_class(fa.program, fa.interner, |scope, c| {
@@ -1977,49 +1979,62 @@ fn run_mixin(fa: &FileAnalysis) -> Vec<Diagnostic> {
             return;
         };
         let label = reflected_class_label(cr.kind, &cr.fqn);
+        let span = enum_member_span(c);
         for mixin in &cr.mixins {
-            let mut check_missing = false;
             match mixin {
-                Type::Named { fqn: mfqn, .. } => {
-                    check_missing = true;
-                    // A known trait is invalid; an unknown class is class.notFound's job.
-                    if let Some(mcr) = fa.reflection.class(mfqn) {
-                        if mcr.kind == ClassKind::Trait {
-                            out.push(
-                                Diagnostic::error(
-                                    enum_member_span(c),
-                                    format!(
-                                        "PHPDoc tag @mixin contains invalid type {}.",
-                                        mfqn.trim_start_matches('\\')
-                                    ),
-                                )
-                                .with_code("mixin.trait"),
-                            );
-                        }
-                    }
+                // Object types — checked for missing type args below.
+                Type::Named { .. } | Type::SelfType | Type::StaticType | Type::Parent => {
+                    check_missing_phpdoc_type(
+                        fa,
+                        &label,
+                        mixin,
+                        MissingTagContext::Mixin,
+                        span,
+                        &mut out,
+                    );
                 }
-                // `self`/`static`/`parent` are object types — valid.
-                Type::SelfType | Type::StaticType | Type::Parent => {
-                    check_missing = true;
-                }
-                // Anything else (scalars, arrays, callables, …) is a non-object.
+                // Lenient: a type we cannot pin to a concrete non-object
+                // (`mixed`, `object`, templates, unions/intersections of
+                // objects, …). Under-reporting keeps the FP posture.
+                Type::Mixed
+                | Type::Unknown(_)
+                | Type::Object
+                | Type::TemplateVar(_)
+                | Type::Nullable(_)
+                | Type::Union(_)
+                | Type::Intersection(_)
+                | Type::Iterable(_) => {}
+                // A concrete non-object (scalars, arrays, callables, …).
                 other => out.push(
                     Diagnostic::error(
-                        enum_member_span(c),
+                        span,
                         format!("PHPDoc tag @mixin contains non-object type {other}."),
                     )
                     .with_code("mixin.nonObject"),
                 ),
             }
-            if check_missing {
-                check_missing_phpdoc_type(
-                    fa,
-                    &label,
-                    mixin,
-                    MissingTagContext::Mixin,
-                    enum_member_span(c),
-                    &mut out,
-                );
+            // Every class named anywhere in the mixin type must exist and must
+            // not be a trait (phpstan's `getReferencedClasses()` loop).
+            for mfqn in object_class_names(mixin) {
+                let short = mfqn.trim_start_matches('\\');
+                match fa.reflection.class(&mfqn) {
+                    Some(mcr) if mcr.kind == ClassKind::Trait => out.push(
+                        Diagnostic::error(
+                            span,
+                            format!("PHPDoc tag @mixin contains invalid type {short}."),
+                        )
+                        .with_code("mixin.trait"),
+                    ),
+                    Some(_) => {}
+                    None if !fa.project.has_class(&mfqn) => out.push(
+                        Diagnostic::error(
+                            span,
+                            format!("PHPDoc tag @mixin contains unknown class {short}."),
+                        )
+                        .with_code("class.notFound"),
+                    ),
+                    None => {}
+                }
             }
         }
     });
@@ -3631,9 +3646,15 @@ mod tests {
     fn duplicate_member_diagnostic_points_at_member_name() {
         let src = "<?php class C { function foo() {} function foo() {} }";
         let diags = run(src, run_duplicate_declaration);
-        assert!(!diags.is_empty(), "expected a duplicate.declaration finding");
+        assert!(
+            !diags.is_empty(),
+            "expected a duplicate.declaration finding"
+        );
         let span = diags[0].primary;
-        assert!(span.start > 0, "diagnostic must not sit at offset 0 (the 1:1 bug)");
+        assert!(
+            span.start > 0,
+            "diagnostic must not sit at offset 0 (the 1:1 bug)"
+        );
         assert_eq!(
             &src[span.start as usize..span.end as usize],
             "foo",
@@ -4387,8 +4408,38 @@ mod tests {
     }
 
     #[test]
-    fn mixin_unknown_class_is_left_to_existence_check() {
+    fn mixin_unknown_class_is_flagged_once() {
         let src = "<?php /** @mixin Unknown */ class C {}";
+        assert_eq!(codes(src, run_mixin), ["class.notFound"]);
+    }
+
+    /// Regression: `mixin.trait` / `mixin.nonObject` used to be emitted by both
+    /// this rule and a twin in `phpdoc.rs`, doubling every finding.
+    #[test]
+    fn mixin_findings_are_not_duplicated() {
+        let count = |src: &str, code: &str| {
+            crate::testutil::all_codes_at(src, 2)
+                .into_iter()
+                .filter(|c| *c == code)
+                .count()
+        };
+        assert_eq!(
+            count("<?php trait T {} /** @mixin T */ class C {}", "mixin.trait"),
+            1
+        );
+        assert_eq!(
+            count("<?php /** @mixin int */ class C {}", "mixin.nonObject"),
+            1
+        );
+        assert_eq!(
+            count("<?php /** @mixin Nope */ class C {}", "class.notFound"),
+            1
+        );
+    }
+
+    #[test]
+    fn mixin_union_of_objects_is_clean() {
+        let src = "<?php class A {} class B {} /** @mixin A|B */ class C {}";
         assert!(codes(src, run_mixin).is_empty());
     }
 

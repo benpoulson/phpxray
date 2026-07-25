@@ -32,7 +32,7 @@ pub(crate) fn run_version(
 
 pub(crate) fn run_version_with(
     src: &str,
-    rule: fn(&FileAnalysis) -> Vec<Diagnostic>,
+    rule: impl FnOnce(&FileAnalysis) -> Vec<Diagnostic>,
     php_version: PhpVersion,
     configure: impl FnOnce(&mut FileAnalysis),
 ) -> Vec<Diagnostic> {
@@ -239,6 +239,22 @@ pub(crate) fn located_codes(
         .into_iter()
         .map(|d| d.diagnostic.code.unwrap_or(""))
         .collect()
+}
+
+/// Run *every* rule registered at `level` and return the error identifiers.
+///
+/// For regression tests that assert an identifier is emitted by exactly one
+/// rule — twin rules emitting the same code is a recurring defect class.
+pub(crate) fn all_codes_at(src: &str, level: u8) -> Vec<&'static str> {
+    run_version_with(
+        src,
+        |fa| crate::analyze_file(fa, level),
+        PhpVersion::default(),
+        |_| {},
+    )
+    .into_iter()
+    .map(|d| d.code.unwrap_or(""))
+    .collect()
 }
 
 /// Like [`codes`] but with an explicit target PHP version (for version-gated rules).
