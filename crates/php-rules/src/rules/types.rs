@@ -664,18 +664,32 @@ mod tests {
         assert_eq!(codes(src, run_implicit_mixed_strictness), ["argument.type"]);
     }
 
-    /// The rule-level half of the target-aware mixed check. The discriminating
-    /// pair is unit-tested directly on the predicate in `compat.rs`; here we pin
-    /// the two shapes reproducible through the full rule.
+    /// The discriminating pair, end to end through the rule.
+    ///
+    /// A `mixed` written in a docblock is **explicit** mixed, so these go through
+    /// `run_explicit_mixed_strictness`; the engine runs both strictness rules at
+    /// max level. Measured on the corpus: testing *containment* reports 54
+    /// findings where the target constrains nothing, while testing only the *top
+    /// level* loses 65 real ones where it does.
     #[test]
-    fn nested_mixed_in_an_unconstrained_position_is_not_reported() {
-        // `count(array|Countable)` pins no value type.
-        let src = "<?php /** @param array<int, mixed> $a */ \
-                   function f(array $a) { count($a); }";
+    fn nested_mixed_reports_only_where_the_target_constrains_it() {
+        // `count(array|Countable)` — the `array` arm pins no value type.
+        let unconstrained = "<?php /** @param array<int, mixed> $a */\n\
+                             function f(array $a) { count($a); }";
         assert!(
-            codes(src, run_implicit_mixed_strictness).is_empty(),
-            "target does not constrain the value position: {:?}",
-            codes(src, run_implicit_mixed_strictness)
+            codes(unconstrained, run_explicit_mixed_strictness).is_empty(),
+            "an unconstrained value position must not be reported: {:?}",
+            codes(unconstrained, run_explicit_mixed_strictness)
+        );
+
+        // `str_replace($search)` wants `array<int|string, string>` — the mixed
+        // value type genuinely violates it.
+        let constrained = "<?php /** @param array<int, mixed> $a */\n\
+                           function f(array $a) { str_replace($a, 'a', 'b'); }";
+        assert_eq!(
+            codes(constrained, run_explicit_mixed_strictness),
+            ["argument.type"],
+            "a constrained value position must still be reported"
         );
 
         // A plainly `mixed` argument against a concrete target still reports.
