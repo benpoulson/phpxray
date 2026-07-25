@@ -579,6 +579,18 @@ fn cmd_reflect(dir: Option<PathBuf>) -> ExitCode {
 /// body (which infers every contained expression). Asserts 0 panics — the
 /// inference layer must be total, like the parser.
 fn cmd_infer(dir: Option<PathBuf>) -> ExitCode {
+    // Same reason as `check`/`astdiff`: left-associative chains in the corpus
+    // produce very deep ASTs and the recursive visitors overflow the default
+    // 8 MB main stack part-way through the sweep.
+    std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(move || cmd_infer_run(dir))
+        .expect("spawn infer thread")
+        .join()
+        .expect("infer thread panicked")
+}
+
+fn cmd_infer_run(dir: Option<PathBuf>) -> ExitCode {
     use php_ast::{Member, Stmt, StmtKind};
     use php_infer::TypeCtx;
     use php_reflect::{resolve_ast_type, ReflectionIndex};
