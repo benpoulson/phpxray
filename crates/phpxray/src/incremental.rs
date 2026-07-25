@@ -397,19 +397,14 @@ impl Session {
             reflection.add_artifact(&e.reflect_artifact);
         }
         // Stubs indexed last (win over source).
-        for (path, program) in &stub_programs {
-            let file_index = index_file(program, &self.interner);
-            let artifact = php_reflect::reflect_stub_artifact(Some(path), program, &self.interner);
-            project.add_file_as(path, &file_index, php_index::SourceKind::Scan);
-            reflection.add_artifact(&artifact);
-        }
-        // Laravel facade aliases (opt-in): register each as a known class so
-        // facade references resolve. After every real declaration, which always
-        // wins — matching the batch engine (`analyze_parsed_progress`).
+        crate::pipeline::index_stubs(
+            &mut project,
+            &mut reflection,
+            &self.interner,
+            &stub_programs,
+        );
         let aliases_now = inputs.facade_aliases().to_vec();
-        for (alias, target) in &aliases_now {
-            project.add_alias(alias, target);
-        }
+        crate::pipeline::register_facade_aliases(&mut project, &aliases_now);
         // Any alias name that appeared, vanished, or changed target invalidates
         // the files that consulted it (alias lookups go through `ProjectIndex`,
         // so they are recorded surface deps like any other class lookup).
@@ -427,10 +422,7 @@ impl Session {
             }
             self.facade_aliases = aliases_now;
         }
-        // Cross-class `@phpstan-import-type` (needs every class indexed first).
-        reflection.resolve_type_imports();
-        // Global `typeAliases` from config, expanded across all reflected types.
-        reflection.apply_global_type_aliases(&inputs.type_aliases.clone().into_iter().collect());
+        crate::pipeline::finalize_indexes(&mut reflection, &inputs.type_aliases);
 
         // Whole-project signature inference (untyped functions). It needs every
         // file's call sites, so each pass re-parses the whole tree (in parallel)
@@ -453,12 +445,8 @@ impl Session {
                 .iter()
                 .chain(stub_programs.iter().map(|(_, p)| p))
                 .collect();
-            let inferred = php_infer::infer_and_apply(
-                &mut reflection,
-                &prog_refs,
-                &self.interner,
-                php_infer::InferOpts::default(),
-            );
+            let inferred =
+                crate::pipeline::infer_signatures(&mut reflection, &prog_refs, &self.interner);
             if let Some(prev) = &self.prev_inferred {
                 diff_inferred(prev, &inferred, &mut changed_surface);
             }

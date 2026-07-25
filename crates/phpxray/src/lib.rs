@@ -9,9 +9,9 @@
 use indicatif::{ProgressBar, ProgressStyle};
 use php_config::{Config, ExcludeMatcher, Level, RuleOptions};
 use php_diagnostics::Severity;
-use php_index::{ProjectIndex, SourceKind as ProjectSourceKind};
-use php_reflect::{ReflectionIndex, SourceKind as ReflectSourceKind};
-use php_resolve::{index_file, resolve_references};
+use php_index::ProjectIndex;
+use php_reflect::ReflectionIndex;
+use php_resolve::resolve_references;
 use php_rules::{analyze_file_located, FileAnalysis, FileFacts};
 use php_span::LineIndex;
 use rayon::prelude::*;
@@ -26,6 +26,7 @@ pub mod fix;
 pub mod incremental;
 pub mod inputs;
 mod laravel;
+mod pipeline;
 pub mod report;
 mod result_cache;
 pub mod suppress;
@@ -496,40 +497,19 @@ fn analyze_parsed_progress(
     let mut project = ProjectIndex::with_builtins_for(options.php_version);
     let mut reflection = ReflectionIndex::with_builtins_for(options.php_version);
     for f in parsed {
-        let project_kind = if f.analyze {
-            ProjectSourceKind::Analyzed
-        } else {
-            ProjectSourceKind::Scan
-        };
-        let reflect_kind = if f.analyze {
-            ReflectSourceKind::Analyzed
-        } else {
-            ReflectSourceKind::Scan
-        };
-        project.add_file_as(&f.path, &index_file(&f.program, interner), project_kind);
-        // A configured stub file is the one source allowed to override an
-        // earlier project declaration (see `reflect_stub_artifact`).
-        if f.stub {
-            reflection.add_artifact(&php_reflect::reflect_stub_artifact(
-                Some(&f.path),
-                &f.program,
-                interner,
-            ));
-        } else {
-            reflection.add_file_labeled_as(Some(&f.path), &f.program, interner, reflect_kind);
-        }
+        pipeline::index_parsed_file(
+            &mut project,
+            &mut reflection,
+            interner,
+            &f.path,
+            &f.program,
+            f.analyze,
+            f.stub,
+        );
         indexing.inc(1);
     }
-    // Laravel facade aliases (opt-in): register each as a known class so facade
-    // references resolve. After real declarations, which always win.
-    for (alias, target) in options.inputs.facade_aliases() {
-        project.add_alias(alias, target);
-    }
-    // Cross-class `@phpstan-import-type` needs every class indexed first.
-    reflection.resolve_type_imports();
-    // Global `typeAliases` from config, expanded across all reflected types.
-    reflection
-        .apply_global_type_aliases(&options.inputs.type_aliases.clone().into_iter().collect());
+    pipeline::register_facade_aliases(&mut project, options.inputs.facade_aliases());
+    pipeline::finalize_indexes(&mut reflection, &options.inputs.type_aliases);
     indexing.finish();
     if let Some(t) = &mut timings {
         t.index = started.elapsed();
@@ -544,12 +524,7 @@ fn analyze_parsed_progress(
         let started = Instant::now();
         let inferring = progress.spinner("Inferring untyped signatures");
         let programs: Vec<&php_ast::Program> = parsed.iter().map(|f| &f.program).collect();
-        php_infer::infer_and_apply(
-            &mut reflection,
-            &programs,
-            interner,
-            php_infer::InferOpts::default(),
-        );
+        pipeline::infer_signatures(&mut reflection, &programs, interner);
         inferring.finish();
         if let Some(t) = &mut timings {
             t.infer_signatures = started.elapsed();
@@ -982,7 +957,7 @@ mod tests {
         for (i, src) in sources.iter().enumerate() {
             let r = php_parser::parse_into(src, &interner).0;
             let path = format!("src/f{i}.php");
-            project.add_file(&path, &index_file(&r, &interner));
+            project.add_file(&path, &php_resolve::index_file(&r, &interner));
             reflection.add_file_labeled_as(
                 Some(&path),
                 &r,
