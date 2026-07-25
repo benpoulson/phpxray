@@ -438,7 +438,10 @@ impl ReflectionIndex {
                 continue;
             };
             let ty = crate::resolve_doc_type(&scope, &[], &dt);
-            map.insert(name.trim_start_matches('\\').to_ascii_lowercase(), ty);
+            map.insert(
+                php_resolve::symbols::SymbolKey::class_like(name).into_string(),
+                ty,
+            );
         }
         if map.is_empty() {
             return;
@@ -1177,7 +1180,7 @@ fn class_key(fqn: &str) -> String {
 fn expand_global_alias(ty: &Type, map: &HashMap<String, Type>, exclude: &str) -> Type {
     ty.clone().map(&mut |part| match part {
         Type::Named { fqn, args } if args.is_empty() => {
-            let full = fqn.trim_start_matches('\\').to_ascii_lowercase();
+            let full = php_resolve::symbols::SymbolKey::class_like(&fqn).into_string();
             let short = full.rsplit('\\').next().unwrap_or(&full);
             if short != exclude {
                 if let Some(t) = map.get(short) {
@@ -1200,7 +1203,7 @@ fn expand_global_alias_guarded(
 ) -> Type {
     ty.clone().map(&mut |part| match part {
         Type::Named { fqn, args } if args.is_empty() => {
-            let full = fqn.trim_start_matches('\\').to_ascii_lowercase();
+            let full = php_resolve::symbols::SymbolKey::class_like(&fqn).into_string();
             if !real.contains(&full) {
                 let short = full.rsplit('\\').next().unwrap_or(&full);
                 if let Some(t) = map.get(short) {

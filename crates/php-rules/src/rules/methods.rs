@@ -128,13 +128,6 @@ fn display(fa: &FileAnalysis, c: &ClassDecl) -> String {
         .unwrap_or_else(|| "class@anonymous".to_string())
 }
 
-/// A best-effort span for a method-level diagnostic. Our AST does not record a
-/// span on [`MethodDecl`] itself, so we point at the first available child span:
-/// The method-name token span.
-fn method_span(m: &MethodDecl) -> Span {
-    m.name_span
-}
-
 /// The class-name token span (the `class` keyword for anonymous classes).
 fn class_span(c: &ClassDecl) -> Span {
     c.name_span
@@ -174,7 +167,7 @@ fn run_abstract_in_non_abstract(fa: &FileAnalysis) -> Vec<Diagnostic> {
             };
             out.push(
                 Diagnostic::error(
-                    method_span(m),
+                    m.name_span,
                     format!(
                         "{lead} {} contains abstract method {mname}().",
                         display(fa, c)
@@ -203,7 +196,7 @@ fn run_abstract_private(fa: &FileAnalysis) -> Vec<Diagnostic> {
             if m.modifiers.is_abstract && vis(m) == Visibility::Private {
                 out.push(
                     Diagnostic::error(
-                        method_span(m),
+                        m.name_span,
                         format!(
                             "Private method {}::{}() cannot be abstract.",
                             display(fa, c),
@@ -228,7 +221,7 @@ fn run_abstract_body(fa: &FileAnalysis) -> Vec<Diagnostic> {
             if m.modifiers.is_abstract && m.body.is_some() {
                 out.push(
                     Diagnostic::error(
-                        method_span(m),
+                        m.name_span,
                         format!(
                             "Abstract method {}::{}() cannot contain body.",
                             display(fa, c),
@@ -241,7 +234,7 @@ fn run_abstract_body(fa: &FileAnalysis) -> Vec<Diagnostic> {
             {
                 out.push(
                     Diagnostic::error(
-                        method_span(m),
+                        m.name_span,
                         format!(
                             "Non-abstract method {}::{}() must contain body.",
                             display(fa, c),
@@ -267,7 +260,7 @@ fn run_final_private(fa: &FileAnalysis) -> Vec<Diagnostic> {
             if m.modifiers.is_final && vis(m) == Visibility::Private {
                 out.push(
                     Diagnostic::error(
-                        method_span(m),
+                        m.name_span,
                         format!(
                             "Private method {}::{}() cannot be final as it is never overridden by other classes.",
                             display(fa, c),
@@ -293,7 +286,7 @@ fn run_visibility_in_interface(fa: &FileAnalysis) -> Vec<Diagnostic> {
             if vis(m) != Visibility::Public {
                 out.push(
                     Diagnostic::error(
-                        method_span(m),
+                        m.name_span,
                         format!(
                             "Method {}::{}() cannot use non-public visibility in interface.",
                             display(fa, c),
@@ -316,7 +309,7 @@ fn run_constructor_return_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
             if is_ctor(fa, m) && m.return_type.is_some() {
                 out.push(
                     Diagnostic::error(
-                        method_span(m),
+                        m.name_span,
                         format!("Constructor of class {} has a return type.", display(fa, c)),
                     )
                     .with_code("constructor.returnType"),
@@ -338,7 +331,7 @@ fn run_constructor_modifiers(fa: &FileAnalysis) -> Vec<Diagnostic> {
             if is_ctor(fa, m) && m.modifiers.is_static {
                 out.push(
                     Diagnostic::error(
-                        method_span(m),
+                        m.name_span,
                         format!(
                             "Constructor {}::__construct() cannot be static.",
                             display(fa, c)
@@ -363,7 +356,7 @@ fn run_duplicate_parameter(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 if !seen.insert(pn) {
                     out.push(
                         Diagnostic::error(
-                            method_span(m),
+                            m.name_span,
                             format!(
                                 "Redefinition of parameter ${pn} in method {}::{}().",
                                 display(fa, c),
@@ -665,7 +658,7 @@ fn check_overriding_method_signature(
                 md.return_type
                     .as_ref()
                     .map(|t| t.span)
-                    .unwrap_or_else(|| method_span(md)),
+                    .unwrap_or_else(|| md.name_span),
                 format!(
                     "Return type ({}) of method {here}::{mname}() should be compatible with return type ({}) of method {there}::{mname}()",
                     method.return_type, pm.return_type
@@ -780,7 +773,7 @@ fn run_missing_return_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 continue;
             }
             let mut d = Diagnostic::error(
-                method_span(md),
+                md.name_span,
                 format!(
                     "Method {}::{name}() has no return type specified.",
                     display(fa, c)
@@ -930,7 +923,7 @@ fn run_missing_param_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     continue; // inherited from an overridden prototype
                 }
                 let mut d = Diagnostic::error(
-                    method_span(md),
+                    md.name_span,
                     format!(
                         "Method {}::{}() has parameter ${} with no type specified.",
                         display(fa, c),
@@ -2165,7 +2158,7 @@ fn run_consistent_constructor_private(fa: &FileAnalysis) -> Vec<Diagnostic> {
             if is_ctor(fa, m) && vis(m) == Visibility::Private {
                 out.push(
                     Diagnostic::error(
-                        method_span(m),
+                        m.name_span,
                         "Private constructor cannot be enforced as consistent for child classes."
                             .to_string(),
                     )
@@ -2202,7 +2195,7 @@ fn run_consistent_constructor(fa: &FileAnalysis) -> Vec<Diagnostic> {
             if !mr.name.eq_ignore_ascii_case("__construct") {
                 continue;
             }
-            compare_constructor_signature(fa, &proto, fqn, mr, method_span(md), &mut out);
+            compare_constructor_signature(fa, &proto, fqn, mr, md.name_span, &mut out);
         }
     });
     out
@@ -3146,7 +3139,7 @@ fn run_missing_method_self_out_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 continue;
             };
             let method_name = fa.interner.resolve(md.name);
-            let span = method_span(md);
+            let span = md.name_span;
             for ty in self_out_doc_types(doc) {
                 SelfOutDocCheck {
                     fa,

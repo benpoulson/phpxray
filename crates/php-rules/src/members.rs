@@ -335,6 +335,26 @@ pub(crate) fn primary_name(r: &ResolvedRef) -> String {
     r.name.trim_start_matches('\\').to_string()
 }
 
+/// Every class name an object-ish type mentions, flattened through nullables
+/// and unions/intersections. Non-object arms contribute nothing.
+pub(crate) fn object_class_names(t: &php_types::Type) -> Vec<String> {
+    fn walk(t: &php_types::Type, out: &mut Vec<String>) {
+        match t {
+            php_types::Type::Named { fqn, .. } => out.push(fqn.to_string()),
+            php_types::Type::Nullable(inner) => walk(inner, out),
+            php_types::Type::Union(parts) | php_types::Type::Intersection(parts) => {
+                for p in parts.iter() {
+                    walk(p, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(t, &mut out);
+    out
+}
+
 #[cfg(test)]
 mod resolver_tests {
     use super::{MemberAccessResolver, ResolveStatus};

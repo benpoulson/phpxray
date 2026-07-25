@@ -142,7 +142,7 @@ fn check_params(
         .collect();
 
     for tag in &block.tags {
-        let (base, prefix) = strip_doc_prefix(&tag.name);
+        let (base, prefix) = crate::doctags::prefix_label(&tag.name);
         if base != "param" {
             continue;
         }
@@ -206,7 +206,7 @@ fn check_param_out(
 ) {
     let block = php_phpdoc::parse_block(doc_raw);
     for tag in &block.tags {
-        let (base, prefix) = strip_doc_prefix(&tag.name);
+        let (base, prefix) = crate::doctags::prefix_label(&tag.name);
         if base != "param-out" || prefix == Some("psalm") {
             continue;
         }
@@ -269,7 +269,7 @@ fn check_param_invoked_callable_tags(
 ) {
     let block = php_phpdoc::parse_block(doc_raw);
     for tag in &block.tags {
-        let (base, prefix) = strip_doc_prefix(&tag.name);
+        let (base, prefix) = crate::doctags::prefix_label(&tag.name);
         let Some(immediately) = (match base {
             "param-immediately-invoked-callable" => Some(true),
             "param-later-invoked-callable" => Some(false),
@@ -614,7 +614,7 @@ fn run_invalid_tag_values(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn check_invalid_doc_values(raw: &str, span: Span, out: &mut Vec<Diagnostic>) {
     let block = php_phpdoc::parse_block(raw);
     for tag in &block.tags {
-        let (base, prefix) = strip_doc_prefix(&tag.name);
+        let (base, prefix) = crate::doctags::prefix_label(&tag.name);
         // Mirrored from phpstan: phan/psalm-specific tags are not reported by
         // this rule. We still validate phpstan-prefixed tags.
         if prefix == Some("psalm") || tag.name.starts_with("phan-") {
@@ -736,7 +736,7 @@ fn check_assert_doc(
     let param_types = declaration_param_types(fa, scope, templates, doc_raw, params);
     let block = php_phpdoc::parse_block(doc_raw);
     for tag in &block.tags {
-        let (base, prefix) = strip_doc_prefix(&tag.name);
+        let (base, prefix) = crate::doctags::prefix_label(&tag.name);
         if !matches!(base, "assert" | "assert-if-true" | "assert-if-false") {
             continue;
         }
@@ -916,7 +916,7 @@ fn check_function_conditionals(
     // parameter out-types too, so include the tag's type operand when present.
     let block = php_phpdoc::parse_block(doc_raw);
     for tag in &block.tags {
-        let (base, prefix) = strip_doc_prefix(&tag.name);
+        let (base, prefix) = crate::doctags::prefix_label(&tag.name);
         if base != "param-out" || prefix == Some("psalm") {
             continue;
         }
@@ -1332,7 +1332,7 @@ fn run_incompatible_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
             match &st.kind {
                 StmtKind::Function(f) => {
                     if let Some(doc) = &f.doc {
-                        let templates = template_names(doc);
+                        let templates = crate::doctags::templates(Some(doc));
                         check_incompat(
                             fa,
                             scope,
@@ -1346,12 +1346,16 @@ fn run_incompatible_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     }
                 }
                 StmtKind::Class(c) => {
-                    let class_templates = c.doc.as_deref().map(template_names).unwrap_or_default();
+                    let class_templates = c
+                        .doc
+                        .as_deref()
+                        .map(|d| crate::doctags::templates(Some(d)))
+                        .unwrap_or_default();
                     for m in &c.members {
                         let Member::Method(mth) = m else { continue };
                         let Some(doc) = &mth.doc else { continue };
                         let mut templates = class_templates.clone();
-                        templates.extend(template_names(doc));
+                        templates.extend(crate::doctags::templates(Some(doc)));
                         check_incompat(
                             fa,
                             scope,
@@ -1369,15 +1373,6 @@ fn run_incompatible_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
     });
     out
-}
-
-/// `@template` names declared in a docblock.
-fn template_names(raw: &str) -> Vec<String> {
-    php_phpdoc::parse(raw)
-        .templates
-        .into_iter()
-        .map(|t| t.name)
-        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1462,7 +1457,11 @@ fn run_property_phpdoc_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 .name
                 .map(|n| fa.interner.resolve(n).to_string())
                 .unwrap_or_else(|| "class@anonymous".to_string());
-            let class_templates = c.doc.as_deref().map(template_names).unwrap_or_default();
+            let class_templates = c
+                .doc
+                .as_deref()
+                .map(|d| crate::doctags::templates(Some(d)))
+                .unwrap_or_default();
             for m in &c.members {
                 let Member::Property(p) = m else { continue };
                 let Some(native_ast) = &p.ty else { continue }; // no native hint -> mixed.
@@ -1511,7 +1510,11 @@ fn run_property_hook_phpdoc_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
             let StmtKind::Class(c) = &st.kind else {
                 continue;
             };
-            let class_templates = c.doc.as_deref().map(template_names).unwrap_or_default();
+            let class_templates = c
+                .doc
+                .as_deref()
+                .map(|d| crate::doctags::templates(Some(d)))
+                .unwrap_or_default();
             for m in &c.members {
                 let Member::Property(p) = m else { continue };
                 let Some(property_native_ast) = &p.ty else {
@@ -1523,7 +1526,7 @@ fn run_property_hook_phpdoc_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     for hook in hooks {
                         let Some(doc_raw) = &hook.doc else { continue };
                         let mut templates = class_templates.clone();
-                        templates.extend(template_names(doc_raw));
+                        templates.extend(crate::doctags::templates(Some(doc_raw)));
                         check_hook_incompat(
                             fa,
                             scope,
@@ -1650,7 +1653,11 @@ fn run_class_const_phpdoc_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 .name
                 .map(|n| fa.interner.resolve(n).to_string())
                 .unwrap_or_else(|| "class@anonymous".to_string());
-            let class_templates = c.doc.as_deref().map(template_names).unwrap_or_default();
+            let class_templates = c
+                .doc
+                .as_deref()
+                .map(|d| crate::doctags::templates(Some(d)))
+                .unwrap_or_default();
             for m in &c.members {
                 let Member::ClassConst(cc) = m else { continue };
                 let Some(native_ast) = &cc.ty else { continue }; // untyped const -> mixed.
@@ -1802,7 +1809,11 @@ fn run_var_tag_trait(fa: &FileAnalysis) -> Vec<Diagnostic> {
         for st in region {
             match &st.kind {
                 StmtKind::Class(c) => {
-                    let class_templates = c.doc.as_deref().map(template_names).unwrap_or_default();
+                    let class_templates = c
+                        .doc
+                        .as_deref()
+                        .map(|d| crate::doctags::templates(Some(d)))
+                        .unwrap_or_default();
                     for m in &c.members {
                         if let Member::Property(p) = m {
                             if let Some(doc) = &p.doc {
@@ -1879,7 +1890,9 @@ struct TemplateEnv {
 impl TemplateEnv {
     fn function(doc: Option<&str>) -> Self {
         Self {
-            all: doc.map(template_names).unwrap_or_default(),
+            all: doc
+                .map(|d| crate::doctags::templates(Some(d)))
+                .unwrap_or_default(),
             class_fqn: None,
             class_templates: Vec::new(),
         }
@@ -1887,7 +1900,10 @@ impl TemplateEnv {
 
     fn method(class_fqn: String, class_templates: Vec<String>, doc: Option<&str>) -> Self {
         let mut all = class_templates.clone();
-        all.extend(doc.map(template_names).unwrap_or_default());
+        all.extend(
+            doc.map(|d| crate::doctags::templates(Some(d)))
+                .unwrap_or_default(),
+        );
         Self {
             all,
             class_fqn: Some(class_fqn),
@@ -1979,7 +1995,11 @@ fn check_var_tag_missing_types_in_stmt(
         StmtKind::Class(c) => {
             let Some(name) = c.name else { return };
             let class_fqn = scope.qualify(fa.interner.resolve(name));
-            let class_templates = c.doc.as_deref().map(template_names).unwrap_or_default();
+            let class_templates = c
+                .doc
+                .as_deref()
+                .map(|d| crate::doctags::templates(Some(d)))
+                .unwrap_or_default();
             for m in &c.members {
                 let Member::Method(mth) = m else { continue };
                 let Some(body) = &mth.body else { continue };
@@ -2087,7 +2107,11 @@ fn run_var_tag_changed_expression_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
         for st in region {
             match &st.kind {
                 StmtKind::Function(f) => {
-                    let templates = f.doc.as_deref().map(template_names).unwrap_or_default();
+                    let templates = f
+                        .doc
+                        .as_deref()
+                        .map(|d| crate::doctags::templates(Some(d)))
+                        .unwrap_or_default();
                     let param_types = declaration_param_types(
                         fa,
                         scope,
@@ -2108,13 +2132,21 @@ fn run_var_tag_changed_expression_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     );
                 }
                 StmtKind::Class(c) => {
-                    let class_templates = c.doc.as_deref().map(template_names).unwrap_or_default();
+                    let class_templates = c
+                        .doc
+                        .as_deref()
+                        .map(|d| crate::doctags::templates(Some(d)))
+                        .unwrap_or_default();
                     for m in &c.members {
                         let Member::Method(mth) = m else { continue };
                         let Some(body) = &mth.body else { continue };
                         let mut templates = class_templates.clone();
-                        templates
-                            .extend(mth.doc.as_deref().map(template_names).unwrap_or_default());
+                        templates.extend(
+                            mth.doc
+                                .as_deref()
+                                .map(|d| crate::doctags::templates(Some(d)))
+                                .unwrap_or_default(),
+                        );
                         let param_types = declaration_param_types(
                             fa,
                             scope,
@@ -2405,7 +2437,7 @@ fn run_self_out(fa: &FileAnalysis) -> Vec<Diagnostic> {
             for m in &c.members {
                 let Member::Method(mth) = m else { continue };
                 let Some(doc) = &mth.doc else { continue };
-                let self_out_tags = doc_tag_types(doc, "self-out");
+                let self_out_tags = crate::doctags::tag_types(doc, "self-out");
                 if self_out_tags.is_empty() {
                     continue;
                 }
@@ -2487,9 +2519,9 @@ fn run_require_sealed_placement(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 continue;
             };
             let Some(doc) = &c.doc else { continue };
-            let templates = template_names(doc);
+            let templates = crate::doctags::templates(Some(doc));
 
-            let require_extends = doc_tag_types(doc, "require-extends");
+            let require_extends = crate::doctags::tag_types(doc, "require-extends");
             if !require_extends.is_empty() {
                 if !matches!(c.kind, ClassKind::Interface | ClassKind::Trait) {
                     out.push(
@@ -2512,7 +2544,7 @@ fn run_require_sealed_placement(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 }
             }
 
-            let require_implements = doc_tag_types(doc, "require-implements");
+            let require_implements = crate::doctags::tag_types(doc, "require-implements");
             if !require_implements.is_empty() {
                 if c.kind != ClassKind::Trait {
                     out.push(
@@ -2535,7 +2567,7 @@ fn run_require_sealed_placement(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 }
             }
 
-            let sealed = doc_tag_types(doc, "sealed");
+            let sealed = crate::doctags::tag_types(doc, "sealed");
             if !sealed.is_empty() {
                 match c.kind {
                     ClassKind::Enum => out.push(
@@ -2584,7 +2616,7 @@ fn check_require_extends_tags(
 
     for tag in tags {
         let ty = resolve_doc_type(scope, templates, tag);
-        let class_names = object_class_names(&ty);
+        let class_names = crate::members::object_class_names(&ty);
         if class_names.is_empty() {
             out.push(
                 Diagnostic::error(
@@ -2650,7 +2682,7 @@ fn check_require_implements_tags(
 ) {
     for tag in tags {
         let ty = resolve_doc_type(scope, templates, tag);
-        let class_names = object_class_names(&ty);
+        let class_names = crate::members::object_class_names(&ty);
         if class_names.is_empty() {
             out.push(
                 Diagnostic::error(
@@ -2699,7 +2731,7 @@ fn check_sealed_tags(
 ) {
     for tag in tags {
         let ty = resolve_doc_type(scope, templates, tag);
-        let class_names = object_class_names(&ty);
+        let class_names = crate::members::object_class_names(&ty);
         if class_names.is_empty() {
             out.push(
                 Diagnostic::error(
@@ -2762,53 +2794,7 @@ fn require_implements_target_id(kind: ClassKind) -> &'static str {
     }
 }
 
-fn doc_tag_types(doc_raw: &str, base: &str) -> Vec<php_phpdoc::DocType> {
-    let block = php_phpdoc::parse_block(doc_raw);
-    block
-        .tags
-        .iter()
-        .filter_map(|tag| {
-            let (b, _) = strip_doc_prefix(&tag.name);
-            if b != base {
-                return None;
-            }
-            php_phpdoc::parse_type_prefix(&tag.value).map(|(ty, _)| ty)
-        })
-        .collect()
-}
-
-fn object_class_names(t: &Type) -> Vec<String> {
-    let mut out = Vec::new();
-    collect_object_class_names(t, &mut out);
-    out
-}
-
-fn collect_object_class_names(t: &Type, out: &mut Vec<String>) {
-    match t {
-        Type::Named { fqn, .. } => out.push(fqn.to_string()),
-        Type::Nullable(inner) => collect_object_class_names(inner, out),
-        Type::Union(parts) | Type::Intersection(parts) => {
-            for p in parts.iter() {
-                collect_object_class_names(p, out);
-            }
-        }
-        _ => {}
-    }
-}
-
 // --- shared helpers ---------------------------------------------------------
-
-/// Split a doc tag name into its base and an optional `phpstan`/`psalm` prefix.
-/// `"phpstan-param"` -> `("param", Some("phpstan"))`; `"param"` -> `("param", None)`.
-fn strip_doc_prefix(name: &str) -> (&str, Option<&str>) {
-    let (base, prefix) = php_phpdoc::query::split_prefix(name);
-    let prefix = match prefix {
-        Some(php_phpdoc::query::TagPrefix::PhpStan) => Some("phpstan"),
-        Some(php_phpdoc::query::TagPrefix::Psalm) => Some("psalm"),
-        None => None,
-    };
-    (base, prefix)
-}
 
 // --- @property / @method tag type validation (PropertyTag/MethodTagRule) -----
 
@@ -2855,7 +2841,7 @@ fn collect_tag_refs(st: &Stmt, fa: &FileAnalysis, scope: &Scope, out: &mut Vec<D
             if doc.properties.is_empty() && doc.methods.is_empty() {
                 return;
             }
-            let templates = template_names(doc_raw);
+            let templates = crate::doctags::templates(Some(doc_raw));
             let display = c
                 .name
                 .map(|n| scope.qualify(fa.interner.resolve(n)))

@@ -12,6 +12,7 @@ use php_resolve::{RefKind, Resolution, ResolvedRef};
 
 pub(crate) mod compat;
 pub(crate) mod decls;
+pub(crate) mod doctags;
 mod facts;
 pub(crate) mod fix;
 pub(crate) mod function_like;

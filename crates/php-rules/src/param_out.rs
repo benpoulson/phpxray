@@ -77,26 +77,6 @@ pub(crate) fn param_out_types(
     out.into_iter().map(|(_, p)| p).collect()
 }
 
-/// `@template` names declared by a docblock.
-pub(crate) fn doc_templates(doc: Option<&str>) -> Vec<String> {
-    doc.map(php_phpdoc::parse)
-        .unwrap_or_default()
-        .templates
-        .into_iter()
-        .map(|t| t.name)
-        .collect()
-}
-
-/// A method's templates: the class's, plus any the method declares itself.
-pub(crate) fn combined_templates(
-    class_templates: &[String],
-    method_doc: Option<&str>,
-) -> Vec<String> {
-    let mut templates = class_templates.to_vec();
-    templates.extend(doc_templates(method_doc));
-    templates
-}
-
 /// The final type of every variable in a body, but **only** for bodies simple
 /// enough that "final" is unambiguous: a straight line of assignments whose
 /// right-hand sides are self-evident.

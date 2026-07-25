@@ -1082,7 +1082,10 @@ fn class_type_aliases(
             continue;
         };
         let ty = resolve_doc_type(scope, templates, &dt);
-        map.insert(key_fqn.trim_start_matches('\\').to_ascii_lowercase(), ty);
+        map.insert(
+            php_resolve::symbols::SymbolKey::class_like(key_fqn).into_string(),
+            ty,
+        );
     }
     if map.len() > 1 {
         // Fixpoint: expand aliases that reference other aliases (bounded).
@@ -1136,7 +1139,9 @@ fn class_imported_types(scope: &Scope, raw: Option<&str>) -> Vec<ImportedType> {
             _ => name,
         };
         let fqn_of = |n: &str| match resolve_doc_type(scope, &[], &DocType::Named(n.to_string())) {
-            Type::Named { fqn, .. } => Some(fqn.trim_start_matches('\\').to_ascii_lowercase()),
+            Type::Named { fqn, .. } => {
+                Some(php_resolve::symbols::SymbolKey::class_like(&fqn).into_string())
+            }
             _ => None,
         };
         let (Some(source_class), Some(local_fqn)) = (fqn_of(other), fqn_of(local)) else {
@@ -1145,7 +1150,7 @@ fn class_imported_types(scope: &Scope, raw: Option<&str>) -> Vec<ImportedType> {
         out.push(ImportedType {
             local_fqn,
             source_class,
-            source_name: name.trim_start_matches('\\').to_ascii_lowercase(),
+            source_name: php_resolve::symbols::SymbolKey::class_like(name).into_string(),
         });
     }
     out
@@ -1159,7 +1164,7 @@ fn expand_aliases(ty: &Type, aliases: &HashMap<String, Type>) -> Type {
 fn expand_aliases_excluding(ty: &Type, aliases: &HashMap<String, Type>, exclude: &str) -> Type {
     ty.clone().map(&mut |part| match part {
         Type::Named { fqn, args } if args.is_empty() => {
-            let key = fqn.trim_start_matches('\\').to_ascii_lowercase();
+            let key = php_resolve::symbols::SymbolKey::class_like(&fqn).into_string();
             if key != exclude {
                 if let Some(t) = aliases.get(&key) {
                     return t.clone();

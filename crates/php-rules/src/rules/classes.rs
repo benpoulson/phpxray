@@ -1959,7 +1959,7 @@ fn run_mixin(fa: &FileAnalysis) -> Vec<Diagnostic> {
             }
             // Every class named anywhere in the mixin type must exist and must
             // not be a trait (phpstan's `getReferencedClasses()` loop).
-            for mfqn in object_class_names(mixin) {
+            for mfqn in crate::members::object_class_names(mixin) {
                 let short = mfqn.trim_start_matches('\\');
                 match fa.reflection.class(&mfqn) {
                     Some(mcr) if mcr.kind == ClassKind::Trait => out.push(
@@ -2010,8 +2010,8 @@ fn run_method_tags(fa: &FileAnalysis) -> Vec<Diagnostic> {
         if doc.methods.is_empty() {
             return;
         }
-        let templates = template_names(doc_raw);
-        let display = class_display(scope, c, fa.interner);
+        let templates = crate::doctags::templates(Some(doc_raw));
+        let display = qualified_class_name(scope, c, fa.interner);
         let label = reflected_class_label(c.kind, &display);
         let span = enum_member_span(c);
         let ctx = TagTypeContext {
@@ -2053,8 +2053,8 @@ fn run_property_tags(fa: &FileAnalysis) -> Vec<Diagnostic> {
         if doc.properties.is_empty() {
             return;
         }
-        let templates = template_names(doc_raw);
-        let display = class_display(scope, c, fa.interner);
+        let templates = crate::doctags::templates(Some(doc_raw));
+        let display = qualified_class_name(scope, c, fa.interner);
         let label = reflected_class_label(c.kind, &display);
         let span = enum_member_span(c);
         let ctx = TagTypeContext {
@@ -2170,8 +2170,8 @@ fn run_local_type_aliases(fa: &FileAnalysis) -> Vec<Diagnostic> {
         if aliases.is_empty() {
             return;
         }
-        let templates = template_names(doc_raw);
-        let display = class_display(scope, c, fa.interner);
+        let templates = crate::doctags::templates(Some(doc_raw));
+        let display = qualified_class_name(scope, c, fa.interner);
         let label = reflected_class_label(c.kind, &display);
         let span = enum_member_span(c);
 
@@ -2573,7 +2573,7 @@ fn local_type_aliases(raw: &str) -> Vec<LocalAlias> {
         .tags
         .iter()
         .filter_map(|tag| {
-            let (base, _prefix) = strip_doc_prefix(&tag.name);
+            let (base, _prefix) = crate::doctags::prefix_label(&tag.name);
             if base != "type" {
                 return None;
             }
@@ -2868,7 +2868,11 @@ fn property_tag_name(access: PropertyAccess) -> &'static str {
     }
 }
 
-fn class_display(scope: &Scope, c: &ClassDecl, interner: &Interner) -> String {
+/// The class's qualified name, or the empty string for an anonymous class.
+/// Distinct from `constants::declared_class_fqn` and
+/// `dead_code::class_display_name` — see those before assuming these are
+/// interchangeable.
+fn qualified_class_name(scope: &Scope, c: &ClassDecl, interner: &Interner) -> String {
     c.name
         .map(|n| display_fqn(&scope.qualify(interner.resolve(n))))
         .unwrap_or_else(|| "Anonymous class".to_string())
@@ -3167,11 +3171,16 @@ fn sealed_docs(fa: &FileAnalysis) -> HashMap<String, SealedDocs> {
             return;
         };
         let fqn = scope.qualify(fa.interner.resolve(name));
-        let templates = template_names(raw);
+        let templates = crate::doctags::templates(Some(raw));
         let mut allowed = Vec::new();
-        for ty in doc_tag_types(scope, &templates, raw, "sealed")
+        for ty in crate::doctags::resolved_tag_types(scope, &templates, raw, "sealed")
             .into_iter()
-            .chain(doc_tag_types(scope, &templates, raw, "inheritors"))
+            .chain(crate::doctags::resolved_tag_types(
+                scope,
+                &templates,
+                raw,
+                "inheritors",
+            ))
         {
             collect_allowed_exact_subtypes(&ty, &mut allowed);
         }
@@ -3228,9 +3237,11 @@ fn requirement_docs(fa: &FileAnalysis) -> HashMap<String, RequirementDocs> {
             return;
         };
         let fqn = scope.qualify(fa.interner.resolve(name));
-        let templates = template_names(raw);
-        let require_extends = doc_tag_types(scope, &templates, raw, "require-extends");
-        let require_implements = doc_tag_types(scope, &templates, raw, "require-implements");
+        let templates = crate::doctags::templates(Some(raw));
+        let require_extends =
+            crate::doctags::resolved_tag_types(scope, &templates, raw, "require-extends");
+        let require_implements =
+            crate::doctags::resolved_tag_types(scope, &templates, raw, "require-implements");
         if require_extends.is_empty() && require_implements.is_empty() {
             return;
         }
@@ -3247,40 +3258,6 @@ fn requirement_docs(fa: &FileAnalysis) -> HashMap<String, RequirementDocs> {
     docs
 }
 
-fn doc_tag_types(scope: &Scope, templates: &[String], doc_raw: &str, base: &str) -> Vec<Type> {
-    let block = php_phpdoc::parse_block(doc_raw);
-    block
-        .tags
-        .iter()
-        .filter_map(|tag| {
-            let (b, _) = strip_doc_prefix(&tag.name);
-            if b != base {
-                return None;
-            }
-            let (ty, _) = php_phpdoc::parse_type_prefix(&tag.value)?;
-            Some(resolve_doc_type(scope, templates, &ty))
-        })
-        .collect()
-}
-
-fn template_names(raw: &str) -> Vec<String> {
-    php_phpdoc::parse(raw)
-        .templates
-        .into_iter()
-        .map(|t| t.name)
-        .collect()
-}
-
-fn strip_doc_prefix(name: &str) -> (&str, Option<&str>) {
-    if let Some(rest) = name.strip_prefix("phpstan-") {
-        (rest, Some("phpstan"))
-    } else if let Some(rest) = name.strip_prefix("psalm-") {
-        (rest, Some("psalm"))
-    } else {
-        (name, None)
-    }
-}
-
 struct MissingRequirement {
     fqn: String,
     ty_display: String,
@@ -3292,7 +3269,7 @@ fn first_missing_required_extends(
     required_ty: &Type,
 ) -> Option<MissingRequirement> {
     let ty_display = required_ty.to_string();
-    for required in object_class_names(required_ty) {
+    for required in crate::members::object_class_names(required_ty) {
         let Some(target) = fa.reflection.class(&required) else {
             continue;
         };
@@ -3324,25 +3301,6 @@ fn required_interface_target(fa: &FileAnalysis, required_ty: &Type) -> Option<Mi
         fqn: fqn.to_string(),
         ty_display: required_ty.to_string(),
     })
-}
-
-fn object_class_names(t: &Type) -> Vec<String> {
-    let mut out = Vec::new();
-    collect_object_class_names(t, &mut out);
-    out
-}
-
-fn collect_object_class_names(t: &Type, out: &mut Vec<String>) {
-    match t {
-        Type::Named { fqn, .. } => out.push(fqn.to_string()),
-        Type::Nullable(inner) => collect_object_class_names(inner, out),
-        Type::Union(parts) | Type::Intersection(parts) => {
-            for p in parts.iter() {
-                collect_object_class_names(p, out);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn collect_interfaces(

@@ -384,7 +384,7 @@ fn run_parameter_out_execution_end_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     };
                     let class_fqn = scope.qualify(fa.interner.resolve(class_name));
                     let class_refl = fa.reflect_class(scope, &class_fqn, c);
-                    let class_templates = param_out::doc_templates(c.doc.as_deref());
+                    let class_templates = crate::doctags::templates(c.doc.as_deref());
                     for member in &c.members {
                         let Member::Method(m) = member else {
                             continue;
@@ -406,7 +406,7 @@ fn run_parameter_out_execution_end_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
                         let description =
                             format!("method {}::{}()", class_refl.fqn, method_refl.name);
                         let templates =
-                            param_out::combined_templates(&class_templates, m.doc.as_deref());
+                            crate::doctags::combined_templates(&class_templates, m.doc.as_deref());
                         check_param_out_execution_body(
                             scope,
                             m.doc.as_deref(),
@@ -436,7 +436,7 @@ fn check_param_out_execution_function(
 ) {
     let refl = fa.reflect_function(scope, f);
     let description = format!("function {}()", refl.fqn);
-    let templates = param_out::doc_templates(f.doc.as_deref());
+    let templates = crate::doctags::templates(f.doc.as_deref());
     check_param_out_execution_body(
         scope,
         f.doc.as_deref(),

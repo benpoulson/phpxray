@@ -387,7 +387,7 @@ fn run_function_signature_variance(fa: &FileAnalysis) -> Vec<Diagnostic> {
 
 fn run_method_template_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    for_each_class_like(fa, |scope, class, fqn, class_span| {
+    for_each_class_like(fa, |scope, class, fqn, _class_span| {
         let Some(class_display) = fqn else { return };
         let class_templates = class.doc.as_deref().map(raw_templates).unwrap_or_default();
         let class_template_names: Vec<&str> =
@@ -404,7 +404,7 @@ fn run_method_template_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
             check_template_tags(
                 fa,
                 scope,
-                method_span(method, class_span),
+                method.name_span,
                 method_templates.clone(),
                 |name| {
                     format!(
@@ -429,7 +429,7 @@ fn run_method_template_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     .unwrap_or_else(|| mt.name.clone());
                 out.push(
                     Diagnostic::error(
-                        method_span(method, class_span),
+                        method.name_span,
                         format!(
                             "PHPDoc tag @template {} for method {class_display}::{method_name}() shadows @template {shadowed} for class {class_display}.",
                             mt.name
@@ -447,7 +447,7 @@ fn run_method_template_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// method-local templates may not be declared covariant/contravariant.
 fn run_method_signature_variance(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    for_each_class_like(fa, |_scope, class, fqn, class_span| {
+    for_each_class_like(fa, |_scope, class, fqn, _class_span| {
         let Some(class_display) = fqn else { return };
         for member in &class.members {
             let Member::Method(method) = member else {
@@ -458,7 +458,7 @@ fn run_method_signature_variance(fa: &FileAnalysis) -> Vec<Diagnostic> {
             };
             let method_name = fa.interner.resolve(method.name);
             check_non_invariant_signature_templates(
-                method_span(method, class_span),
+                method.name_span,
                 raw_templates(raw),
                 &format!("in method {class_display}::{method_name}()"),
                 "method.variance",
@@ -905,7 +905,7 @@ fn local_doc_before_trait_use(source: &str, trait_name_start: usize) -> Option<&
 
 fn doc_has_use_tag(raw: &str) -> bool {
     parse_block(raw).tags.iter().any(|tag| {
-        let (base, _prefix) = strip_doc_prefix(&tag.name);
+        let (base, _prefix) = crate::doctags::prefix_label(&tag.name);
         base == "use" || base == "template-use"
     })
 }
@@ -1040,7 +1040,7 @@ fn raw_templates(raw: &str) -> Vec<TemplateInfo> {
         .tags
         .iter()
         .filter_map(|tag| {
-            let (base, _prefix) = strip_doc_prefix(&tag.name);
+            let (base, _prefix) = crate::doctags::prefix_label(&tag.name);
             if !is_template_tag(base) {
                 return None;
             }
@@ -1054,23 +1054,13 @@ fn method_tag_templates(raw: &str) -> Vec<MethodTagTemplates> {
         .tags
         .iter()
         .filter_map(|tag| {
-            let (base, _prefix) = strip_doc_prefix(&tag.name);
+            let (base, _prefix) = crate::doctags::prefix_label(&tag.name);
             if base != "method" {
                 return None;
             }
             parse_method_tag_templates(&tag.value)
         })
         .collect()
-}
-
-fn strip_doc_prefix(name: &str) -> (&str, Option<&str>) {
-    if let Some(rest) = name.strip_prefix("phpstan-") {
-        (rest, Some("phpstan"))
-    } else if let Some(rest) = name.strip_prefix("psalm-") {
-        (rest, Some("psalm"))
-    } else {
-        (name, None)
-    }
 }
 
 fn is_template_tag(base: &str) -> bool {
@@ -1318,10 +1308,6 @@ fn visit_stmts(stmts: &[Stmt], f: &mut impl FnMut(&Stmt)) {
             _ => {}
         }
     }
-}
-
-fn method_span(method: &php_ast::MethodDecl, _fallback: Span) -> Span {
-    method.name_span
 }
 
 #[cfg(test)]

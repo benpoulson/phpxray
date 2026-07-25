@@ -3303,7 +3303,7 @@ fn run_reading_write_only(fa: &FileAnalysis) -> Vec<Diagnostic> {
         if write_targets.contains(&(r.start as u32, r.end as u32)) {
             continue; // it's a write, not a read.
         }
-        let Some(class) = receiver_class(fa, fetch.base) else {
+        let Some(class) = named_receiver_class(fa, fetch.base) else {
             continue;
         };
         if !symbols::class_tree_fully_known(fa, &class) {
@@ -3347,7 +3347,7 @@ fn run_writing_to_read_only(fa: &FileAnalysis) -> Vec<Diagnostic> {
         let MemberName::Ident(p) = name else {
             continue;
         };
-        let Some(class) = receiver_class(fa, base) else {
+        let Some(class) = named_receiver_class(fa, base) else {
             continue;
         };
         if !symbols::class_tree_fully_known(fa, &class) {
@@ -3375,7 +3375,12 @@ fn run_writing_to_read_only(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// Resolve a property-fetch receiver expression to a single concrete class FQN,
 /// covering both `$this` (via the inferred type, which the type map seeds) and an
 /// arbitrary inferred object type.
-fn receiver_class(fa: &FileAnalysis, base: &Expr) -> Option<String> {
+/// The receiver's class, accepting **only** a directly-named type.
+/// Deliberately narrower than `comparison::receiver_class`, which goes through
+/// `members::sole_class` and so also resolves nullables and single-arm unions.
+/// Widening this would make these rules resolve more receivers and report more,
+/// so it is a recall decision rather than a cleanup.
+fn named_receiver_class(fa: &FileAnalysis, base: &Expr) -> Option<String> {
     members::sole_class(&fa.type_of(base))
 }
 

@@ -354,7 +354,10 @@ fn record_member(
 }
 
 /// The display name phpstan uses for a class in dead-code messages.
-fn class_display(c: &ClassDecl, scope: &php_resolve::Scope, interner: &Interner) -> String {
+/// The class's name **for a message**: display-stripped FQN, or the words
+/// `Anonymous class`. Distinct from `constants::declared_class_fqn` and
+/// `classes::qualified_class_name`, which render differently on purpose.
+fn class_display_name(c: &ClassDecl, scope: &php_resolve::Scope, interner: &Interner) -> String {
     c.name
         .map(|n| scope.qualify(interner.resolve(n)))
         .unwrap_or_default()
@@ -406,7 +409,7 @@ fn run_unused_private_method(fa: &FileAnalysis) -> Vec<Diagnostic> {
             .iter()
             .map(|s| s.to_ascii_lowercase())
             .collect();
-        let display = class_display(c, scope, fa.interner);
+        let display = class_display_name(c, scope, fa.interner);
         for m in &c.members {
             let Member::Method(md) = m else { continue };
             if md.modifiers.visibility != Some(Visibility::Private) {
@@ -429,7 +432,7 @@ fn run_unused_private_method(fa: &FileAnalysis) -> Vec<Diagnostic> {
             };
             out.push(
                 Diagnostic::error(
-                    method_span(md),
+                    md.name_span,
                     format!("{kind} {display}::{name}() is unused."),
                 )
                 .with_code("method.unused"),
@@ -437,11 +440,6 @@ fn run_unused_private_method(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
     });
     out
-}
-
-/// The method-name token span.
-fn method_span(md: &MethodDecl) -> php_span::Span {
-    md.name_span
 }
 
 // ---------------------------------------------------------------------------
@@ -459,7 +457,7 @@ fn run_unused_private_constant(fa: &FileAnalysis) -> Vec<Diagnostic> {
         if refs.has_dynamic_member {
             return;
         }
-        let display = class_display(c, scope, fa.interner);
+        let display = class_display_name(c, scope, fa.interner);
         for m in &c.members {
             let Member::ClassConst(cd) = m else { continue };
             if cd.modifiers.visibility != Some(Visibility::Private) {
@@ -503,7 +501,7 @@ fn run_unused_private_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
         if refs.has_dynamic_member {
             return;
         }
-        let display = class_display(c, scope, fa.interner);
+        let display = class_display_name(c, scope, fa.interner);
         for m in &c.members {
             let Member::Property(pd) = m else { continue };
             if pd.modifiers.visibility != Some(Visibility::Private) {

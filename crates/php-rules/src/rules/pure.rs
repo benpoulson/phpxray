@@ -76,14 +76,14 @@ fn run_pure_method(fa: &FileAnalysis) -> Vec<Diagnostic> {
             &desc,
             "pureMethod.parameterByRef",
             &refl.params,
-            method_span(m),
+            m.name_span,
         );
         if !is_constructor(fa.interner, m)
             && is_void_without_throw_or_assert(&refl.return_type, m.doc.as_deref())
         {
             out.push(
                 Diagnostic::error(
-                    method_span(m),
+                    m.name_span,
                     format!("{desc} is marked as pure but returns void."),
                 )
                 .with_code("pureMethod.void"),
@@ -153,10 +153,6 @@ fn for_each_function(fa: &FileAnalysis, mut f: impl FnMut(&Scope, &FunctionDecl)
 
 fn function_span(f: &FunctionDecl) -> Span {
     f.name_span
-}
-
-fn method_span(m: &MethodDecl) -> Span {
-    m.name_span
 }
 
 pub(crate) static RULES: &[RuleEntry] = &[

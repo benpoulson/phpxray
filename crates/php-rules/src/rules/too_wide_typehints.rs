@@ -1216,7 +1216,7 @@ fn check_function_param_out(
     out: &mut Vec<Diagnostic>,
 ) {
     let refl = fa.reflect_function(scope, f);
-    let templates = param_out::doc_templates(f.doc.as_deref());
+    let templates = crate::doctags::templates(f.doc.as_deref());
     let desc = format!("Function {}()", refl.fqn);
     check_param_out_too_wide_body(
         scope,
@@ -1289,7 +1289,7 @@ fn check_class_param_out_methods(
     };
     let class_fqn = scope.qualify(fa.interner.resolve(class_name));
     let class_refl = fa.reflect_class(scope, &class_fqn, c);
-    let class_templates = param_out::doc_templates(c.doc.as_deref());
+    let class_templates = crate::doctags::templates(c.doc.as_deref());
     for member in &c.members {
         let Member::Method(md) = member else {
             continue;
@@ -1308,7 +1308,7 @@ fn check_class_param_out_methods(
         else {
             continue;
         };
-        let templates = param_out::combined_templates(&class_templates, md.doc.as_deref());
+        let templates = crate::doctags::combined_templates(&class_templates, md.doc.as_deref());
         let desc = format!("Method {}::{}()", class_refl.fqn, method_refl.name);
         check_param_out_too_wide_body(
             scope,

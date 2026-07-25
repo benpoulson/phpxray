@@ -62,7 +62,11 @@ use php_types::Type;
 // ---------------------------------------------------------------------------
 
 /// The display label phpstan uses (`false` = without generics): a class's name.
-fn class_display(c: &ClassDecl, scope: &Scope, interner: &Interner) -> String {
+/// The class's resolved FQN as written, with `class@anonymous` standing in for
+/// an anonymous class. Note this keeps any leading `\\` — see also
+/// `dead_code::class_display_name` and `classes::qualified_class_name`, which
+/// render the same declaration differently on purpose.
+fn declared_class_fqn(c: &ClassDecl, scope: &Scope, interner: &Interner) -> String {
     match c.name {
         Some(n) => scope.qualify(interner.resolve(n)),
         None => "class@anonymous".to_string(),
@@ -241,7 +245,7 @@ fn run_missing_const_iterable_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
 fn run_final_private_constant(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     crate::decls::for_each_class_like(fa, |scope, _fqn, c| {
-        let display = class_display(c, scope, fa.interner);
+        let display = declared_class_fqn(c, scope, fa.interner);
         for m in &c.members {
             let Member::ClassConst(cd) = m else { continue };
             if !(cd.modifiers.is_final && cd.modifiers.visibility == Some(Visibility::Private)) {
@@ -687,7 +691,7 @@ fn run_overriding_constant(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     crate::decls::for_each_class_like(fa, |scope, _fqn, c| {
         let Some(_) = c.name else { return };
-        let fqn = class_display(c, scope, fa.interner);
+        let fqn = declared_class_fqn(c, scope, fa.interner);
         // Only reason about a class whose whole hierarchy is reflected: an
         // unindexed/built-in ancestor could carry the overridden constant.
         if !fa.class_fully_known(&fqn) {
@@ -915,7 +919,7 @@ fn run_value_assigned_to_class_constant(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     crate::decls::for_each_class_like(fa, |scope, _fqn, c| {
         let Some(_) = c.name else { return };
-        let fqn = class_display(c, scope, fa.interner);
+        let fqn = declared_class_fqn(c, scope, fa.interner);
         let display = fqn.trim_start_matches('\\');
         for m in &c.members {
             let Member::ClassConst(cd) = m else { continue };
