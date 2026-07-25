@@ -4,7 +4,6 @@ use crate::TypeCtx;
 use php_ast::{BinOp, Expr, ExprKind, Stmt, StmtKind, UnOp};
 use php_resolve::Scope;
 use php_types::Type;
-use std::collections::HashMap;
 
 /// Conservative per-call return refinement.
 pub(crate) fn refine_return(
@@ -23,19 +22,11 @@ pub(crate) fn refine_return(
     if caller.depth >= 2 || !refinable {
         return declared.clone();
     }
-    let mut sub = TypeCtx {
-        index: caller.index,
-        scope: callee_scope,
-        interner: caller.interner,
-        class: callee_class,
-        vars: HashMap::new(),
-        callables: HashMap::new(),
-        depth: caller.depth + 1,
-        native: caller.native,
-        generator_send: None,
-        terminators: caller.terminators.clone(),
-        autoviv_shapes: false,
-    };
+    // The callee's body is analysed in the callee's namespace scope, one level
+    // deeper; everything else is inherited config (see `TypeCtx::child_scoped`).
+    let mut sub = caller.child_scoped(callee_scope);
+    sub.class = callee_class;
+    sub.depth = caller.depth + 1;
     for (name, arg) in params.iter().zip(args) {
         sub.vars.insert(name.clone(), caller.infer(&arg.value));
     }

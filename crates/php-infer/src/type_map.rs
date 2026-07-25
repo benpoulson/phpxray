@@ -236,14 +236,14 @@ fn build(
 /// The seeded local type of a parameter — native (untyped variadic → `array`) or
 /// merged, depending on `native`.
 fn seed_type(p: &php_reflect::ParamReflection, native: bool) -> Type {
-    if !native {
-        return p.local_type();
-    }
-    if p.variadic {
-        Type::Array(None)
-    } else {
-        p.native_ty.clone()
-    }
+    let declared = if native { &p.native_ty } else { &p.ty };
+    crate::param_local_type(
+        Some(declared),
+        p.variadic,
+        native,
+        &[],
+        crate::ParamFallback::Declared,
+    )
 }
 
 fn contextual_param_vars(
@@ -263,23 +263,14 @@ fn contextual_param_type(p: &ParamReflection, inferred: &[Type], native: bool) -
     if p.explicit {
         return seed_type(p, native);
     }
-    if native {
-        return if p.variadic {
-            Type::Array(None)
-        } else {
-            inferred.first().cloned().unwrap_or(Type::Mixed)
-        };
-    }
-    if p.variadic {
-        let item = if inferred.is_empty() {
-            Type::Mixed
-        } else {
-            Type::union(inferred.to_vec())
-        };
-        Type::List(Box::new(item))
-    } else {
-        inferred.first().cloned().unwrap_or(Type::Mixed)
-    }
+    // No declaration to honour: seed purely from the observed arguments.
+    crate::param_local_type(
+        None,
+        p.variadic,
+        native,
+        inferred,
+        crate::ParamFallback::Inferred,
+    )
 }
 
 /// If `s` declares a function or class, record types for each of its bodies in a
@@ -598,12 +589,7 @@ mod tests {
             let ExprKind::Name(n) = &callee.kind else {
                 return;
             };
-            let tail = n
-                .text
-                .trim_start_matches('\\')
-                .rsplit('\\')
-                .next()
-                .unwrap_or(&n.text);
+            let tail = crate::last_segment(&n.text);
             if tail.eq_ignore_ascii_case(name) {
                 found = map
                     .get(&key(e.span))

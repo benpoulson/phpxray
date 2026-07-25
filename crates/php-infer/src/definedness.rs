@@ -597,12 +597,7 @@ fn expr_escape(e: &Expr, interner: &Interner) -> bool {
         | ExprKind::Include { .. } => true,
         ExprKind::Call { callee, .. } => {
             if let ExprKind::Name(n) = &callee.kind {
-                let last = n
-                    .text
-                    .rsplit('\\')
-                    .next()
-                    .unwrap_or(&n.text)
-                    .to_ascii_lowercase();
+                let last = crate::last_segment(&n.text).to_ascii_lowercase();
                 if ESCAPE_FUNCTIONS.contains(&last.as_str()) {
                     return true;
                 }

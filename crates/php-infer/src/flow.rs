@@ -12,6 +12,9 @@
 //! approximation is sound enough to drive diagnostics and never panics.
 
 use crate::{
+    arg_is_plain_positional, args_are_plain_positional, last_segment, peel_paren, strip_this_vars,
+};
+use crate::{
     arrays, collection_method, is_first_class_callable,
     refine::{strip_false, strip_falsy, strip_null_strict},
     CallableAlias, TypeCtx,
@@ -508,7 +511,7 @@ impl TypeCtx<'_> {
         let ExprKind::Name(n) = &callee.kind else {
             return None;
         };
-        let last = n.text.rsplit('\\').next().unwrap_or(&n.text);
+        let last = last_segment(&n.text);
         if !last.eq_ignore_ascii_case("count") && !last.eq_ignore_ascii_case("sizeof") {
             return None;
         }
@@ -516,7 +519,7 @@ impl TypeCtx<'_> {
             return None;
         }
         let arg = args.first()?;
-        (!arg.spread && !arg.placeholder && arg.name.is_none()).then_some(&arg.value)
+        arg_is_plain_positional(arg).then_some(&arg.value)
     }
 
     fn assert_facts_fn(&self, n: &Name, args: &[Arg], truthy: Option<bool>, out: &mut Vec<Fact>) {
@@ -1593,82 +1596,23 @@ impl TypeCtx<'_> {
     }
 
     fn rec_closure(&self, c: &ClosureExpr, inferred_params: &[Type], map: &mut RecMap) {
-        let mut vars = Env::new();
-        let mut callables = CallableEnv::new();
-        for u in &c.uses {
-            let name = self.interner.resolve(u.name).to_string();
-            let ty = self.vars.get(&name).cloned().unwrap_or(Type::Mixed);
-            vars.insert(name, ty);
-            if let Some(alias) = self.callables.get(self.interner.resolve(u.name)) {
-                callables.insert(self.interner.resolve(u.name).to_string(), alias.clone());
-            }
-        }
-        self.seed_ast_params(&mut vars, &c.params, inferred_params);
-        let class = (!c.is_static).then(|| self.class.clone()).flatten();
-        let generator_send = c.return_type.as_ref().and_then(|t| {
-            crate::generator_send_type(&php_reflect::resolve_ast_type(self.scope, t))
-        });
-        self.record_child_block(class, vars, callables, generator_send, &c.body, map);
+        let mut child = self.closure_child(c, inferred_params);
+        child.autoviv_shapes = !crate::definedness::scope_has_escape_hatch(&c.body, self.interner);
+        child.record_block(&c.body, map);
     }
 
     fn rec_arrow(&self, a: &ArrowFn, inferred_params: &[Type], map: &mut RecMap) {
-        let mut vars = self.vars.clone();
-        if a.is_static {
-            strip_this_vars(&mut vars);
-        }
-        self.seed_ast_params(&mut vars, &a.params, inferred_params);
-        let class = (!a.is_static).then(|| self.class.clone()).flatten();
-        let generator_send = a.return_type.as_ref().and_then(|t| {
-            crate::generator_send_type(&php_reflect::resolve_ast_type(self.scope, t))
-        });
-        self.record_child_expr(
-            class,
-            vars,
-            self.callables.clone(),
-            generator_send,
-            &a.body,
-            map,
-        );
+        self.arrow_child(a, inferred_params).rec_here(&a.body, map);
     }
 
     fn seed_ast_params(&self, vars: &mut Env, params: &[Param], inferred: &[Type]) {
         for (i, p) in params.iter().enumerate() {
             let name = self.interner.resolve(p.name).to_string();
+            let rest = &inferred[i.min(inferred.len())..];
             vars.insert(
                 name,
-                self.ast_param_local_type(p, &inferred[i.min(inferred.len())..]),
+                self.ast_param_type(p, rest, crate::ParamFallback::Inferred),
             );
-        }
-    }
-
-    fn ast_param_local_type(&self, p: &Param, inferred: &[Type]) -> Type {
-        if self.native {
-            return if p.variadic {
-                Type::Array(None)
-            } else {
-                p.ty.as_ref()
-                    .map(|t| php_reflect::resolve_ast_type(self.scope, t))
-                    .unwrap_or_else(|| inferred.first().cloned().unwrap_or(Type::Mixed))
-            };
-        }
-        if let Some(ast_ty) =
-            p.ty.as_ref()
-                .map(|t| php_reflect::resolve_ast_type(self.scope, t))
-        {
-            if p.variadic {
-                Type::List(Box::new(ast_ty))
-            } else {
-                ast_ty
-            }
-        } else if p.variadic {
-            let item = if inferred.is_empty() {
-                Type::Mixed
-            } else {
-                Type::union(inferred.to_vec())
-            };
-            Type::List(Box::new(item))
-        } else {
-            inferred.first().cloned().unwrap_or(Type::Mixed)
         }
     }
 
@@ -1792,9 +1736,7 @@ impl TypeCtx<'_> {
             } => {
                 let mut vars = vars.clone();
                 self.seed_ast_params(&mut vars, &expr.params, inferred);
-                let generator_send = expr.return_type.as_ref().and_then(|t| {
-                    crate::generator_send_type(&php_reflect::resolve_ast_type(self.scope, t))
-                });
+                let generator_send = self.declared_generator_send(expr.return_type.as_ref());
                 self.record_child_block(
                     class.clone(),
                     vars,
@@ -1813,9 +1755,7 @@ impl TypeCtx<'_> {
             } => {
                 let mut vars = vars.clone();
                 self.seed_ast_params(&mut vars, &expr.params, inferred);
-                let generator_send = expr.return_type.as_ref().and_then(|t| {
-                    crate::generator_send_type(&php_reflect::resolve_ast_type(self.scope, t))
-                });
+                let generator_send = self.declared_generator_send(expr.return_type.as_ref());
                 self.record_child_expr(
                     class.clone(),
                     vars,
@@ -1845,13 +1785,10 @@ impl TypeCtx<'_> {
         body: &[Stmt],
         map: &mut RecMap,
     ) {
-        let mut child = TypeCtx::new(self.index, self.scope, self.interner);
+        let mut child = self.child();
         child.class = class;
         child.vars = vars;
         child.callables = callables;
-        child.depth = self.depth;
-        child.native = self.native;
-        child.terminators = self.terminators.clone();
         child.generator_send = generator_send;
         child.autoviv_shapes = !crate::definedness::scope_has_escape_hatch(body, self.interner);
         child.record_block(body, map);
@@ -1866,13 +1803,10 @@ impl TypeCtx<'_> {
         e: &Expr,
         map: &mut RecMap,
     ) {
-        let mut child = TypeCtx::new(self.index, self.scope, self.interner);
+        let mut child = self.child();
         child.class = class;
         child.vars = vars;
         child.callables = callables;
-        child.depth = self.depth;
-        child.native = self.native;
-        child.terminators = self.terminators.clone();
         child.generator_send = generator_send;
         child.rec_here(e, map);
     }
@@ -2344,18 +2278,6 @@ fn span_key(e: &Expr) -> (u32, u32) {
     (r.start as u32, r.end as u32)
 }
 
-fn args_are_plain_positional(args: &[Arg]) -> bool {
-    args.iter()
-        .all(|a| !a.spread && !a.placeholder && a.name.is_none())
-}
-
-fn peel_paren(e: &Expr) -> &Expr {
-    match &e.kind {
-        ExprKind::Paren(inner) => peel_paren(inner),
-        _ => e,
-    }
-}
-
 fn array_filter_callback_params(args: &[Arg], value: Type, key: Type) -> Option<Vec<Type>> {
     match args.get(2).map(|a| &a.value) {
         None => Some(vec![value]),
@@ -2408,10 +2330,6 @@ fn preg_match_array_type() -> Type {
         Type::union(vec![Type::Int, Type::String]),
         Type::String,
     ))))
-}
-
-fn strip_this_vars(vars: &mut Env) {
-    vars.retain(|k, _| k != "this" && !k.starts_with("this->"));
 }
 
 /// Apply narrowing facts to an environment in place.
@@ -2882,10 +2800,6 @@ fn class_name_arg(t: &Type) -> Option<String> {
         Type::LiteralString(s) if !s.is_empty() => Some(s.trim_start_matches('\\').to_string()),
         _ => None,
     }
-}
-
-fn last_segment(name: &str) -> &str {
-    name.rsplit('\\').next().unwrap_or(name)
 }
 
 /// Does executing `s` always leave the current block (so its environment never

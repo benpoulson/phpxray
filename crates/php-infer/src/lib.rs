@@ -13,6 +13,12 @@
 //! never panics.
 
 pub mod arrays;
+mod util;
+pub(crate) use php_ast::queries::peel_paren;
+pub(crate) use util::{
+    arg_is_plain_positional, args_are_plain_positional, last_segment, param_local_type,
+    strip_this_vars, ParamFallback,
+};
 mod assign;
 mod const_eval;
 mod definedness;
@@ -82,6 +88,17 @@ enum CollectionMethod {
 }
 
 /// The context an expression is typed in.
+///
+/// Fields fall into two classes, and the distinction is load-bearing — see
+/// [`TypeCtx::child_scoped`], the single place child scopes are built:
+///
+/// * **Inherited configuration** — per-analysis settings every child shares with
+///   its parent: `index`, `scope`, `interner`, `native`, `depth`, `terminators`.
+/// * **Scope state** — set up per scope by whoever creates it: `class`, `vars`,
+///   `callables`, `generator_send`, `autoviv_shapes`.
+///
+/// When adding a field, classify it and add it to `child_scoped`'s exhaustive
+/// literal (which will not compile until you do).
 pub struct TypeCtx<'a> {
     /// Project-wide reflection (classes/functions with resolved member types).
     pub index: &'a ReflectionIndex,
@@ -151,7 +168,7 @@ impl Terminators {
                 let ExprKind::Name(n) = &callee.kind else {
                     return false;
                 };
-                let last = n.text.rsplit('\\').next().unwrap_or(&n.text);
+                let last = crate::util::last_segment(&n.text);
                 self.functions.contains(&last.to_ascii_lowercase())
             }
             ExprKind::MethodCall { method, .. } | ExprKind::StaticCall { method, .. } => {
@@ -1164,24 +1181,36 @@ impl<'a> TypeCtx<'a> {
         Type::Callable(Some(Box::new(CallableSig { params, ret })))
     }
 
+    /// What an *untyped* AST parameter falls back to.
+    ///
+    /// The only real difference between the declaration-site view and the
+    /// body-seeding view: a declaration has no call-site context, a seeded body
+    /// does. Everything else about parameter typing (native-vs-merged, variadic
+    /// wrapping) is shared — see [`TypeCtx::ast_param_type`].
     fn ast_param_decl_type(&self, p: &Param) -> Type {
-        if self.native {
-            return if p.variadic {
-                Type::Array(None)
-            } else {
-                p.ty.as_ref()
-                    .map(|t| php_reflect::resolve_ast_type(self.scope, t))
-                    .unwrap_or(Type::Mixed)
-            };
-        }
-        match &p.ty {
-            Some(t) if p.variadic => {
-                Type::List(Box::new(php_reflect::resolve_ast_type(self.scope, t)))
-            }
-            Some(t) => php_reflect::resolve_ast_type(self.scope, t),
-            None if p.variadic => Type::List(Box::new(Type::Mixed)),
-            None => Type::Mixed,
-        }
+        self.ast_param_type(p, &[], ParamFallback::Declared)
+    }
+
+    /// The type of AST parameter `p` inside the function-like body.
+    ///
+    /// The single answer to "what type does `$p` have here?", shared by the
+    /// declaration-signature path, the closure/arrow inference path, and the
+    /// type-map recording path (which previously had three near-copies that had
+    /// already drifted in native mode).
+    ///
+    /// `inferred` is the observed call-site/callback argument types for this
+    /// parameter onwards (empty when there is no call-site context).
+    fn ast_param_type(&self, p: &Param, inferred: &[Type], fallback: ParamFallback) -> Type {
+        let declared =
+            p.ty.as_ref()
+                .map(|t| php_reflect::resolve_ast_type(self.scope, t));
+        param_local_type(
+            declared.as_ref(),
+            p.variadic,
+            self.native,
+            inferred,
+            fallback,
+        )
     }
 
     fn callable_alias_return_type(&self, alias: &CallableAlias, inferred_params: &[Type]) -> Type {
@@ -1234,16 +1263,64 @@ impl<'a> TypeCtx<'a> {
             .unwrap_or(body)
     }
 
-    fn closure_child(&self, c: &ClosureExpr, inferred_params: &[Type]) -> TypeCtx<'a> {
-        let mut child = TypeCtx::new(self.index, self.scope, self.interner);
+    /// A child scope in `scope`, inheriting this context's **configuration**
+    /// (reflection, interner, native mode, depth, terminators) and starting with
+    /// **empty scope state** (class, vars, callables, generator slot,
+    /// auto-vivification permission), which each caller sets up itself.
+    ///
+    /// This is deliberately an exhaustive struct literal and the ONLY place
+    /// child contexts are built. Adding a field to [`TypeCtx`] therefore fails
+    /// to compile *here*, forcing the author to classify it as inherited config
+    /// or fresh scope state. Hand-copying a subset at each site is what silently
+    /// dropped `terminators` from every closure body until it was found in
+    /// review — do not reintroduce `..Default::default()` or a `TypeCtx::new`
+    /// spread, which restore exactly that hole.
+    pub(crate) fn child_scoped<'b>(&self, scope: &'b Scope) -> TypeCtx<'b>
+    where
+        'a: 'b,
+    {
+        TypeCtx {
+            // --- inherited configuration ---
+            index: self.index,
+            scope,
+            interner: self.interner,
+            native: self.native,
+            depth: self.depth,
+            terminators: self.terminators.clone(),
+            // --- fresh scope state ---
+            class: None,
+            vars: HashMap::new(),
+            callables: CallableAliases::new(),
+            generator_send: None,
+            autoviv_shapes: false,
+        }
+    }
+
+    /// [`Self::child_scoped`] in the same namespace scope as the parent — the
+    /// common case (closures, arrow fns, recorded child bodies).
+    pub(crate) fn child(&self) -> TypeCtx<'a> {
+        self.child_scoped(self.scope)
+    }
+
+    /// The type a plain `yield` receives in a scope declaring `return_type`,
+    /// when that declaration is precise enough to use.
+    pub(crate) fn declared_generator_send(
+        &self,
+        return_type: Option<&php_ast::Type>,
+    ) -> Option<Type> {
+        return_type.and_then(|t| generator_send_type(&php_reflect::resolve_ast_type(self.scope, t)))
+    }
+
+    /// The child scope of a closure body: `use (...)` captures (with their
+    /// callable aliases), `$this` unless `static`, the declared generator send
+    /// slot, then parameters seeded over the top.
+    ///
+    /// Shared by the inference path and the type-map recording path — they used
+    /// to build this identically in two places.
+    pub(crate) fn closure_child(&self, c: &ClosureExpr, inferred_params: &[Type]) -> TypeCtx<'a> {
+        let mut child = self.child();
         child.class = (!c.is_static).then(|| self.class.clone()).flatten();
-        child.depth = self.depth;
-        child.native = self.native;
-        child.terminators = self.terminators.clone();
-        child.generator_send = c
-            .return_type
-            .as_ref()
-            .and_then(|t| generator_send_type(&php_reflect::resolve_ast_type(self.scope, t)));
+        child.generator_send = self.declared_generator_send(c.return_type.as_ref());
         for u in &c.uses {
             let name = self.interner.resolve(u.name).to_string();
             let ty = self.vars.get(&name).cloned().unwrap_or(Type::Mixed);
@@ -1256,16 +1333,12 @@ impl<'a> TypeCtx<'a> {
         child
     }
 
-    fn arrow_child(&self, a: &ArrowFn, inferred_params: &[Type]) -> TypeCtx<'a> {
-        let mut child = TypeCtx::new(self.index, self.scope, self.interner);
+    /// The child scope of an arrow-fn body: the enclosing environment is
+    /// captured by value automatically, then parameters seeded over it.
+    pub(crate) fn arrow_child(&self, a: &ArrowFn, inferred_params: &[Type]) -> TypeCtx<'a> {
+        let mut child = self.child();
         child.class = (!a.is_static).then(|| self.class.clone()).flatten();
-        child.depth = self.depth;
-        child.native = self.native;
-        child.terminators = self.terminators.clone();
-        child.generator_send = a
-            .return_type
-            .as_ref()
-            .and_then(|t| generator_send_type(&php_reflect::resolve_ast_type(self.scope, t)));
+        child.generator_send = self.declared_generator_send(a.return_type.as_ref());
         child.vars = self.vars.clone();
         child.callables = self.callables.clone();
         if a.is_static {
@@ -1281,38 +1354,18 @@ impl<'a> TypeCtx<'a> {
         vars: HashMap<String, Type>,
         callables: CallableAliases,
     ) -> TypeCtx<'a> {
-        let mut child = TypeCtx::new(self.index, self.scope, self.interner);
+        let mut child = self.child();
         child.class = class;
         child.vars = vars;
         child.callables = callables;
-        child.depth = self.depth;
-        child.native = self.native;
-        child.terminators = self.terminators.clone();
-        child.generator_send = None;
         child
     }
 
     fn seed_callback_params(&mut self, params: &[Param], inferred: &[Type]) {
         for (i, p) in params.iter().enumerate() {
             let name = self.interner.resolve(p.name).to_string();
-            let ty = if let Some(t) = &p.ty {
-                let ty = php_reflect::resolve_ast_type(self.scope, t);
-                if p.variadic {
-                    Type::List(Box::new(ty))
-                } else {
-                    ty
-                }
-            } else if p.variadic {
-                let rest = &inferred[i.min(inferred.len())..];
-                let item = if rest.is_empty() {
-                    Type::Mixed
-                } else {
-                    Type::union(rest.to_vec())
-                };
-                Type::List(Box::new(item))
-            } else {
-                inferred.get(i).cloned().unwrap_or(Type::Mixed)
-            };
+            let rest = &inferred[i.min(inferred.len())..];
+            let ty = self.ast_param_type(p, rest, ParamFallback::Inferred);
             self.vars.insert(name, ty);
         }
     }
@@ -1810,7 +1863,7 @@ impl<'a> TypeCtx<'a> {
                 let ExprKind::Name(n) = &args[1].value.kind else {
                     return None;
                 };
-                let success = match n.text.rsplit('\\').next().unwrap_or(&n.text) {
+                let success = match last_segment(&n.text) {
                     "FILTER_VALIDATE_INT" => Type::Int,
                     "FILTER_VALIDATE_FLOAT" => Type::Float,
                     "FILTER_VALIDATE_BOOLEAN" | "FILTER_VALIDATE_BOOL" => {
@@ -2084,25 +2137,6 @@ fn is_first_class_callable(args: &[php_ast::Arg]) -> bool {
     args.iter().any(|a| a.placeholder)
 }
 
-fn args_are_plain_positional(args: &[Arg]) -> bool {
-    args.iter()
-        .all(|a| !a.spread && !a.placeholder && a.name.is_none())
-}
-
-fn peel_paren(e: &Expr) -> &Expr {
-    match &e.kind {
-        ExprKind::Paren(inner) => peel_paren(inner),
-        _ => e,
-    }
-}
-
-fn last_segment(name: &str) -> &str {
-    name.trim_start_matches('\\')
-        .rsplit('\\')
-        .next()
-        .unwrap_or(name)
-}
-
 fn collection_method(name: &str) -> Option<CollectionMethod> {
     match name.to_ascii_lowercase().as_str() {
         "map" => Some(CollectionMethod::Map),
@@ -2332,10 +2366,6 @@ fn yield_from_return_type(delegated: &Type) -> Option<Type> {
         }
         _ => None,
     }
-}
-
-fn strip_this_vars(vars: &mut HashMap<String, Type>) {
-    vars.retain(|k, _| k != "this" && !k.starts_with("this->"));
 }
 
 /// The type of a magic constant (`__LINE__`, `__FILE__`, …), if `name` is one.
@@ -2626,6 +2656,123 @@ fn is_array(t: &Type) -> bool {
 mod tests {
     use super::*;
     use php_ast::{Program, StmtKind};
+
+    /// The parameter-typing truth table, executable.
+    ///
+    /// This used to be three near-copies (`ast_param_decl_type`,
+    /// `seed_callback_params`, flow.rs's `ast_param_local_type`) which had
+    /// already drifted: the closure-inference copy had **no native branch**, so
+    /// on that path a typed variadic stayed `list<T>` in native mode while the
+    /// recording path correctly produced PHP's untyped `array`. Consolidating
+    /// resolved that in favour of the native branch (the Zend corpus does not
+    /// exercise it either way — hence this test).
+    #[test]
+    fn ast_param_type_truth_table() {
+        use ParamFallback::{Declared, Inferred};
+        let (index, interner, program) =
+            build("function f(int $a, int ...$v) {} function g($u, ...$w) {}");
+        let scope = Scope::global();
+        let params: Vec<&Param> = program
+            .stmts
+            .iter()
+            .filter_map(|s| match &s.kind {
+                StmtKind::Function(f) => Some(f),
+                _ => None,
+            })
+            .flat_map(|f| f.params.iter())
+            .collect();
+        let (typed, typed_variadic, untyped, untyped_variadic) =
+            (params[0], params[1], params[2], params[3]);
+
+        let mut ctx = TypeCtx::new(&index, &scope, &interner);
+        let observed = [Type::String, Type::Bool];
+        let t = |c: &TypeCtx<'_>, p: &Param, inf: &[Type], f: ParamFallback| {
+            c.ast_param_type(p, inf, f).to_string()
+        };
+
+        // --- merged mode ---
+        assert_eq!(t(&ctx, typed, &[], Declared), "int");
+        assert_eq!(t(&ctx, typed_variadic, &[], Declared), "list<int>");
+        assert_eq!(t(&ctx, untyped, &[], Declared), "mixed");
+        assert_eq!(t(&ctx, untyped_variadic, &[], Declared), "list<mixed>");
+        // With call-site context, only the *untyped* answers change.
+        assert_eq!(t(&ctx, typed, &observed, Inferred), "int");
+        assert_eq!(t(&ctx, typed_variadic, &observed, Inferred), "list<int>");
+        assert_eq!(t(&ctx, untyped, &observed, Inferred), "string");
+        assert_eq!(
+            t(&ctx, untyped_variadic, &observed, Inferred),
+            "list<string|bool>"
+        );
+        assert_eq!(t(&ctx, untyped, &[], Inferred), "mixed");
+
+        // --- native mode: a variadic is PHP's own untyped array ---
+        ctx.native = true;
+        assert_eq!(t(&ctx, typed, &[], Declared), "int");
+        assert_eq!(t(&ctx, typed_variadic, &[], Declared), "array");
+        assert_eq!(t(&ctx, untyped, &[], Declared), "mixed");
+        assert_eq!(t(&ctx, untyped_variadic, &[], Declared), "array");
+        assert_eq!(t(&ctx, typed_variadic, &observed, Inferred), "array");
+        assert_eq!(t(&ctx, untyped, &observed, Inferred), "string");
+    }
+
+    /// Every child-scope builder must carry the parent's **inherited
+    /// configuration** through. This is the canary for `TypeCtx::child_scoped`:
+    /// if someone adds a config field and classifies it as fresh scope state,
+    /// this fails rather than silently defaulting it in every closure body (the
+    /// `terminators` bug). Each field is set to a NON-default value so a missed
+    /// copy is observable.
+    #[test]
+    fn child_scopes_inherit_every_config_field() {
+        let (index, interner, program) = build("function f() {}");
+        let scope = Scope::global();
+        let terminators = std::sync::Arc::new(Terminators {
+            functions: ["bail".to_string()].into_iter().collect(),
+            methods: ["fail".to_string()].into_iter().collect(),
+        });
+        let mut parent = TypeCtx::new(&index, &scope, &interner);
+        parent.native = true;
+        parent.depth = 1;
+        parent.terminators = terminators.clone();
+        parent.class = Some("C".into());
+        parent.vars.insert("x".into(), Type::Int);
+
+        let assert_inherited = |c: &TypeCtx<'_>, label: &str| {
+            assert!(c.native, "{label}: native not inherited");
+            assert_eq!(c.depth, 1, "{label}: depth not inherited");
+            assert_eq!(
+                *c.terminators, *terminators,
+                "{label}: terminators not inherited"
+            );
+            assert!(
+                std::ptr::eq(c.index, &index),
+                "{label}: index not inherited"
+            );
+            assert!(
+                std::ptr::eq(c.interner, &interner),
+                "{label}: interner not inherited"
+            );
+        };
+
+        // The base builder, and every public path that goes through it.
+        assert_inherited(&parent.child(), "child");
+        assert_inherited(&parent.child_scoped(&scope), "child_scoped");
+        assert_inherited(
+            &parent.child_with_env(Some("D".into()), HashMap::new(), CallableAliases::new()),
+            "child_with_env",
+        );
+
+        // Scope state must NOT leak into a fresh child.
+        let fresh = parent.child();
+        assert_eq!(fresh.class, None, "class leaked into child");
+        assert!(fresh.vars.is_empty(), "vars leaked into child");
+        assert!(fresh.callables.is_empty(), "callables leaked into child");
+        assert_eq!(
+            fresh.generator_send, None,
+            "generator_send leaked into child"
+        );
+        assert!(!fresh.autoviv_shapes, "autoviv_shapes leaked into child");
+        let _ = program;
+    }
 
     /// Parse `<?php` + `src`, index it, and return (index, interner, program).
     fn build(src: &str) -> (ReflectionIndex, Interner, Program) {

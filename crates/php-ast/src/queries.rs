@@ -111,3 +111,49 @@ mod tests {
         assert!(!contains_yield_in_scope(&[nested]));
     }
 }
+
+/// Strip redundant parentheses: `((expr))` → `expr`.
+///
+/// The AST keeps `Paren` nodes because PHP's own AST records parenthesization
+/// (it is load-bearing for a few `attr` flags in the differential dump), so
+/// every consumer that pattern-matches on an expression's *shape* has to peel
+/// them first. Shared here rather than re-implemented per crate — this had six
+/// copies across `php-infer` and `php-rules`.
+pub fn peel_paren(e: &Expr) -> &Expr {
+    match &e.kind {
+        ExprKind::Paren(inner) => peel_paren(inner),
+        _ => e,
+    }
+}
+
+#[cfg(test)]
+mod peel_tests {
+    use super::peel_paren;
+    use crate::{Expr, ExprKind};
+    use php_span::Span;
+
+    // Built by hand: `php-ast` must not depend on the parser/lexer (CLAUDE.md
+    // §3 — the AST is the stable contract and never pulls in the tokenizer),
+    // not even as a dev-dependency.
+    fn expr(kind: ExprKind) -> Expr {
+        Expr {
+            span: Span::new(0, 0),
+            kind,
+        }
+    }
+
+    #[test]
+    fn peels_nested_parens_to_the_inner_expression() {
+        let inner = expr(ExprKind::Int(1));
+        let wrapped = expr(ExprKind::Paren(Box::new(expr(ExprKind::Paren(Box::new(
+            inner,
+        ))))));
+        assert!(matches!(peel_paren(&wrapped).kind, ExprKind::Int(1)));
+    }
+
+    #[test]
+    fn leaves_a_bare_expression_alone() {
+        let bare = expr(ExprKind::Int(7));
+        assert!(matches!(peel_paren(&bare).kind, ExprKind::Int(7)));
+    }
+}
