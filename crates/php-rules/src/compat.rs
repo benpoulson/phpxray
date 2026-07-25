@@ -81,6 +81,17 @@ pub(crate) fn strict_mixed_source(
 }
 
 pub(crate) fn concrete_target(ty: &Type) -> bool {
+    // A union with a `mixed` arm accepts *anything*, so reporting "mixed given"
+    // against it is indefensible — `is_callable(callable|mixed)` was doing exactly
+    // that. `is_mixed()` only looks at the top level, hence the explicit arm scan.
+    if let Type::Union(parts) = ty {
+        if parts
+            .iter()
+            .any(|p| matches!(p, Type::Mixed | Type::ExplicitMixed))
+        {
+            return false;
+        }
+    }
     !ty.is_mixed()
         && !matches!(
             ty,

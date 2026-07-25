@@ -216,15 +216,6 @@ fn run_strict_mixed(
     out
 }
 
-fn strict_mixed_source(
-    ty: &php_types::Type,
-    include_explicit: bool,
-    include_implicit: bool,
-) -> bool {
-    (include_explicit && ty.contains_explicit_mixed())
-        || (include_implicit && ty.contains_implicit_mixed())
-}
-
 /// Whether a member-access receiver *is* mixed. Unlike [`strict_mixed_source`]
 /// this is a top-level test: `Collection<mixed, mixed>` or `array<int, mixed>`
 /// merely *contain* mixed in a type argument — calling/indexing on them is
@@ -235,15 +226,6 @@ fn receiver_is_mixed(ty: &php_types::Type, include_explicit: bool, include_impli
         php_types::Type::Mixed => include_implicit,
         _ => false,
     }
-}
-
-fn concrete_target(ty: &php_types::Type) -> bool {
-    use php_types::Type as T;
-    !ty.is_mixed()
-        && !matches!(
-            ty,
-            T::Unknown(_) | T::TemplateVar(_) | T::Conditional { .. } | T::Void | T::Never
-        )
 }
 
 fn reflected_function_target(fa: &FileAnalysis, r: &ResolvedRef) -> Option<String> {
@@ -295,11 +277,19 @@ fn check_function_call_mixed(
             let Some(param) = func.params.get(i) else {
                 break;
             };
-            if param.variadic || !concrete_target(&param.ty) {
+            // A variadic absorbs every remaining argument, so stop. But a
+            // parameter whose target is not concrete only means *this* argument
+            // cannot be judged — `break` here silently disabled checking of every
+            // LATER parameter (e.g. `is_callable`'s `callable|mixed` first param
+            // hid its `string` third param).
+            if param.variadic {
                 break;
             }
+            if !crate::compat::concrete_target(&param.ty) {
+                continue;
+            }
             let given = fa.type_of(&arg.value);
-            if strict_mixed_source(&given, include_explicit, include_implicit) {
+            if crate::compat::strict_mixed_source(&given, include_explicit, include_implicit) {
                 out.push(
                     Diagnostic::error(
                         arg.value.span,
@@ -354,11 +344,19 @@ fn check_method_call_mixed(
             let Some(param) = found.member.params.get(i) else {
                 break;
             };
-            if param.variadic || !concrete_target(&param.ty) {
+            // A variadic absorbs every remaining argument, so stop. But a
+            // parameter whose target is not concrete only means *this* argument
+            // cannot be judged — `break` here silently disabled checking of every
+            // LATER parameter (e.g. `is_callable`'s `callable|mixed` first param
+            // hid its `string` third param).
+            if param.variadic {
                 break;
             }
+            if !crate::compat::concrete_target(&param.ty) {
+                continue;
+            }
             let given = fa.type_of(&arg.value);
-            if strict_mixed_source(&given, include_explicit, include_implicit) {
+            if crate::compat::strict_mixed_source(&given, include_explicit, include_implicit) {
                 out.push(
                     Diagnostic::error(
                         arg.value.span,
@@ -408,7 +406,7 @@ fn collect_return_scopes(
     match &st.kind {
         StmtKind::Function(f) => {
             let refl = fa.reflect_function(scope, f);
-            if concrete_target(&refl.return_type) {
+            if crate::compat::concrete_target(&refl.return_type) {
                 for s in &f.body {
                     check_return_stmts(
                         fa,
@@ -436,7 +434,7 @@ fn collect_return_scopes(
                 else {
                     continue;
                 };
-                if !concrete_target(&mr.return_type) {
+                if !crate::compat::concrete_target(&mr.return_type) {
                     continue;
                 }
                 for s in body {
@@ -466,7 +464,7 @@ fn check_return_stmts(
     match &st.kind {
         StmtKind::Return(Some(value)) => {
             let given = fa.type_of(value);
-            if strict_mixed_source(&given, include_explicit, include_implicit) {
+            if crate::compat::strict_mixed_source(&given, include_explicit, include_implicit) {
                 out.push(
                     Diagnostic::error(
                         value.span,
@@ -615,6 +613,41 @@ pub(crate) static RULES: &[RuleEntry] = &[
 mod tests {
     use super::*;
     use crate::testutil::codes;
+
+    // --- strict-mixed argument reporting ------------------------------------
+
+    /// A target that itself **accepts** `mixed` must never yield a
+    /// "mixed given" report — `is_callable(callable|mixed)` did exactly that,
+    /// 22 times on the Zend corpus.
+    #[test]
+    fn a_mixed_accepting_target_is_never_reported() {
+        // `is_callable`'s first parameter is `callable|mixed`: anything fits.
+        let src = "<?php function f($x) { is_callable($x); }";
+        assert!(
+            codes(src, run_implicit_mixed_strictness).is_empty(),
+            "reported against a target that accepts mixed: {:?}",
+            codes(src, run_implicit_mixed_strictness)
+        );
+    }
+
+    /// A parameter whose target is not concrete means *that argument* cannot be
+    /// judged — it must not stop the loop. The old `break` let a `mixed` first
+    /// parameter hide every later one (`in_array`'s `array` haystack,
+    /// `json_encode`'s `int` flags).
+    #[test]
+    fn a_non_concrete_parameter_does_not_hide_later_ones() {
+        // `in_array(mixed $needle, array $haystack)` — #1 is unjudgeable, #2 is not.
+        let src = "<?php function f($x) { in_array('a', $x); }";
+        assert_eq!(
+            codes(src, run_implicit_mixed_strictness),
+            ["argument.type"],
+            "the array haystack should still be checked"
+        );
+
+        // `json_encode(mixed $value, int $flags)` — same shape.
+        let src = "<?php function f($x) { json_encode([1], $x); }";
+        assert_eq!(codes(src, run_implicit_mixed_strictness), ["argument.type"]);
+    }
 
     // --- union types ---------------------------------------------------------
 
