@@ -202,6 +202,7 @@ fn render(e: &Expr, i: &Interner) -> String {
             render_args(args, i)
         ),
         Paren(inner) => render(inner, i),
+        CallablePlaceholder => "(...)".into(),
         Error => "<error>".into(),
     }
 }

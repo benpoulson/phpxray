@@ -792,6 +792,7 @@ fn collect_void_yield_uses_expr(e: &Expr, consumed: bool, out: &mut Vec<Diagnost
         | ExprKind::Name(_)
         | ExprKind::Closure(_)
         | ExprKind::ArrowFn(_)
+        | ExprKind::CallablePlaceholder
         | ExprKind::Error => {}
         ExprKind::Interpolated(parts) | ExprKind::ShellExec(parts) => {
             parts

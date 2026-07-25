@@ -155,6 +155,7 @@ impl Collector {
             | ExprKind::Float(_)
             | ExprKind::Str(_)
             | ExprKind::Variable(_)
+            | ExprKind::CallablePlaceholder
             | ExprKind::Error => {}
 
             // A bare name in expression position is a constant fetch.

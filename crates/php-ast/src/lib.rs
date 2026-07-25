@@ -653,6 +653,14 @@ pub enum ExprKind {
     /// props) and treats a parenthesized name as a constant fetch.
     Paren(Box<Expr>),
 
+    /// The lone `...` of first-class-callable syntax (`strlen(...)`).
+    ///
+    /// A real node rather than [`ExprKind::Error`]: `f(...)` is **valid** PHP, so
+    /// planting an error node in it broke the "Error ⇔ invalid source" contract —
+    /// anything counting `Error` nodes as parse damage, or typing argument
+    /// values, was wrong on every first-class callable. Carries no payload; the
+    /// `...` has no value and `Arg::placeholder` still marks the argument.
+    CallablePlaceholder,
     /// A syntactically invalid expression that was recovered from.
     Error,
 }

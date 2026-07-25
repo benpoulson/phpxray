@@ -2505,7 +2505,7 @@ impl<'a> Parser<'a> {
             args.push(Arg {
                 span: self.span_to(astart),
                 name: None,
-                value: Expr::new(Span::at(astart), ExprKind::Error),
+                value: Expr::new(self.span_to(astart), ExprKind::CallablePlaceholder),
                 spread: false,
                 placeholder: true,
             });

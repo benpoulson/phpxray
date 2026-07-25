@@ -139,3 +139,34 @@ fn representative_sources_uphold_the_invariant() {
         assert!(bad.is_empty(), "span collision in {src}: {bad:?}");
     }
 }
+
+/// `Error` nodes must mean "invalid source", nothing else.
+///
+/// First-class-callable syntax (`f(...)`) used to plant an `ExprKind::Error`
+/// inside perfectly valid code, so any pass treating `Error` as parse damage —
+/// or trying to type an argument's value — was wrong on every such call.
+#[test]
+fn first_class_callables_contain_no_error_nodes() {
+    for src in [
+        "<?php $f = strlen(...);",
+        "<?php $f = $obj->method(...);",
+        "<?php $f = Foo::bar(...);",
+        "<?php array_map(strlen(...), $xs);",
+    ] {
+        let r = php_parser::parse(src);
+        assert!(!r.has_errors(), "{src} should parse cleanly");
+        let mut errors = 0;
+        let mut placeholders = 0;
+        walk::for_each_expr(&r.program, &mut |e| match e.kind {
+            ExprKind::Error => errors += 1,
+            ExprKind::CallablePlaceholder => placeholders += 1,
+            _ => {}
+        });
+        assert_eq!(errors, 0, "{src} planted an Error node in valid code");
+        assert_eq!(placeholders, 1, "{src} should have exactly one placeholder");
+    }
+
+    // Genuinely invalid source still produces Error nodes.
+    let bad = php_parser::parse("<?php $x = ;");
+    assert!(bad.has_errors());
+}

@@ -1134,6 +1134,10 @@ impl<'a> Dumper<'a> {
             ),
             ExprKind::YieldFrom(e) => node("YIELD_FROM", vec![("expr", self.expr(e))]),
             ExprKind::Paren(inner) => self.paren(inner),
+            // Never reached in practice: `args()` short-circuits a
+            // first-class-callable argument list to CALLABLE_CONVERT before any
+            // argument value is dumped. Kept for exhaustiveness.
+            ExprKind::CallablePlaceholder => C::N("CALLABLE_CONVERT".into(), vec![]),
             ExprKind::Error => C::N("ERROR".into(), vec![]),
         }
     }

@@ -20,7 +20,6 @@ impl Token {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[non_exhaustive]
 pub enum TokenKind {
     // --- structural / HTML island ---
     InlineHtml,

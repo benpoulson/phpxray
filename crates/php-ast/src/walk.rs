@@ -299,6 +299,7 @@ where
         | ExprKind::Str(_)
         | ExprKind::Variable(_)
         | ExprKind::Name(_)
+        | ExprKind::CallablePlaceholder
         | ExprKind::Error => {}
         ExprKind::Interpolated(parts) | ExprKind::ShellExec(parts) => {
             parts.iter().for_each(|p| go(p, on_s, on_e))

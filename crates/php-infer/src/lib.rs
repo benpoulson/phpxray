@@ -313,6 +313,9 @@ impl<'a> TypeCtx<'a> {
                 yield_from_return_type(&self.infer(inner)).unwrap_or(Type::Mixed)
             }
             ExprKind::Include { .. } | ExprKind::Eval(_) => Type::Mixed,
+            // The `...` of `f(...)` has no value of its own; the enclosing call
+            // is what produces a Closure.
+            ExprKind::CallablePlaceholder => Type::Mixed,
             ExprKind::Error => Type::Mixed,
         }
     }
