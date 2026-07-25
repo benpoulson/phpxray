@@ -116,77 +116,127 @@ fn le_bound(a: Option<i64>, b: Option<i64>) -> bool {
     }
 }
 
-/// Whether a value of type `value` is assignable to a slot of type `target`.
-pub fn is_assignable(index: &ReflectionIndex, value: &Type, target: &Type) -> bool {
-    use Type::*;
-
-    // Leniency escapes: top/bottom and anything we couldn't resolve.
-    match (value, target) {
-        (_, Mixed | ExplicitMixed) => return true, // everything fits mixed
-        (Never, _) => return true,                 // never is the bottom type
-        (Mixed | ExplicitMixed, _) => return true, // mixed value — don't flag by default
-        (Unknown(_), _) | (_, Unknown(_)) => return true,
-        // A template variable's concrete type is unknown (bounded by its
-        // `@template T of …`, which we don't track) — stay lenient either way.
-        (TemplateVar(_), _) | (_, TemplateVar(_)) => return true,
-        _ => {}
-    }
-    if value == target {
-        return true;
-    }
-
-    // PHP's `/` and `**` yield a *benevolent* `int|float` (phpstan's
-    // `BenevolentUnionType`). With `checkBenevolentUnionTypes` off — phpstan's
-    // default at *every* level — a benevolent union satisfies a target if *any*
-    // member does, so `$even / 2` (typed `int|float`) is accepted where `int` is
-    // expected. We can't distinguish a benevolent union from a declared
-    // `int|float`, so a declared one is likewise lenient toward a numeric target;
-    // that's a safe under-report (phpstan would flag the declared case only at
-    // level 8+), never a false positive.
-    if let Union(parts) = value {
-        let numeric = parts
-            .iter()
-            .all(|p| matches!(p, Int | Float | LiteralInt(_) | IntRange { .. }))
-            && parts.iter().any(|p| matches!(p, Float));
-        if numeric && matches!(target, Int | Float) {
-            return true;
-        }
-    }
-    // A union value is assignable only if *every* member is.
-    if let Union(parts) = value {
-        return parts.iter().all(|p| is_assignable(index, p, target));
-    }
-    // `?A` (value) ⊑ target iff both `A` and `null` are.
-    if let Nullable(v) = value {
-        return is_assignable(index, v, target) && is_assignable(index, &Null, target);
-    }
-
-    // A union/nullable target accepts the value if *any* arm does.
-    match target {
-        Nullable(t) => return matches!(value, Null) || is_assignable(index, value, t),
-        Union(parts) => return parts.iter().any(|t| is_assignable(index, value, t)),
-        _ => {}
-    }
-
-    assignable_atom(index, value, target)
+/// The single subtype-relation result, richer than either public projection.
+///
+/// The two public APIs ask *different* questions, and both need to be answered
+/// from one implementation or they drift (they already had: a hand-maintained
+/// bool copy and trinary copy disagreed on 31 of 676 type pairs).
+///
+/// The key insight is that `Trinary::Maybe` is **overloaded** — it means both
+/// "we could not resolve this" and "some arms of this union fit". Those need
+/// opposite answers from `is_assignable`: lenient (`true`) for the first,
+/// strict (`false`) for the second. So the core distinguishes them, and each
+/// public API projects the variants it cares about.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Verdict {
+    /// Every value of `value` fits `target`.
+    Yes,
+    /// Unresolvable (`mixed`/`Unknown`/a template variable). The low-FP posture
+    /// accepts these, so `is_assignable` reports `true`.
+    Uncertain,
+    /// Some arms fit and some do not (`?int` into `int`). A genuine mismatch for
+    /// acceptance purposes — `is_assignable` reports `false` — but only a
+    /// "maybe" for report-maybes strictness levels.
+    Partial,
+    /// No value of `value` fits `target`.
+    No,
 }
 
+impl Verdict {
+    fn from_bool(v: bool) -> Self {
+        if v {
+            Verdict::Yes
+        } else {
+            Verdict::No
+        }
+    }
+
+    /// Combine the per-member verdicts of a **union value** (every member must
+    /// fit) or a nullable value (`?A` == `A|null`).
+    fn all(parts: impl Iterator<Item = Verdict>) -> Verdict {
+        let (mut any_no, mut any_yes, mut any_uncertain) = (false, false, false);
+        for v in parts {
+            match v {
+                Verdict::No => any_no = true,
+                Verdict::Yes => any_yes = true,
+                Verdict::Uncertain => any_uncertain = true,
+                Verdict::Partial => {
+                    any_no = true;
+                    any_yes = true;
+                }
+            }
+        }
+        match (any_no, any_yes || any_uncertain) {
+            (false, _) if any_uncertain => Verdict::Uncertain,
+            (false, _) => Verdict::Yes,
+            (true, false) => Verdict::No,
+            (true, true) => Verdict::Partial,
+        }
+    }
+
+    /// Combine the per-arm verdicts of a **union target** (any arm may accept).
+    fn any(parts: impl Iterator<Item = Verdict>) -> Verdict {
+        let (mut any_yes, mut any_uncertain, mut any_partial) = (false, false, false);
+        for v in parts {
+            match v {
+                Verdict::Yes => any_yes = true,
+                Verdict::Uncertain => any_uncertain = true,
+                Verdict::Partial => any_partial = true,
+                Verdict::No => {}
+            }
+        }
+        if any_yes {
+            Verdict::Yes
+        } else if any_uncertain {
+            Verdict::Uncertain
+        } else if any_partial {
+            Verdict::Partial
+        } else {
+            Verdict::No
+        }
+    }
+}
+
+/// Whether a value of type `value` is assignable to a slot of type `target`.
+///
+/// Lenient by contract: `true` when the relation cannot be resolved, so a
+/// first-cut linter under-reports rather than producing false positives.
+pub fn is_assignable(index: &ReflectionIndex, value: &Type, target: &Type) -> bool {
+    matches!(
+        assignable_verdict(index, value, target),
+        Verdict::Yes | Verdict::Uncertain
+    )
+}
+
+/// Graded assignability for the report-maybes strictness levels (L7+).
+///
+/// `Maybe` covers both "unresolvable" and "partially assignable" — see
+/// [`Verdict`] for why those must stay distinct internally.
 pub fn assignable_trinary(index: &ReflectionIndex, value: &Type, target: &Type) -> Trinary {
+    match assignable_verdict(index, value, target) {
+        Verdict::Yes => Trinary::Yes,
+        Verdict::No => Trinary::No,
+        Verdict::Uncertain | Verdict::Partial => Trinary::Maybe,
+    }
+}
+
+/// The subtype relation — the one implementation behind both public APIs.
+fn assignable_verdict(index: &ReflectionIndex, value: &Type, target: &Type) -> Verdict {
     use Type::*;
 
     // Leniency escapes: top/bottom and anything we couldn't resolve.
     match (value, target) {
-        (_, Mixed | ExplicitMixed) => return Trinary::Yes, // everything fits mixed
-        (Never, _) => return Trinary::Yes,                 // never is the bottom type
-        (Mixed | ExplicitMixed, _) => return Trinary::Maybe,
-        (Unknown(_), _) | (_, Unknown(_)) => return Trinary::Maybe,
+        (_, Mixed | ExplicitMixed) => return Verdict::Yes, // everything fits mixed
+        (Never, _) => return Verdict::Yes,                 // never is the bottom type
+        (Mixed | ExplicitMixed, _) => return Verdict::Uncertain,
+        (Unknown(_), _) | (_, Unknown(_)) => return Verdict::Uncertain,
         // A template variable's concrete type is unknown (bounded by its
         // `@template T of …`, which we don't track) — stay lenient either way.
-        (TemplateVar(_), _) | (_, TemplateVar(_)) => return Trinary::Maybe,
+        (TemplateVar(_), _) | (_, TemplateVar(_)) => return Verdict::Uncertain,
         _ => {}
     }
     if value == target {
-        return Trinary::Yes;
+        return Verdict::Yes;
     }
 
     // PHP's `/` and `**` yield a *benevolent* `int|float` (phpstan's
@@ -203,54 +253,38 @@ pub fn assignable_trinary(index: &ReflectionIndex, value: &Type, target: &Type) 
             .all(|p| matches!(p, Int | Float | LiteralInt(_) | IntRange { .. }))
             && parts.iter().any(|p| matches!(p, Float));
         if numeric && matches!(target, Int | Float) {
-            return Trinary::Yes;
+            return Verdict::Yes;
         }
     }
     // A union value is assignable only if *every* member is.
     if let Union(parts) = value {
-        if parts
-            .iter()
-            .all(|p| assignable_trinary(index, p, target).is_yes())
-        {
-            return Trinary::Yes;
-        }
-        if parts
-            .iter()
-            .all(|p| matches!(assignable_trinary(index, p, target), Trinary::No))
-        {
-            return Trinary::No;
-        }
-        return Trinary::Maybe;
+        return Verdict::all(parts.iter().map(|p| assignable_verdict(index, p, target)));
     }
     // `?A` (value) ⊑ target iff both `A` and `null` are.
     if let Nullable(v) = value {
-        return assignable_trinary(index, &Union(vec![(**v).clone(), Null].into()), target);
+        return Verdict::all(
+            [v.as_ref(), &Null]
+                .into_iter()
+                .map(|p| assignable_verdict(index, p, target)),
+        );
     }
 
     // A union/nullable target accepts the value if *any* arm does.
     match target {
         Nullable(t) => {
-            return assignable_trinary(index, value, &Union(vec![(**t).clone(), Null].into()));
+            return Verdict::any(
+                [t.as_ref(), &Null]
+                    .into_iter()
+                    .map(|t| assignable_verdict(index, value, t)),
+            );
         }
         Union(parts) => {
-            if parts
-                .iter()
-                .any(|t| assignable_trinary(index, value, t).is_yes())
-            {
-                return Trinary::Yes;
-            }
-            if parts
-                .iter()
-                .all(|t| matches!(assignable_trinary(index, value, t), Trinary::No))
-            {
-                return Trinary::No;
-            }
-            return Trinary::Maybe;
+            return Verdict::any(parts.iter().map(|t| assignable_verdict(index, value, t)));
         }
         _ => {}
     }
 
-    Trinary::from_bool(assignable_atom(index, value, target))
+    Verdict::from_bool(assignable_atom(index, value, target))
 }
 
 /// Atomic (non-union, non-nullable) assignability: scalar widening, array/iterable
@@ -442,6 +476,94 @@ mod tests {
         let mut idx = ReflectionIndex::new();
         idx.add_file(&r.program, &r.interner);
         (idx, r.interner)
+    }
+
+    /// The two public projections of the one subtype relation must stay
+    /// consistent: `is_assignable` accepts exactly `Yes` + the *uncertain* half
+    /// of `Maybe`, and rejects the *partially assignable* half.
+    ///
+    /// Measured against the pre-unification implementations, `is_assignable`
+    /// and `assignable_trinary != No` disagreed on **31 of these 676 pairs** —
+    /// every one a partially-assignable union (`?int` -> `int`,
+    /// `int|string` -> `int`, ...). That is why `Verdict` keeps `Uncertain` and
+    /// `Partial` apart: collapsing them either way silently changes which
+    /// mismatches get reported. This matrix guards both projections.
+    #[test]
+    fn differential_is_assignable_vs_trinary() {
+        let (idx, _i) = index_of("class A {} class B extends A {} interface I {} class U {}");
+        let named = |n: &str| Type::Named {
+            fqn: n.into(),
+            args: vec![],
+        };
+        let atoms = vec![
+            ("mixed", Type::Mixed),
+            ("never", Type::Never),
+            ("unknown", Type::Unknown("x".into())),
+            ("T", Type::TemplateVar("T".into())),
+            ("int", Type::Int),
+            ("float", Type::Float),
+            ("string", Type::String),
+            ("bool", Type::Bool),
+            ("null", Type::Null),
+            ("42", Type::LiteralInt(42)),
+            ("'s'", Type::LiteralString("s".into())),
+            ("int|string", Type::union(vec![Type::Int, Type::String])),
+            ("int|float", Type::union(vec![Type::Int, Type::Float])),
+            ("?int", Type::nullable(Type::Int)),
+            ("?A", Type::nullable(named("A"))),
+            ("A", named("A")),
+            ("B", named("B")),
+            ("I", named("I")),
+            ("Unindexed", named("Nope")),
+            ("array", Type::Array(None)),
+            ("list<int>", Type::List(Box::new(Type::Int))),
+            ("iterable", Type::Iterable(None)),
+            ("callable", Type::Callable(None)),
+            ("class-string", Type::ClassString(None)),
+            ("A|B", Type::union(vec![named("A"), named("B")])),
+            ("int|null", Type::union(vec![Type::Int, Type::Null])),
+        ];
+        let mut bad = Vec::new();
+        let mut partial = 0usize;
+        for (vn, v) in &atoms {
+            for (tn, t) in &atoms {
+                let b = is_assignable(&idx, v, t);
+                let tri = assignable_trinary(&idx, v, t);
+                let verdict = assignable_verdict(&idx, v, t);
+                // The projections must agree with the core, by construction.
+                let want_b = matches!(verdict, Verdict::Yes | Verdict::Uncertain);
+                let want_tri = match verdict {
+                    Verdict::Yes => Trinary::Yes,
+                    Verdict::No => Trinary::No,
+                    _ => Trinary::Maybe,
+                };
+                if b != want_b || tri != want_tri {
+                    bad.push(format!(
+                        "{vn} -> {tn}: {verdict:?} but bool={b} trinary={tri:?}"
+                    ));
+                }
+                // A `Yes`/`No` verdict must project identically through both.
+                if matches!(verdict, Verdict::Yes | Verdict::No) && b != (tri != Trinary::No) {
+                    bad.push(format!("{vn} -> {tn}: {verdict:?} projections disagree"));
+                }
+                if verdict == Verdict::Partial {
+                    partial += 1;
+                    // This is the half that must be rejected by `is_assignable`
+                    // while staying a `Maybe` for the strictness levels.
+                    assert!(!b, "{vn} -> {tn}: Partial must not be assignable");
+                    assert_eq!(tri, Trinary::Maybe, "{vn} -> {tn}");
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "{} inconsistent pairs:\n  {}",
+            bad.len(),
+            bad.join("\n  ")
+        );
+        // The overloaded-`Maybe` set is real and non-empty — if this ever drops
+        // to zero the matrix has stopped covering the interesting cases.
+        assert_eq!(partial, 31, "the partially-assignable pair set changed");
     }
 
     fn ok(v: Type, t: Type) -> bool {
