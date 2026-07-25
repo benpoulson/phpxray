@@ -14,6 +14,7 @@ use crate::{
 };
 use php_ast::{Arg, Expr, ExprKind, MemberName, Name, Stmt};
 use php_diagnostics::Diagnostic;
+use php_infer::builtins::{callback_spec, CallbackSeed};
 use php_infer::{arrays, contextual_body_type_map, TypeMap};
 use php_reflect::{FunctionReflection, MethodReflection, ParamReflection, SourceKind};
 use php_resolve::{Resolution, Scope};
@@ -244,55 +245,51 @@ fn builtin_callback_seed<'a>(
     if !func.builtin {
         return None;
     }
-    match last_segment(&func.fqn).to_ascii_lowercase().as_str() {
-        "array_map" => {
-            let callback = args.first()?;
-            let inferred = args
-                .iter()
-                .skip(1)
-                .map(|arg| array_value_type(&fa.type_of(&arg.value)))
-                .collect();
-            Some((callback, inferred))
-        }
-        "array_filter" => {
+    // The callback position and seeding shape come from the one table in
+    // `php_infer::builtins`; this side only computes the types, from the type map.
+    let spec = callback_spec(&last_segment(&func.fqn).to_ascii_lowercase())?;
+    let callback = args.get(spec.callback)?;
+    let inferred = match spec.seed {
+        CallbackSeed::ArrayValuesAfterCallback => args
+            .iter()
+            .skip(spec.callback + 1)
+            .map(|arg| array_value_type(&fa.type_of(&arg.value)))
+            .collect(),
+        CallbackSeed::FilterOverArray0 => {
             let array = args.first()?;
-            let callback = args.get(1)?;
             let value = array_value_type(&fa.type_of(&array.value));
             let key = array_key_type(&fa.type_of(&array.value));
-            let inferred = array_filter_callback_params(args, value, key)?;
-            Some((callback, inferred))
+            array_filter_callback_params(args, value, key)?
         }
-        "array_walk" => {
+        CallbackSeed::WalkOverArray0 => {
             let array = args.first()?;
-            let callback = args.get(1)?;
-            let mut inferred = vec![
+            let mut params = vec![
                 array_value_type(&fa.type_of(&array.value)),
                 array_key_type(&fa.type_of(&array.value)),
             ];
             if let Some(user_arg) = args.get(2) {
-                inferred.push(fa.type_of(&user_arg.value));
+                params.push(fa.type_of(&user_arg.value));
             }
-            Some((callback, inferred))
+            params
         }
-        "usort" | "uasort" => {
+        CallbackSeed::ValuePairOfArray0 => {
             let array = args.first()?;
-            let callback = args.get(1)?;
             let value = array_value_type(&fa.type_of(&array.value));
-            Some((callback, vec![value.clone(), value]))
+            vec![value.clone(), value]
         }
-        "uksort" => {
+        CallbackSeed::KeyPairOfArray0 => {
             let array = args.first()?;
-            let callback = args.get(1)?;
             let key = array_key_type(&fa.type_of(&array.value));
-            Some((callback, vec![key.clone(), key]))
+            vec![key.clone(), key]
         }
-        "preg_replace_callback" => {
-            let callback = args.get(1)?;
-            preg_replace_callback_flags_are_plain(args)
-                .then(|| (callback, vec![preg_match_array_type()]))
+        CallbackSeed::PregMatchArray => {
+            if !preg_replace_callback_flags_are_plain(args) {
+                return None;
+            }
+            vec![preg_match_array_type()]
         }
-        _ => None,
-    }
+    };
+    Some((callback, inferred))
 }
 
 fn collection_callback_seed<'a>(

@@ -1320,17 +1320,7 @@ fn direct_iterable_named_key_value(fqn: &str, args: &[Type]) -> Option<(Type, Ty
 }
 
 fn is_known_generic_iterable(fqn: &str) -> bool {
-    matches!(
-        fqn.trim_start_matches('\\').to_ascii_lowercase().as_str(),
-        "generator"
-            | "iterator"
-            | "seekableiterator"
-            | "traversable"
-            | "iteratoraggregate"
-            | "arrayobject"
-            | "splfixedarray"
-            | "weakmap"
-    )
+    php_types::builtins::generic_builtin_class(fqn).is_some_and(|c| c.iterable)
 }
 
 fn shape_field_key_type(field: &php_types::ShapeField) -> Type {

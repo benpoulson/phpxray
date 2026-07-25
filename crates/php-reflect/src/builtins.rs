@@ -238,13 +238,9 @@ fn named_types(names: Vec<&str>) -> Vec<Type> {
 }
 
 fn builtin_class_templates(fqn: &str) -> Vec<String> {
-    let names: &[&str] = match fqn.trim_start_matches('\\').to_ascii_lowercase().as_str() {
-        "traversable" | "iteratoraggregate" | "iterator" | "seekableiterator" | "arrayaccess"
-        | "arrayobject" | "splfixedarray" | "weakmap" => &["TKey", "TValue"],
-        "generator" => &["TKey", "TYield", "TSend", "TReturn"],
-        _ => &[],
-    };
-    names.iter().map(|name| (*name).to_string()).collect()
+    php_types::builtins::generic_builtin_class(fqn)
+        .map(|c| c.templates.iter().map(|n| (*n).to_string()).collect())
+        .unwrap_or_default()
 }
 
 fn ensure_class<'a>(

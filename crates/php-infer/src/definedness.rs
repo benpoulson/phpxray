@@ -60,15 +60,6 @@ const ALWAYS_DEFINED: &[&str] = &[
 
 /// Function names whose presence means we can't reason about definedness in the
 /// enclosing scope (they can introduce or require arbitrary variables).
-const ESCAPE_FUNCTIONS: &[&str] = &[
-    "extract",
-    "parse_str",
-    "mb_parse_str",
-    "get_defined_vars",
-    "compact",
-    "eval",
-];
-
 /// Analyse a whole program and return the possibly-undefined variable reads.
 pub fn undefined_variables(program: &php_ast::Program, interner: &Interner) -> Vec<UndefVar> {
     undefined_variables_with(program, interner, &crate::Terminators::default())
@@ -598,7 +589,7 @@ fn expr_escape(e: &Expr, interner: &Interner) -> bool {
         ExprKind::Call { callee, .. } => {
             if let ExprKind::Name(n) = &callee.kind {
                 let last = crate::last_segment(&n.text).to_ascii_lowercase();
-                if ESCAPE_FUNCTIONS.contains(&last.as_str()) {
+                if crate::builtins::is_variable_escape_fn(&last) {
                     return true;
                 }
             }

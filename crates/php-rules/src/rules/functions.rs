@@ -2148,85 +2148,6 @@ fn doc_has_param(doc: Option<&str>, name: &str) -> bool {
 // Call-as-statement with no side effects (CallToFunctionStatementWithoutSideEffectsRule)
 // ---------------------------------------------------------------------------
 
-/// Built-in functions known to be pure / side-effect-free. A conservative subset
-/// of phpstan's `@phpstan-pure` stub annotations — chosen so a statement-level
-/// call to one is unambiguously a mistake. (We intentionally omit functions whose
-/// purity is version- or argument-dependent.)
-const PURE_BUILTINS: &[&str] = &[
-    "strlen",
-    "count",
-    "sizeof",
-    "array_keys",
-    "array_values",
-    "array_merge",
-    "array_map",
-    "array_filter",
-    "array_search",
-    "in_array",
-    "array_key_exists",
-    "implode",
-    "explode",
-    "str_repeat",
-    "str_replace",
-    "substr",
-    "strpos",
-    "stripos",
-    "strrpos",
-    "trim",
-    "ltrim",
-    "rtrim",
-    "strtolower",
-    "strtoupper",
-    "ucfirst",
-    "ucwords",
-    "lcfirst",
-    "sprintf",
-    "number_format",
-    "abs",
-    "ceil",
-    "floor",
-    "round",
-    "max",
-    "min",
-    "intval",
-    "floatval",
-    "strval",
-    "boolval",
-    "is_int",
-    "is_string",
-    "is_array",
-    "is_bool",
-    "is_float",
-    "is_null",
-    "is_numeric",
-    "is_object",
-    "is_callable",
-    "gettype",
-    "json_encode",
-    "base64_encode",
-    "base64_decode",
-    "urlencode",
-    "urldecode",
-    "htmlspecialchars",
-    "htmlentities",
-    "nl2br",
-    "wordwrap",
-    "str_pad",
-    "str_split",
-    "array_slice",
-    "array_reverse",
-    "array_unique",
-    "array_flip",
-    "array_sum",
-    "array_product",
-    "array_column",
-    "array_combine",
-    "array_fill",
-    "array_pad",
-    "range",
-    "compact",
-];
-
 /// `CallToFunctionStatementWithoutSideEffectsRule` — a call to a known pure
 /// built-in whose result is thrown away (the call *is* the whole statement). The
 /// return value is the only effect, so the statement is dead. Conservative: only
@@ -2250,7 +2171,7 @@ fn run_call_statement_no_side_effects(fa: &FileAnalysis) -> Vec<Diagnostic> {
         let Some(tail) = function_tail_lower(fa, r) else {
             return;
         };
-        if !PURE_BUILTINS.contains(&tail.as_str()) {
+        if !php_infer::builtins::is_pure_builtin(&tail) {
             return;
         }
         if !is_global_function(fa, r, &tail) {

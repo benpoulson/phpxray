@@ -13,6 +13,8 @@
 //! never panics.
 
 pub mod arrays;
+pub mod builtins;
+mod limits;
 mod util;
 pub(crate) use php_ast::queries::peel_paren;
 pub(crate) use util::{
@@ -41,6 +43,7 @@ pub use signatures::{
 };
 pub use type_map::{contextual_body_type_map, type_map, type_map_with, Facets, TypeMap};
 
+use crate::limits::{FOLD_CAP, MAX_SHAPE_FIELDS};
 use php_ast::{
     Arg, ArrowFn, BinOp, CastKind, ClosureExpr, Expr, ExprKind, MemberName, Name, Param, UnOp,
 };
@@ -360,7 +363,6 @@ impl<'a> TypeCtx<'a> {
         // is an array shape `array{a: …, 5: …}` — the precision phpstan tracks and
         // the form user code assigns to `array{…}`-typed slots. Capped to keep
         // shapes (and their Display) bounded; beyond it, fall back to `array<K,V>`.
-        const MAX_SHAPE_FIELDS: usize = 64;
         if items.len() <= MAX_SHAPE_FIELDS {
             if let Some(fields) = self.shape_fields(items) {
                 return Type::Shape {
@@ -471,267 +473,6 @@ impl<'a> TypeCtx<'a> {
         callee_class: Option<String>,
     ) -> Type {
         returns::refine_return(self, declared, body, params, args, callee_class)
-    }
-
-    /// Argument-dependent return types for selected built-ins. Returns `None` to
-    /// fall back to the stub signature.
-    fn dynamic_return(&self, fname: &str, args: &[php_ast::Arg]) -> Option<Type> {
-        if !args_are_plain_positional(args) {
-            return None;
-        }
-
-        // The string-replace family returns the *subject*'s shape: a string
-        // subject yields a string, an array subject an array. The stub can only
-        // say `string|array`, which then poisons every downstream string use.
-        if let Some(idx) = match fname {
-            "str_replace"
-            | "str_ireplace"
-            | "preg_replace"
-            | "preg_replace_callback"
-            | "preg_replace_callback_array" => Some(2),
-            "substr_replace" => Some(0),
-            _ => None,
-        } {
-            return match self.infer(&args.get(idx)?.value) {
-                Type::String | Type::StringOf(_) | Type::LiteralString(_) => Some(Type::String),
-                Type::Array(_) | Type::List(_) => Some(Type::Array(None)),
-                _ => None,
-            };
-        }
-
-        if let Some(t) = self.string_builtin_return(fname, args) {
-            return Some(t);
-        }
-
-        // `count()` of a non-empty container is at least 1.
-        if matches!(fname, "count" | "sizeof") {
-            if let Type::NonEmpty(_) = self.infer(&args.first()?.value) {
-                return Some(Type::int_range(Some(1), None));
-            }
-            return None;
-        }
-
-        // Array functions that preserve their first argument's element type — the
-        // stubs return a bare `array`, losing the value type and cascading into
-        // downstream `array<K,V>` argument/return mismatches.
-        match fname {
-            "array_map" => self.array_map_return(args),
-            // `array_merge(...$arrays)` unions element types; all-list inputs
-            // stay a list (re-indexed), and one non-empty input makes the
-            // result non-empty.
-            "array_merge" => {
-                if args.is_empty() {
-                    return None;
-                }
-                let mut keys = Vec::new();
-                let mut values = Vec::new();
-                let mut all_lists = true;
-                let mut any_non_empty = false;
-                for a in args {
-                    let t = self.infer(&a.value);
-                    any_non_empty |= matches!(t, Type::NonEmpty(_));
-                    match t.peel_non_empty() {
-                        Type::List(v) => values.push((**v).clone()),
-                        t @ (Type::Array(_) | Type::Shape { .. }) => {
-                            all_lists = false;
-                            let (k, v) = arrays::iter_key_value(t);
-                            keys.push(k);
-                            values.push(v);
-                        }
-                        _ => return None,
-                    }
-                }
-                let v = Type::union(values);
-                let merged = if all_lists {
-                    Type::List(Box::new(v))
-                } else {
-                    keys.push(Type::Int); // list parts contribute int keys
-                    Type::Array(Some(Box::new((Type::union(keys), v))))
-                };
-                Some(if any_non_empty {
-                    Type::non_empty(merged)
-                } else {
-                    merged
-                })
-            }
-            // `array_combine($keys, $values)` → `array<value-of-keys, value-of-values>`.
-            "array_combine" => {
-                let k = self.array_value_type(args.first()?)?;
-                let v = self.array_value_type(args.get(1)?)?;
-                Some(Type::Array(Some(Box::new((k, v)))))
-            }
-            // `array_fill($start, $count, $value)` → `array<int, V>`; a
-            // positive literal count is non-empty.
-            "array_fill" => {
-                let v = self.infer(&args.get(2)?.value);
-                let filled = Type::Array(Some(Box::new((Type::Int, v))));
-                Some(match self.infer(&args.get(1)?.value) {
-                    Type::LiteralInt(n) if n >= 1 => Type::non_empty(filled),
-                    _ => filled,
-                })
-            }
-            // `array_fill_keys($keys, $value)` → `array<value-of-keys, V>`.
-            "array_fill_keys" => {
-                let k = self.array_value_type(args.first()?)?;
-                let v = self.infer(&args.get(1)?.value);
-                Some(Type::Array(Some(Box::new((k, v)))))
-            }
-            // `array_flip(array<K, V>)` → `array<V, K>`.
-            "array_flip" => {
-                let t = self.infer(&args.first()?.value);
-                let (k, v) = arrays::iter_key_value(&t);
-                if matches!(k, Type::Mixed) && matches!(v, Type::Mixed) {
-                    return None;
-                }
-                Some(Type::Array(Some(Box::new((v, k)))))
-            }
-            // `array_pop`/`array_shift` return an element or `null` when empty.
-            "array_pop" | "array_shift" => {
-                let v = self.array_value_type(args.first()?)?;
-                Some(v.nullable())
-            }
-            // `array_chunk($a, $n)` → a list of non-empty chunks (re-indexed
-            // without the preserve-keys flag).
-            "array_chunk" if args.len() == 2 => {
-                let v = self.array_value_type(args.first()?)?;
-                Some(Type::List(Box::new(Type::non_empty(Type::List(Box::new(
-                    v,
-                ))))))
-            }
-            // `range($a, $b)` always yields at least one element.
-            "range" => {
-                let int_ish =
-                    |t: &Type| matches!(t, Type::Int | Type::LiteralInt(_) | Type::IntRange { .. });
-                let a = self.infer(&args.first()?.value);
-                let b = self.infer(&args.get(1)?.value);
-                let elem = if int_ish(&a) && int_ish(&b) && args.len() == 2 {
-                    Type::Int
-                } else if matches!(a, Type::Float) || matches!(b, Type::Float) {
-                    Type::Float
-                } else {
-                    return None;
-                };
-                Some(Type::non_empty(Type::List(Box::new(elem))))
-            }
-            // `iterator_to_array($it)` — element types via the iterable
-            // machinery; `preserve_keys: false` re-indexes into a list.
-            "iterator_to_array" => {
-                let t = self.infer(&args.first()?.value);
-                let (k, v) = self
-                    .index
-                    .iterable_key_value_on_type(&t)
-                    .unwrap_or_else(|| arrays::iter_key_value(&t));
-                if matches!(k, Type::Mixed) && matches!(v, Type::Mixed) {
-                    return None;
-                }
-                let preserve = match args.get(1).map(|a| self.infer(&a.value)) {
-                    Some(Type::False) => false,
-                    None | Some(Type::True) => true,
-                    _ => return None,
-                };
-                Some(if preserve {
-                    Type::Array(Some(Box::new((k, v))))
-                } else {
-                    Type::List(Box::new(v))
-                })
-            }
-            "array_keys" => Some(Type::List(Box::new(self.array_key_type(args.first()?)?))),
-            // `array_values(array<K,V>)` → `list<V>`.
-            "array_values" => Some(Type::List(Box::new(self.array_value_type(args.first()?)?))),
-            "array_column" => self.array_column_return(args),
-            // These keep the value type AND re-index integer keys (default
-            // flags), so a list stays a list; returning the input type holds.
-            "array_reverse" | "array_slice" | "array_splice" | "array_pad" => {
-                match self.infer(&args.first()?.value) {
-                    t @ (Type::Array(_) | Type::List(_)) => Some(t),
-                    _ => None,
-                }
-            }
-            // These keep the value type but *preserve keys while dropping
-            // entries* — a list comes out with holes, i.e. `array<int, V>`,
-            // NOT `list<V>` (phpstan models this; `arrayValues.list` relies
-            // on the distinction: `array_values(array_filter($list))` is a
-            // meaningful call).
-            "array_filter" | "array_unique" | "array_diff" | "array_intersect" => {
-                match self.infer(&args.first()?.value) {
-                    Type::List(v) => Some(Type::Array(Some(Box::new((Type::Int, *v))))),
-                    t @ Type::Array(_) => Some(t),
-                    _ => None,
-                }
-            }
-            // `max`/`min`: a single iterable arg yields its value type; otherwise
-            // the union of the argument types. The stub's `int|float` otherwise
-            // poisons `int`-typed uses (e.g. `str_repeat(' ', max(0, $n - $w))`).
-            "max" | "min" => {
-                if args.len() == 1 {
-                    return self.array_value_type(args.first()?);
-                }
-                let tys: Vec<Type> = args.iter().map(|a| self.infer(&a.value)).collect();
-                Some(Type::union(tys))
-            }
-            // `abs` preserves int/float.
-            "abs" => match self.infer(&args.first()?.value) {
-                Type::Int | Type::LiteralInt(_) => Some(Type::Int),
-                Type::Float => Some(Type::Float),
-                _ => None,
-            },
-            // `array_search($needle, $haystack)` returns the *key* of the haystack
-            // (or `false`). The stub's `int|string|false` poisons int-keyed (list)
-            // uses — `array_splice($list, array_search(...), …)` after `!== false`.
-            "array_search" => {
-                let key = self.array_key_type(args.get(1)?)?;
-                Some(Type::union(vec![key, Type::False]))
-            }
-            // `array_key_first`/`array_key_last` return the key (or `null`).
-            "array_key_first" | "array_key_last" => {
-                let key = self.array_key_type(args.first()?)?;
-                Some(Type::union(vec![key, Type::Null]))
-            }
-            // `count_chars($s, $mode)`: modes 0-2 return an array, mode 3/4 a string.
-            // The stub's `array|string` poisons `strlen(count_chars($s, 3))`.
-            "count_chars" => match self.infer(&args.get(1)?.value) {
-                Type::LiteralInt(3) | Type::LiteralInt(4) => Some(Type::String),
-                Type::LiteralInt(0..=2) => Some(Type::Array(None)),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
-    fn array_map_return(&self, args: &[Arg]) -> Option<Type> {
-        if self.native {
-            return None;
-        }
-        let callback = args.first()?;
-        let inferred_params: Vec<Type> = args
-            .iter()
-            .skip(1)
-            .map(|a| self.array_value_type(a).unwrap_or(Type::Mixed))
-            .collect();
-        if inferred_params.is_empty() {
-            return None;
-        }
-        let ret = self.callback_return_type(callback, &inferred_params)?;
-        if template_observation_is_imprecise(&ret) {
-            return None;
-        }
-        // With multiple arrays PHP re-indexes sequentially (a list); with one
-        // array the input's KEYS are preserved, so the result is a list only
-        // when the input is one. `array_map($cb, array_filter($list))` keeps
-        // the filter's holes — claiming `list` here would false-flag the
-        // `array_values()` call that re-indexes it.
-        if args.len() > 2 {
-            return Some(Type::List(Box::new(ret)));
-        }
-        match self.infer(&args.get(1)?.value) {
-            Type::List(_) => Some(Type::List(Box::new(ret))),
-            input @ (Type::Array(_) | Type::Shape { .. } | Type::Iterable(_)) => {
-                let key = arrays::array_key_type(&input)
-                    .unwrap_or_else(|| Type::union(vec![Type::Int, Type::String]));
-                Some(Type::Array(Some(Box::new((key, ret)))))
-            }
-            _ => None,
-        }
     }
 
     fn array_column_return(&self, args: &[Arg]) -> Option<Type> {
@@ -1725,216 +1466,6 @@ impl<'a> TypeCtx<'a> {
         }
     }
 
-    /// Return refinements for the string builtins (phpstan's per-function
-    /// DynamicReturnTypeExtensions, batch B1): literal folding where the value
-    /// is fully known, non-emptiness where the output provably has a byte.
-    /// `None` falls back to the stub signature.
-    fn string_builtin_return(&self, fname: &str, args: &[php_ast::Arg]) -> Option<Type> {
-        const FOLD_CAP: usize = 512;
-        let lit = |i: usize| -> Option<String> {
-            match self.infer(&args.get(i)?.value) {
-                Type::LiteralString(s) => Some(s.to_string()),
-                _ => None,
-            }
-        };
-        let arg_non_empty = |i: usize| -> bool {
-            match args.get(i).map(|a| self.infer(&a.value)) {
-                Some(Type::LiteralString(s)) => !s.is_empty(),
-                Some(Type::StringOf(r)) => r.implies(php_types::StringRefinement::NonEmpty),
-                _ => false,
-            }
-        };
-        let non_empty_string = || Type::StringOf(php_types::StringRefinement::NonEmpty);
-        Some(match fname {
-            // A `%`-free literal format is the result verbatim; with
-            // conversions, every specifier but `%s` emits at least one char, so
-            // stripping `%%` and `%s` from a literal format proves
-            // non-emptiness when anything remains (positional `%1$s` forms are
-            // skipped via the `$` guard).
-            "sprintf" | "vsprintf" => {
-                let fmt = lit(0)?;
-                if !fmt.contains('%') {
-                    if fmt.is_empty() {
-                        return None;
-                    }
-                    return Some(Type::LiteralString(fmt.into()));
-                }
-                if fmt.contains('$') {
-                    return None;
-                }
-                let stripped = fmt.replace("%%", "").replace("%s", "");
-                if stripped.is_empty() {
-                    return None;
-                }
-                non_empty_string()
-            }
-            // `explode` with a non-empty separator and no limit always yields
-            // at least one element (the whole string when the separator is
-            // absent). A `limit` argument can produce an empty list.
-            "explode" => {
-                let base = Type::List(Box::new(Type::String));
-                if args.len() == 2 && arg_non_empty(0) {
-                    Type::non_empty(base)
-                } else {
-                    base
-                }
-            }
-            // Length-preserving transforms: fold literals (byte-wise ASCII
-            // semantics since PHP 8.0), keep non-emptiness otherwise.
-            "strtolower" | "strtoupper" | "ucfirst" | "lcfirst" | "strrev" => {
-                match self.infer(&args.first()?.value) {
-                    Type::LiteralString(s) => {
-                        let s = s.to_string();
-                        Type::LiteralString(
-                            match fname {
-                                "strtolower" => s.to_ascii_lowercase(),
-                                "strtoupper" => s.to_ascii_uppercase(),
-                                "ucfirst" => ascii_change_first(&s, true),
-                                "lcfirst" => ascii_change_first(&s, false),
-                                _ => s.chars().rev().collect(),
-                            }
-                            .into(),
-                        )
-                    }
-                    Type::StringOf(r) if r.implies(php_types::StringRefinement::NonEmpty) => {
-                        non_empty_string()
-                    }
-                    _ => return None,
-                }
-            }
-            // Default-charlist trim of a literal folds exactly.
-            "trim" | "ltrim" | "rtrim" if args.len() == 1 => {
-                let s = lit(0)?;
-                const WS: &[char] = &[' ', '\t', '\n', '\r', '\0', '\x0B'];
-                let folded = match fname {
-                    "trim" => s.trim_matches(WS),
-                    "ltrim" => s.trim_start_matches(WS),
-                    _ => s.trim_end_matches(WS),
-                };
-                Type::LiteralString(folded.into())
-            }
-            // `str_repeat`: two known literals fold (size-capped); a non-empty
-            // subject repeated a provably-positive count stays non-empty.
-            "str_repeat" => {
-                let times = match self.infer(&args.get(1)?.value) {
-                    Type::LiteralInt(n) => Some(n),
-                    Type::IntRange { min: Some(m), .. } if m >= 1 => None,
-                    _ => return None,
-                };
-                match (lit(0), times) {
-                    (Some(s), Some(n))
-                        if n >= 0 && s.len().saturating_mul(n as usize) <= FOLD_CAP =>
-                    {
-                        Type::LiteralString(s.repeat(n as usize).into())
-                    }
-                    _ if arg_non_empty(0) => non_empty_string(),
-                    _ => return None,
-                }
-            }
-            // `str_pad($s, $len)`: the result has max(len, strlen) bytes.
-            "str_pad" => {
-                let len_positive = matches!(
-                    self.infer(&args.get(1)?.value),
-                    Type::LiteralInt(n) if n >= 1
-                );
-                if len_positive || arg_non_empty(0) {
-                    non_empty_string()
-                } else {
-                    return None;
-                }
-            }
-            // `number_format` always prints at least one digit.
-            "number_format" => non_empty_string(),
-            // `date` with a non-empty literal format emits at least one char
-            // (every format char produces output; literal chars pass through).
-            "date" | "gmdate" => {
-                if lit(0)?.is_empty() {
-                    return None;
-                }
-                non_empty_string()
-            }
-            // `dirname('')` is `'.'` — always non-empty. `uniqid` likewise.
-            "dirname" | "uniqid" => non_empty_string(),
-            // `gettype` returns one of a fixed non-empty word set.
-            "gettype" => non_empty_string(),
-            // `filter_var($v, FILTER_VALIDATE_*)` — the filter constant names
-            // the success type (failure is `false`; flag args are skipped).
-            "filter_var" if args.len() == 2 => {
-                let ExprKind::Name(n) = &args[1].value.kind else {
-                    return None;
-                };
-                let success = match last_segment(&n.text) {
-                    "FILTER_VALIDATE_INT" => Type::Int,
-                    "FILTER_VALIDATE_FLOAT" => Type::Float,
-                    "FILTER_VALIDATE_BOOLEAN" | "FILTER_VALIDATE_BOOL" => {
-                        // Failure also yields `false` — plain bool covers it.
-                        return Some(Type::Bool);
-                    }
-                    "FILTER_VALIDATE_EMAIL"
-                    | "FILTER_VALIDATE_URL"
-                    | "FILTER_VALIDATE_IP"
-                    | "FILTER_VALIDATE_DOMAIN"
-                    | "FILTER_VALIDATE_MAC" => Type::String,
-                    _ => return None,
-                };
-                Type::union(vec![success, Type::False])
-            }
-            // `preg_split` without flags yields at least one piece (or `false`
-            // on a bad pattern). The 4th (flags) arg can produce an empty list.
-            "preg_split" if args.len() <= 3 => Type::union(vec![
-                Type::non_empty(Type::List(Box::new(Type::String))),
-                Type::False,
-            ]),
-            // `parse_url($url)` → the component shape (all keys optional) or
-            // `false` on a seriously malformed URL.
-            "parse_url" if args.len() == 1 => {
-                let f = |key: &str, ty: Type| php_types::ShapeField {
-                    key: Some(key.to_string()),
-                    optional: true,
-                    ty,
-                };
-                Type::union(vec![
-                    Type::Shape {
-                        fields: vec![
-                            f("scheme", Type::String),
-                            f("host", Type::String),
-                            f("port", Type::Int),
-                            f("user", Type::String),
-                            f("pass", Type::String),
-                            f("path", Type::String),
-                            f("query", Type::String),
-                            f("fragment", Type::String),
-                        ],
-                        sealed: true,
-                    },
-                    Type::False,
-                ])
-            }
-            // `pathinfo($p)` → its documented shape (`basename`/`filename`
-            // always present); the 2-arg component form returns a string.
-            "pathinfo" => {
-                if args.len() >= 2 {
-                    return Some(Type::String);
-                }
-                let f = |key: &str, optional: bool| php_types::ShapeField {
-                    key: Some(key.to_string()),
-                    optional,
-                    ty: Type::String,
-                };
-                Type::Shape {
-                    fields: vec![
-                        f("dirname", true),
-                        f("basename", false),
-                        f("extension", true),
-                        f("filename", false),
-                    ],
-                    sealed: true,
-                }
-            }
-            _ => return None,
-        })
-    }
-
     /// The class FQN to query members on, given a value's type.
     fn type_class_fqn(&self, t: &Type) -> Option<String> {
         match t {
@@ -2309,7 +1840,7 @@ fn subst_templates(ty: &Type, subst: &HashMap<String, Type>, unbound_to_mixed: b
     })
 }
 
-fn template_observation_is_imprecise(t: &Type) -> bool {
+pub(crate) fn template_observation_is_imprecise(t: &Type) -> bool {
     let mut imprecise = false;
     let _ = t.clone().map(&mut |part| {
         if matches!(
@@ -2445,8 +1976,7 @@ fn null_truth(t: &Type) -> Option<bool> {
 /// comparisons), otherwise a plain `string`. Capped to avoid carrying huge
 /// generated string constants around as types.
 fn literal_string(bytes: &[u8]) -> Type {
-    const MAX: usize = 64;
-    if bytes.len() <= MAX {
+    if bytes.len() <= crate::limits::MAX_LITERAL_STRING {
         if let Ok(s) = std::str::from_utf8(bytes) {
             return Type::LiteralString(s.into());
         }
@@ -2484,7 +2014,6 @@ fn is_string_ty(t: &Type) -> bool {
 /// literal-ish operands keep `literal-string`, and one provably non-empty
 /// side makes the result `non-empty-string`.
 fn concat_type(l: &Type, r: &Type) -> Type {
-    const FOLD_CAP: usize = 512;
     if let (Some(a), Some(b)) = (literal_text(l), literal_text(r)) {
         if a.len() + b.len() <= FOLD_CAP {
             return Type::LiteralString(format!("{a}{b}").into());
@@ -2516,7 +2045,7 @@ fn concat_type(l: &Type, r: &Type) -> Type {
 }
 
 /// `ucfirst`/`lcfirst` semantics: change the case of the first ASCII byte.
-fn ascii_change_first(s: &str, upper: bool) -> String {
+pub(crate) fn ascii_change_first(s: &str, upper: bool) -> String {
     let mut out = s.to_string();
     // Safety of the byte poke: ASCII case changes never alter UTF-8 validity.
     if let Some(b) = unsafe { out.as_bytes_mut() }.first_mut() {

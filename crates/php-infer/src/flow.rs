@@ -11,6 +11,8 @@
 //! assigned on only some paths widens to include its prior/`mixed` value. This
 //! approximation is sound enough to drive diagnostics and never panics.
 
+use crate::builtins::CallbackSeed;
+use crate::limits::{LOOP_FIXPOINT_LIMIT, LOOP_UNION_ARM_CAP, SHAPE_UNION_ARM_CAP};
 use crate::{
     arg_is_plain_positional, args_are_plain_positional, last_segment, peel_paren, strip_this_vars,
 };
@@ -46,8 +48,6 @@ type RecMap = HashMap<(u32, u32), Type>;
 /// time against the place's current type, so a property's declared type (not
 /// `mixed`) is the baseline.
 type Fact = (String, Type);
-
-const LOOP_FIXPOINT_LIMIT: usize = 6;
 
 impl TypeCtx<'_> {
     /// Seed parameters from a function/method's reflected signature, then analyse
@@ -413,7 +413,7 @@ impl TypeCtx<'_> {
                     let fname = last_segment(&n.text).to_ascii_lowercase();
                     // A userland function shadowing a builtin name says nothing
                     // about its argument's type.
-                    let builtin = self.narrows_as_builtin(n);
+                    let builtin = self.resolves_to_builtin(n);
                     if let Some(arg0) = args.first().filter(|_| builtin) {
                         if let Some(place) = self.place_key(&arg0.value) {
                             if truthy {
@@ -488,20 +488,6 @@ impl TypeCtx<'_> {
     // (IfTrue/IfFalse gate on the branch, Always applies to both); `None` is
     // the statement path, where only Always applies.
 
-    /// May a call to `n` be narrowed as the **global builtin** of that name?
-    ///
-    /// PHP's unqualified-function fallback means a namespaced
-    /// `function is_int(): bool` shadows the global one for unqualified calls in
-    /// that namespace, with entirely different semantics — narrowing on it would
-    /// be unsound (the contract in this module's header: never over-narrow). A
-    /// fully-qualified `\is_int` always resolves to the builtin. A name that
-    /// resolves to nothing stays permissive: an incomplete index must not
-    /// silently switch narrowing off. Same posture as `apply_preg_match_out` /
-    /// `rec_builtin_callback_args`, which already guarded this way.
-    fn narrows_as_builtin(&self, n: &Name) -> bool {
-        !self.function_reflection(n).is_some_and(|f| !f.builtin)
-    }
-
     /// The sole argument of a `count($x)` / `sizeof($x)` call, when it is the
     /// global builtin (a userland `count()` proves nothing about emptiness).
     fn count_call_arg<'e>(&self, e: &'e Expr) -> Option<&'e Expr> {
@@ -515,7 +501,7 @@ impl TypeCtx<'_> {
         if !last.eq_ignore_ascii_case("count") && !last.eq_ignore_ascii_case("sizeof") {
             return None;
         }
-        if !self.narrows_as_builtin(n) {
+        if !self.resolves_to_builtin(n) {
             return None;
         }
         let arg = args.first()?;
@@ -662,7 +648,7 @@ impl TypeCtx<'_> {
         let ExprKind::Name(n) = &callee.kind else {
             return;
         };
-        if !self.narrows_as_builtin(n) {
+        if !self.resolves_to_builtin(n) {
             return;
         }
         let fname = last_segment(&n.text).to_ascii_lowercase();
@@ -1627,63 +1613,60 @@ impl TypeCtx<'_> {
             return;
         };
         let fname = last_segment(&func.fqn).to_ascii_lowercase();
-        match fname.as_str() {
-            "array_map" => {
-                let Some(callback) = args.first() else { return };
-                let inferred: Vec<Type> = args
-                    .iter()
-                    .skip(1)
-                    .map(|a| self.arg_array_value_type(a))
-                    .collect();
-                self.rec_callback_arg(callback, inferred, map);
-            }
-            "array_filter" => {
-                let (Some(array), Some(callback)) = (args.first(), args.get(1)) else {
-                    return;
-                };
+        // Which argument is the callable and how its parameters are seeded is
+        // table knowledge shared with the rules layer (`crate::builtins`); only
+        // the type computation is local.
+        let Some(spec) = crate::builtins::callback_spec(&fname) else {
+            return;
+        };
+        let Some(callback) = args.get(spec.callback) else {
+            return;
+        };
+        let array = args.first();
+        let inferred: Vec<Type> = match spec.seed {
+            CallbackSeed::ArrayValuesAfterCallback => args
+                .iter()
+                .skip(spec.callback + 1)
+                .map(|a| self.arg_array_value_type(a))
+                .collect(),
+            CallbackSeed::FilterOverArray0 => {
+                let Some(array) = array else { return };
                 let value = self.arg_array_value_type(array);
                 let key = self.arg_array_key_type(array);
-                let Some(inferred) = array_filter_callback_params(args, value, key) else {
+                let Some(params) = array_filter_callback_params(args, value, key) else {
                     return;
                 };
-                self.rec_callback_arg(callback, inferred, map);
+                params
             }
-            "array_walk" => {
-                let (Some(array), Some(callback)) = (args.first(), args.get(1)) else {
-                    return;
-                };
-                let mut inferred = vec![
+            CallbackSeed::WalkOverArray0 => {
+                let Some(array) = array else { return };
+                let mut params = vec![
                     self.arg_array_value_type(array),
                     self.arg_array_key_type(array),
                 ];
                 if let Some(user_arg) = args.get(2) {
-                    inferred.push(self.infer(&user_arg.value));
+                    params.push(self.infer(&user_arg.value));
                 }
-                self.rec_callback_arg(callback, inferred, map);
+                params
             }
-            "usort" | "uasort" => {
-                let (Some(array), Some(callback)) = (args.first(), args.get(1)) else {
-                    return;
-                };
+            CallbackSeed::ValuePairOfArray0 => {
+                let Some(array) = array else { return };
                 let value = self.arg_array_value_type(array);
-                self.rec_callback_arg(callback, vec![value.clone(), value], map);
+                vec![value.clone(), value]
             }
-            "uksort" => {
-                let (Some(array), Some(callback)) = (args.first(), args.get(1)) else {
-                    return;
-                };
+            CallbackSeed::KeyPairOfArray0 => {
+                let Some(array) = array else { return };
                 let key = self.arg_array_key_type(array);
-                self.rec_callback_arg(callback, vec![key.clone(), key], map);
+                vec![key.clone(), key]
             }
-            "preg_replace_callback" => {
-                let Some(callback) = args.get(1) else { return };
+            CallbackSeed::PregMatchArray => {
                 if !preg_replace_callback_flags_are_plain(args) {
                     return;
                 }
-                self.rec_callback_arg(callback, vec![preg_match_array_type()], map);
+                vec![preg_match_array_type()]
             }
-            _ => {}
-        }
+        };
+        self.rec_callback_arg(callback, inferred, map);
     }
 
     fn rec_collection_callback_args(
@@ -1875,7 +1858,7 @@ impl TypeCtx<'_> {
         let ExprKind::Name(n) = &callee.kind else {
             return;
         };
-        if !last_segment(&n.text).eq_ignore_ascii_case("assert") || !self.narrows_as_builtin(n) {
+        if !last_segment(&n.text).eq_ignore_ascii_case("assert") || !self.resolves_to_builtin(n) {
             return;
         }
         let Some(cond) = args.first() else { return };
@@ -2510,10 +2493,10 @@ fn widen_loop_state(state: FlowState) -> FlowState {
 
 fn widen_loop_type(t: &Type) -> Type {
     match t {
-        Type::Union(parts) if parts.len() > 8 => {
+        Type::Union(parts) if parts.len() > LOOP_UNION_ARM_CAP => {
             let widened = Type::union(parts.iter().map(generalize_literal).collect());
             match &widened {
-                Type::Union(parts) if parts.len() > 8 => Type::Mixed,
+                Type::Union(parts) if parts.len() > LOOP_UNION_ARM_CAP => Type::Mixed,
                 _ => widened,
             }
         }
@@ -2866,8 +2849,6 @@ fn merge(envs: Vec<Env>) -> Env {
 /// cap the shape arms collapse into ONE shape: the union of their key sets,
 /// each key optional unless present-and-required in every arm, field types
 /// unioned. Strictly wider than the exact union (sound) and bounded.
-const SHAPE_UNION_ARM_CAP: usize = 6;
-
 fn collapse_shape_union(ty: Type) -> Type {
     let Type::Union(parts) = &ty else { return ty };
     let nshapes = parts

@@ -44,7 +44,9 @@ pub struct InferOpts {
 
 impl Default for InferOpts {
     fn default() -> Self {
-        InferOpts { rounds: 3 }
+        InferOpts {
+            rounds: crate::limits::SIGNATURE_INFERENCE_ROUNDS,
+        }
     }
 }
 
@@ -185,7 +187,7 @@ fn body_return_type(
     let mut ctx = TypeCtx::new(index, scope, interner);
     ctx.class = class;
     // depth 1 so any nested per-call refinement stays shallow (one more level).
-    ctx.depth = 1;
+    ctx.depth = crate::limits::CALLEE_ANALYSIS_DEPTH;
     ctx.vars = params.iter().cloned().collect();
 
     let mut returns = Vec::new();

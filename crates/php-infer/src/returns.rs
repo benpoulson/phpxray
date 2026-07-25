@@ -19,7 +19,7 @@ pub(crate) fn refine_return(
     };
     let refinable = matches!(declared, Type::Nullable(_))
         || matches!(declared, Type::Union(parts) if parts.contains(&Type::Null));
-    if caller.depth >= 2 || !refinable {
+    if caller.depth >= crate::limits::MAX_REFINE_DEPTH || !refinable {
         return declared.clone();
     }
     // The callee's body is analysed in the callee's namespace scope, one level

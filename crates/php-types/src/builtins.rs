@@ -7,6 +7,81 @@ use crate::PhpVersion;
 
 pub const BUILTIN_SOURCE: &str = "<builtin>";
 
+/// A built-in class that carries `@template` parameters.
+///
+/// The stub manifests describe members but not genericity, so the template names
+/// are curated here — in **one** place, because two consumers need overlapping
+/// but *different* facts about these classes and had each grown their own list.
+pub struct GenericBuiltinClass {
+    /// Lowercased, `\`-free class name (the comparison key).
+    pub lower_name: &'static str,
+    /// `@template` names, in declaration order.
+    pub templates: &'static [&'static str],
+    /// Whether instances can be iterated (`foreach`) — which is **not** the same
+    /// as being generic. `ArrayAccess` has `TKey`/`TValue` but provides only
+    /// offset access; iterating requires `Traversable`. Conflating the two would
+    /// make `foreach` over an `ArrayAccess` bind loop variables it cannot have.
+    pub iterable: bool,
+}
+
+const KEY_VALUE: &[&str] = &["TKey", "TValue"];
+
+/// Every generic built-in class, with its templates and whether it is iterable.
+pub static GENERIC_BUILTIN_CLASSES: &[GenericBuiltinClass] = &[
+    GenericBuiltinClass {
+        lower_name: "traversable",
+        templates: KEY_VALUE,
+        iterable: true,
+    },
+    GenericBuiltinClass {
+        lower_name: "iterator",
+        templates: KEY_VALUE,
+        iterable: true,
+    },
+    GenericBuiltinClass {
+        lower_name: "seekableiterator",
+        templates: KEY_VALUE,
+        iterable: true,
+    },
+    GenericBuiltinClass {
+        lower_name: "iteratoraggregate",
+        templates: KEY_VALUE,
+        iterable: true,
+    },
+    GenericBuiltinClass {
+        lower_name: "arrayobject",
+        templates: KEY_VALUE,
+        iterable: true,
+    },
+    GenericBuiltinClass {
+        lower_name: "splfixedarray",
+        templates: KEY_VALUE,
+        iterable: true,
+    },
+    GenericBuiltinClass {
+        lower_name: "weakmap",
+        templates: KEY_VALUE,
+        iterable: true,
+    },
+    // Generic, but not iterable — see `GenericBuiltinClass::iterable`.
+    GenericBuiltinClass {
+        lower_name: "arrayaccess",
+        templates: KEY_VALUE,
+        iterable: false,
+    },
+    GenericBuiltinClass {
+        lower_name: "generator",
+        templates: &["TKey", "TYield", "TSend", "TReturn"],
+        iterable: true,
+    },
+];
+
+/// Look up a generic built-in class by any spelling of its name.
+pub fn generic_builtin_class(fqn: &str) -> Option<&'static GenericBuiltinClass> {
+    let key = fqn.trim_start_matches('\\').to_ascii_lowercase();
+    GENERIC_BUILTIN_CLASSES.iter().find(|c| c.lower_name == key)
+}
+
 const BUILTIN_FUNCTIONS_80400: &str = include_str!("../stubs/builtin-functions-80400.txt");
 const BUILTIN_FUNCTIONS_80500: &str = include_str!("../stubs/builtin-functions-80500.txt");
 const BUILTIN_FUNCTIONS_80600: &str = include_str!("../stubs/builtin-functions-80600.txt");
@@ -271,5 +346,50 @@ mod tests {
             BuiltinClassRecord::Class { fqn, .. } if *fqn == "Exception"
         )));
         assert!(constants_for(version).iter().any(|c| c.fqn == "PHP_EOL"));
+    }
+}
+
+#[cfg(test)]
+mod generic_class_tests {
+    use super::*;
+
+    /// The two former consumers disagreed on `ArrayAccess`, and that difference
+    /// is correct rather than drift: it is generic but not iterable. Pin both
+    /// facts so a future "cleanup" cannot collapse them.
+    #[test]
+    fn array_access_is_generic_but_not_iterable() {
+        let c = generic_builtin_class("ArrayAccess").expect("ArrayAccess is generic");
+        assert_eq!(c.templates, &["TKey", "TValue"]);
+        assert!(!c.iterable, "ArrayAccess provides offsets, not iteration");
+
+        let t = generic_builtin_class("Traversable").expect("Traversable is generic");
+        assert!(t.iterable);
+    }
+
+    #[test]
+    fn lookup_accepts_any_spelling() {
+        for spelling in ["Generator", "generator", "\\Generator", "\\GENERATOR"] {
+            let c = generic_builtin_class(spelling).expect(spelling);
+            assert_eq!(c.templates, &["TKey", "TYield", "TSend", "TReturn"]);
+        }
+        assert!(generic_builtin_class("NotABuiltin").is_none());
+    }
+
+    /// Every entry must name a class the stub manifests actually ship, or the
+    /// curated genericity silently applies to nothing.
+    #[test]
+    fn every_generic_class_exists_in_the_manifests() {
+        let records = class_records_for(PhpVersion::default());
+        for c in GENERIC_BUILTIN_CLASSES {
+            assert!(
+                records.iter().any(|r| matches!(
+                    r,
+                    BuiltinClassRecord::Class { fqn, .. }
+                        if fqn.trim_start_matches('\\').to_ascii_lowercase() == c.lower_name
+                )),
+                "GENERIC_BUILTIN_CLASSES names {:?}, which is not in the builtin class manifest",
+                c.lower_name
+            );
+        }
     }
 }
