@@ -1802,9 +1802,9 @@ impl TypeCtx<'_> {
         child.callables = callables;
         child.depth = self.depth;
         child.native = self.native;
+        child.terminators = self.terminators.clone();
         child.generator_send = generator_send;
-        child.autoviv_shapes =
-            !crate::definedness::scope_has_escape_hatch(body, self.interner);
+        child.autoviv_shapes = !crate::definedness::scope_has_escape_hatch(body, self.interner);
         child.record_block(body, map);
     }
 
@@ -1823,6 +1823,7 @@ impl TypeCtx<'_> {
         child.callables = callables;
         child.depth = self.depth;
         child.native = self.native;
+        child.terminators = self.terminators.clone();
         child.generator_send = generator_send;
         child.rec_here(e, map);
     }

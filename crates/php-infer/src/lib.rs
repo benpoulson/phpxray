@@ -109,6 +109,11 @@ pub struct TypeCtx<'a> {
     /// the declared return type makes it precise enough to use.
     pub(crate) generator_send: Option<Type>,
     /// User-configured always-terminating calls (`earlyTerminating*` config).
+    ///
+    /// **Must be propagated to every child scope** (closures, arrow fns, recorded
+    /// child bodies, interprocedural sub-contexts). Dropping it makes
+    /// [`Self::always_terminates`] miss configured terminators inside those
+    /// bodies, so branches that should be excluded from a merge widen instead.
     pub terminators: std::sync::Arc<Terminators>,
     /// Whether flow may create shape types for auto-vivified index writes on
     /// provably-undefined variables. Set only by scope drivers that verified
@@ -1228,6 +1233,7 @@ impl<'a> TypeCtx<'a> {
         child.class = (!c.is_static).then(|| self.class.clone()).flatten();
         child.depth = self.depth;
         child.native = self.native;
+        child.terminators = self.terminators.clone();
         child.generator_send = c
             .return_type
             .as_ref()
@@ -1249,6 +1255,7 @@ impl<'a> TypeCtx<'a> {
         child.class = (!a.is_static).then(|| self.class.clone()).flatten();
         child.depth = self.depth;
         child.native = self.native;
+        child.terminators = self.terminators.clone();
         child.generator_send = a
             .return_type
             .as_ref()
@@ -1274,6 +1281,7 @@ impl<'a> TypeCtx<'a> {
         child.callables = callables;
         child.depth = self.depth;
         child.native = self.native;
+        child.terminators = self.terminators.clone();
         child.generator_send = None;
         child
     }

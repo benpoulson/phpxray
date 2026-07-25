@@ -394,6 +394,61 @@ mod tests {
         (map, r)
     }
 
+    /// The type recorded for the *last* `$name` read in `src`, with `bail()`
+    /// configured as an early-terminating call.
+    fn last_var_with_terminator(src: &str, name: &str) -> String {
+        let r = php_parser::parse(src);
+        assert!(!r.has_errors(), "parse errors: {src}");
+        let mut reflection = ReflectionIndex::with_builtins();
+        reflection.add_file(&r.program, &r.interner);
+        let terminators = std::sync::Arc::new(crate::Terminators {
+            functions: ["bail".to_string()].into_iter().collect(),
+            methods: Default::default(),
+        });
+        let map = type_map_with(&reflection, &r.program, &r.interner, false, &terminators);
+        let mut found = "<not found>".to_string();
+        walk::for_each_expr(&r.program, &mut |e| {
+            if matches!(&e.kind, ExprKind::Variable(s) if r.interner.resolve(*s) == name) {
+                found = map
+                    .get(&key(e.span))
+                    .map(|f| f.merged.to_string())
+                    .unwrap_or_else(|| "<unmapped>".into());
+            }
+        });
+        found
+    }
+
+    /// Regression: `TypeCtx` child scopes used to drop `terminators`, so a
+    /// configured early-terminating call did not end a branch inside a closure
+    /// or arrow-fn body and the guarded type stayed widened.
+    #[test]
+    fn configured_terminator_narrows_inside_closure() {
+        // Control: the same guard at function top level.
+        assert_eq!(
+            last_var_with_terminator(
+                "<?php function f(?string $s) { if ($s === null) { bail(); } return $s; }",
+                "s"
+            ),
+            "string"
+        );
+        assert_eq!(
+            last_var_with_terminator(
+                "<?php function f() { $cb = function (?string $s) { \
+                 if ($s === null) { bail(); } return $s; }; }",
+                "s"
+            ),
+            "string"
+        );
+        assert_eq!(
+            last_var_with_terminator(
+                "<?php function f(?string $s) { $cb = function () use ($s) { \
+                 if ($s === null) { bail(); } return $s; }; }",
+                "s"
+            ),
+            "string"
+        );
+    }
+
     fn build_native(src: &str) -> (RawMap, php_parser::ParseResult) {
         let r = php_parser::parse(src);
         assert!(!r.has_errors(), "parse errors: {src}");
