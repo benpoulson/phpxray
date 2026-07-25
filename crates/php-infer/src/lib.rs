@@ -50,6 +50,7 @@ use php_ast::{
 use php_intern::Interner;
 use php_reflect::ReflectionIndex;
 use php_resolve::{Resolution, Scope};
+use php_span::NodeKey;
 use php_types::{CallableSig, Type};
 use std::collections::HashMap;
 
@@ -58,14 +59,14 @@ type CallableAliases = HashMap<String, CallableAlias>;
 #[derive(Clone)]
 pub(crate) enum CallableAlias {
     Closure {
-        id: (u32, u32),
+        id: NodeKey,
         expr: Box<ClosureExpr>,
         vars: HashMap<String, Type>,
         callables: CallableAliases,
         class: Option<String>,
     },
     Arrow {
-        id: (u32, u32),
+        id: NodeKey,
         expr: Box<ArrowFn>,
         vars: HashMap<String, Type>,
         callables: CallableAliases,
@@ -74,7 +75,7 @@ pub(crate) enum CallableAlias {
 }
 
 impl CallableAlias {
-    fn id(&self) -> (u32, u32) {
+    fn id(&self) -> NodeKey {
         match self {
             CallableAlias::Closure { id, .. } | CallableAlias::Arrow { id, .. } => *id,
         }

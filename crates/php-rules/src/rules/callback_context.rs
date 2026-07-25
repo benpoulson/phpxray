@@ -21,7 +21,7 @@ use php_resolve::{Resolution, Scope};
 use php_types::Type;
 use std::collections::HashSet;
 
-type SpanKey = (u32, u32);
+type SpanKey = php_span::NodeKey;
 type DedupeKey = (Option<String>, SpanKey, &'static str, String);
 
 pub(crate) static RULES: &[LocatedRuleEntry] = &[
@@ -896,7 +896,7 @@ fn array_key_type(ty: &Type) -> Type {
     arrays::array_key_type(ty).unwrap_or(Type::Mixed)
 }
 
-fn assignment_target_spans(body: &[Stmt]) -> HashSet<(u32, u32)> {
+fn assignment_target_spans(body: &[Stmt]) -> HashSet<php_span::NodeKey> {
     let mut spans = HashSet::new();
     for_each_body_expr(body, |e| {
         let (ExprKind::Assign { target, .. } | ExprKind::AssignRef { target, .. }) = &e.kind else {
@@ -909,7 +909,7 @@ fn assignment_target_spans(body: &[Stmt]) -> HashSet<(u32, u32)> {
     spans
 }
 
-fn undefined_allowed_property_spans(body: &[Stmt]) -> HashSet<(u32, u32)> {
+fn undefined_allowed_property_spans(body: &[Stmt]) -> HashSet<php_span::NodeKey> {
     let mut spans = HashSet::new();
     for_each_body_expr(body, |e| match &e.kind {
         ExprKind::Isset(vars) => {
@@ -929,7 +929,7 @@ fn undefined_allowed_property_spans(body: &[Stmt]) -> HashSet<(u32, u32)> {
     spans
 }
 
-fn mark_property_subtree(expr: &Expr, spans: &mut HashSet<(u32, u32)>) {
+fn mark_property_subtree(expr: &Expr, spans: &mut HashSet<php_span::NodeKey>) {
     walk::for_each_subexpr(expr, &mut |e| {
         if matches!(e.kind, ExprKind::Prop { .. }) {
             spans.insert(span_key(e));
@@ -976,13 +976,12 @@ fn last_segment(name: &str) -> &str {
         .unwrap_or(name)
 }
 
-fn span_key(e: &Expr) -> (u32, u32) {
+fn span_key(e: &Expr) -> php_span::NodeKey {
     span_key_raw(e.span)
 }
 
-fn span_key_raw(span: php_span::Span) -> (u32, u32) {
-    let r = span.range();
-    (r.start as u32, r.end as u32)
+fn span_key_raw(span: php_span::Span) -> php_span::NodeKey {
+    php_span::NodeKey::of(span)
 }
 
 fn skip_return(t: &Type) -> bool {

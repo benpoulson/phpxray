@@ -521,16 +521,15 @@ fn named_fqn(t: &Type) -> Option<String> {
 }
 
 fn type_of(map: &TypeMap, e: &Expr) -> Type {
-    let r = e.span.range();
-    map.get(&(r.start as u32, r.end as u32))
+    map.get(&php_span::NodeKey::of(e.span))
         .map(|f| f.merged.clone())
         .unwrap_or(Type::Mixed)
 }
 
-fn function_ref_map(refs: &[ResolvedRef]) -> HashMap<(u32, u32), &ResolvedRef> {
+fn function_ref_map(refs: &[ResolvedRef]) -> HashMap<php_span::NodeKey, &ResolvedRef> {
     refs.iter()
         .filter(|r| r.kind == RefKind::Function)
-        .map(|r| ((r.span.start, r.span.end), r))
+        .map(|r| (php_span::NodeKey::of(r.span), r))
         .collect()
 }
 
@@ -538,13 +537,13 @@ fn function_ref_map(refs: &[ResolvedRef]) -> HashMap<(u32, u32), &ResolvedRef> {
 /// global fallback (prefer the namespaced candidate when it exists).
 fn resolve_call_fqn(
     callee: &Expr,
-    fmap: &HashMap<(u32, u32), &ResolvedRef>,
+    fmap: &HashMap<php_span::NodeKey, &ResolvedRef>,
     index: &ReflectionIndex,
 ) -> Option<String> {
     let ExprKind::Name(n) = &callee.kind else {
         return None;
     };
-    let r = fmap.get(&(n.span.start, n.span.end))?;
+    let r = fmap.get(&php_span::NodeKey::of(n.span))?;
     match &r.resolution {
         Resolution::Fqn(fqn) => Some(fqn.clone()),
         Resolution::Fallback { namespaced, global } => {

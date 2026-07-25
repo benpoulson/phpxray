@@ -21,9 +21,8 @@ use php_resolve::Scope;
 use php_types::Type;
 
 /// The type-map key (byte span) of an expression.
-fn key(e: &Expr) -> (u32, u32) {
-    let r = e.span.range();
-    (r.start as u32, r.end as u32)
+fn key(e: &Expr) -> php_span::NodeKey {
+    php_span::NodeKey::of(e.span)
 }
 
 /// The declared return type of the function/method currently being checked, with

@@ -15,6 +15,7 @@ use php_ast::{walk, Member, Program, StmtKind};
 use php_intern::Interner;
 use php_reflect::{reflect_class, reflect_function, ParamReflection, ReflectionIndex};
 use php_resolve::{for_each_region, Scope};
+use php_span::NodeKey;
 use php_types::Type;
 use std::collections::HashMap;
 
@@ -42,11 +43,11 @@ impl Facets {
 }
 
 /// Inferred [`Facets`] for each expression, keyed by its span (start, end).
-pub type TypeMap = HashMap<(u32, u32), Facets>;
+pub type TypeMap = HashMap<NodeKey, Facets>;
 
 /// Internal single-facet recording map — what the flow recorder fills for one
 /// view. The public [`TypeMap`] is assembled from one or two of these.
-type RawMap = HashMap<(u32, u32), Type>;
+type RawMap = HashMap<NodeKey, Type>;
 
 /// Assemble the public faceted map from the merged raw map plus an optional
 /// native raw map (present only when `treatPhpDocTypesAsCertain: false`).
@@ -81,9 +82,8 @@ fn facet(merged: RawMap, native: Option<RawMap>) -> TypeMap {
 }
 
 #[cfg(test)]
-fn key(span: php_span::Span) -> (u32, u32) {
-    let r = span.range();
-    (r.start as u32, r.end as u32)
+fn key(span: php_span::Span) -> NodeKey {
+    NodeKey::of(span)
 }
 
 /// Build the faceted type map for one parsed file. The merged (PHPDoc-refined)

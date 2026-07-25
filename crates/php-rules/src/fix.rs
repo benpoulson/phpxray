@@ -481,10 +481,9 @@ pub(crate) fn return_narrowing_fix(
     let mut bare = false;
     crate::decls::collect_returns_in_body(body, &mut |e| match e {
         Some(expr) => {
-            let r = expr.span.range();
             parts.push(
                 types
-                    .get(&(r.start as u32, r.end as u32))
+                    .get(&php_span::NodeKey::of(expr.span))
                     .map(|f| f.merged.clone())
                     .unwrap_or(Type::Mixed),
             );

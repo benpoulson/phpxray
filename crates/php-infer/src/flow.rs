@@ -25,6 +25,7 @@ use php_ast::{
     Arg, ArrowFn, BinOp, ClosureExpr, Expr, ExprKind, FunctionDecl, MemberName, Name, Param, Stmt,
     StmtKind, UnOp,
 };
+use php_span::NodeKey;
 use php_types::Type;
 use std::collections::{HashMap, HashSet};
 
@@ -38,7 +39,7 @@ type FlowState = (Env, CallableEnv);
 
 /// The recording target for [`TypeCtx::record_block`]: a `span (start,end) → Type`
 /// map (the same shape as [`crate::TypeMap`]).
-type RecMap = HashMap<(u32, u32), Type>;
+type RecMap = HashMap<NodeKey, Type>;
 
 /// A flow-narrowing fact: a "place" (a variable, or `$this->prop`/`$v->prop`)
 /// and the type it definitely has in the branch. Only *sound* refinements are
@@ -2256,9 +2257,8 @@ impl TypeCtx<'_> {
 }
 
 /// Span key for the type map: an expression's `(start, end)` byte range.
-fn span_key(e: &Expr) -> (u32, u32) {
-    let r = e.span.range();
-    (r.start as u32, r.end as u32)
+fn span_key(e: &Expr) -> NodeKey {
+    NodeKey::of(e.span)
 }
 
 fn array_filter_callback_params(args: &[Arg], value: Type, key: Type) -> Option<Vec<Type>> {

@@ -150,9 +150,8 @@ impl FileAnalysis<'_> {
     /// seeded), so this resolves inside them too; `mixed` means genuinely unknown
     /// (e.g. an untyped parameter), as anywhere else.
     pub fn type_of(&self, e: &Expr) -> Type {
-        let r = e.span.range();
         self.types
-            .get(&(r.start as u32, r.end as u32))
+            .get(&php_span::NodeKey::of(e.span))
             .map(|f| f.merged.clone())
             .unwrap_or(Type::Mixed)
     }
@@ -161,9 +160,8 @@ impl FileAnalysis<'_> {
     /// Reads the native facet of the single faceted map; it is only meaningful
     /// (and only consulted) under `treatPhpDocTypesAsCertain: false`.
     pub fn native_type_of(&self, e: &Expr) -> Type {
-        let r = e.span.range();
         self.types
-            .get(&(r.start as u32, r.end as u32))
+            .get(&php_span::NodeKey::of(e.span))
             .map(|f| f.native().clone())
             .unwrap_or(Type::Mixed)
     }

@@ -86,6 +86,46 @@ impl std::fmt::Debug for Span {
     }
 }
 
+/// A stable identity for an AST node, used as the key of node-indexed maps
+/// (notably `php_infer`'s type map).
+///
+/// Today this **is** the node's byte span, which is why it exists as a newtype
+/// rather than a bare `(u32, u32)`: the planned arena migration (CLAUDE.md §10.4)
+/// replaces span-derived identity with a real node ID, and the intent is that
+/// only this type's definition and constructor change, not every call site.
+///
+/// # Known identity flaws inherited from spans
+///
+/// These are properties of *span* identity, not bugs in this type. The arena
+/// migration removes them; until then callers must be aware:
+///
+/// * **Identical-span parent/child pairs collide** — a wrapper node that
+///   consumes no extra source text shares its child's span, so whichever is
+///   recorded last wins. `php-ast` documents a no-identical-spans invariant for
+///   the parser to uphold; violations are bugs against it.
+/// * **Loop fixpoint iterations overwrite** — a body re-analysed per iteration
+///   records the same keys each round, so the last iteration's types survive.
+/// * **Re-seeded callback bodies need a separate map** — recording one body under
+///   two different parameter seedings would collide, which is why
+///   `contextual_body_type_map` builds a parallel map instead of merging.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct NodeKey(u32, u32);
+
+impl NodeKey {
+    /// The key identifying the node that occupies `span`.
+    #[inline]
+    pub fn of(span: Span) -> Self {
+        NodeKey(span.start, span.end)
+    }
+
+    /// The raw span bounds. For diagnostics/tests only — do not key new maps on
+    /// the tuple, key them on `NodeKey`.
+    #[inline]
+    pub fn bounds(self) -> (u32, u32) {
+        (self.0, self.1)
+    }
+}
+
 /// A 1-based line and column (column counted in bytes within the line).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LineCol {

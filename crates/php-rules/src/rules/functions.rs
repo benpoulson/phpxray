@@ -1816,9 +1816,8 @@ fn known_anonymous_return_type(fa: &FileAnalysis, e: &Expr) -> Option<Type> {
     const_return_expr_type(e)
 }
 
-fn expr_key(e: &Expr) -> (u32, u32) {
-    let r = e.span.range();
-    (r.start as u32, r.end as u32)
+fn expr_key(e: &Expr) -> php_span::NodeKey {
+    php_span::NodeKey::of(e.span)
 }
 
 fn const_return_expr_type(e: &Expr) -> Option<Type> {
