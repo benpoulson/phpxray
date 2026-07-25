@@ -41,7 +41,20 @@ thread_local! {
 /// discarded (analysis drivers bracket strictly, so this only matters after a
 /// panic unwound mid-file).
 pub fn start() {
-    ACTIVE.with(|a| *a.borrow_mut() = Some(RecordedDeps::default()));
+    ACTIVE.with(|a| {
+        let mut slot = a.borrow_mut();
+        // Recording is per-thread and non-reentrant: a nested `start()` would
+        // silently discard the outer file's dependency set, and the incremental
+        // engine would then under-invalidate that file (stale findings, not a
+        // crash). The invariant is "one analyzed file per thread at a time" —
+        // which is also why per-file analysis must not fan out with rayon.
+        debug_assert!(
+            slot.is_none(),
+            "depsrec::start() called while recording is already in progress — \
+             per-file analysis must not nest or spawn parallel work"
+        );
+        *slot = Some(RecordedDeps::default());
+    });
 }
 
 /// Stop recording on this thread and return what was recorded. Returns an

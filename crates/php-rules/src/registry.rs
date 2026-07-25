@@ -41,6 +41,20 @@ pub struct ReflectCache {
 
 /// The read-only inputs a rule reads about one file. The shared project/reflection
 /// indexes are borrowed (built once for the whole run).
+///
+/// # Invariant: one analyzed file per thread, no nested parallelism
+///
+/// Rules must not fan out with rayon (or otherwise move work to another thread)
+/// *inside* the analysis of one file. Cross-file dependency recording
+/// ([`php_resolve::depsrec`]) is a **thread-local**: the incremental engine
+/// brackets each file with `depsrec::start()`/`finish()` on the worker thread
+/// that analyzes it, so index lookups performed on a different thread are simply
+/// not recorded. The failure mode is silent — that file under-records its
+/// dependencies and watch mode then serves stale findings for it, with no crash
+/// and no failing test. Parallelism belongs *across* files (which is where the
+/// engines already put it), never within one.
+///
+/// `depsrec::start()` carries a `debug_assert!` for the nesting half of this.
 pub struct FileAnalysis<'a> {
     pub path: &'a str,
     pub source: &'a str,
