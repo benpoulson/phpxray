@@ -664,6 +664,37 @@ mod tests {
         assert_eq!(codes(src, run_implicit_mixed_strictness), ["argument.type"]);
     }
 
+    /// Level gating, which the harness previously masked by forcing every
+    /// strictness switch on: implicit-mixed checks exist only at `max`, explicit
+    /// ones from level 9.
+    #[test]
+    fn strict_mixed_rules_respect_their_levels() {
+        use crate::testutil::codes_at_level;
+        let implicit = "<?php function f($x) { strlen($x); }";
+        for level in [0, 7, 8, 9] {
+            assert!(
+                codes_at_level(implicit, run_implicit_mixed_strictness, level).is_empty(),
+                "implicit-mixed must not fire at level {level}"
+            );
+        }
+        assert_eq!(
+            codes_at_level(implicit, run_implicit_mixed_strictness, 10),
+            ["argument.type"]
+        );
+
+        let explicit = "<?php /** @param mixed $x */ function f($x) { strlen($x); }";
+        for level in [0, 7, 8] {
+            assert!(
+                codes_at_level(explicit, run_explicit_mixed_strictness, level).is_empty(),
+                "explicit-mixed must not fire at level {level}"
+            );
+        }
+        assert_eq!(
+            codes_at_level(explicit, run_explicit_mixed_strictness, 9),
+            ["argument.type"]
+        );
+    }
+
     /// The discriminating pair, end to end through the rule.
     ///
     /// A `mixed` written in a docblock is **explicit** mixed, so these go through

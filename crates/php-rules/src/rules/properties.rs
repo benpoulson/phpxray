@@ -4074,7 +4074,7 @@ pub(crate) static RULES: &[RuleEntry] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{codes, codes_with, fixes, run, run_fixes};
+    use crate::testutil::{codes, codes_strict, codes_with, fixes, run_fixes, run_strict};
 
     // --- UninitializedPropertyRule (property.uninitialized) -------------
 
@@ -4085,7 +4085,7 @@ mod tests {
                 public int $x;
             }"#;
         assert_eq!(
-            codes(src, run_uninitialized_properties),
+            codes_strict(src, run_uninitialized_properties),
             ["property.uninitialized"]
         );
     }
@@ -4097,7 +4097,7 @@ mod tests {
             class Widget {
                 public int $size;
             }"#;
-        let diags = run(src, run_uninitialized_properties);
+        let diags = run_strict(src, run_uninitialized_properties);
         assert_eq!(
             diags[0].message,
             "Class App\\Widget has an uninitialized property $size. Give it default value or assign it in the constructor."
@@ -4111,7 +4111,7 @@ mod tests {
                 public int $x;
                 public function __construct() { $this->x = 1; }
             }"#;
-        assert!(codes(src, run_uninitialized_properties).is_empty());
+        assert!(codes_strict(src, run_uninitialized_properties).is_empty());
     }
 
     #[test]
@@ -4123,7 +4123,7 @@ mod tests {
                 public function __construct() { $this->x = 1; }
             }"#;
         assert_eq!(
-            codes(src, run_uninitialized_properties),
+            codes_strict(src, run_uninitialized_properties),
             ["property.uninitialized"]
         );
     }
@@ -4137,7 +4137,7 @@ mod tests {
                 public ?int $nullableDefault = null;
                 public function __construct(public int $promoted) {}
             }"#;
-        assert!(codes(src, run_uninitialized_properties).is_empty());
+        assert!(codes_strict(src, run_uninitialized_properties).is_empty());
     }
 
     #[test]
@@ -4167,7 +4167,7 @@ mod tests {
                 public int $x;
                 public function init(): void { $this->x = 1; }
             }"#;
-        assert!(codes(src, run_uninitialized_properties).is_empty());
+        assert!(codes_strict(src, run_uninitialized_properties).is_empty());
     }
 
     #[test]
@@ -4177,7 +4177,7 @@ mod tests {
                 public int $x;
                 public function __construct(string $k) { $this->$k = 1; }
             }"#;
-        assert!(codes(src, run_uninitialized_properties).is_empty());
+        assert!(codes_strict(src, run_uninitialized_properties).is_empty());
     }
 
     #[test]
@@ -4187,7 +4187,7 @@ mod tests {
                 public int $x;
                 public function __construct() { settype($this->x, 'integer'); }
             }"#;
-        assert!(codes(src, run_uninitialized_properties).is_empty());
+        assert!(codes_strict(src, run_uninitialized_properties).is_empty());
     }
 
     #[test]

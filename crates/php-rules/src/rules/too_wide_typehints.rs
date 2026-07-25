@@ -1686,7 +1686,7 @@ pub(crate) static RULES: &[RuleEntry] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{codes, codes_with, run};
+    use crate::testutil::{codes, codes_strict, codes_with, run};
 
     fn msgs(src: &str, rule: fn(&FileAnalysis) -> Vec<Diagnostic>) -> Vec<String> {
         run(src, rule).into_iter().map(|d| d.message).collect()
@@ -1960,12 +1960,9 @@ mod tests {
             class Base { public function m(): ?int { return null; } }
             class C extends Base { public function m(): ?int { return 1; } }";
         // With the flag on, the override (narrowing a known ancestor) is checked.
-        assert_eq!(codes(src, run_method_return), ["return.unusedType"]);
-        // With the flag off, non-final public methods stay skipped.
-        assert!(codes_with(src, run_method_return, |fa| fa
-            .check_too_wide_return_public =
-            false)
-        .is_empty());
+        assert_eq!(codes_strict(src, run_method_return), ["return.unusedType"]);
+        // ...and it is off by default, as in any run that does not configure it.
+        assert!(codes(src, run_method_return).is_empty());
     }
 
     #[test]
