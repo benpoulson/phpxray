@@ -525,7 +525,17 @@ fn analyze_parsed_progress(
             ReflectSourceKind::Scan
         };
         project.add_file_as(&f.path, &index_file(&f.program, interner), project_kind);
-        reflection.add_file_labeled_as(Some(&f.path), &f.program, interner, reflect_kind);
+        // A configured stub file is the one source allowed to override an
+        // earlier project declaration (see `reflect_stub_artifact`).
+        if f.stub {
+            reflection.add_artifact(&php_reflect::reflect_stub_artifact(
+                Some(&f.path),
+                &f.program,
+                interner,
+            ));
+        } else {
+            reflection.add_file_labeled_as(Some(&f.path), &f.program, interner, reflect_kind);
+        }
         indexing.inc(1);
     }
     // Laravel facade aliases (opt-in): register each as a known class so facade
@@ -925,6 +935,38 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Regression: `ProjectIndex` resolved a redeclared class through its FIRST
+    /// declaration while `ReflectionIndex` used the LAST, so name-level rules
+    /// and member/type rules could contradict each other in one run.
+    #[test]
+    fn both_indexes_agree_on_the_redeclaration_winner() {
+        let sources = [
+            "<?php class B { public function fromB() {} }",
+            "<?php class C { public function fromC() {} }",
+            "<?php class A extends B {}",
+            "<?php class A extends C {}",
+        ];
+        let interner = php_intern::Interner::new();
+        let mut project = ProjectIndex::new();
+        let mut reflection = php_reflect::ReflectionIndex::new();
+        for (i, src) in sources.iter().enumerate() {
+            let r = php_parser::parse_into(src, &interner).0;
+            let path = format!("src/f{i}.php");
+            project.add_file(&path, &index_file(&r, &interner));
+            reflection.add_file_labeled_as(
+                Some(&path),
+                &r,
+                &interner,
+                php_reflect::SourceKind::Analyzed,
+            );
+        }
+        // Name level: `A` inherits from `B` (the first declaration).
+        assert_eq!(project.class("A").unwrap().extends, ["B"]);
+        // Member level must resolve through the SAME parent.
+        assert!(reflection.find_method("A", "fromB").is_some());
+        assert!(reflection.find_method("A", "fromC").is_none());
+    }
 
     #[test]
     fn nested_vendor_dirs_are_pruned_from_discovery() {

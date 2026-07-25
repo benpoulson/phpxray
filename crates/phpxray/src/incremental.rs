@@ -403,8 +403,7 @@ impl Session {
         // Stubs indexed last (win over source).
         for (path, program) in &stub_programs {
             let file_index = index_file(program, &self.interner);
-            let artifact =
-                reflect_artifact(Some(path), program, &self.interner, php_reflect::SourceKind::Scan);
+            let artifact = php_reflect::reflect_stub_artifact(Some(path), program, &self.interner);
             project.add_file_as(path, &file_index, php_index::SourceKind::Scan);
             reflection.add_artifact(&artifact);
         }

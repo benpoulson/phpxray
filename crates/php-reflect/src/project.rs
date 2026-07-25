@@ -349,10 +349,8 @@ impl ReflectionIndex {
                     reflection,
                     body,
                 } => {
-                    // Scan-only files must not replace curated builtin stubs.
-                    if kind == SourceKind::Scan
-                        && self.functions.get(key).is_some_and(|f| f.builtin)
-                    {
+                    let existing = self.functions.get(key).map(|f| f.builtin);
+                    if !accepts_redeclaration(kind, artifact.stub, existing) {
                         continue;
                     }
                     self.bodies.insert(key.clone(), Arc::clone(body));
@@ -363,8 +361,8 @@ impl ReflectionIndex {
                     reflection,
                     bodies,
                 } => {
-                    if kind == SourceKind::Scan && self.classes.get(key).is_some_and(|c| c.builtin)
-                    {
+                    let existing = self.classes.get(key).map(|c| c.builtin);
+                    if !accepts_redeclaration(kind, artifact.stub, existing) {
                         continue;
                     }
                     for (body_key, body) in bodies {
@@ -1006,6 +1004,10 @@ fn apply_params(params: &mut [crate::ParamReflection], inferred: &[Option<Type>]
 #[derive(Debug, Clone)]
 pub struct FileReflectionArtifact {
     kind: SourceKind,
+    /// A configured `stubFiles` entry. Stubs exist precisely to *override* a
+    /// project declaration, so they are the one exception to the first-wins
+    /// redeclaration rule in [`ReflectionIndex::add_artifact`].
+    stub: bool,
     entries: Vec<ArtifactEntry>,
 }
 
@@ -1119,7 +1121,46 @@ pub fn reflect_artifact(
             });
         }
     });
-    FileReflectionArtifact { kind, entries }
+    FileReflectionArtifact {
+        kind,
+        stub: false,
+        entries,
+    }
+}
+
+/// [`reflect_artifact`] for a configured `stubFiles` entry: scan-only for
+/// analysis purposes, but allowed to override an earlier project declaration.
+pub fn reflect_stub_artifact(
+    path: Option<&str>,
+    program: &Program,
+    interner: &Interner,
+) -> FileReflectionArtifact {
+    FileReflectionArtifact {
+        stub: true,
+        ..reflect_artifact(path, program, interner, SourceKind::Scan)
+    }
+}
+
+/// Should an incoming declaration overwrite what is already indexed under its
+/// key? `existing` is `Some(is_builtin)` when a declaration is already present.
+///
+/// * Scan-only sources never replace a curated builtin (a vendored polyfill must
+///   not clobber the real signature).
+/// * Otherwise the **first** declaration wins, matching
+///   [`php_index::ProjectIndex`] and PHP itself (the first class to load wins;
+///   the redeclaration is a fatal error). Keeping the two indexes on the same
+///   winner is what stops name-level rules and member/type rules from
+///   contradicting each other on a redeclared class.
+/// * Configured stub files are the deliberate exception — overriding a project
+///   declaration is their entire purpose.
+/// * Analyzed source may still shadow a builtin (an unchanged long-standing
+///   allowance for polyfills).
+fn accepts_redeclaration(kind: SourceKind, stub: bool, existing: Option<bool>) -> bool {
+    match existing {
+        None => true,
+        Some(true) => stub || kind != SourceKind::Scan,
+        Some(false) => stub,
+    }
 }
 
 fn class_key(fqn: &str) -> String {
@@ -1334,6 +1375,94 @@ mod tests {
         let mut idx = ReflectionIndex::new();
         idx.add_file(&r.program, &r.interner);
         idx
+    }
+
+    fn add(idx: &mut ReflectionIndex, src: &str, kind: SourceKind) {
+        let r = php_parser::parse(src);
+        assert!(!r.has_errors(), "parse errors");
+        idx.add_file_labeled_as(None, &r.program, &r.interner, kind);
+    }
+
+    fn add_stub(idx: &mut ReflectionIndex, src: &str) {
+        let r = php_parser::parse(src);
+        assert!(!r.has_errors(), "parse errors");
+        idx.add_artifact(&reflect_stub_artifact(None, &r.program, &r.interner));
+    }
+
+    /// Regression: `add_artifact` was unconditional last-wins while
+    /// `ProjectIndex` is first-wins, so name-level rules and member/type rules
+    /// could resolve a redeclared class through *different* parents in one run.
+    #[test]
+    fn redeclared_class_keeps_the_first_declaration() {
+        let mut idx = ReflectionIndex::new();
+        add(
+            &mut idx,
+            "<?php class B { public function fromB() {} }",
+            SourceKind::Analyzed,
+        );
+        add(
+            &mut idx,
+            "<?php class C { public function fromC() {} }",
+            SourceKind::Analyzed,
+        );
+        add(&mut idx, "<?php class A extends B {}", SourceKind::Analyzed);
+        add(&mut idx, "<?php class A extends C {}", SourceKind::Analyzed);
+        assert_eq!(idx.class("A").unwrap().parents, vec![named("B")]);
+        assert!(idx.find_method("A", "fromB").is_some());
+        assert!(idx.find_method("A", "fromC").is_none());
+    }
+
+    #[test]
+    fn redeclared_function_keeps_the_first_declaration() {
+        let mut idx = ReflectionIndex::new();
+        add(
+            &mut idx,
+            "<?php function f(): int { return 1; }",
+            SourceKind::Analyzed,
+        );
+        add(
+            &mut idx,
+            "<?php function f(): string { return 'x'; }",
+            SourceKind::Analyzed,
+        );
+        assert_eq!(idx.function("f").unwrap().return_type, Type::Int);
+    }
+
+    /// Stub files exist to override project declarations — the one exception.
+    #[test]
+    fn stub_file_overrides_an_earlier_declaration() {
+        let mut idx = ReflectionIndex::new();
+        add(
+            &mut idx,
+            "<?php function f(): int { return 1; }",
+            SourceKind::Analyzed,
+        );
+        add_stub(&mut idx, "<?php function f(): string {}");
+        assert_eq!(idx.function("f").unwrap().return_type, Type::String);
+
+        let mut idx = ReflectionIndex::new();
+        add(
+            &mut idx,
+            "<?php class A { public function a(): int {} }",
+            SourceKind::Analyzed,
+        );
+        add_stub(&mut idx, "<?php class A { public function a(): string {} }");
+        assert_eq!(
+            idx.find_method("A", "a").unwrap().member.return_type,
+            Type::String
+        );
+    }
+
+    #[test]
+    fn scan_source_still_never_replaces_a_builtin() {
+        let mut idx = ReflectionIndex::with_builtins();
+        let before = idx.function("strlen").unwrap().return_type.clone();
+        add(
+            &mut idx,
+            "<?php function strlen($s): array { return []; }",
+            SourceKind::Scan,
+        );
+        assert_eq!(idx.function("strlen").unwrap().return_type, before);
     }
 
     fn named(fqn: &str) -> Type {

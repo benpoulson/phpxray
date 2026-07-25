@@ -16,13 +16,12 @@ mod builtins;
 mod model;
 mod project;
 pub use model::{
-    attr_target, reflect_class, reflect_function, AssertReflection, AttributeSpec,
-    ClassReflection, ConstReflection, FunctionReflection, MethodReflection, ParamReflection,
-    PropertyReflection,
+    attr_target, reflect_class, reflect_function, AssertReflection, AttributeSpec, ClassReflection,
+    ConstReflection, FunctionReflection, MethodReflection, ParamReflection, PropertyReflection,
 };
 pub use project::{
-    reflect_artifact, reflect_file, FileReflectionArtifact, Found, InferredSig, InferredSignatures,
-    ReflectedFile, ReflectionIndex, SourceKind,
+    reflect_artifact, reflect_file, reflect_stub_artifact, FileReflectionArtifact, Found,
+    InferredSig, InferredSignatures, ReflectedFile, ReflectionIndex, SourceKind,
 };
 
 /// Resolve a native PHP type declaration to a semantic [`Type`] in `scope`.
