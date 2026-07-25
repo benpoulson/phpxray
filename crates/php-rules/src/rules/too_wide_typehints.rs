@@ -41,6 +41,7 @@
 //!   final-scope/inheritance semantics to match phpstan without FPs.
 //! - `TooWidePropertyHookParameterType*` — needs hook-specific param-out tracking.
 
+use crate::members;
 use crate::{symbols, walk, FileAnalysis, RuleEntry};
 use php_ast::{
     ArrowFn, ClassDecl, ClosureExpr, Expr, ExprKind, FunctionDecl, HookBody, Member, MemberName,
@@ -1104,7 +1105,8 @@ fn static_property_name_if_static(name: &MemberName, fa: &FileAnalysis) -> Optio
 fn receiver_is_this(base: &Expr, class_fqn: &str, fa: &FileAnalysis, ctx: &TypeCtx<'_>) -> bool {
     match &base.kind {
         ExprKind::Variable(sym) if fa.interner.resolve(*sym) == "this" => true,
-        _ => sole_class(&ctx.infer(base)).is_some_and(|fqn| symbols::same_fqn(&fqn, class_fqn)),
+        _ => members::sole_class(&ctx.infer(base))
+            .is_some_and(|fqn| symbols::same_fqn(&fqn, class_fqn)),
     }
 }
 
@@ -1137,14 +1139,6 @@ fn static_class_matches_current(class: &Expr, class_fqn: &str, ctx: &TypeCtx<'_>
 
 fn static_class_may_be_current(class: &Expr, class_fqn: &str, ctx: &TypeCtx<'_>) -> bool {
     static_class_matches_current(class, class_fqn, ctx).unwrap_or(true)
-}
-
-fn sole_class(ty: &Type) -> Option<String> {
-    match ty {
-        Type::Named { fqn, .. } => Some(fqn.to_string()),
-        Type::Nullable(inner) => sole_class(inner),
-        _ => None,
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -76,6 +76,7 @@
 //!   unresolvable types, and generic-object arity/variance need richer PHPDoc
 //!   reflection than is available here.
 
+use crate::members;
 use crate::{decls, symbols, unknown_symbols, walk, FileAnalysis, RuleEntry};
 use php_ast::{
     AttributeGroup, ClassDecl, ClassKind, Expr, ExprKind, Member, MemberName, MethodDecl, Name,
@@ -649,7 +650,9 @@ fn run_enum_sanity(fa: &FileAnalysis) -> Vec<Diagnostic> {
                         )
                         .with_code("enum.destructor"),
                     );
-                } else if is_magic_method(&lower) && !ALLOWED_ENUM_MAGIC.contains(&lower.as_str()) {
+                } else if members::is_magic_method(&lower)
+                    && !ALLOWED_ENUM_MAGIC.contains(&lower.as_str())
+                {
                     out.push(
                         Diagnostic::error(
                             enum_member_span(c),
@@ -716,31 +719,6 @@ fn run_enum_sanity(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
     });
     out
-}
-
-/// All recognised PHP magic methods (those that get special treatment); used to
-/// distinguish a method merely starting with `__` from an actual magic method.
-fn is_magic_method(lower: &str) -> bool {
-    matches!(
-        lower,
-        "__construct"
-            | "__destruct"
-            | "__call"
-            | "__callstatic"
-            | "__get"
-            | "__set"
-            | "__isset"
-            | "__unset"
-            | "__sleep"
-            | "__wakeup"
-            | "__serialize"
-            | "__unserialize"
-            | "__tostring"
-            | "__invoke"
-            | "__set_state"
-            | "__clone"
-            | "__debuginfo"
-    )
 }
 
 fn ec_span(ec: &php_ast::EnumCaseDecl) -> php_span::Span {

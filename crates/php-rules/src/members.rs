@@ -4,6 +4,7 @@ use crate::{symbols, FileAnalysis};
 use php_reflect::{Found, FunctionReflection, MethodReflection, PropertyReflection};
 use php_resolve::{Resolution, ResolvedRef};
 use php_types::Type;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResolveStatus<T> {
@@ -248,6 +249,58 @@ impl<'a> MemberAccessResolver<'a> {
         ResolveStatus::Unknown
     }
 }
+
+/// Index the file's resolved *function* references by callee span.
+///
+/// Rules that walk calls need this to turn a callee `Name` into its resolution;
+/// it existed verbatim in three category files.
+pub(crate) fn function_refs(refs: &[ResolvedRef]) -> HashMap<(u32, u32), &ResolvedRef> {
+    refs.iter()
+        .filter(|r| r.kind == php_resolve::RefKind::Function)
+        .map(|r| ((r.span.start, r.span.end), r))
+        .collect()
+}
+
+/// The resolved reference for a call's callee, when it is a plain name.
+pub(crate) fn resolved_callee<'a>(
+    callee: &php_ast::Expr,
+    fmap: &HashMap<(u32, u32), &'a ResolvedRef>,
+) -> Option<&'a ResolvedRef> {
+    if let php_ast::ExprKind::Name(n) = &callee.kind {
+        return fmap.get(&(n.span.start, n.span.end)).copied();
+    }
+    None
+}
+
+/// Whether `lower` — an **already lowercased** method name — is one of PHP's
+/// magic methods (`__construct`, `__get`, …).
+///
+/// Magic methods are invoked by the engine, so rules about unused or
+/// unconventional methods must exempt them. Takes lowercased input to match the
+/// two former copies exactly; callers already lowercase for their own lookups.
+pub(crate) fn is_magic_method(lower: &str) -> bool {
+    MAGIC_METHODS.contains(&lower)
+}
+
+const MAGIC_METHODS: &[&str] = &[
+    "__construct",
+    "__destruct",
+    "__call",
+    "__callstatic",
+    "__get",
+    "__set",
+    "__isset",
+    "__unset",
+    "__sleep",
+    "__wakeup",
+    "__serialize",
+    "__unserialize",
+    "__tostring",
+    "__invoke",
+    "__set_state",
+    "__clone",
+    "__debuginfo",
+];
 
 pub(crate) fn sole_class(ty: &Type) -> Option<String> {
     match ty {

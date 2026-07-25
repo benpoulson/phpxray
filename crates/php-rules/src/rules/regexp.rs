@@ -18,6 +18,7 @@
 //!   flags `preg_quote()` calls inside a concatenated regex pattern when the
 //!   quote delimiter is missing or contradicts the pattern delimiter.
 
+use crate::members;
 use crate::{facts::CallFact, FactKind, FactRuleEntry, FactRuleHandler, FileAnalysis, RuleEntry};
 use php_ast::{Arg, BinOp, Expr, ExprKind};
 use php_diagnostics::Diagnostic;
@@ -53,25 +54,6 @@ pub(crate) static FACT_RULES: &[FactRuleEntry] = &[
         FactRuleHandler::FunctionCall(check_quoting_call),
     ),
 ];
-
-/// Build a span→resolution map for function references (callee names).
-fn function_refs(refs: &[ResolvedRef]) -> HashMap<(u32, u32), &ResolvedRef> {
-    refs.iter()
-        .filter(|r| r.kind == php_resolve::RefKind::Function)
-        .map(|r| ((r.span.start, r.span.end), r))
-        .collect()
-}
-
-/// The resolved reference for a call's callee, if it is a plain name.
-fn resolved_callee<'a>(
-    callee: &Expr,
-    fmap: &HashMap<(u32, u32), &'a ResolvedRef>,
-) -> Option<&'a ResolvedRef> {
-    if let ExprKind::Name(n) = &callee.kind {
-        return fmap.get(&(n.span.start, n.span.end)).copied();
-    }
-    None
-}
 
 /// The unqualified, lowercased global tail of a resolved function name, used to
 /// match built-ins like `preg_match`. Returns the global candidate's last
@@ -111,7 +93,7 @@ fn is_global_preg(fa: &FileAnalysis, r: &ResolvedRef, tail: &str) -> bool {
 /// argument folds to a constant string that is a structurally-invalid PCRE
 /// pattern.
 fn run_pattern(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     let mut out = Vec::new();
     for call in fa.facts.function_calls() {
         check_pattern_call_with_refs(fa, call, &fmap, &mut out);
@@ -120,7 +102,7 @@ fn run_pattern(fa: &FileAnalysis) -> Vec<Diagnostic> {
 }
 
 fn check_pattern_call(fa: &FileAnalysis, call: &CallFact, out: &mut Vec<Diagnostic>) {
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     check_pattern_call_with_refs(fa, call, &fmap, out);
 }
 
@@ -130,7 +112,7 @@ fn check_pattern_call_with_refs(
     fmap: &HashMap<(u32, u32), &ResolvedRef>,
     out: &mut Vec<Diagnostic>,
 ) {
-    let Some(r) = resolved_callee(call.callee, fmap) else {
+    let Some(r) = members::resolved_callee(call.callee, fmap) else {
         return;
     };
     let Some(tail) = global_tail_lower(r) else {
@@ -177,7 +159,7 @@ fn check_pattern_call_with_refs(
 /// checks patterns built by concatenation; the delimiter is read from the
 /// leftmost constant piece of the concat.
 fn run_quoting(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     let mut out = Vec::new();
     for call in fa.facts.function_calls() {
         check_quoting_call_with_refs(fa, call, &fmap, &mut out);
@@ -186,7 +168,7 @@ fn run_quoting(fa: &FileAnalysis) -> Vec<Diagnostic> {
 }
 
 fn check_quoting_call(fa: &FileAnalysis, call: &CallFact, out: &mut Vec<Diagnostic>) {
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     check_quoting_call_with_refs(fa, call, &fmap, out);
 }
 
@@ -196,7 +178,7 @@ fn check_quoting_call_with_refs(
     fmap: &HashMap<(u32, u32), &ResolvedRef>,
     out: &mut Vec<Diagnostic>,
 ) {
-    let Some(r) = resolved_callee(call.callee, fmap) else {
+    let Some(r) = members::resolved_callee(call.callee, fmap) else {
         return;
     };
     let Some(tail) = global_tail_lower(r) else {
@@ -326,7 +308,7 @@ fn validate_quote_expr(
     let ExprKind::Call { callee, args } = &e.kind else {
         return;
     };
-    let Some(r) = resolved_callee(callee, fmap) else {
+    let Some(r) = members::resolved_callee(callee, fmap) else {
         return;
     };
     let Some(tail) = global_tail_lower(r) else {

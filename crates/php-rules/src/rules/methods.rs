@@ -2856,10 +2856,10 @@ fn method_call_for_no_discard(e: &Expr) -> Option<(&Expr, bool, bool)> {
         ExprKind::Cast {
             kind: CastKind::Void,
             expr,
-        } => (peel_paren(expr), true),
+        } => (php_ast::queries::peel_paren(expr), true),
         _ => (e, false),
     };
-    let e = peel_paren(e);
+    let e = php_ast::queries::peel_paren(e);
     match &e.kind {
         ExprKind::MethodCall { .. } => Some((e, in_void_cast, false)),
         ExprKind::Binary {
@@ -2877,10 +2877,10 @@ fn static_method_call_for_no_discard(e: &Expr) -> Option<(&Expr, bool, bool)> {
         ExprKind::Cast {
             kind: CastKind::Void,
             expr,
-        } => (peel_paren(expr), true),
+        } => (php_ast::queries::peel_paren(expr), true),
         _ => (e, false),
     };
-    let e = peel_paren(e);
+    let e = php_ast::queries::peel_paren(e);
     match &e.kind {
         ExprKind::StaticCall { .. } => Some((e, in_void_cast, false)),
         ExprKind::Binary {
@@ -2894,40 +2894,39 @@ fn static_method_call_for_no_discard(e: &Expr) -> Option<(&Expr, bool, bool)> {
 }
 
 fn pipe_method_call_for_no_discard(rhs: &Expr) -> Option<(&Expr, bool)> {
-    let rhs = peel_paren(rhs);
+    let rhs = php_ast::queries::peel_paren(rhs);
     match &rhs.kind {
         ExprKind::MethodCall { args, .. } if args.iter().any(|a| a.placeholder) => {
             Some((rhs, true))
         }
         ExprKind::ArrowFn(a)
-            if matches!(&peel_paren(&a.body).kind, ExprKind::MethodCall { .. }) =>
+            if matches!(
+                &php_ast::queries::peel_paren(&a.body).kind,
+                ExprKind::MethodCall { .. }
+            ) =>
         {
-            Some((peel_paren(&a.body), false))
+            Some((php_ast::queries::peel_paren(&a.body), false))
         }
         _ => None,
     }
 }
 
 fn pipe_static_method_call_for_no_discard(rhs: &Expr) -> Option<(&Expr, bool)> {
-    let rhs = peel_paren(rhs);
+    let rhs = php_ast::queries::peel_paren(rhs);
     match &rhs.kind {
         ExprKind::StaticCall { args, .. } if args.iter().any(|a| a.placeholder) => {
             Some((rhs, true))
         }
         ExprKind::ArrowFn(a)
-            if matches!(&peel_paren(&a.body).kind, ExprKind::StaticCall { .. }) =>
+            if matches!(
+                &php_ast::queries::peel_paren(&a.body).kind,
+                ExprKind::StaticCall { .. }
+            ) =>
         {
-            Some((peel_paren(&a.body), false))
+            Some((php_ast::queries::peel_paren(&a.body), false))
         }
         _ => None,
     }
-}
-
-fn peel_paren(mut e: &Expr) -> &Expr {
-    while let ExprKind::Paren(inner) = &e.kind {
-        e = inner;
-    }
-    e
 }
 
 fn static_call_class_fqn_for_no_discard(

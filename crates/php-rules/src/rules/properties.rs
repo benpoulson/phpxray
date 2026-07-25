@@ -41,6 +41,7 @@
 //!   property-hook get/set body rules — need expression-type inference of the
 //!   access receiver / value, or virtual-property hook semantics beyond the AST.
 
+use crate::members;
 use crate::{
     compat, decls,
     facts::AssignmentKind,
@@ -271,7 +272,7 @@ fn receiver_class_for_property_fetch(
     if matches!(&base.kind, ExprKind::Variable(v) if fa.interner.resolve(*v) == "this") {
         return current_class.map(|c| c.to_string());
     }
-    sole_class(&fa.type_of(base))
+    members::sole_class(&fa.type_of(base))
 }
 
 fn property_fetch_parts<'a>(fa: &'a FileAnalysis, fetch: &'a Expr) -> Option<(&'a Expr, &'a str)> {
@@ -2759,24 +2760,6 @@ fn walk_expr_local(e: &Expr, on_expr: &mut impl FnMut(&Expr)) {
 
 // --- type helpers (general property access) ---------------------------------
 
-/// If `ty` denotes a single, concrete object class (directly or under one level
-/// of nullable/parens), return its FQN (sans leading `\`). Returns `None` for
-/// unions of classes, `mixed`/`object`/unknown, scalars, generics-bound vars,
-/// `self`/`static`/`parent`, etc. — anything we cannot pin to one named class.
-/// This is what keeps the access rules false-positive-free: we only judge a
-/// receiver whose class is unambiguous.
-fn sole_class(ty: &Type) -> Option<String> {
-    match ty {
-        Type::Named { fqn, .. } | Type::EnumCase { fqn, .. } => {
-            Some(fqn.trim_start_matches('\\').to_string())
-        }
-        // `?C` / `C|null`: the access itself is a *different* (nullable) problem;
-        // for member existence we still know the non-null part is exactly `C`.
-        Type::Nullable(inner) => sole_class(inner),
-        _ => None,
-    }
-}
-
 /// Does `class_fqn` (or its hierarchy) declare a magic `__get`/`__set` that would
 /// make any property access legal? If so we never flag undefined properties.
 fn has_magic_accessor(fqn: &str, fa: &FileAnalysis, write: bool) -> bool {
@@ -3089,7 +3072,7 @@ fn check_property_access(
     if fa.check_nullables && super::type_contains_null(&base_ty) {
         return;
     }
-    let Some(class) = sole_class(&base_ty) else {
+    let Some(class) = members::sole_class(&base_ty) else {
         return;
     };
     if is_dynamic_property_class(&class) {
@@ -3403,7 +3386,7 @@ fn run_writing_to_read_only(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// covering both `$this` (via the inferred type, which the type map seeds) and an
 /// arbitrary inferred object type.
 fn receiver_class(fa: &FileAnalysis, base: &Expr) -> Option<String> {
-    sole_class(&fa.type_of(base))
+    members::sole_class(&fa.type_of(base))
 }
 
 // --- InvalidCallablePropertyTypeRule (level 0) -----------------------------
@@ -3743,7 +3726,9 @@ fn run_types_assigned_to_properties(fa: &FileAnalysis) -> Vec<Diagnostic> {
             return;
         };
         let recv = fa.type_of(base);
-        let Some(fqn) = sole_class(&recv) else { return };
+        let Some(fqn) = members::sole_class(&recv) else {
+            return;
+        };
         if !fa.class_fully_known(&fqn) {
             return;
         }

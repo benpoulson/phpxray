@@ -13,6 +13,7 @@
 //!   arrow functions, and property-hook params (incl. promoted ctor params).
 
 #![allow(unused_imports)]
+use crate::members;
 use crate::{walk, FileAnalysis, RuleEntry};
 use php_ast::{
     ArrowFn, ClassDecl, ClosureExpr, Expr, ExprKind, FunctionDecl, Member, MemberName, MethodDecl,
@@ -245,23 +246,6 @@ fn concrete_target(ty: &php_types::Type) -> bool {
         )
 }
 
-fn function_refs(refs: &[ResolvedRef]) -> HashMap<(u32, u32), &ResolvedRef> {
-    refs.iter()
-        .filter(|r| r.kind == RefKind::Function)
-        .map(|r| ((r.span.start, r.span.end), r))
-        .collect()
-}
-
-fn resolved_callee<'a>(
-    callee: &Expr,
-    fmap: &HashMap<(u32, u32), &'a ResolvedRef>,
-) -> Option<&'a ResolvedRef> {
-    if let ExprKind::Name(n) = &callee.kind {
-        return fmap.get(&(n.span.start, n.span.end)).copied();
-    }
-    None
-}
-
 fn reflected_function_target(fa: &FileAnalysis, r: &ResolvedRef) -> Option<String> {
     match &r.resolution {
         Resolution::Fqn(fqn) => fa.reflection.function(fqn).map(|_| fqn.clone()),
@@ -282,7 +266,7 @@ fn check_function_call_mixed(
     include_implicit: bool,
     out: &mut Vec<Diagnostic>,
 ) {
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     walk::for_each_expr(fa.program, &mut |e| {
         let ExprKind::Call { callee, args } = &e.kind else {
             return;
@@ -293,7 +277,7 @@ fn check_function_call_mixed(
         {
             return;
         }
-        let Some(r) = resolved_callee(callee, &fmap) else {
+        let Some(r) = members::resolved_callee(callee, &fmap) else {
             return;
         };
         let Some(fqn) = reflected_function_target(fa, r) else {

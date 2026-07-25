@@ -48,6 +48,7 @@
 //!   cross-file purity cases for the `CallTo*StatementWithoutImpurePointsRule`
 //!   family.
 
+use crate::members;
 use crate::{symbols, walk, FileAnalysis, RuleEntry};
 use php_ast::{
     BinOp, ClassDecl, ClassKind, Expr, ExprKind, FunctionDecl, Member, MemberName, MethodDecl,
@@ -415,7 +416,7 @@ fn run_unused_private_method(fa: &FileAnalysis) -> Vec<Diagnostic> {
             let lower = name.to_ascii_lowercase();
             // Excluded: constructor, __clone, and any magic method (the engine
             // may call them implicitly, so they're never "unused").
-            if is_magic_method(&lower) {
+            if members::is_magic_method(&lower) {
                 continue;
             }
             if used.contains(&lower) || refs.string_literals.contains(&name) {
@@ -436,31 +437,6 @@ fn run_unused_private_method(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
     });
     out
-}
-
-/// A magic method (lowercased) — these are invoked implicitly by the engine, so
-/// they never count as "unused". Includes `__construct`/`__destruct`.
-fn is_magic_method(lower: &str) -> bool {
-    matches!(
-        lower,
-        "__construct"
-            | "__destruct"
-            | "__call"
-            | "__callstatic"
-            | "__get"
-            | "__set"
-            | "__isset"
-            | "__unset"
-            | "__sleep"
-            | "__wakeup"
-            | "__serialize"
-            | "__unserialize"
-            | "__tostring"
-            | "__invoke"
-            | "__set_state"
-            | "__clone"
-            | "__debuginfo"
-    )
 }
 
 /// The method-name token span.
@@ -1111,7 +1087,7 @@ fn exact_method_call_key(
     recv: &Expr,
     method: &MemberName,
 ) -> Option<CallableKey> {
-    let recv = peel_paren(recv);
+    let recv = php_ast::queries::peel_paren(recv);
     if !matches!(recv.kind, ExprKind::Variable(_)) {
         return None;
     }
@@ -1195,7 +1171,7 @@ fn named_type_fqn(t: &Type) -> Option<String> {
 }
 
 fn function_call_key(scope: &Scope, callee: &Expr) -> Option<CallableKey> {
-    let ExprKind::Name(name) = &peel_paren(callee).kind else {
+    let ExprKind::Name(name) = &php_ast::queries::peel_paren(callee).kind else {
         return None;
     };
     let fqn = match scope.resolve_function(name) {
@@ -1207,7 +1183,7 @@ fn function_call_key(scope: &Scope, callee: &Expr) -> Option<CallableKey> {
 }
 
 fn class_expr_fqn(scope: &Scope, class: &Expr) -> Option<String> {
-    let ExprKind::Name(name) = &peel_paren(class).kind else {
+    let ExprKind::Name(name) = &php_ast::queries::peel_paren(class).kind else {
         return None;
     };
     match scope.resolve_class(name) {
@@ -1216,13 +1192,6 @@ fn class_expr_fqn(scope: &Scope, class: &Expr) -> Option<String> {
             None
         }
     }
-}
-
-fn peel_paren(mut e: &Expr) -> &Expr {
-    while let ExprKind::Paren(inner) = &e.kind {
-        e = inner;
-    }
-    e
 }
 
 // ---------------------------------------------------------------------------

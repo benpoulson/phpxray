@@ -512,10 +512,7 @@ impl<'a> FileFacts<'a> {
                 });
             }
             ExprKind::MethodCall {
-                recv,
-                method,
-                args,
-                ..
+                recv, method, args, ..
             } => {
                 self.scoped_method_calls.push(ScopedMethodCallFact {
                     scope: scope.clone(),

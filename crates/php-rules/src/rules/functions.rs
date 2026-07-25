@@ -65,12 +65,6 @@ use php_resolve::{for_each_region, Resolution, ResolvedRef, Scope};
 use php_types::Type;
 use std::collections::{HashMap, HashSet};
 
-/// PHP superglobal variable names (without the leading `$`).
-/// Mirrors `PHPStan\Analyser\Scope::SUPERGLOBAL_VARIABLES`.
-const SUPERGLOBALS: &[&str] = &[
-    "GLOBALS", "_SERVER", "_GET", "_POST", "_FILES", "_COOKIE", "_SESSION", "_REQUEST", "_ENV",
-];
-
 fn run_return_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
     return_type_errors(
         fa.reflection,
@@ -193,7 +187,7 @@ fn run_invalid_parameter_name(fa: &FileAnalysis) -> Vec<Diagnostic> {
     for_each_param_list(fa.program, |params| {
         for p in params {
             let name = fa.interner.resolve(p.name);
-            if SUPERGLOBALS.contains(&name) {
+            if crate::symbols::SUPERGLOBALS.contains(&name) {
                 out.push(
                     Diagnostic::error(
                         p_span(p),
@@ -544,7 +538,7 @@ fn run_invalid_lexical_use(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     Diagnostic::error(e.span, "Cannot use $this as lexical variable.".to_string())
                         .with_code("closure.useThis"),
                 );
-            } else if SUPERGLOBALS.contains(&name) {
+            } else if crate::symbols::SUPERGLOBALS.contains(&name) {
                 out.push(
                     Diagnostic::error(
                         e.span,
@@ -667,42 +661,20 @@ fn collect_arrow_captured(body: &Expr, interner: &Interner, names: &mut HashSet<
 // Call-site rules (resolve the callee name via resolved_refs)
 // ---------------------------------------------------------------------------
 
-/// Build a span→resolution map for function references so call-site rules can
-/// look up the resolved FQN of a callee `Name`.
-fn function_refs(refs: &[ResolvedRef]) -> HashMap<(u32, u32), &ResolvedRef> {
-    refs.iter()
-        .filter(|r| r.kind == php_resolve::RefKind::Function)
-        .map(|r| ((r.span.start, r.span.end), r))
-        .collect()
-}
-
-/// The resolved canonical function name for a call's callee, if it's a plain
-/// name reference we resolved. Returns the FQN candidate (namespaced for the
-/// fallback case).
-fn resolved_callee<'a>(
-    callee: &Expr,
-    fmap: &HashMap<(u32, u32), &'a ResolvedRef>,
-) -> Option<&'a ResolvedRef> {
-    if let ExprKind::Name(n) = &callee.kind {
-        return fmap.get(&(n.span.start, n.span.end)).copied();
-    }
-    None
-}
-
 /// Look up a function in the project/builtins honouring the global fallback, and
 /// return its canonical (declared) name if found.
 /// `CallToNonExistentFunctionRule` (the `function.notFound` half — `nameCase` is
 /// a separate rule below). A call `foo(...)` where `foo` resolves to neither a
 /// project function nor a built-in.
 fn run_call_to_non_existent_function(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     let resolver = CallResolver::new(fa);
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
         let ExprKind::Call { callee, .. } = &e.kind else {
             return;
         };
-        let Some(r) = resolved_callee(callee, &fmap) else {
+        let Some(r) = members::resolved_callee(callee, &fmap) else {
             return;
         };
         if matches!(resolver.function(r), ResolveStatus::Unknown) {
@@ -719,14 +691,14 @@ fn run_call_to_non_existent_function(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// `CallToNonExistentFunctionRule` (the `function.nameCase` half). A call whose
 /// spelling case-insensitively matches a known function but differs in case.
 fn run_function_name_case(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     let resolver = CallResolver::new(fa);
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
         let ExprKind::Call { callee, .. } = &e.kind else {
             return;
         };
-        let Some(r) = resolved_callee(callee, &fmap) else {
+        let Some(r) = members::resolved_callee(callee, &fmap) else {
             return;
         };
         let ResolveStatus::Known(target) = resolver.function(r) else {
@@ -771,13 +743,13 @@ fn function_tail_lower(fa: &FileAnalysis, r: &ResolvedRef) -> Option<String> {
 /// `DefineParametersRule` — `define('X', $v, true)` passes the removed 3rd
 /// `$case_insensitive` argument (case-insensitive constants gone since PHP 8.0).
 fn run_define_parameters(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
         let ExprKind::Call { callee, args } = &e.kind else {
             return;
         };
-        let Some(r) = resolved_callee(callee, &fmap) else {
+        let Some(r) = members::resolved_callee(callee, &fmap) else {
             return;
         };
         // `define` is a global function with no namespace; only match the global.
@@ -894,13 +866,13 @@ fn is_definitely_not_callable(t: &php_types::Type) -> bool {
 /// `is_castable_to_string`; only fires when the element type is concrete and
 /// definitely not stringable (arrays of arrays, etc.) — false-positive-safe.
 fn run_implode_castable(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
         let ExprKind::Call { callee, args } = &e.kind else {
             return;
         };
-        let Some(r) = resolved_callee(callee, &fmap) else {
+        let Some(r) = members::resolved_callee(callee, &fmap) else {
             return;
         };
         let Some(tail) = function_tail_lower(fa, r) else {
@@ -950,13 +922,13 @@ fn run_implode_castable(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// inference), and `printf`/`sprintf` (not `sscanf`/`fscanf`, which need runtime
 /// `sscanf`).
 fn run_printf_parameters(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
         let ExprKind::Call { callee, args } = &e.kind else {
             return;
         };
-        let Some(r) = resolved_callee(callee, &fmap) else {
+        let Some(r) = members::resolved_callee(callee, &fmap) else {
             return;
         };
         let Some(tail) = function_tail_lower(fa, r) else {
@@ -1124,13 +1096,13 @@ fn printf_placeholder_count(format: &str) -> Option<usize> {
 /// functions present in the reflection index (project sources) — built-in stubs
 /// are names-only, so their arities aren't reflected.
 fn run_argument_count(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
         let ExprKind::Call { callee, args } = &e.kind else {
             return;
         };
-        let Some(r) = resolved_callee(callee, &fmap) else {
+        let Some(r) = members::resolved_callee(callee, &fmap) else {
             return;
         };
         // Spread/first-class-callable/named args: count is indeterminate or N/A.
@@ -1193,13 +1165,13 @@ fn run_argument_count(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// assignability. Lenient: unknown callee, `mixed`/unresolved arg or param types
 /// produce no diagnostic.
 fn run_argument_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
         let ExprKind::Call { callee, args } = &e.kind else {
             return;
         };
-        let Some(r) = resolved_callee(callee, &fmap) else {
+        let Some(r) = members::resolved_callee(callee, &fmap) else {
             return;
         };
         // Positional, fully-spelled-out calls only (named/spread/first-class break
@@ -1268,7 +1240,7 @@ fn run_argument_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// first-class-callable `foo(...)` where `foo` doesn't exist. Type-based
 /// callable checks are deferred.
 fn run_function_callable(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     let resolver = CallResolver::new(fa);
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
@@ -1279,7 +1251,7 @@ fn run_function_callable(fa: &FileAnalysis) -> Vec<Diagnostic> {
         if args.len() != 1 || !args[0].placeholder {
             return;
         }
-        let Some(r) = resolved_callee(callee, &fmap) else {
+        let Some(r) = members::resolved_callee(callee, &fmap) else {
             return;
         };
         if matches!(resolver.function(r), ResolveStatus::Unknown) {
@@ -1304,13 +1276,13 @@ fn run_function_callable(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// array's size. We only handle a literal format and a literal `array(...)` of
 /// values (no spread/named); otherwise the size is indeterminate and we skip.
 fn run_printf_array_parameters(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
         let ExprKind::Call { callee, args } = &e.kind else {
             return;
         };
-        let Some(r) = resolved_callee(callee, &fmap) else {
+        let Some(r) = members::resolved_callee(callee, &fmap) else {
             return;
         };
         let Some(tail) = function_tail_lower(fa, r) else {
@@ -2154,7 +2126,7 @@ fn doc_has_param(doc: Option<&str>, name: &str) -> bool {
 /// flagged for the curated `PURE_BUILTINS` set, and never for a user function
 /// (whose purity we can't determine).
 fn run_call_statement_no_side_effects(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     let mut out = Vec::new();
     let mut visit = |e: &Expr| {
         let ExprKind::Call { callee, args } = &e.kind else {
@@ -2165,7 +2137,7 @@ fn run_call_statement_no_side_effects(fa: &FileAnalysis) -> Vec<Diagnostic> {
         if args.len() == 1 && args[0].placeholder {
             return;
         }
-        let Some(r) = resolved_callee(callee, &fmap) else {
+        let Some(r) = members::resolved_callee(callee, &fmap) else {
             return;
         };
         let Some(tail) = function_tail_lower(fa, r) else {
@@ -2207,7 +2179,7 @@ fn run_call_statement_no_discard(fa: &FileAnalysis) -> Vec<Diagnostic> {
     if !fa.php_version.at_least(80500) {
         return Vec::new();
     }
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     let mut out = Vec::new();
     for s in &fa.program.stmts {
         stmt_level_calls(s, &mut |e| {
@@ -2292,10 +2264,10 @@ fn function_call_for_no_discard(e: &Expr) -> Option<(&Expr, bool, bool)> {
         ExprKind::Cast {
             kind: CastKind::Void,
             expr,
-        } => (peel_paren(expr), true),
+        } => (php_ast::queries::peel_paren(expr), true),
         _ => (e, false),
     };
-    let e = peel_paren(e);
+    let e = php_ast::queries::peel_paren(e);
     match &e.kind {
         ExprKind::Call { .. } => Some((e, in_void_cast, false)),
         ExprKind::Binary {
@@ -2309,21 +2281,19 @@ fn function_call_for_no_discard(e: &Expr) -> Option<(&Expr, bool, bool)> {
 }
 
 fn pipe_function_call_for_no_discard(rhs: &Expr) -> Option<(&Expr, bool)> {
-    let rhs = peel_paren(rhs);
+    let rhs = php_ast::queries::peel_paren(rhs);
     match &rhs.kind {
         ExprKind::Call { args, .. } if args.iter().any(|a| a.placeholder) => Some((rhs, true)),
-        ExprKind::ArrowFn(a) if matches!(&peel_paren(&a.body).kind, ExprKind::Call { .. }) => {
-            Some((peel_paren(&a.body), false))
+        ExprKind::ArrowFn(a)
+            if matches!(
+                &php_ast::queries::peel_paren(&a.body).kind,
+                ExprKind::Call { .. }
+            ) =>
+        {
+            Some((php_ast::queries::peel_paren(&a.body), false))
         }
         _ => None,
     }
-}
-
-fn peel_paren(mut e: &Expr) -> &Expr {
-    while let ExprKind::Paren(inner) = &e.kind {
-        e = inner;
-    }
-    e
 }
 
 fn function_no_discard_target(
@@ -2331,7 +2301,7 @@ fn function_no_discard_target(
     callee: &Expr,
     fmap: &HashMap<(u32, u32), &ResolvedRef>,
 ) -> Option<NoDiscardFunctionTarget> {
-    if let Some(r) = resolved_callee(callee, fmap) {
+    if let Some(r) = members::resolved_callee(callee, fmap) {
         let fqn = reflection_function_fqn(fa, r)?;
         let func = fa.reflection.function(&fqn)?;
         return Some(NoDiscardFunctionTarget::Function {
@@ -2594,7 +2564,7 @@ fn class_stmt_level_calls<F: FnMut(&Expr)>(c: &ClassDecl, f: &mut F) {
 /// `true` (or any non-`false`) silences it; only a literal `false`/missing 2nd
 /// arg in a value position is flagged.
 fn run_useless_return_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     let mut out = Vec::new();
     // Set of spans that are calls appearing in statement position (first-level):
     // those are NOT in a value position, so they're exempt.
@@ -2613,7 +2583,7 @@ fn run_useless_return_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
         if statement_calls.contains(&(e.span.start, e.span.end)) {
             return; // bare statement — result isn't used.
         }
-        let Some(r) = resolved_callee(callee, &fmap) else {
+        let Some(r) = members::resolved_callee(callee, &fmap) else {
             return;
         };
         let Some(tail) = function_tail_lower(fa, r) else {
@@ -2675,13 +2645,13 @@ fn is_literal_false(e: &Expr) -> bool {
 /// inferred `list<…>` argument; the `arrayValues.empty` case needs non-emptiness
 /// tracking we don't model, so it is deferred.
 fn run_array_values(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
         let ExprKind::Call { callee, args } = &e.kind else {
             return;
         };
-        let Some(r) = resolved_callee(callee, &fmap) else {
+        let Some(r) = members::resolved_callee(callee, &fmap) else {
             return;
         };
         if function_tail_lower(fa, r).as_deref() != Some("array_values")
@@ -2722,13 +2692,13 @@ fn run_array_values(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// Any dynamic value/spread/by-ref item is skipped so inferred imprecision cannot
 /// create false positives.
 fn run_array_filter(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
         let ExprKind::Call { callee, args } = &e.kind else {
             return;
         };
-        let Some(r) = resolved_callee(callee, &fmap) else {
+        let Some(r) = members::resolved_callee(callee, &fmap) else {
             return;
         };
         if function_tail_lower(fa, r).as_deref() != Some("array_filter")
@@ -2865,13 +2835,13 @@ fn run_parameter_castable_to_string(fa: &FileAnalysis) -> Vec<Diagnostic> {
         "array_count_values",
         "array_fill_keys",
     ];
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
         let ExprKind::Call { callee, args } = &e.kind else {
             return;
         };
-        let Some(r) = resolved_callee(callee, &fmap) else {
+        let Some(r) = members::resolved_callee(callee, &fmap) else {
             return;
         };
         let Some(tail) = function_tail_lower(fa, r) else {
@@ -2923,13 +2893,13 @@ fn run_parameter_castable_to_string(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// flags) to avoid resolving `SORT_*` flag constants we don't expose. Only fires
 /// for a concrete, definitely-non-stringable element type.
 fn run_sort_castable_to_string(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
         let ExprKind::Call { callee, args } = &e.kind else {
             return;
         };
-        let Some(r) = resolved_callee(callee, &fmap) else {
+        let Some(r) = members::resolved_callee(callee, &fmap) else {
             return;
         };
         if function_tail_lower(fa, r).as_deref() != Some("array_unique")
@@ -2989,13 +2959,13 @@ fn is_definitely_not_numeric(ty: &php_types::Type) -> bool {
 /// by numeric addition/multiplication, so every element must cast to a number.
 /// Only fires for a concrete element type that is definitely non-numeric.
 fn run_parameter_castable_to_number(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
         let ExprKind::Call { callee, args } = &e.kind else {
             return;
         };
-        let Some(r) = resolved_callee(callee, &fmap) else {
+        let Some(r) = members::resolved_callee(callee, &fmap) else {
             return;
         };
         let Some(tail) = function_tail_lower(fa, r) else {
@@ -3039,13 +3009,13 @@ fn run_parameter_castable_to_number(fa: &FileAnalysis) -> Vec<Diagnostic> {
 // ---------------------------------------------------------------------------
 
 fn run_random_int_parameters(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
         let ExprKind::Call { callee, args } = &e.kind else {
             return;
         };
-        let Some(r) = resolved_callee(callee, &fmap) else {
+        let Some(r) = members::resolved_callee(callee, &fmap) else {
             return;
         };
         if function_tail_lower(fa, r).as_deref() != Some("random_int")
@@ -3279,13 +3249,13 @@ fn const_default_type(e: &Expr) -> Option<php_types::Type> {
 /// argument's expression mentions *both* constant names anywhere in a `|`/`+`
 /// flag composition. Conservative — only the literal constant-name form is flagged.
 fn run_filter_var(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
         let ExprKind::Call { callee, args } = &e.kind else {
             return;
         };
-        let Some(r) = resolved_callee(callee, &fmap) else {
+        let Some(r) = members::resolved_callee(callee, &fmap) else {
             return;
         };
         if function_tail_lower(fa, r).as_deref() != Some("filter_var")
@@ -3341,13 +3311,13 @@ fn collect_const_names(e: &Expr, out: &mut HashSet<String>) {
 /// callable (a concrete non-callable scalar). Strings/arrays/objects can be
 /// callables, so they're never flagged; `mixed`/unknown is skipped.
 fn run_call_user_func(fa: &FileAnalysis) -> Vec<Diagnostic> {
-    let fmap = function_refs(fa.resolved_refs);
+    let fmap = members::function_refs(fa.resolved_refs);
     let mut out = Vec::new();
     crate::walk::for_each_expr(fa.program, &mut |e| {
         let ExprKind::Call { callee, args } = &e.kind else {
             return;
         };
-        let Some(r) = resolved_callee(callee, &fmap) else {
+        let Some(r) = members::resolved_callee(callee, &fmap) else {
             return;
         };
         let Some(tail) = function_tail_lower(fa, r) else {

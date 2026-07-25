@@ -1211,7 +1211,7 @@ fn const_shape_key(expr: &Expr) -> Option<String> {
 }
 
 fn is_always_defined_name(name: &str) -> bool {
-    ALWAYS_DEFINED.contains(&name)
+    crate::symbols::is_always_defined(name)
 }
 
 fn isset_facts(fa: &FileAnalysis) -> IssetFacts {
@@ -1561,24 +1561,6 @@ fn byref_stmt(
 // CompactVariablesRule — `compact('undefinedVar')`
 // ---------------------------------------------------------------------------
 
-/// PHP superglobals + always-available variables (never "undefined").
-const ALWAYS_DEFINED: &[&str] = &[
-    "GLOBALS",
-    "_SERVER",
-    "_GET",
-    "_POST",
-    "_FILES",
-    "_COOKIE",
-    "_SESSION",
-    "_REQUEST",
-    "_ENV",
-    "this",
-    "http_response_header",
-    "argc",
-    "argv",
-    "php_errormsg",
-];
-
 /// Functions that can introduce arbitrary variables into a scope — their presence
 /// makes scope-level "never assigned" reasoning unsafe, so we skip the scope.
 const ESCAPE_FUNCTIONS: &[&str] = &[
@@ -1630,7 +1612,7 @@ fn check_scope(
             };
             for arg in args {
                 for (name, span) in constant_string_names(&arg.value) {
-                    if ALWAYS_DEFINED.contains(&name.as_str()) || bound.contains(&name) {
+                    if crate::symbols::is_always_defined(&name) || bound.contains(&name) {
                         continue;
                     }
                     out.push(

@@ -212,7 +212,7 @@ fn push_context<'a>(
     out: &mut Vec<CallbackContext<'a>>,
 ) {
     if matches!(
-        peel_paren(&callback.value).kind,
+        php_ast::queries::peel_paren(&callback.value).kind,
         ExprKind::Closure(_) | ExprKind::ArrowFn(_)
     ) {
         return;
@@ -329,7 +329,7 @@ fn resolve_callback_body<'a>(
     scope: &Scope,
     e: &Expr,
 ) -> Option<CallbackBody<'a>> {
-    match &peel_paren(e).kind {
+    match &php_ast::queries::peel_paren(e).kind {
         ExprKind::Str(bytes) => literal_str(bytes)
             .and_then(|name| function_fqn_from_text(fa, scope, &name))
             .and_then(|fqn| function_callback_body(fa, &fqn)),
@@ -757,7 +757,7 @@ fn class_fqn_from_callable_array_target(
     scope: &Scope,
     e: &Expr,
 ) -> Option<String> {
-    match &peel_paren(e).kind {
+    match &php_ast::queries::peel_paren(e).kind {
         ExprKind::ClassConst { class, name } => {
             let MemberName::Ident(sym) = name else {
                 return None;
@@ -775,7 +775,7 @@ fn class_fqn_from_callable_array_target(
 }
 
 fn class_fqn_from_expr(fa: &FileAnalysis, scope: &Scope, e: &Expr) -> Option<String> {
-    match &peel_paren(e).kind {
+    match &php_ast::queries::peel_paren(e).kind {
         ExprKind::Name(name) => match scope.resolve_class(name) {
             Resolution::Fqn(fqn) => Some(fqn),
             Resolution::LateStatic(_)
@@ -864,7 +864,7 @@ fn array_filter_mode(e: &Expr) -> Option<ArrayFilterMode> {
         Some(_) => return None,
         None => {}
     }
-    let ExprKind::Name(n) = &peel_paren(e).kind else {
+    let ExprKind::Name(n) = &php_ast::queries::peel_paren(e).kind else {
         return None;
     };
     match global_const_text(&n.text)? {
@@ -938,7 +938,7 @@ fn mark_property_subtree(expr: &Expr, spans: &mut HashSet<(u32, u32)>) {
 }
 
 fn literal_string_expr(e: &Expr) -> Option<String> {
-    match &peel_paren(e).kind {
+    match &php_ast::queries::peel_paren(e).kind {
         ExprKind::Str(bytes) => literal_str(bytes),
         _ => None,
     }
@@ -957,15 +957,8 @@ fn args_are_plain_positional(args: &[Arg]) -> bool {
         .all(|a| !a.spread && !a.placeholder && a.name.is_none())
 }
 
-fn peel_paren(e: &Expr) -> &Expr {
-    match &e.kind {
-        ExprKind::Paren(inner) => peel_paren(inner),
-        _ => e,
-    }
-}
-
 fn int_lit(e: &Expr) -> Option<i64> {
-    match &peel_paren(e).kind {
+    match &php_ast::queries::peel_paren(e).kind {
         ExprKind::Int(n) => Some(*n),
         _ => None,
     }
