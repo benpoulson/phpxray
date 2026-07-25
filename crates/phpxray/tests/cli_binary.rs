@@ -834,3 +834,46 @@ fn path_only_ignore_entry_suppresses_that_subtree() {
     assert!(!text.contains("src/gen/a.php"), "{text}");
     assert!(text.contains("src/app.php"), "{text}");
 }
+
+/// Regression: the result-cache key hashed the `laravelAliases` *flag* but not
+/// the files the alias map is read from. Those live outside the analyzed set
+/// (`config/app.php`, `vendor/composer/installed.json`), so editing them left a
+/// warm cache serving a stale report — removing a facade alias still said
+/// "No errors" while a cold run reported `class.notFound`.
+#[test]
+fn result_cache_notices_laravel_alias_source_edits() {
+    let p = TempProject::new("alias-cache");
+    p.write(
+        "src/app.php",
+        "<?php\nfunction go(): void { Str::of('x'); }\n",
+    );
+    p.write(
+        "src/support.php",
+        "<?php\nnamespace Illuminate\\Support;\nclass Str { public static function of($v) {} }\n",
+    );
+    p.write(
+        "phpxray.yaml",
+        "level: 0\npaths:\n  - src\nlaravelAliases: true\n",
+    );
+    let with_alias = "<?php\nreturn ['aliases' => ['Str' => Illuminate\\Support\\Str::class]];\n";
+    p.write("config/app.php", with_alias);
+
+    // Warm the cache with the alias registered.
+    let first = p.run(["--no-progress"]);
+    assert_eq!(first.status.code(), Some(0), "{}", stdout(&first));
+
+    // Remove the alias: the cached report must NOT be reused.
+    p.write("config/app.php", "<?php\nreturn ['aliases' => []];\n");
+    let removed = p.run(["--no-progress"]);
+    assert_eq!(removed.status.code(), Some(1), "{}", stdout(&removed));
+    assert!(
+        stdout(&removed).contains("class.notFound"),
+        "stale cached report served after an alias-source edit: {}",
+        stdout(&removed)
+    );
+
+    // Restoring it goes back to clean (and may legitimately hit the cache).
+    p.write("config/app.php", with_alias);
+    let restored = p.run(["--no-progress"]);
+    assert_eq!(restored.status.code(), Some(0), "{}", stdout(&restored));
+}

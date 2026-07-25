@@ -31,10 +31,9 @@
 //! — conservative over clever. Equivalence with the batch engine is enforced by
 //! tests that diff entire reports after edit scenarios.
 
+use crate::inputs::AnalysisInputs;
 use crate::suppress::{self, CompiledIgnores, InlineIgnores};
-use crate::{
-    analyze_one_file, discover_inputs, rel_path, AnalysisContext, Finding, ParsedFile, Report,
-};
+use crate::{analyze_one_file, discover_inputs, rel_path, Finding, ParsedFile, Report};
 use php_config::Config;
 use php_index::ProjectIndex;
 use php_reflect::{reflect_artifact, FileReflectionArtifact, ReflectionIndex};
@@ -109,54 +108,26 @@ impl DiscoveryFingerprint {
     }
 }
 
-/// Config fields that determine analysis *results* (per-file findings).
+/// Config inputs that determine analysis *results* (per-file findings).
+///
+/// Derived wholly from [`AnalysisInputs`] — the one registration point for
+/// analysis inputs — so it can never drift from the result-cache key again. It
+/// deliberately does NOT cover discovery inputs; those change the file *set* and
+/// live in [`DiscoveryFingerprint`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct AnalysisFingerprint {
-    level: u8,
-    php_version: Option<String>,
-    treat_phpdoc_types_as_certain: bool,
-    infer_untyped_signatures: bool,
-    check_explicit_mixed: Option<bool>,
-    check_implicit_mixed: Option<bool>,
-    check_uninitialized_properties: bool,
-    check_too_wide_return_public: bool,
-    laravel_aliases: bool,
-    early_terminating_function_calls: Vec<String>,
-    early_terminating_method_calls: Vec<(String, Vec<String>)>,
-    type_aliases: Vec<(String, String)>,
+    /// Opaque digest of every analysis input; equality means "reuse findings".
+    digest: String,
+    /// Kept out of the digest because it is needed as a *value*: a change here
+    /// rebuilds the builtin universe rather than just re-analyzing.
+    php_version_raw: Option<String>,
 }
 
 impl AnalysisFingerprint {
-    fn of(config: &Config) -> Self {
+    fn of(inputs: &AnalysisInputs) -> Self {
         Self {
-            level: config.level.value(),
-            php_version: config.php_version.clone(),
-            treat_phpdoc_types_as_certain: config.treat_phpdoc_types_as_certain,
-            early_terminating_function_calls: config.early_terminating_function_calls.clone(),
-            early_terminating_method_calls: {
-                let mut entries: Vec<(String, Vec<String>)> = config
-                    .early_terminating_method_calls
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                entries.sort();
-                entries
-            },
-            infer_untyped_signatures: config.infer_untyped_signatures,
-            check_explicit_mixed: config.check_explicit_mixed,
-            check_implicit_mixed: config.check_implicit_mixed,
-            check_uninitialized_properties: config.check_uninitialized_properties,
-            check_too_wide_return_public: config.check_too_wide_return_public,
-            laravel_aliases: config.laravel_aliases,
-            type_aliases: {
-                let mut entries: Vec<(String, String)> = config
-                    .type_aliases
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                entries.sort();
-                entries
-            },
+            digest: inputs.fingerprint(),
+            php_version_raw: inputs.php_version_raw.clone(),
         }
     }
 }
@@ -222,7 +193,10 @@ impl Session {
             compiled_ignores: CompiledIgnores::compile(&config.ignore),
             ignore_fingerprint: config.ignore.clone(),
             discovery_fingerprint: DiscoveryFingerprint::of(config),
-            analysis_fingerprint: AnalysisFingerprint::of(config),
+            // Left empty on purpose: the first pass analyzes everything anyway,
+            // and resolving the real inputs needs the project root, which only
+            // `run` has. The empty digest simply reads as "inputs changed".
+            analysis_fingerprint: AnalysisFingerprint::default(),
             prev_inferred: None,
             stub_sources: Vec::new(),
             facade_aliases: Vec::new(),
@@ -240,10 +214,11 @@ impl Session {
     pub fn run(&mut self, config: &Config, root: &Path, hint: Option<&ChangeHint>) -> Report {
         // Config-level invalidation.
         let discovery_fp = DiscoveryFingerprint::of(config);
-        let analysis_fp = AnalysisFingerprint::of(config);
+        let inputs = AnalysisInputs::resolve(config, root);
+        let analysis_fp = AnalysisFingerprint::of(&inputs);
         let discovery_changed = discovery_fp != self.discovery_fingerprint;
         let analysis_changed = analysis_fp != self.analysis_fingerprint;
-        if analysis_fp.php_version != self.analysis_fingerprint.php_version {
+        if analysis_fp.php_version_raw != self.analysis_fingerprint.php_version_raw {
             // New builtin universe: rebuild the bases.
             self.php_version = config
                 .php_version
@@ -271,7 +246,15 @@ impl Session {
             match self.diff_hinted(hint.unwrap(), root) {
                 Some(diff) => diff,
                 // A hinted path was unknown or unreadable — fall back to a walk.
-                None => self.diff_full(config, root),
+                None => {
+                    trace_incremental(|| {
+                        format!(
+                            "hinted diff failed for {:?} — falling back to a full walk",
+                            hint.unwrap().paths
+                        )
+                    });
+                    self.diff_full(config, root)
+                }
             }
         } else {
             self.diff_full(config, root)
@@ -423,11 +406,7 @@ impl Session {
         // Laravel facade aliases (opt-in): register each as a known class so
         // facade references resolve. After every real declaration, which always
         // wins — matching the batch engine (`analyze_parsed_progress`).
-        let aliases_now = if config.laravel_aliases {
-            crate::laravel::collect_facade_aliases(root)
-        } else {
-            Vec::new()
-        };
+        let aliases_now = inputs.facade_aliases().to_vec();
         for (alias, target) in &aliases_now {
             project.add_alias(alias, target);
         }
@@ -451,7 +430,7 @@ impl Session {
         // Cross-class `@phpstan-import-type` (needs every class indexed first).
         reflection.resolve_type_imports();
         // Global `typeAliases` from config, expanded across all reflected types.
-        reflection.apply_global_type_aliases(&config.type_aliases);
+        reflection.apply_global_type_aliases(&inputs.type_aliases.clone().into_iter().collect());
 
         // Whole-project signature inference (untyped functions). It needs every
         // file's call sites, so each pass re-parses the whole tree (in parallel)
@@ -462,7 +441,7 @@ impl Session {
         // makes the ordinary invalidation below re-analyze it. (Declared-artifact
         // diffing alone cannot see inferred changes — a call-site edit in file C
         // can change file A's inferred signature without touching A.)
-        if config.infer_untyped_signatures {
+        if inputs.infer_untyped_signatures {
             let sources: Vec<&str> = self.files.values().map(|e| e.source.as_str()).collect();
             let programs: Vec<php_ast::Program> = sources
                 .par_iter()
@@ -544,24 +523,19 @@ impl Session {
         }
 
         // Analyze in parallel, recording each file's dependencies.
-        let ctx = AnalysisContext {
-            interner: &self.interner,
-            level: self.analysis_fingerprint.level,
-            php_version: self.php_version,
-            treat_phpdoc_types_as_certain: self.analysis_fingerprint.treat_phpdoc_types_as_certain,
-            rule_options: config.rule_options(),
-            collect_fixes: false,
-            terminators: crate::terminators_from_config(config),
-            iterable_param_evidence: None,
-            project: &project,
-            reflection: &reflection,
-            sources: self
-                .files
+        let ctx = crate::build_analysis_context(
+            &inputs,
+            &self.interner,
+            &project,
+            &reflection,
+            self.files
                 .iter()
                 .filter(|(_, e)| e.analyze)
                 .map(|(rel, e)| (rel.as_str(), e.source.as_str()))
                 .collect(),
-        };
+            None,
+            false,
+        );
         let results: Vec<(String, Vec<Finding>, RecordedDeps)> = to_analyze
             .par_iter()
             .map(|f| {
@@ -615,10 +589,16 @@ impl Session {
     /// Diff using only the hinted paths: returns `(changed, removed)` or `None`
     /// when a hinted path is outside the known file set (forces a full walk).
     fn diff_hinted(&self, hint: &ChangeHint, root: &Path) -> Option<FileDiff> {
+        // The root must be canonicalized to match: event paths are canonical, so
+        // comparing them against a symlinked or relative root makes every
+        // `strip_prefix` fail, every path look unknown, and every keystroke fall
+        // back to a full walk. On macOS this hits any project under `/tmp`
+        // (-> `/private/tmp`).
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let mut changed = Vec::new();
         for abs in &hint.paths {
             let canonical = abs.canonicalize().unwrap_or_else(|_| abs.clone());
-            let rel = rel_path(&canonical, root);
+            let rel = rel_path(&canonical, &root);
             let entry = self.files.get(&rel)?; // unknown path → full walk
                                                // Read bytes + lossy-decode (non-UTF-8 PHP is legal); a genuine I/O
                                                // error → `None` → full walk.
@@ -659,6 +639,15 @@ impl Session {
 /// Record every name a `FileIndex` declares (classes, functions, constants)
 /// into the changed-surface set. Used when symbol *existence* may have changed
 /// — `has_class`/`has_function`/`has_constant` dependents must re-check.
+/// Emit an incremental-analysis trace line when `PHPXRAY_DEBUG_INCREMENTAL` is
+/// set. Falling back from a hinted diff to a full walk is a silent performance
+/// cliff otherwise — the results stay correct, so nothing else surfaces it.
+fn trace_incremental(msg: impl FnOnce() -> String) {
+    if std::env::var_os("PHPXRAY_DEBUG_INCREMENTAL").is_some() {
+        eprintln!("[incremental] {}", msg());
+    }
+}
+
 /// Did the configured stub files' content change since the previous pass?
 ///
 /// `was_first_pass` must be the value captured **before** `Session::run` clears

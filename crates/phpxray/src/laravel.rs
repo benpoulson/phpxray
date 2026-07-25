@@ -17,6 +17,25 @@ use php_resolve::{for_each_region, Resolution, Scope};
 use std::collections::BTreeMap;
 use std::path::Path;
 
+/// The alias map **plus the bytes it was derived from**.
+///
+/// The sources live outside the analyzed file set, so the result-cache key and
+/// the incremental fingerprint cannot notice them changing unless they are
+/// carried explicitly — editing `config/app.php` used to serve a stale cached
+/// report. See [`crate::inputs::AnalysisInputs`].
+pub(crate) fn alias_inputs(root: &Path) -> crate::inputs::LaravelAliasInputs {
+    let mut sources = Vec::new();
+    for rel in ["vendor/composer/installed.json", "config/app.php"] {
+        if let Ok(text) = std::fs::read_to_string(root.join(rel)) {
+            sources.push((rel.to_string(), text));
+        }
+    }
+    crate::inputs::LaravelAliasInputs {
+        aliases: collect_facade_aliases(root),
+        sources,
+    }
+}
+
 /// Collect the runtime class aliases (`alias name` → `target FQN`) for a project
 /// root. Deterministic order; first definition of a name wins.
 pub fn collect_facade_aliases(root: &Path) -> Vec<(String, String)> {

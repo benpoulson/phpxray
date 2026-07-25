@@ -24,6 +24,7 @@ use walkdir::WalkDir;
 pub mod baseline;
 pub mod fix;
 pub mod incremental;
+pub mod inputs;
 mod laravel;
 pub mod report;
 mod result_cache;
@@ -94,25 +95,6 @@ pub(crate) fn stub_inputs(config: &Config, root: &Path) -> Vec<(String, String, 
             (rel_path(&path, root), read_source_lossy(&path), false)
         })
         .collect()
-}
-
-/// Build the flow-terminator set from the config's `earlyTerminating*` lists
-/// (method names are matched without re-checking the class — see
-/// [`php_rules::Terminators`]).
-fn terminators_from_config(config: &Config) -> std::sync::Arc<php_rules::Terminators> {
-    std::sync::Arc::new(php_rules::Terminators {
-        functions: config
-            .early_terminating_function_calls
-            .iter()
-            .map(|f| f.trim_start_matches('\\').to_ascii_lowercase())
-            .collect(),
-        methods: config
-            .early_terminating_method_calls
-            .values()
-            .flatten()
-            .map(|m| m.to_ascii_lowercase())
-            .collect(),
-    })
 }
 
 /// The effective result-cache directory for a project: `RunOptions::cache_dir`
@@ -370,38 +352,46 @@ fn run_pipeline(config: &Config, root: &Path, options: RunOptions) -> (Report, V
         .as_deref()
         .and_then(php_rules::PhpVersion::parse)
         .unwrap_or_default();
-    let rule_options = config.rule_options();
+    // One resolution of the analysis inputs, shared by the pipeline options, the
+    // result-cache key, and (in the incremental engine) the fingerprint.
+    let analysis_inputs = crate::inputs::AnalysisInputs::resolve(config, root);
     let analysis_options = AnalyzeParsedOptions {
-        level: config.level.value(),
+        inputs: analysis_inputs.clone(),
         php_version,
-        treat_phpdoc_types_as_certain: config.treat_phpdoc_types_as_certain,
-        infer_untyped_signatures: config.infer_untyped_signatures,
-        rule_options,
         collect_fixes: options.collect_fixes,
         debug: options.debug,
-        terminators: terminators_from_config(config),
-        type_aliases: std::sync::Arc::new(config.type_aliases.clone()),
-        facade_aliases: std::sync::Arc::new(if config.laravel_aliases {
-            laravel::collect_facade_aliases(root)
-        } else {
-            Vec::new()
-        }),
     };
-    let cache = (options.use_result_cache && !options.debug).then(|| {
-        let cache_dir = result_cache_dir(config, root, options.cache_dir.as_deref());
-        let cache_files: Vec<_> = inputs
-            .iter()
-            .map(|(path, source, analyze)| result_cache::CacheFileInput {
-                path,
-                source,
-                analyze: *analyze,
-            })
-            .collect();
-        let key = result_cache::key(config, root, php_version, rule_options, &cache_files);
-        (cache_dir, key)
-    });
+    let cache_echo = result_cache::CacheEcho {
+        level: analysis_inputs.level,
+        files: inputs.len(),
+        root: root.display().to_string(),
+    };
+    // `key` returns `None` when the running binary's identity is unavailable —
+    // the cache then stays off for the run rather than keying on a weaker digest.
+    let cache = (options.use_result_cache && !options.debug)
+        .then(|| {
+            let cache_dir = result_cache_dir(config, root, options.cache_dir.as_deref());
+            let cache_files: Vec<_> = inputs
+                .iter()
+                .map(|(path, source, analyze)| result_cache::CacheFileInput {
+                    path,
+                    source,
+                    analyze: *analyze,
+                })
+                .collect();
+            let key = result_cache::key(config, root, &analysis_inputs, &cache_files);
+            if key.is_none() {
+                // Rare (a broken environment), but silently losing the cache
+                // just looks like an unexplained slowdown — say so.
+                eprintln!(
+                    "warning: result cache disabled — could not determine this binary's identity"
+                );
+            }
+            key.map(|key| (cache_dir, key))
+        })
+        .flatten();
     if let Some((cache_dir, key)) = &cache {
-        if let Some(mut report) = result_cache::load(cache_dir, key) {
+        if let Some(mut report) = result_cache::load(cache_dir, key, &cache_echo) {
             if let Some(mut t) = timings {
                 t.cache_hit = true;
                 report.timings = Some(t);
@@ -441,7 +431,7 @@ fn run_pipeline(config: &Config, root: &Path, options: RunOptions) -> (Report, V
         &sources,
     );
     if let Some((cache_dir, key)) = &cache {
-        result_cache::store(cache_dir, key, &report);
+        result_cache::store(cache_dir, key, &report, cache_echo);
     }
     (report, parsed)
 }
@@ -459,18 +449,19 @@ pub fn analyze_parsed(
         parsed,
         interner,
         AnalyzeParsedOptions {
-            level,
+            inputs: crate::inputs::AnalysisInputs {
+                level,
+                php_version,
+                treat_phpdoc_types_as_certain,
+                // Dev affordance (mirrors PHPXRAY_WATCH_FULL): `PHPXRAY_NO_INFER=1`
+                // disables untyped-signature inference for batch tooling / audits.
+                infer_untyped_signatures: std::env::var_os("PHPXRAY_NO_INFER").is_none(),
+                rule_options: Level(level).rule_options(),
+                ..crate::inputs::AnalysisInputs::defaults_for(level, php_version)
+            },
             php_version,
-            treat_phpdoc_types_as_certain,
-            // Dev affordance (mirrors PHPXRAY_WATCH_FULL): `PHPXRAY_NO_INFER=1`
-            // disables untyped-signature inference for batch tooling / audits.
-            infer_untyped_signatures: std::env::var_os("PHPXRAY_NO_INFER").is_none(),
-            rule_options: Level(level).rule_options(),
             collect_fixes: false,
             debug: false,
-            terminators: Default::default(),
-            type_aliases: Default::default(),
-            facade_aliases: Default::default(),
         },
         &Progress::hidden(),
         None,
@@ -479,24 +470,17 @@ pub fn analyze_parsed(
 
 #[derive(Debug, Clone)]
 struct AnalyzeParsedOptions {
-    level: u8,
+    /// Every analysis-affecting input, resolved once. See [`crate::inputs`].
+    inputs: crate::inputs::AnalysisInputs,
+    /// The parsed `php_version` — kept alongside `inputs` because index
+    /// construction needs it before the context is built.
     php_version: php_rules::PhpVersion,
-    treat_phpdoc_types_as_certain: bool,
-    /// Run whole-project signature inference for untyped functions before rules.
-    infer_untyped_signatures: bool,
-    rule_options: RuleOptions,
     /// Attach machine-applicable fixes to supported diagnostics (`--fix` runs).
+    /// Not an analysis *input*: it adds data to findings, it does not change which
+    /// findings exist, so it is deliberately outside the cache key.
     collect_fixes: bool,
     /// Print each analyzed file to stderr as analysis reaches it (`--debug`).
     debug: bool,
-    /// User-configured always-terminating calls (`earlyTerminating*` config).
-    terminators: std::sync::Arc<php_rules::Terminators>,
-    /// Global `typeAliases` (config); expanded into reflected types after indexing.
-    type_aliases: std::sync::Arc<std::collections::HashMap<String, String>>,
-    /// Laravel facade aliases (`alias` → `target FQN`) registered as known
-    /// classes so facade references don't report `class.notFound`. Empty unless
-    /// `laravelAliases` is enabled. See [`laravel::collect_facade_aliases`].
-    facade_aliases: std::sync::Arc<Vec<(String, String)>>,
 }
 
 fn analyze_parsed_progress(
@@ -538,13 +522,14 @@ fn analyze_parsed_progress(
     }
     // Laravel facade aliases (opt-in): register each as a known class so facade
     // references resolve. After real declarations, which always win.
-    for (alias, target) in options.facade_aliases.iter() {
+    for (alias, target) in options.inputs.facade_aliases() {
         project.add_alias(alias, target);
     }
     // Cross-class `@phpstan-import-type` needs every class indexed first.
     reflection.resolve_type_imports();
     // Global `typeAliases` from config, expanded across all reflected types.
-    reflection.apply_global_type_aliases(&options.type_aliases);
+    reflection
+        .apply_global_type_aliases(&options.inputs.type_aliases.clone().into_iter().collect());
     indexing.finish();
     if let Some(t) = &mut timings {
         t.index = started.elapsed();
@@ -555,7 +540,7 @@ fn analyze_parsed_progress(
     // shared reflection index so all downstream inference/rules see them. Runs
     // sequentially before the parallel per-file analysis. Scan-only files
     // contribute call sites and bodies too (they were reflected above).
-    if options.infer_untyped_signatures {
+    if options.inputs.infer_untyped_signatures {
         let started = Instant::now();
         let inferring = progress.spinner("Inferring untyped signatures");
         let programs: Vec<&php_ast::Program> = parsed.iter().map(|f| &f.program).collect();
@@ -584,23 +569,19 @@ fn analyze_parsed_progress(
         analyzed_count,
         format!("Analyzing files on {workers} workers"),
     );
-    let ctx = AnalysisContext {
+    let ctx = build_analysis_context(
+        &options.inputs,
         interner,
-        level: options.level,
-        php_version: options.php_version,
-        treat_phpdoc_types_as_certain: options.treat_phpdoc_types_as_certain,
-        rule_options: options.rule_options,
-        collect_fixes: options.collect_fixes,
-        terminators: options.terminators.clone(),
-        iterable_param_evidence: iterable_param_evidence.as_ref(),
-        project: &project,
-        reflection: &reflection,
-        sources: parsed
+        &project,
+        &reflection,
+        parsed
             .iter()
             .filter(|f| f.analyze)
             .map(|f| (f.path.as_str(), f.source.as_str()))
             .collect(),
-    };
+        iterable_param_evidence.as_ref(),
+        options.collect_fixes,
+    );
     let started = Instant::now();
     let mut findings_by_file = parsed
         .par_iter()
@@ -637,7 +618,57 @@ fn analyze_parsed_progress(
     }
 }
 
-struct AnalysisContext<'a> {
+/// Build the per-run analysis context from the resolved inputs.
+///
+/// Both engines funnel through here so neither can quietly disagree about what a
+/// rule sees. **Exhaustively destructures [`AnalysisInputs`]** for the same
+/// reason `hash_into` does: a new analysis input cannot be added without
+/// deciding whether rules need it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_analysis_context<'a>(
+    inputs: &crate::inputs::AnalysisInputs,
+    interner: &'a php_intern::Interner,
+    project: &'a ProjectIndex,
+    reflection: &'a ReflectionIndex,
+    sources: HashMap<&'a str, &'a str>,
+    iterable_param_evidence: Option<&'a php_infer::ExplicitParamEvidence>,
+    collect_fixes: bool,
+) -> AnalysisContext<'a> {
+    let crate::inputs::AnalysisInputs {
+        level,
+        php_version,
+        treat_phpdoc_types_as_certain,
+        rule_options,
+        terminators,
+        // Consumed earlier in the pipeline (index building / the inference
+        // pre-pass), not by individual rules.
+        php_version_raw: _,
+        infer_untyped_signatures: _,
+        check_explicit_mixed: _,
+        check_implicit_mixed: _,
+        check_uninitialized_properties: _,
+        check_too_wide_return_public: _,
+        early_terminating_function_calls: _,
+        early_terminating_method_calls: _,
+        type_aliases: _,
+        laravel: _,
+    } = inputs;
+    AnalysisContext {
+        interner,
+        level: *level,
+        php_version: *php_version,
+        treat_phpdoc_types_as_certain: *treat_phpdoc_types_as_certain,
+        rule_options: *rule_options,
+        collect_fixes,
+        terminators: terminators.clone(),
+        iterable_param_evidence,
+        project,
+        reflection,
+        sources,
+    }
+}
+
+pub(crate) struct AnalysisContext<'a> {
     interner: &'a php_intern::Interner,
     level: u8,
     php_version: php_rules::PhpVersion,
