@@ -2757,18 +2757,6 @@ fn walk_expr_local(e: &Expr, on_expr: &mut impl FnMut(&Expr)) {
     }
 }
 
-// --- type helpers (general property access) ---------------------------------
-
-/// Does `class_fqn` (or its hierarchy) declare a magic `__get`/`__set` that would
-/// make any property access legal? If so we never flag undefined properties.
-fn has_magic_accessor(fqn: &str, fa: &FileAnalysis, write: bool) -> bool {
-    if members::allows_dynamic_properties(fqn) {
-        return true;
-    }
-    let getset = if write { "__set" } else { "__get" };
-    fa.reflection.find_method(fqn, getset).is_some()
-}
-
 // --- AccessPropertiesRule (level 0, general receiver) ----------------------
 
 /// phpstan `AccessPropertiesRule` (`AccessPropertiesCheck`), the FP-safe subset
@@ -3009,25 +2997,32 @@ fn union_property_status(
     if parts.len() < 2 || super::type_contains_null(ty) {
         return None;
     }
+    let resolver = MemberAccessResolver::new(fa);
     let mut has_prop = false;
     let mut lacks_prop = false;
     for part in parts.iter() {
         let Type::Named { fqn, .. } = part else {
             return None;
         };
-        let class = fqn.trim_start_matches('\\');
-        if !symbols::class_tree_fully_known(fa, class) {
-            return None;
-        }
-        if fa.reflection.class(class).map(|c| c.kind) == Some(ClassKind::Interface) {
-            return None;
-        }
-        if fa.reflection.find_property(class, prop).is_some()
-            || has_magic_accessor(class, fa, write)
+        // An interface arm abandons the whole union rather than counting as
+        // present: an implementation may declare the property, so neither answer
+        // is safe. The resolver folds interfaces into `Skipped`, so this must be
+        // decided here, before asking it.
+        if fa
+            .reflection
+            .class(fqn.trim_start_matches('\\'))
+            .map(|c| c.kind)
+            == Some(ClassKind::Interface)
         {
-            has_prop = true;
-        } else {
-            lacks_prop = true;
+            return None;
+        }
+        match resolver.instance_property(part, prop, write) {
+            // Not fully known — the property could be inherited from something
+            // unindexed, so the union yields no verdict at all.
+            ResolveStatus::Opaque => return None,
+            // Declared, or reachable via `__get`/`__set` or dynamic properties.
+            ResolveStatus::Known(_) | ResolveStatus::Skipped => has_prop = true,
+            ResolveStatus::Unknown => lacks_prop = true,
         }
     }
     Some((has_prop, lacks_prop))
@@ -3065,9 +3060,6 @@ fn check_property_access(
     let Some(class) = members::sole_class(&base_ty) else {
         return;
     };
-    if members::allows_dynamic_properties(&class) {
-        return;
-    }
     if matches!(
         MemberAccessResolver::new(fa).instance_property(&base_ty, prop, write),
         ResolveStatus::Unknown
