@@ -29,8 +29,7 @@ pub fn apply(
         .iter()
         .map(|(path, src)| (*path, inline_ignores(src)))
         .collect();
-    let inline_refs: HashMap<&str, &InlineIgnores> =
-        inline.iter().map(|(p, i)| (*p, i)).collect();
+    let inline_refs: HashMap<&str, &InlineIgnores> = inline.iter().map(|(p, i)| (*p, i)).collect();
     apply_compiled(report, &compiled, report_unmatched, &inline_refs)
 }
 
@@ -223,16 +222,16 @@ struct Matcher {
 }
 
 impl Matcher {
-    /// Compile an entry; `None` for a degenerate entry (no message, no raw
-    /// message, and no identifier — too broad to honor safely).
+    /// Compile an entry; `None` only for a wholly empty entry (no message, raw
+    /// message, identifier **or** path — it would match everything).
+    ///
+    /// A `path`-only entry is legal and ignores every finding under that path,
+    /// matching phpstan (`ValidateIgnoredErrorsExtension` skips entries without
+    /// a message, and `IgnoredError` then matches on the path alone). It used to
+    /// compile to `None` here — silently discarded, never matching and never
+    /// surfacing in unmatched-ignore reporting.
     fn compile(e: &IgnoreEntry) -> Option<Matcher> {
-        if e.message.is_none()
-            && e.messages.is_empty()
-            && e.raw_message.is_none()
-            && e.raw_messages.is_empty()
-            && e.identifier.is_none()
-            && e.identifiers.is_empty()
-        {
+        if is_empty_entry(e) {
             return None;
         }
         let messages: Vec<Regex> = e
@@ -261,9 +260,10 @@ impl Matcher {
         // Bucketable iff every pattern is glob-free and multi-segment (a bare
         // single-segment name matches at any depth, so it can't be bucketed).
         let bucket_paths: Vec<String> = if !path_patterns.is_empty()
-            && path_patterns.iter().all(|p| {
-                !p.contains(['*', '?']) && p.trim_end_matches('/').contains('/')
-            }) {
+            && path_patterns
+                .iter()
+                .all(|p| !p.contains(['*', '?']) && p.trim_end_matches('/').contains('/'))
+        {
             path_patterns
                 .iter()
                 .map(|p| p.trim_end_matches('/').replace('\\', "/"))
@@ -279,6 +279,10 @@ impl Matcher {
             .or_else(|| e.raw_messages.first().cloned())
             .or_else(|| e.identifier.clone())
             .or_else(|| e.identifiers.first().cloned())
+            // A path-only entry has no message to name it — describe it by path
+            // so unmatched-ignore reporting can still identify it.
+            .or_else(|| e.path.clone())
+            .or_else(|| e.paths.first().cloned())
             .unwrap_or_default();
         Some(Matcher {
             messages,
@@ -296,9 +300,7 @@ impl Matcher {
         if !self.messages.is_empty() && !self.messages.iter().any(|re| re.is_match(&f.message)) {
             return false;
         }
-        if !self.raw_messages.is_empty()
-            && !self.raw_messages.iter().any(|m| m == &f.message)
-        {
+        if !self.raw_messages.is_empty() && !self.raw_messages.iter().any(|m| m == &f.message) {
             return false;
         }
         if !self.identifiers.is_empty()
@@ -320,6 +322,54 @@ impl Matcher {
     fn describe(&self) -> &str {
         &self.desc
     }
+}
+
+/// Is this ignore entry wholly empty — no message, raw message, identifier or
+/// path? Such an entry would match every finding, so it is never honoured.
+fn is_empty_entry(e: &IgnoreEntry) -> bool {
+    e.message.is_none()
+        && e.messages.is_empty()
+        && e.raw_message.is_none()
+        && e.raw_messages.is_empty()
+        && e.identifier.is_none()
+        && e.identifiers.is_empty()
+        && e.path.is_none()
+        && e.paths.is_empty()
+}
+
+/// Validate the config's `ignore` entries, returning one human-readable problem
+/// per bad entry.
+///
+/// phpstan treats a malformed `ignoreErrors` entry as a hard configuration error
+/// (`ValidateIgnoredErrorsExtension` throws
+/// `InvalidIgnoredErrorPatternsException`, and analysis never starts) rather
+/// than degrading it. We previously compiled an invalid regex into an escaped
+/// literal that almost never matched, then reported it as *unmatched* — telling
+/// the user their finding was fixed when in fact their pattern was broken.
+pub fn validate_ignores(entries: &[IgnoreEntry]) -> Vec<String> {
+    let mut out = Vec::new();
+    for e in entries {
+        // A `count` marks a baseline-generated entry — mechanically produced, so
+        // it is correct by construction. phpstan skips these for the same reason.
+        if e.count.is_some() {
+            continue;
+        }
+        if is_empty_entry(e) {
+            out.push(
+                "Ignore entry has no message, identifier or path — it would ignore everything."
+                    .to_string(),
+            );
+            continue;
+        }
+        for m in e.message.iter().chain(e.messages.iter()) {
+            let body = strip_delims(m);
+            if let Err(err) = Regex::new(body) {
+                let first = err.to_string().lines().next().unwrap_or("").to_string();
+                out.push(format!("Ignore pattern {m} is not a valid regex: {first}"));
+            }
+        }
+    }
+    out
 }
 
 /// Strip matched `/.../`, `#...#`, or `~...~` regex delimiters.
@@ -665,6 +715,81 @@ mod tests {
         assert_eq!(out.findings[0].path, "src/App.php");
     }
 
+    /// Regression: a `path`-only entry compiled to `None` — silently discarded,
+    /// never matching and never surfacing as unmatched. phpstan honours it.
+    #[test]
+    fn path_only_entry_ignores_everything_under_that_path() {
+        let r = report(vec![
+            finding("src/Gen/A.php", 3, "bad return", "return.type"),
+            finding("src/Gen/B.php", 1, "unknown class", "class.notFound"),
+            finding("src/App.php", 5, "bad return", "return.type"),
+        ]);
+        let entries = vec![IgnoreEntry {
+            path: Some("src/Gen".into()),
+            ..Default::default()
+        }];
+        let out = apply(r, &entries, false, &no_sources());
+        assert_eq!(out.findings.len(), 1);
+        assert_eq!(out.findings[0].path, "src/App.php");
+    }
+
+    /// A path-only entry that matches nothing must still be reportable as
+    /// unmatched (it used to be invisible to that check).
+    #[test]
+    fn unmatched_path_only_entry_is_reported() {
+        let r = report(vec![finding("src/App.php", 5, "bad return", "return.type")]);
+        let entries = vec![IgnoreEntry {
+            path: Some("src/Gone".into()),
+            ..Default::default()
+        }];
+        let out = apply(r, &entries, true, &no_sources());
+        assert!(
+            out.findings
+                .iter()
+                .any(|f| f.identifier == Some("ignore.unmatched")
+                    || f.message.contains("src/Gone")),
+            "expected an unmatched-ignore finding: {:?}",
+            out.findings
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_and_empty_entries() {
+        // Valid entries pass.
+        assert!(validate_ignores(&[
+            IgnoreEntry {
+                message: Some("/Cannot call .* on null/".into()),
+                ..Default::default()
+            },
+            IgnoreEntry {
+                path: Some("src/Gen".into()),
+                ..Default::default()
+            },
+        ])
+        .is_empty());
+
+        // A broken regex is a configuration error, not a literal fallback.
+        let bad = validate_ignores(&[IgnoreEntry {
+            message: Some("/Cannot call (unclosed/".into()),
+            ..Default::default()
+        }]);
+        assert_eq!(bad.len(), 1);
+        assert!(bad[0].contains("not a valid regex"), "{bad:?}");
+
+        // A wholly empty entry would ignore everything.
+        let empty = validate_ignores(&[IgnoreEntry::default()]);
+        assert_eq!(empty.len(), 1);
+        assert!(empty[0].contains("ignore everything"), "{empty:?}");
+
+        // Baseline-generated entries (they carry a `count`) are never validated.
+        assert!(validate_ignores(&[IgnoreEntry {
+            message: Some("/Cannot call (unclosed/".into()),
+            count: Some(1),
+            ..Default::default()
+        }])
+        .is_empty());
+    }
+
     #[test]
     fn ignore_by_message_regex() {
         let r = report(vec![
@@ -829,11 +954,10 @@ mod tests {
         ]);
         // As a regex, `f()` would match `fX` too (empty group); rawMessage
         // must match only the literal message.
-        let entries = php_config::Config::from_yaml(
-            "ignore:\n  - rawMessage: \"calling f() is bad\"\n",
-        )
-        .unwrap()
-        .ignore;
+        let entries =
+            php_config::Config::from_yaml("ignore:\n  - rawMessage: \"calling f() is bad\"\n")
+                .unwrap()
+                .ignore;
         let out = apply(r, &entries, false, &HashMap::new());
         let kept: Vec<&str> = out.findings.iter().map(|f| f.message.as_str()).collect();
         assert_eq!(kept, ["calling fX) is bad"]);

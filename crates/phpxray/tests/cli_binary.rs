@@ -14,10 +14,8 @@ impl TempProject {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "phpxray-{name}-{}-{unique}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("phpxray-{name}-{}-{unique}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         Self { root }
     }
@@ -163,10 +161,7 @@ fn check_explicit_mixed_config_enables_strict_mixed_at_low_level() {
         "<?php\nfunction f(mixed $x): void { $x->go(); }\n",
     );
 
-    write_config(
-        &p,
-        "level: 0\npaths:\n  - src\ncheckExplicitMixed: true\n",
-    );
+    write_config(&p, "level: 0\npaths:\n  - src\ncheckExplicitMixed: true\n");
     let strict = p.run(["--error-format", "json"]);
     assert!(!strict.status.success(), "{}", stdout(&strict));
     let json: serde_json::Value = serde_json::from_str(&stdout(&strict)).unwrap();
@@ -257,7 +252,10 @@ fn rules_check_inside_closure_and_arrow_bodies() {
     // `type_of` (here method.notFound) fire on a typed param inside them.
     let p = TempProject::new("closure-bodies");
     write_config(&p, "level: 6\npaths:\n  - src\n");
-    p.write("src/User.php", "<?php class User { public function name(): string { return \"\"; } }\n");
+    p.write(
+        "src/User.php",
+        "<?php class User { public function name(): string { return \"\"; } }\n",
+    );
     p.write(
         "src/run.php",
         "<?php\nfunction run(): void {\n  $f = function (User $u) { return $u->bogus(); };\n  $g = fn (User $u) => $u->alsoBogus();\n}\n",
@@ -265,8 +263,14 @@ fn rules_check_inside_closure_and_arrow_bodies() {
 
     let output = p.run([] as [&str; 0]);
     let out = stdout(&output);
-    assert!(out.contains("User::bogus"), "closure body not checked: {out}");
-    assert!(out.contains("User::alsoBogus"), "arrow body not checked: {out}");
+    assert!(
+        out.contains("User::bogus"),
+        "closure body not checked: {out}"
+    );
+    assert!(
+        out.contains("User::alsoBogus"),
+        "arrow body not checked: {out}"
+    );
 }
 
 #[test]
@@ -306,7 +310,10 @@ fn inline_suppression_suppresses_line_finding() {
 #[test]
 fn laravel_facade_aliases_resolve_only_when_enabled() {
     let p = TempProject::new("laravel-aliases");
-    p.write("src/Use.php", "<?php Sentry::captureException(); Str::random(8);\n");
+    p.write(
+        "src/Use.php",
+        "<?php Sentry::captureException(); Str::random(8);\n",
+    );
     // config/app.php: `Str` alias, resolved through the file's `use` import.
     p.write(
         "config/app.php",
@@ -525,10 +532,7 @@ fn fix_inserts_phpdoc_and_is_idempotent() {
 fn fix_respects_baseline() {
     let p = TempProject::new("fix-baseline");
     write_config(&p, "level: 6\npaths:\n  - src\n");
-    p.write(
-        "src/app.php",
-        "<?php\nclass C {\n    private $v = 1;\n}\n",
-    );
+    p.write("src/app.php", "<?php\nclass C {\n    private $v = 1;\n}\n");
     let baseline = p.run(["--generate-baseline", "--no-progress"]);
     assert!(baseline.status.success());
     write_config(
@@ -540,7 +544,11 @@ fn fix_respects_baseline() {
     let fixed = p.run(["--fix", "--no-progress"]);
     let err = String::from_utf8_lossy(&fixed.stderr).into_owned();
     assert!(err.contains("Fixed 0 finding(s) in 0 file(s)."), "{err}");
-    assert_eq!(read(&p, "src/app.php"), original, "baselined finding must not be fixed");
+    assert_eq!(
+        read(&p, "src/app.php"),
+        original,
+        "baselined finding must not be fixed"
+    );
 }
 
 #[test]
@@ -677,7 +685,11 @@ fn neon_baseline_generate_and_consume_round_trip() {
     assert_eq!(bare.status.code(), Some(1));
 
     // Generate a phpstan-compatible NEON baseline.
-    let gen = p.run(["--generate-baseline", "phpstan-baseline.neon", "--no-progress"]);
+    let gen = p.run([
+        "--generate-baseline",
+        "phpstan-baseline.neon",
+        "--no-progress",
+    ]);
     assert!(gen.status.success());
     let neon = read(&p, "phpstan-baseline.neon");
     assert!(neon.starts_with("parameters:\n\tignoreErrors:\n"), "{neon}");
@@ -762,4 +774,63 @@ fn fix_inserts_into_existing_docblock_and_array_param() {
         content.contains(" * Maps ids.\n * @param list<int> $ids\n * @return list<int>\n */"),
         "{content}"
     );
+}
+
+/// Regression: a malformed `ignore:` entry used to be silently degraded — an
+/// invalid regex became a literal match that never fired, then surfaced as an
+/// *unmatched* ignore, telling the user the finding was fixed. phpstan refuses
+/// to start on one; so do we.
+#[test]
+fn invalid_ignore_entry_is_a_config_error() {
+    let p = TempProject::new("bad-ignore");
+    p.write("src/a.php", "<?php\nfunction f(): int { return 'x'; }\n");
+    p.write(
+        "phpxray.yaml",
+        "level: max\npaths:\n  - src\nignore:\n  - message: '/Cannot call (unclosed/'\n",
+    );
+    let out = p.run(["--no-progress"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not a valid regex"), "{err}");
+
+    // A wholly empty entry would ignore everything.
+    p.write(
+        "phpxray.yaml",
+        "level: max\npaths:\n  - src\nignore:\n  - count: ~\n",
+    );
+    let out = p.run(["--no-progress"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("ignore everything"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A `path`-only ignore entry is legal (phpstan honours it) and must suppress
+/// every finding under that path. It used to be discarded silently.
+#[test]
+fn path_only_ignore_entry_suppresses_that_subtree() {
+    let p = TempProject::new("path-only-ignore");
+    p.write(
+        "src/gen/a.php",
+        "<?php\nfunction g(): int { return 'x'; }\n",
+    );
+    p.write("src/app.php", "<?php\nfunction h(): int { return 'y'; }\n");
+    p.write("phpxray.yaml", "level: max\npaths:\n  - src\n");
+    let before = p.run(["--no-progress", "--error-format", "json"]);
+    assert!(
+        stdout(&before).contains("src/gen/a.php"),
+        "{}",
+        stdout(&before)
+    );
+
+    p.write(
+        "phpxray.yaml",
+        "level: max\npaths:\n  - src\nignore:\n  - path: src/gen\n",
+    );
+    let after = p.run(["--no-progress", "--error-format", "json"]);
+    let text = stdout(&after);
+    assert!(!text.contains("src/gen/a.php"), "{text}");
+    assert!(text.contains("src/app.php"), "{text}");
 }

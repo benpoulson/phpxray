@@ -1,8 +1,8 @@
 //! The `phpxray` command-line entry point.
 
 use clap::Parser;
-use phpxray::{baseline, report, run_with_options, RunOptions};
 use php_config::Config;
+use phpxray::{baseline, report, run_with_options, RunOptions};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -259,9 +259,7 @@ fn main() -> ExitCode {
         }
     }
 
-    if cli.fail_without_result_cache
-        && !report.timings.as_ref().is_some_and(|t| t.cache_hit)
-    {
+    if cli.fail_without_result_cache && !report.timings.as_ref().is_some_and(|t| t.cache_hit) {
         eprintln!("error: result cache was not used (fresh analysis was required)");
         return ExitCode::from(2);
     }
@@ -320,6 +318,22 @@ fn resolve_and_override(cli: &Cli) -> Result<RunConfig, ExitCode> {
     }
     if config.paths.is_empty() {
         eprintln!("error: no paths to analyze (set `paths` in the config or pass paths on the command line)");
+        return Err(ExitCode::from(2));
+    }
+    // A malformed `ignore:` entry is a configuration error, not something to
+    // silently degrade — phpstan refuses to start on one too. Degrading an
+    // invalid regex to a literal match made it look like the finding was fixed.
+    let ignore_problems = phpxray::suppress::validate_ignores(&config.ignore);
+    if !ignore_problems.is_empty() {
+        let plural = if ignore_problems.len() == 1 {
+            "entry"
+        } else {
+            "entries"
+        };
+        eprintln!("error: invalid {plural} in `ignore`:");
+        for p in &ignore_problems {
+            eprintln!("  {p}");
+        }
         return Err(ExitCode::from(2));
     }
     Ok(RunConfig {
@@ -460,11 +474,7 @@ mod tests {
         let dir = temp_dir("target-config");
         let project = dir.join("project");
         fs::create_dir_all(&project).unwrap();
-        fs::write(
-            project.join("phpxray.yaml"),
-            "level: 6\npaths:\n  - app\n",
-        )
-        .unwrap();
+        fs::write(project.join("phpxray.yaml"), "level: 6\npaths:\n  - app\n").unwrap();
 
         let cli = Cli::parse_from(["phpxray", project.to_str().unwrap()]);
         let resolved = resolve_config(&cli).unwrap();
