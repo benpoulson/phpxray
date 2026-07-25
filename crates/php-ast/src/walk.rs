@@ -169,15 +169,19 @@ where
         }
         // Nested declarations introduce new scopes: only descend when crossing.
         StmtKind::Function(fd) if cross => {
+            walk_attrs(&fd.attrs, on_s, on_e);
             walk_params(&fd.params, on_s, on_e);
             fd.body
                 .iter()
                 .for_each(|st| walk_stmt(st, on_s, on_e, true));
         }
         StmtKind::Class(c) if cross => walk_class(c, on_s, on_e),
-        StmtKind::ConstDecl { consts, .. } => consts
-            .iter()
-            .for_each(|c| walk_expr(&c.value, on_s, on_e, cross)),
+        StmtKind::ConstDecl { attrs, consts, .. } => {
+            walk_attrs(attrs, on_s, on_e);
+            consts
+                .iter()
+                .for_each(|c| walk_expr(&c.value, on_s, on_e, cross));
+        }
         StmtKind::Return(None)
         | StmtKind::Function(_)
         | StmtKind::Class(_)
@@ -230,12 +234,14 @@ where
     for m in &c.members {
         match m {
             Member::Method(md) => {
+                walk_attrs(&md.attrs, on_s, on_e);
                 walk_params(&md.params, on_s, on_e);
                 if let Some(body) = &md.body {
                     body.iter().for_each(|st| walk_stmt(st, on_s, on_e, true));
                 }
             }
             Member::Property(pd) => {
+                walk_attrs(&pd.attrs, on_s, on_e);
                 for elem in &pd.props {
                     if let Some(d) = &elem.default {
                         walk_expr(d, on_s, on_e, true);
@@ -247,11 +253,14 @@ where
                     }
                 }
             }
-            Member::ClassConst(cd) => cd
-                .consts
-                .iter()
-                .for_each(|c| walk_expr(&c.value, on_s, on_e, true)),
+            Member::ClassConst(cd) => {
+                walk_attrs(&cd.attrs, on_s, on_e);
+                cd.consts
+                    .iter()
+                    .for_each(|c| walk_expr(&c.value, on_s, on_e, true));
+            }
             Member::EnumCase(ec) => {
+                walk_attrs(&ec.attrs, on_s, on_e);
                 if let Some(v) = &ec.value {
                     walk_expr(v, on_s, on_e, true);
                 }
@@ -266,6 +275,7 @@ where
     S: FnMut(&'a Stmt),
     E: FnMut(&'a Expr),
 {
+    walk_attrs(&h.attrs, on_s, on_e);
     if let Some(params) = &h.params {
         walk_params(params, on_s, on_e);
     }
@@ -409,12 +419,14 @@ where
         ExprKind::Isset(es) => es.iter().for_each(|e| go(e, on_s, on_e)),
         ExprKind::Closure(c) => {
             if cross {
+                walk_attrs(&c.attrs, on_s, on_e);
                 walk_params(&c.params, on_s, on_e);
                 c.body.iter().for_each(|st| walk_stmt(st, on_s, on_e, true));
             }
         }
         ExprKind::ArrowFn(a) => {
             if cross {
+                walk_attrs(&a.attrs, on_s, on_e);
                 walk_params(&a.params, on_s, on_e);
                 walk_expr(&a.body, on_s, on_e, true);
             }
