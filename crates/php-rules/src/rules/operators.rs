@@ -39,7 +39,7 @@
 use crate::facts::AssignmentKind;
 use crate::{
     facts::{AssignmentFact, BinaryFact, UnaryFact},
-    FactKind, FactRuleEntry, FactRuleHandler, FileAnalysis, RuleEntry,
+    FactRuleEntry, FactRuleHandler, FileAnalysis, RuleEntry,
 };
 use php_ast::{BinOp, Expr, ExprKind, UnOp};
 use php_diagnostics::Diagnostic;
@@ -592,44 +592,30 @@ pub(crate) static RULES: &[RuleEntry] = &[
 pub(crate) static FACT_RULES: &[FactRuleEntry] = &[
     FactRuleEntry::new(
         "operators.invalidAssignVar",
-        0,
-        FactKind::Assignment,
         FactRuleHandler::Assignment(check_invalid_assign_var),
     ),
     FactRuleEntry::new(
         "operators.invalidIncDec",
-        0,
-        FactKind::Expression,
         FactRuleHandler::Expression(check_invalid_inc_dec),
     ),
     FactRuleEntry::new(
         "operators.backtick",
-        0,
-        FactKind::Expression,
         FactRuleHandler::Expression(check_backtick),
     ),
     FactRuleEntry::new(
         "operators.pipeByRef",
-        0,
-        FactKind::Binary,
         FactRuleHandler::Binary(check_pipe_byref),
     ),
     FactRuleEntry::new(
         "operators.invalidBinary",
-        2,
-        FactKind::Expression,
         FactRuleHandler::Expression(check_invalid_binary),
     ),
     FactRuleEntry::new(
         "operators.invalidUnary",
-        2,
-        FactKind::Unary,
         FactRuleHandler::Unary(check_invalid_unary),
     ),
     FactRuleEntry::new(
         "operators.invalidComparison",
-        2,
-        FactKind::Binary,
         FactRuleHandler::Binary(check_invalid_comparison),
     ),
 ];

@@ -60,7 +60,7 @@
 
 use crate::{
     facts::{BinaryFact, CallFact, MethodCallFact, StaticCallFact, UnaryFact},
-    symbols, walk, FactKind, FactRuleEntry, FactRuleHandler, FileAnalysis, RuleEntry,
+    symbols, walk, FactRuleEntry, FactRuleHandler, FileAnalysis, RuleEntry,
 };
 use php_ast::{
     BinOp, ClassDecl, ClassKind, ElseIf, Expr, ExprKind, Member, MemberName, MethodDecl, Stmt,
@@ -2407,56 +2407,38 @@ pub(crate) static RULES: &[RuleEntry] = &[
 pub(crate) static FACT_RULES: &[FactRuleEntry] = &[
     FactRuleEntry::new(
         "comparison.booleanNot",
-        4,
-        FactKind::Unary,
         FactRuleHandler::Unary(check_boolean_not),
     ),
     FactRuleEntry::new(
         "comparison.logicalXor",
-        4,
-        FactKind::Binary,
         FactRuleHandler::Binary(check_logical_xor),
     ),
     FactRuleEntry::new(
         "comparison.strict",
-        4,
-        FactKind::Binary,
         FactRuleHandler::Binary(check_strict_comparison),
     ),
     FactRuleEntry::new(
         "comparison.constant",
-        4,
-        FactKind::Binary,
         FactRuleHandler::Binary(check_constant_comparison),
     ),
     FactRuleEntry::new(
         "comparison.impossibleInstanceof",
-        4,
-        FactKind::Expression,
         FactRuleHandler::Expression(check_impossible_instanceof),
     ),
     FactRuleEntry::new(
         "comparison.impossibleCheckType",
-        4,
-        FactKind::FunctionCall,
         FactRuleHandler::FunctionCall(check_impossible_check_type),
     ),
     FactRuleEntry::new(
         "comparison.impossibleCheckTypeMethodCall",
-        4,
-        FactKind::MethodCall,
         FactRuleHandler::MethodCall(check_impossible_check_type_method_call),
     ),
     FactRuleEntry::new(
         "comparison.impossibleCheckTypeStaticMethodCall",
-        4,
-        FactKind::StaticCall,
         FactRuleHandler::StaticCall(check_impossible_check_type_static_method_call),
     ),
     FactRuleEntry::new(
         "comparison.matchArms",
-        4,
-        FactKind::Expression,
         FactRuleHandler::Expression(check_match_arms),
     ),
 ];

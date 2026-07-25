@@ -24,7 +24,7 @@
 //!
 use crate::{
     facts::{CastFact, EchoFact, PrintFact},
-    FactKind, FactRuleEntry, FactRuleHandler, FileAnalysis, RuleEntry,
+    FactRuleEntry, FactRuleHandler, FileAnalysis, RuleEntry,
 };
 use php_ast::{CastKind, Expr, ExprKind, StmtKind};
 use php_diagnostics::Diagnostic;
@@ -355,38 +355,14 @@ pub(crate) static RULES: &[RuleEntry] = &[
 pub(crate) static FACT_RULES: &[FactRuleEntry] = &[
     FactRuleEntry::new(
         "cast.deprecated",
-        0,
-        FactKind::Cast,
         FactRuleHandler::Cast(check_deprecated_cast),
     ),
-    FactRuleEntry::new(
-        "cast.unset",
-        0,
-        FactKind::Cast,
-        FactRuleHandler::Cast(check_unset_cast),
-    ),
-    FactRuleEntry::new(
-        "cast.invalid",
-        2,
-        FactKind::Cast,
-        FactRuleHandler::Cast(check_invalid_cast),
-    ),
-    FactRuleEntry::new(
-        "cast.echo",
-        2,
-        FactKind::Echo,
-        FactRuleHandler::Echo(check_echo),
-    ),
-    FactRuleEntry::new(
-        "cast.print",
-        2,
-        FactKind::Print,
-        FactRuleHandler::Print(check_print),
-    ),
+    FactRuleEntry::new("cast.unset", FactRuleHandler::Cast(check_unset_cast)),
+    FactRuleEntry::new("cast.invalid", FactRuleHandler::Cast(check_invalid_cast)),
+    FactRuleEntry::new("cast.echo", FactRuleHandler::Echo(check_echo)),
+    FactRuleEntry::new("cast.print", FactRuleHandler::Print(check_print)),
     FactRuleEntry::new(
         "cast.encapsedPart",
-        2,
-        FactKind::Expression,
         FactRuleHandler::Expression(check_invalid_encapsed_part),
     ),
 ];

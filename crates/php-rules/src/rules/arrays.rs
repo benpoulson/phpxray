@@ -53,7 +53,7 @@
 
 use crate::{
     facts::{ArrayFact, AssignmentFact, AssignmentKind, ForeachFact, IndexFact},
-    walk, FactKind, FactRuleEntry, FactRuleHandler, FileAnalysis, RuleEntry,
+    walk, FactRuleEntry, FactRuleHandler, FileAnalysis, RuleEntry,
 };
 use php_ast::{ArrayItem, Expr, ExprKind};
 use php_diagnostics::Diagnostic;
@@ -1195,62 +1195,42 @@ pub(crate) static RULES: &[RuleEntry] = &[
 pub(crate) static FACT_RULES: &[FactRuleEntry] = &[
     FactRuleEntry::new(
         "array.duplicateKey",
-        0,
-        FactKind::Array,
         FactRuleHandler::Array(check_duplicate_keys),
     ),
     FactRuleEntry::new(
         "foreach.nonIterable",
-        3,
-        FactKind::Foreach,
         FactRuleHandler::Foreach(check_iterable_in_foreach),
     ),
     FactRuleEntry::new(
         "arrayUnpacking.nonIterable",
-        3,
-        FactKind::Array,
         FactRuleHandler::Array(check_unpack_iterable_in_array),
     ),
     FactRuleEntry::new(
         "arrayUnpacking.stringOffset",
-        3,
-        FactKind::Array,
         FactRuleHandler::Array(check_array_unpacking_string_offset),
     ),
     FactRuleEntry::new(
         "offsetAccess.nonArray",
-        3,
-        FactKind::Assignment,
         FactRuleHandler::Assignment(check_array_destructuring),
     ),
     FactRuleEntry::new(
         "array.invalidKey",
-        3,
-        FactKind::Array,
         FactRuleHandler::Array(check_invalid_key_in_array_item),
     ),
     FactRuleEntry::new(
         "offsetAccess.invalidOffset",
-        3,
-        FactKind::Index,
         FactRuleHandler::Index(check_invalid_key_in_dim_fetch),
     ),
     FactRuleEntry::new(
         "offsetAssign.dimType",
-        3,
-        FactKind::Assignment,
         FactRuleHandler::Assignment(check_offset_access_assignment),
     ),
     FactRuleEntry::new(
         "offsetAssign.valueType",
-        3,
-        FactKind::Assignment,
         FactRuleHandler::Assignment(check_offset_access_value_assignment),
     ),
     FactRuleEntry::new(
         "foreach.emptyArray",
-        4,
-        FactKind::Foreach,
         FactRuleHandler::Foreach(check_dead_foreach),
     ),
 ];

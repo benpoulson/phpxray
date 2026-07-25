@@ -383,26 +383,28 @@ impl FactRuleHandler {
     }
 }
 
+/// A rule that opts into the shared node dispatcher, so many rules share one
+/// traversal instead of each walking the file.
+///
+/// Carries only what cannot be derived: the `name` that joins it to its
+/// [`RuleEntry`] (which owns the level) and the `handler` (which determines the
+/// node kind). It used to repeat both the level and the kind, with tests
+/// asserting the copies agreed — a disagreement would have made the rule run at
+/// one level and dispatch at another. Not storing them is a stronger guarantee
+/// than checking them.
 pub(crate) struct FactRuleEntry {
     pub(crate) name: &'static str,
-    pub(crate) level: u8,
-    pub(crate) kind: FactKind,
     pub(crate) handler: FactRuleHandler,
 }
 
 impl FactRuleEntry {
-    pub(crate) const fn new(
-        name: &'static str,
-        level: u8,
-        kind: FactKind,
-        handler: FactRuleHandler,
-    ) -> Self {
-        Self {
-            name,
-            level,
-            kind,
-            handler,
-        }
+    pub(crate) const fn new(name: &'static str, handler: FactRuleHandler) -> Self {
+        Self { name, handler }
+    }
+
+    /// The node kind this rule is dispatched on, determined by its handler.
+    pub(crate) fn kind(&self) -> FactKind {
+        self.handler.kind()
     }
 }
 
@@ -456,11 +458,14 @@ pub fn located_rules_for_level(level: u8) -> impl Iterator<Item = &'static Locat
         .filter(move |r| r.level <= level)
 }
 
-fn fact_rule_for_name(name: &str, level: u8) -> Option<&'static FactRuleEntry> {
+/// The dispatcher entry for a registry rule, if it has one. Callers iterate
+/// `rules_for_level`, so the level filter has already been applied by the
+/// `RuleEntry` that owns it.
+fn fact_rule_for_name(name: &str) -> Option<&'static FactRuleEntry> {
     crate::rules::FACT_CATEGORY_RULES
         .iter()
         .flat_map(|cat| cat.iter())
-        .find(|r| r.name == name && r.level <= level)
+        .find(|r| r.name == name)
 }
 
 /// Run every rule active at `level` over one file and collect the diagnostics.
@@ -482,8 +487,7 @@ pub fn analyze_file_located(fa: &FileAnalysis, level: u8) -> Vec<LocatedDiagnost
     let mut fact_rules: Vec<(usize, &'static FactRuleEntry)> = Vec::new();
 
     for (idx, rule) in active.iter().enumerate() {
-        if let Some(fact_rule) = fact_rule_for_name(rule.name, level) {
-            debug_assert_eq!(fact_rule.kind, fact_rule.handler.kind());
+        if let Some(fact_rule) = fact_rule_for_name(rule.name) {
             fact_rules.push((idx, fact_rule));
         } else {
             slots[idx].extend((rule.run)(fa));
@@ -527,7 +531,7 @@ fn dispatch_fact_rules(
         let active: Vec<_> = fact_rules
             .iter()
             .copied()
-            .filter(|(_, rule)| rule.kind == kind)
+            .filter(|(_, rule)| rule.kind() == kind)
             .collect();
         if active.is_empty() {
             continue;
@@ -750,31 +754,15 @@ mod tests {
                 "fact rule {} must have a matching RuleEntry",
                 fact_rule.name
             );
-            assert_eq!(fact_rule.kind, fact_rule.handler.kind());
-            // A fact rule declares its level TWICE — once on its `RuleEntry`,
-            // once on its `FactRuleEntry` — and the dispatcher joins them by
-            // name. If the two disagree, the rule runs at one level and is
-            // dispatched at another: it silently vanishes below the higher level
-            // or fires below the lower one. Nothing but this assertion catches it.
-            let entry = crate::rules::CATEGORY_RULES
-                .iter()
-                .flat_map(|cat| cat.iter())
-                .find(|r| r.name == fact_rule.name)
-                .expect("checked above");
-            assert_eq!(
-                entry.level, fact_rule.level,
-                "fact rule {} is registered at level {} but dispatched at level {}",
-                fact_rule.name, entry.level, fact_rule.level
-            );
         }
 
         let dispatched_names: Vec<_> = rules_for_level(10)
-            .filter(|rule| fact_rule_for_name(rule.name, 10).is_some())
+            .filter(|rule| fact_rule_for_name(rule.name).is_some())
             .map(|rule| rule.name)
             .collect();
         let registry_filtered: Vec<_> = registry
             .into_iter()
-            .filter(|name| fact_rule_for_name(name, 10).is_some())
+            .filter(|name| fact_rule_for_name(name).is_some())
             .collect();
         assert_eq!(dispatched_names, registry_filtered);
     }

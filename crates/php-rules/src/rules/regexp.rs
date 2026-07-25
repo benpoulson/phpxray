@@ -19,7 +19,7 @@
 //!   quote delimiter is missing or contradicts the pattern delimiter.
 
 use crate::members;
-use crate::{facts::CallFact, FactKind, FactRuleEntry, FactRuleHandler, FileAnalysis, RuleEntry};
+use crate::{facts::CallFact, FactRuleEntry, FactRuleHandler, FileAnalysis, RuleEntry};
 use php_ast::{Arg, BinOp, Expr, ExprKind};
 use php_diagnostics::Diagnostic;
 use php_infer::{eval_const, ConstVal};
@@ -43,14 +43,10 @@ pub(crate) static RULES: &[RuleEntry] = &[
 pub(crate) static FACT_RULES: &[FactRuleEntry] = &[
     FactRuleEntry::new(
         "regexp.pattern",
-        0,
-        FactKind::FunctionCall,
         FactRuleHandler::FunctionCall(check_pattern_call),
     ),
     FactRuleEntry::new(
         "argument.invalidPregQuote",
-        5,
-        FactKind::FunctionCall,
         FactRuleHandler::FunctionCall(check_quoting_call),
     ),
 ];

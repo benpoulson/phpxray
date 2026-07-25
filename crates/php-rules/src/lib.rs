@@ -36,7 +36,7 @@ pub use registry::{
     analyze_file, analyze_file_located, rule_manifest, rules_for_level, FileAnalysis,
     LocatedDiagnostic, LocatedRuleEntry, RuleEntry, RuleManifestEntry,
 };
-pub(crate) use registry::{FactKind, FactRuleEntry, FactRuleHandler};
+pub(crate) use registry::{FactRuleEntry, FactRuleHandler};
 pub use return_type::return_type_errors;
 
 /// Report every reference in `refs` whose target is unknown to `index` (neither
