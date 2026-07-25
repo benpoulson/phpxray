@@ -9,9 +9,9 @@
 //! the dependent never names the changed class, file adds/removes, cross-file
 //! located findings whose lines shift, and config changes.
 
+use php_config::Config;
 use phpxray::incremental::{ChangeHint, Session};
 use phpxray::{run_with_options, Report, RunOptions};
-use php_config::Config;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -140,10 +140,8 @@ fn temp_dir(label: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "phpxray-{label}-{}-{id}-{now}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("phpxray-{label}-{}-{id}-{now}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -554,7 +552,10 @@ fn inferred_signature_change_invalidates_dependents() {
     );
     let before = p.check("initial", None);
 
-    p.write("src/base.php", "<?php function base() { return \"str\"; }\n");
+    p.write(
+        "src/base.php",
+        "<?php function base() { return \"str\"; }\n",
+    );
     let hint = p.hint(&["src/base.php"]);
     let after = p.check("inferred signature chain edit", Some(&hint));
     assert_ne!(
@@ -592,11 +593,10 @@ fn ignore_change_resuppresses_without_breaking_equivalence() {
     assert!(!before.is_empty());
 
     let mut config = Config::from_yaml("level: max\npaths:\n  - src\n").unwrap();
-    config.ignore = Config::from_yaml(
-        "level: max\npaths: [src]\nignore:\n  - identifier: return.type\n",
-    )
-    .unwrap()
-    .ignore;
+    config.ignore =
+        Config::from_yaml("level: max\npaths: [src]\nignore:\n  - identifier: return.type\n")
+            .unwrap()
+            .ignore;
     config.report_unmatched_ignored = false;
     p.config = config;
     let after = p.check("with ignore", Some(&ChangeHint::default()));
@@ -650,7 +650,11 @@ fn invalidation_is_selective() {
         ],
     );
     p.check("initial", None);
-    assert_eq!(p.session.last_pass().files_reanalyzed, 5, "first pass = all");
+    assert_eq!(
+        p.session.last_pass().files_reanalyzed,
+        5,
+        "first pass = all"
+    );
 
     // Body-only edit (signature identical): selective.
     p.write(

@@ -227,7 +227,11 @@ impl TypeCtx<'_> {
             .and_then(|e| literal_string_of(&self.infer(e)));
         // A deeper write (`$v[k][…]`) makes `$v[k]` an array; a direct write
         // (`$v[k] = X`) stores X.
-        let field_ty = if nested { Type::Array(None) } else { ty.clone() };
+        let field_ty = if nested {
+            Type::Array(None)
+        } else {
+            ty.clone()
+        };
         match self.vars.get(&root).cloned() {
             // PHP auto-vivification: an index write through an undefined
             // variable creates exactly that array — a fresh sealed shape when
@@ -545,7 +549,14 @@ impl TypeCtx<'_> {
         if found.member.asserts.is_empty() {
             return;
         }
-        self.push_assert_facts(&found.member.asserts, &found.member.params, args, None, truthy, out);
+        self.push_assert_facts(
+            &found.member.asserts,
+            &found.member.params,
+            args,
+            None,
+            truthy,
+            out,
+        );
     }
 
     fn assert_facts_method(
@@ -610,7 +621,10 @@ impl TypeCtx<'_> {
                     continue;
                 };
                 // Named/spread args break positional mapping.
-                if args.iter().any(|x| x.name.is_some() || x.spread || x.placeholder) {
+                if args
+                    .iter()
+                    .any(|x| x.name.is_some() || x.spread || x.placeholder)
+                {
                     continue;
                 }
                 let Some(arg) = args.get(idx) else { continue };
@@ -823,10 +837,7 @@ impl TypeCtx<'_> {
                 let Some(place) = self.place_key(&arg0.value) else {
                     return;
                 };
-                if matches!(
-                    self.infer(&arg0.value),
-                    Type::String | Type::StringOf(_)
-                ) {
+                if matches!(self.infer(&arg0.value), Type::String | Type::StringOf(_)) {
                     out.push((place, Type::StringOf(php_types::StringRefinement::Numeric)));
                 }
             }
@@ -839,10 +850,7 @@ impl TypeCtx<'_> {
                 let Some(place) = self.place_key(&arg0.value) else {
                     return;
                 };
-                if matches!(
-                    self.infer(&arg0.value),
-                    Type::String | Type::StringOf(_)
-                ) {
+                if matches!(self.infer(&arg0.value), Type::String | Type::StringOf(_)) {
                     out.push((place, Type::ClassString(None)));
                 }
             }
@@ -891,7 +899,14 @@ impl TypeCtx<'_> {
 
     /// `count($x) CMP n` non-emptiness: a branch where the count is provably
     /// >= 1 makes the counted container non-empty.
-    fn count_cmp_facts(&self, op: BinOp, lhs: &Expr, rhs: &Expr, truthy: bool, out: &mut Vec<Fact>) {
+    fn count_cmp_facts(
+        &self,
+        op: BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        truthy: bool,
+        out: &mut Vec<Fact>,
+    ) {
         let (call, lit, op) = if let Some(n) = int_lit(rhs) {
             (lhs, n, op)
         } else if let Some(n) = int_lit(lhs) {
@@ -1539,9 +1554,7 @@ impl TypeCtx<'_> {
                     // When every arm condition is a singleton (enum case or
                     // scalar literal), the arm body sees the subject narrowed
                     // to their union (`match ($s) { Suit::Hearts => …`).
-                    let narrowed = place
-                        .as_ref()
-                        .and_then(|_| self.match_arm_narrowing(arm));
+                    let narrowed = place.as_ref().and_then(|_| self.match_arm_narrowing(arm));
                     match (&place, narrowed) {
                         (Some(place), Some(t)) => {
                             let saved = self.vars.clone();
@@ -2293,7 +2306,10 @@ impl TypeCtx<'_> {
 
     fn name_class_type(&self, n: &Name) -> Option<Type> {
         match self.scope.resolve_class(n) {
-            php_resolve::Resolution::Fqn(fqn) => Some(Type::Named { fqn: fqn.into(), args: vec![] }),
+            php_resolve::Resolution::Fqn(fqn) => Some(Type::Named {
+                fqn: fqn.into(),
+                args: vec![],
+            }),
             php_resolve::Resolution::LateStatic(s) => match s.as_str() {
                 "self" => self.self_type(),
                 "static" => Some(Type::StaticType),
@@ -2489,8 +2505,14 @@ fn predicate_matches(m: &Type, t: &Type) -> bool {
         Float => matches!(m, Float),
         Bool => matches!(m, Bool | True | False),
         Array(_) => matches!(m.peel_non_empty(), Array(_) | List(_) | Shape { .. }),
-        Object => matches!(m, Object | Named { .. } | EnumCase { .. } | SelfType | StaticType),
-        Iterable(_) => matches!(m.peel_non_empty(), Iterable(_) | Array(_) | List(_) | Shape { .. }),
+        Object => matches!(
+            m,
+            Object | Named { .. } | EnumCase { .. } | SelfType | StaticType
+        ),
+        Iterable(_) => matches!(
+            m.peel_non_empty(),
+            Iterable(_) | Array(_) | List(_) | Shape { .. }
+        ),
         Callable(_) => matches!(m, Callable(_)),
         Null => matches!(m, Null),
         _ => false,
@@ -3600,10 +3622,7 @@ mod tests {
                 if (array_key_exists('name', $a)) { $y = $a; }
             }
         "#;
-        assert_eq!(
-            var_after(src, "y"),
-            "array{id: int, name: string}|mixed"
-        );
+        assert_eq!(var_after(src, "y"), "array{id: int, name: string}|mixed");
     }
 
     #[test]
@@ -3652,9 +3671,8 @@ mod tests {
 
     #[test]
     fn string_refinement_specifiers() {
-        let probe = |guard: &str| {
-            format!("function f(string $s) {{ if ({guard}) {{ $y = $s; }} }}")
-        };
+        let probe =
+            |guard: &str| format!("function f(string $s) {{ if ({guard}) {{ $y = $s; }} }}");
         assert_eq!(
             var_after(&probe("str_contains($s, '@')"), "y"),
             "non-empty-string|mixed"

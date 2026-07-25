@@ -197,7 +197,9 @@ fn doc_keyword(name: &str) -> Option<Type> {
         "double" => Type::Float,
         "boolean" => Type::Bool,
         "non-empty-string" => Type::StringOf(php_types::StringRefinement::NonEmpty),
-        "non-falsy-string" | "truthy-string" => Type::StringOf(php_types::StringRefinement::NonFalsy),
+        "non-falsy-string" | "truthy-string" => {
+            Type::StringOf(php_types::StringRefinement::NonFalsy)
+        }
         "numeric-string" => Type::StringOf(php_types::StringRefinement::Numeric),
         "literal-string" => Type::StringOf(php_types::StringRefinement::Literal),
         "callable-string" => Type::StringOf(php_types::StringRefinement::Callable),
@@ -264,7 +266,10 @@ fn doc_generic(scope: &Scope, templates: &[String], base: &str, args: &[DocType]
         "key-of" => match resolved.as_slice() {
             [Type::Array(Some(kv))] | [Type::Iterable(Some(kv))] => kv.0.clone(),
             [Type::List(_)] => Type::Int,
-            [Type::Shape { fields, sealed: true }] => {
+            [Type::Shape {
+                fields,
+                sealed: true,
+            }] => {
                 let keys: Vec<Type> = fields
                     .iter()
                     .map(|f| match &f.key {
@@ -286,9 +291,10 @@ fn doc_generic(scope: &Scope, templates: &[String], base: &str, args: &[DocType]
         "value-of" => match resolved.as_slice() {
             [Type::Array(Some(kv))] | [Type::Iterable(Some(kv))] => kv.1.clone(),
             [Type::List(inner)] => (**inner).clone(),
-            [Type::Shape { fields, sealed: true }] if !fields.is_empty() => {
-                Type::union(fields.iter().map(|f| f.ty.clone()).collect())
-            }
+            [Type::Shape {
+                fields,
+                sealed: true,
+            }] if !fields.is_empty() => Type::union(fields.iter().map(|f| f.ty.clone()).collect()),
             _ => Type::Mixed,
         },
         "int-mask-of" | "int-mask" => Type::Int,
@@ -525,7 +531,10 @@ mod tests {
         assert_eq!(doc(&s, &[], "class-string"), Type::ClassString(None));
         assert_eq!(doc(&s, &[], "list"), Type::List(Box::new(Type::Mixed)));
         assert_eq!(doc(&s, &[], "positive-int"), Type::int_range(Some(1), None));
-        assert_eq!(doc(&s, &[], "negative-int"), Type::int_range(None, Some(-1)));
+        assert_eq!(
+            doc(&s, &[], "negative-int"),
+            Type::int_range(None, Some(-1))
+        );
         assert_eq!(
             doc(&s, &[], "non-negative-int"),
             Type::int_range(Some(0), None)
@@ -659,14 +668,8 @@ mod tests {
             "int|string"
         );
         assert_eq!(doc(&s, &[], "int-mask-of<1|2|4>"), Type::Int);
-        assert_eq!(
-            doc(&s, &[], "int<min, 0>"),
-            Type::int_range(None, Some(0))
-        );
-        assert_eq!(
-            doc(&s, &[], "int<1, max>"),
-            Type::int_range(Some(1), None)
-        );
+        assert_eq!(doc(&s, &[], "int<min, 0>"), Type::int_range(None, Some(0)));
+        assert_eq!(doc(&s, &[], "int<1, max>"), Type::int_range(Some(1), None));
     }
 
     #[test]

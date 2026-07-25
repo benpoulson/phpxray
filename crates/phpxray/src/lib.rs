@@ -295,10 +295,8 @@ pub fn run_fix(config: &Config, root: &Path, options: RunOptions) -> FixReport {
     let mut summary = fix::FixSummary::default();
     for round in 0..MAX_ROUNDS {
         let (report, parsed) = run_pipeline(config, root, fix_options.clone());
-        let sources: HashMap<String, String> = parsed
-            .into_iter()
-            .map(|f| (f.path, f.source))
-            .collect();
+        let sources: HashMap<String, String> =
+            parsed.into_iter().map(|f| (f.path, f.source)).collect();
         let round_summary = fix::apply_fixes(&report.findings, &sources, root);
         summary.findings_fixed += round_summary.findings_fixed;
         for path in round_summary.changed_paths.iter() {
@@ -991,15 +989,22 @@ mod tests {
         fs::create_dir_all(&real).unwrap();
         fs::create_dir_all(&nested).unwrap();
         fs::write(real.join("A.php"), "<?php class A {}\n").unwrap();
-        fs::write(nested.join("A.php"), "<?php class A { public function shadow(): void {} }\n")
-            .unwrap();
+        fs::write(
+            nested.join("A.php"),
+            "<?php class A { public function shadow(): void {} }\n",
+        )
+        .unwrap();
 
         let config = Config::from_yaml("level: 0\npaths: []\nscanPaths:\n  - vendor\n").unwrap();
         let files: Vec<String> = discover_inputs(&config, &dir)
             .into_iter()
             .map(|f| rel_path(&f.path, &dir))
             .collect();
-        assert_eq!(files, ["vendor/pkg/lib/A.php"], "nested copy must be pruned");
+        assert_eq!(
+            files,
+            ["vendor/pkg/lib/A.php"],
+            "nested copy must be pruned"
+        );
 
         let _ = fs::remove_dir_all(dir);
     }

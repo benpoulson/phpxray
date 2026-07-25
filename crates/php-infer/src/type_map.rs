@@ -54,13 +54,27 @@ fn facet(merged: RawMap, native: Option<RawMap>) -> TypeMap {
     match native {
         None => merged
             .into_iter()
-            .map(|(k, m)| (k, Facets { merged: m, native: None }))
+            .map(|(k, m)| {
+                (
+                    k,
+                    Facets {
+                        merged: m,
+                        native: None,
+                    },
+                )
+            })
             .collect(),
         Some(mut native) => merged
             .into_iter()
             .map(|(k, m)| {
                 let n = native.remove(&k).map(Box::new);
-                (k, Facets { merged: m, native: n })
+                (
+                    k,
+                    Facets {
+                        merged: m,
+                        native: n,
+                    },
+                )
             })
             .collect(),
     }
@@ -82,7 +96,13 @@ pub fn type_map(
     interner: &Interner,
     want_native: bool,
 ) -> TypeMap {
-    type_map_with(reflection, program, interner, want_native, empty_terminators())
+    type_map_with(
+        reflection,
+        program,
+        interner,
+        want_native,
+        empty_terminators(),
+    )
 }
 
 /// [`type_map`] honouring user-configured `earlyTerminating*` calls.
@@ -120,11 +140,25 @@ pub fn contextual_body_type_map(
     body: &[php_ast::Stmt],
 ) -> TypeMap {
     let merged = contextual_raw(
-        reflection, scope, interner, class.clone(), params, inferred_params, false, body,
+        reflection,
+        scope,
+        interner,
+        class.clone(),
+        params,
+        inferred_params,
+        false,
+        body,
     );
     let native = want_native.then(|| {
         contextual_raw(
-            reflection, scope, interner, class, params, inferred_params, true, body,
+            reflection,
+            scope,
+            interner,
+            class,
+            params,
+            inferred_params,
+            true,
+            body,
         )
     });
     facet(merged, native)
@@ -184,7 +218,15 @@ fn build(
         // and conditional declarations; each is its own scope).
         for st in region {
             walk::for_each_stmt_in_stmt(st, &mut |s| {
-                collect_scope(reflection, scope, interner, s, native, terminators, &mut map)
+                collect_scope(
+                    reflection,
+                    scope,
+                    interner,
+                    s,
+                    native,
+                    terminators,
+                    &mut map,
+                )
             });
         }
     });

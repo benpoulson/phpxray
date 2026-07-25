@@ -631,7 +631,12 @@ impl ReflectionIndex {
         None
     }
 
-    fn is_sub_fqn(&self, sub: &str, sup_key: &str, visited: &mut Vec<*const ClassReflection>) -> bool {
+    fn is_sub_fqn(
+        &self,
+        sub: &str,
+        sup_key: &str,
+        visited: &mut Vec<*const ClassReflection>,
+    ) -> bool {
         // Reflexive: compare canonical keys without allocating for `sub`.
         if with_ci_key(sub, |sk| sk == sup_key) {
             return true;
@@ -870,8 +875,7 @@ impl ReflectionIndex {
     /// return inference).
     pub fn function_body(&self, fqn: &str) -> Option<(&[Stmt], &Scope)> {
         depsrec::note_body(fqn);
-        with_ci_key(fqn, |key| self.bodies.get(key))
-            .map(|r| (r.body.as_slice(), &r.scope))
+        with_ci_key(fqn, |key| self.bodies.get(key)).map(|r| (r.body.as_slice(), &r.scope))
     }
 
     /// Full body metadata for a free function, including source path/kind when
@@ -1170,11 +1174,7 @@ fn class_key(fqn: &str) -> String {
 /// Replace `Named` nodes whose *short name* keys `map` with the alias body
 /// (namespace-independent). Used for the alias-references-alias fixpoint, where
 /// no real-class guard is needed (the map only holds alias names).
-fn expand_global_alias(
-    ty: &Type,
-    map: &HashMap<String, Type>,
-    exclude: &str,
-) -> Type {
+fn expand_global_alias(ty: &Type, map: &HashMap<String, Type>, exclude: &str) -> Type {
     ty.clone().map(&mut |part| match part {
         Type::Named { fqn, args } if args.is_empty() => {
             let full = fqn.trim_start_matches('\\').to_ascii_lowercase();
@@ -1494,7 +1494,9 @@ mod tests {
         let mut defs = std::collections::HashMap::new();
         defs.insert("UserId".to_string(), "int".to_string());
         idx.apply_global_type_aliases(&defs);
-        let m = idx.class("App\\Repo").unwrap().methods[0].return_type.clone();
+        let m = idx.class("App\\Repo").unwrap().methods[0]
+            .return_type
+            .clone();
         assert_eq!(m, Type::Int);
         let p = idx.function("App\\take").unwrap().params[0].ty.clone();
         assert_eq!(p, Type::Int);
@@ -1515,7 +1517,9 @@ mod tests {
         let mut defs = std::collections::HashMap::new();
         defs.insert("UserId".to_string(), "int".to_string());
         idx.apply_global_type_aliases(&defs);
-        let m = idx.class("App\\Repo").unwrap().methods[0].return_type.clone();
+        let m = idx.class("App\\Repo").unwrap().methods[0]
+            .return_type
+            .clone();
         assert_eq!(m, named("App\\UserId"));
     }
 

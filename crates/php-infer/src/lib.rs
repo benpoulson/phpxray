@@ -302,7 +302,10 @@ impl<'a> TypeCtx<'a> {
             return self
                 .class
                 .clone()
-                .map(|fqn| Type::Named { fqn: fqn.into(), args: vec![] })
+                .map(|fqn| Type::Named {
+                    fqn: fqn.into(),
+                    args: vec![],
+                })
                 .unwrap_or(Type::Mixed);
         }
         self.vars.get(name).cloned().unwrap_or(Type::Mixed)
@@ -574,15 +577,14 @@ impl<'a> TypeCtx<'a> {
             // without the preserve-keys flag).
             "array_chunk" if args.len() == 2 => {
                 let v = self.array_value_type(args.first()?)?;
-                Some(Type::List(Box::new(Type::non_empty(Type::List(
-                    Box::new(v),
-                )))))
+                Some(Type::List(Box::new(Type::non_empty(Type::List(Box::new(
+                    v,
+                ))))))
             }
             // `range($a, $b)` always yields at least one element.
             "range" => {
-                let int_ish = |t: &Type| {
-                    matches!(t, Type::Int | Type::LiteralInt(_) | Type::IntRange { .. })
-                };
+                let int_ish =
+                    |t: &Type| matches!(t, Type::Int | Type::LiteralInt(_) | Type::IntRange { .. });
                 let a = self.infer(&args.first()?.value);
                 let b = self.infer(&args.get(1)?.value);
                 let elem = if int_ish(&a) && int_ish(&b) && args.len() == 2 {
@@ -884,7 +886,11 @@ impl<'a> TypeCtx<'a> {
     /// unchanged. Falls back to the bare class when nothing binds — a pure
     /// precision add, never a regression.
     fn instantiate_generic(&self, base: Type, args: &[Arg]) -> Type {
-        let Type::Named { fqn, args: existing } = &base else {
+        let Type::Named {
+            fqn,
+            args: existing,
+        } = &base
+        else {
             return base;
         };
         if !existing.is_empty() {
@@ -1603,7 +1609,10 @@ impl<'a> TypeCtx<'a> {
     fn class_type(&self, e: &Expr) -> Option<Type> {
         match &e.kind {
             ExprKind::Name(n) => Some(match self.scope.resolve_class(n) {
-                Resolution::Fqn(fqn) => Type::Named { fqn: fqn.into(), args: vec![] },
+                Resolution::Fqn(fqn) => Type::Named {
+                    fqn: fqn.into(),
+                    args: vec![],
+                },
                 Resolution::LateStatic(s) => match s.as_str() {
                     "self" => self.self_type()?,
                     "static" => Type::StaticType,
@@ -1619,9 +1628,10 @@ impl<'a> TypeCtx<'a> {
     }
 
     fn self_type(&self) -> Option<Type> {
-        self.class
-            .clone()
-            .map(|fqn| Type::Named { fqn: fqn.into(), args: vec![] })
+        self.class.clone().map(|fqn| Type::Named {
+            fqn: fqn.into(),
+            args: vec![],
+        })
     }
 
     fn parent_type(&self) -> Option<Type> {
@@ -1640,9 +1650,7 @@ impl<'a> TypeCtx<'a> {
             },
             // The `self<...>`/`static<...>` sentinels (from `@phpstan-self-out`)
             // keep their generic args, binding the base to the receiver class.
-            Type::Named { fqn, args }
-                if !args.is_empty() && matches!(&*fqn, "self" | "static") =>
-            {
+            Type::Named { fqn, args } if !args.is_empty() && matches!(&*fqn, "self" | "static") => {
                 Type::Named {
                     fqn: bound.into(),
                     args,
@@ -1761,7 +1769,9 @@ impl<'a> TypeCtx<'a> {
                     _ => return None,
                 };
                 match (lit(0), times) {
-                    (Some(s), Some(n)) if n >= 0 && s.len().saturating_mul(n as usize) <= FOLD_CAP => {
+                    (Some(s), Some(n))
+                        if n >= 0 && s.len().saturating_mul(n as usize) <= FOLD_CAP =>
+                    {
                         Type::LiteralString(s.repeat(n as usize).into())
                     }
                     _ if arg_non_empty(0) => non_empty_string(),
@@ -1807,8 +1817,11 @@ impl<'a> TypeCtx<'a> {
                         // Failure also yields `false` — plain bool covers it.
                         return Some(Type::Bool);
                     }
-                    "FILTER_VALIDATE_EMAIL" | "FILTER_VALIDATE_URL" | "FILTER_VALIDATE_IP"
-                    | "FILTER_VALIDATE_DOMAIN" | "FILTER_VALIDATE_MAC" => Type::String,
+                    "FILTER_VALIDATE_EMAIL"
+                    | "FILTER_VALIDATE_URL"
+                    | "FILTER_VALIDATE_IP"
+                    | "FILTER_VALIDATE_DOMAIN"
+                    | "FILTER_VALIDATE_MAC" => Type::String,
                     _ => return None,
                 };
                 Type::union(vec![success, Type::False])
@@ -2342,7 +2355,9 @@ fn magic_constant(name: &str) -> Option<Type> {
 fn apply_sign(neg: bool, t: Type) -> Type {
     match t {
         Type::LiteralInt(n) => Type::LiteralInt(if neg { n.wrapping_neg() } else { n }),
-        Type::Union(parts) => Type::union(parts.iter().map(|p| apply_sign(neg, p.clone())).collect()),
+        Type::Union(parts) => {
+            Type::union(parts.iter().map(|p| apply_sign(neg, p.clone())).collect())
+        }
         other => numeric_unary(other),
     }
 }
@@ -2671,7 +2686,7 @@ mod tests {
         assert_eq!(infer("42;"), "42"); // literal-int type
         assert_eq!(infer("1.5;"), "float");
         assert_eq!(infer("'hi';"), "'hi'"); // literal-string type
-        // Interpolation with a non-empty literal run is non-empty.
+                                            // Interpolation with a non-empty literal run is non-empty.
         assert_eq!(infer("\"a$b\";"), "non-empty-string");
         assert_eq!(infer("true;"), "true");
         assert_eq!(infer("false;"), "false");
@@ -2798,10 +2813,7 @@ mod tests {
         assert_eq!(infer("date($fmt);"), "string"); // unknown format — stub type
         assert_eq!(infer("dirname($p);"), "non-empty-string");
         assert_eq!(infer("gettype($x);"), "non-empty-string");
-        assert_eq!(
-            infer("filter_var($x, FILTER_VALIDATE_INT);"),
-            "int|false"
-        );
+        assert_eq!(infer("filter_var($x, FILTER_VALIDATE_INT);"), "int|false");
         assert_eq!(
             infer("filter_var($x, FILTER_VALIDATE_EMAIL);"),
             "string|false"
@@ -2812,7 +2824,10 @@ mod tests {
             "non-empty-list<string>|false"
         );
         let url = infer("parse_url($u);");
-        assert!(url.contains("host?: string") && url.ends_with("|false"), "{url}");
+        assert!(
+            url.contains("host?: string") && url.ends_with("|false"),
+            "{url}"
+        );
         let pi = infer("pathinfo($p);");
         assert!(
             pi.contains("basename: string") && pi.contains("extension?: string"),
@@ -2823,20 +2838,23 @@ mod tests {
 
     #[test]
     fn array_builtin_returns() {
-        let vars = &[(
-            "list",
-            Type::List(Box::new(Type::String)),
-        ), (
-            "map",
-            Type::Array(Some(Box::new((Type::String, Type::Int)))),
-        )][..];
+        let vars = &[
+            ("list", Type::List(Box::new(Type::String))),
+            (
+                "map",
+                Type::Array(Some(Box::new((Type::String, Type::Int)))),
+            ),
+        ][..];
         let probe = |src: &str| infer_with(src, vars, None);
         assert_eq!(probe("array_merge($list, $list);"), "list<string>");
         assert_eq!(
             probe("array_merge($list, $map);"),
             "array<string|int, string|int>"
         );
-        assert_eq!(probe("array_combine($list, $list);"), "array<string, string>");
+        assert_eq!(
+            probe("array_combine($list, $list);"),
+            "array<string, string>"
+        );
         assert_eq!(probe("array_fill(0, 3, 'x');"), "non-empty-array<int, 'x'>");
         assert_eq!(probe("array_fill_keys($list, 1);"), "array<string, 1>");
         assert_eq!(probe("array_flip($map);"), "array<int, string>");
@@ -2847,10 +2865,7 @@ mod tests {
         );
         assert_eq!(probe("range(1, 10);"), "non-empty-list<int>");
         assert_eq!(probe("range(0.5, 2.5);"), "non-empty-list<float>");
-        assert_eq!(
-            probe("iterator_to_array($map, false);"),
-            "list<int>"
-        );
+        assert_eq!(probe("iterator_to_array($map, false);"), "list<int>");
     }
 
     #[test]
@@ -2988,7 +3003,13 @@ mod tests {
         assert_eq!(
             infer_with(
                 &format!("{src} $r->find();"),
-                &[("r", Type::Named { fqn: "UserRepository".into(), args: vec![] })],
+                &[(
+                    "r",
+                    Type::Named {
+                        fqn: "UserRepository".into(),
+                        args: vec![]
+                    }
+                )],
                 None,
             ),
             "User|null"

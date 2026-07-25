@@ -36,10 +36,10 @@ use crate::{
     analyze_one_file, discover_inputs, rel_path, AnalysisContext, Finding, ParsedFile, Report,
 };
 use php_config::Config;
+use php_index::ProjectIndex;
 use php_reflect::{reflect_artifact, FileReflectionArtifact, ReflectionIndex};
 use php_resolve::depsrec::{self, RecordedDeps};
 use php_resolve::{index_file, FileIndex};
-use php_index::ProjectIndex;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -620,8 +620,8 @@ impl Session {
             let canonical = abs.canonicalize().unwrap_or_else(|_| abs.clone());
             let rel = rel_path(&canonical, root);
             let entry = self.files.get(&rel)?; // unknown path → full walk
-            // Read bytes + lossy-decode (non-UTF-8 PHP is legal); a genuine I/O
-            // error → `None` → full walk.
+                                               // Read bytes + lossy-decode (non-UTF-8 PHP is legal); a genuine I/O
+                                               // error → `None` → full walk.
             let source = std::fs::read(&canonical)
                 .ok()
                 .map(|b| String::from_utf8_lossy(&b).into_owned())?;
@@ -715,7 +715,10 @@ fn diff_inferred(
         }
     }
     for (class_fqn, method) in new.methods.keys() {
-        if !old.methods.contains_key(&(class_fqn.clone(), method.clone())) {
+        if !old
+            .methods
+            .contains_key(&(class_fqn.clone(), method.clone()))
+        {
             changed_surface.insert(depsrec::symbol_hash(class_fqn));
         }
     }
