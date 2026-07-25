@@ -26,67 +26,12 @@
 //!   not modelled here.
 
 use crate::{FileAnalysis, RuleEntry};
-use php_ast::{ClassDecl, ClassKind, Member, Stmt, StmtKind, Visibility};
+use php_ast::{ClassKind, Member, Visibility};
 use php_diagnostics::Diagnostic;
 use php_reflect::{ConstReflection, ReflectionIndex};
-use php_resolve::{for_each_region, Scope};
+
 use std::collections::{HashMap, HashSet};
 
-/// Visit each class-like declaration with its enclosing namespace [`Scope`],
-/// descending into nested/conditional blocks (so a class declared inside an
-/// `if`/`try`/loop is still seen). Mirrors `classes.rs::for_each_class`.
-fn for_each_class(
-    program: &php_ast::Program,
-    interner: &php_intern::Interner,
-    mut f: impl FnMut(&Scope, &ClassDecl),
-) {
-    fn visit(scope: &Scope, st: &Stmt, f: &mut impl FnMut(&Scope, &ClassDecl)) {
-        match &st.kind {
-            StmtKind::Class(c) => f(scope, c),
-            StmtKind::Block(b) => b.iter().for_each(|s| visit(scope, s, f)),
-            StmtKind::If {
-                then, elseifs, els, ..
-            } => {
-                visit(scope, then, f);
-                for e in elseifs {
-                    visit(scope, &e.body, f);
-                }
-                if let Some(e) = els {
-                    visit(scope, e, f);
-                }
-            }
-            StmtKind::While { body, .. }
-            | StmtKind::DoWhile { body, .. }
-            | StmtKind::For { body, .. }
-            | StmtKind::Foreach { body, .. } => visit(scope, body, f),
-            StmtKind::Try {
-                body,
-                catches,
-                finally,
-            } => {
-                body.iter().for_each(|s| visit(scope, s, f));
-                for c in catches {
-                    c.body.iter().for_each(|s| visit(scope, s, f));
-                }
-                if let Some(fin) = finally {
-                    fin.iter().for_each(|s| visit(scope, s, f));
-                }
-            }
-            StmtKind::Switch { cases, .. } => {
-                for c in cases {
-                    c.body.iter().for_each(|s| visit(scope, s, f));
-                }
-            }
-            StmtKind::Declare { body: Some(b), .. } => visit(scope, b, f),
-            _ => {}
-        }
-    }
-    for_each_region(&program.stmts, interner, |scope, region| {
-        for st in region {
-            visit(scope, st, &mut f);
-        }
-    });
-}
 
 // ---------------------------------------------------------------------------
 // TraitAttributesRule — `#[AllowDynamicProperties]` on a trait
@@ -99,7 +44,7 @@ fn run_constants_in_traits(fa: &FileAnalysis) -> Vec<Diagnostic> {
         return Vec::new();
     }
     let mut out = Vec::new();
-    for_each_class(fa.program, fa.interner, |_scope, c| {
+    crate::decls::for_each_class_like(fa, |_scope, _fqn, c| {
         if c.kind != ClassKind::Trait {
             return;
         }
@@ -121,7 +66,7 @@ fn run_constants_in_traits(fa: &FileAnalysis) -> Vec<Diagnostic> {
 
 fn run_trait_attributes(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    for_each_class(fa.program, fa.interner, |_scope, c| {
+    crate::decls::for_each_class_like(fa, |_scope, _fqn, c| {
         if c.kind != ClassKind::Trait {
             return;
         }
@@ -189,7 +134,7 @@ fn recursive_trait_constants<'a>(
 
 fn run_conflicting_trait_constants(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    for_each_class(fa.program, fa.interner, |scope, c| {
+    crate::decls::for_each_class_like(fa, |scope, _fqn, c| {
         // Only a class/enum can `use` traits and declare overriding constants; we
         // need the declaring class's own FQN to address it.
         let Some(name_sym) = c.name else { return };
@@ -294,7 +239,7 @@ fn run_not_analysed_trait(fa: &FileAnalysis) -> Vec<Diagnostic> {
     // incremental analysis re-runs on any surface change — only pay it (and
     // record it) for files that actually declare traits.
     let mut own_traits: Vec<(String, php_span::Span)> = Vec::new();
-    for_each_class(fa.program, fa.interner, |scope, c| {
+    crate::decls::for_each_class_like(fa, |scope, _fqn, c| {
         if c.kind != ClassKind::Trait {
             return;
         }
@@ -494,5 +439,20 @@ mod tests {
             codes(src, run_conflicting_trait_constants),
             ["classConstant.final"]
         );
+    }
+}
+
+#[cfg(test)]
+mod local_class_tests {
+    use crate::testutil::codes;
+
+    /// Regression: `traits.rs` hand-rolled its own class visitor that did not
+    /// descend into function bodies, so a trait (or class) declared inside a
+    /// function was invisible to every rule in this file — a silent false
+    /// negative. The canonical `decls::for_each_class_like` descends correctly.
+    #[test]
+    fn traits_declared_inside_a_function_are_analysed() {
+        let src = "<?php function make() { trait LocalT { public function t(): void {} } }";
+        assert_eq!(codes(src, super::run_not_analysed_trait), ["trait.unused"]);
     }
 }

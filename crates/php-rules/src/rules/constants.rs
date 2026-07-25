@@ -61,62 +61,6 @@ use php_types::Type;
 // (Mirrors classes.rs::for_each_class; kept local since that one is private.)
 // ---------------------------------------------------------------------------
 
-fn for_each_class(
-    program: &php_ast::Program,
-    interner: &Interner,
-    mut f: impl FnMut(&Scope, &ClassDecl),
-) {
-    fn visit(scope: &Scope, st: &Stmt, f: &mut impl FnMut(&Scope, &ClassDecl)) {
-        match &st.kind {
-            StmtKind::Class(c) => {
-                f(scope, c);
-                // Nested anonymous classes live inside member bodies; those are
-                // reached by the per-class member walks where needed, not here.
-            }
-            StmtKind::Block(b) => b.iter().for_each(|s| visit(scope, s, f)),
-            StmtKind::If {
-                then, elseifs, els, ..
-            } => {
-                visit(scope, then, f);
-                for e in elseifs {
-                    visit(scope, &e.body, f);
-                }
-                if let Some(e) = els {
-                    visit(scope, e, f);
-                }
-            }
-            StmtKind::While { body, .. }
-            | StmtKind::DoWhile { body, .. }
-            | StmtKind::For { body, .. }
-            | StmtKind::Foreach { body, .. } => visit(scope, body, f),
-            StmtKind::Try {
-                body,
-                catches,
-                finally,
-            } => {
-                body.iter().for_each(|s| visit(scope, s, f));
-                for c in catches {
-                    c.body.iter().for_each(|s| visit(scope, s, f));
-                }
-                if let Some(fin) = finally {
-                    fin.iter().for_each(|s| visit(scope, s, f));
-                }
-            }
-            StmtKind::Switch { cases, .. } => {
-                for c in cases {
-                    c.body.iter().for_each(|s| visit(scope, s, f));
-                }
-            }
-            StmtKind::Declare { body: Some(b), .. } => visit(scope, b, f),
-            _ => {}
-        }
-    }
-    for_each_region(&program.stmts, interner, |scope, region| {
-        for st in region {
-            visit(scope, st, &mut f);
-        }
-    });
-}
 
 /// The display label phpstan uses (`false` = without generics): a class's name.
 fn class_display(c: &ClassDecl, scope: &Scope, interner: &Interner) -> String {
@@ -133,7 +77,7 @@ fn class_display(c: &ClassDecl, scope: &Scope, interner: &Interner) -> String {
 /// A class constant must not be named `class` (`Foo::class` is reserved).
 fn run_class_as_class_constant(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    for_each_class(fa.program, fa.interner, |_scope, c| {
+    crate::decls::for_each_class_like(fa, |_scope, _fqn, c| {
         for m in &c.members {
             let Member::ClassConst(cd) = m else { continue };
             for ce in &cd.consts {
@@ -163,7 +107,7 @@ fn run_final_constant_version(fa: &FileAnalysis) -> Vec<Diagnostic> {
         return Vec::new();
     }
     let mut out = Vec::new();
-    for_each_class(fa.program, fa.interner, |_scope, c| {
+    crate::decls::for_each_class_like(fa, |_scope, _fqn, c| {
         for m in &c.members {
             let Member::ClassConst(cd) = m else { continue };
             if cd.modifiers.is_final {
@@ -189,7 +133,7 @@ fn run_native_typed_constant_version(fa: &FileAnalysis) -> Vec<Diagnostic> {
         return Vec::new();
     }
     let mut out = Vec::new();
-    for_each_class(fa.program, fa.interner, |_scope, c| {
+    crate::decls::for_each_class_like(fa, |_scope, _fqn, c| {
         for m in &c.members {
             let Member::ClassConst(cd) = m else { continue };
             if cd.ty.is_some() {
@@ -241,7 +185,7 @@ fn run_constant_attributes_version(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// untyped constant infers its value type from the literal, so it's never bare.
 fn run_missing_const_iterable_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    for_each_class(fa.program, fa.interner, |scope, c| {
+    crate::decls::for_each_class_like(fa, |scope, _fqn, c| {
         let Some(nm) = c.name else { return };
         let fqn = scope.qualify(fa.interner.resolve(nm));
         if !fa.class_fully_known(&fqn) {
@@ -298,7 +242,7 @@ fn run_missing_const_iterable_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
 /// constants are never inherited and so can never be overridden.
 fn run_final_private_constant(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    for_each_class(fa.program, fa.interner, |scope, c| {
+    crate::decls::for_each_class_like(fa, |scope, _fqn, c| {
         let display = class_display(c, scope, fa.interner);
         for m in &c.members {
             let Member::ClassConst(cd) = m else { continue };
@@ -743,7 +687,7 @@ fn check_magic(n: &Name, ctx: MagicCtx, out: &mut Vec<Diagnostic>) {
 /// and cannot narrow visibility below the overridden one.
 fn run_overriding_constant(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    for_each_class(fa.program, fa.interner, |scope, c| {
+    crate::decls::for_each_class_like(fa, |scope, _fqn, c| {
         let Some(_) = c.name else { return };
         let fqn = class_display(c, scope, fa.interner);
         // Only reason about a class whose whole hierarchy is reflected: an
@@ -971,7 +915,7 @@ fn literal_value_type(e: &Expr) -> php_types::Type {
 
 fn run_value_assigned_to_class_constant(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    for_each_class(fa.program, fa.interner, |scope, c| {
+    crate::decls::for_each_class_like(fa, |scope, _fqn, c| {
         let Some(_) = c.name else { return };
         let fqn = class_display(c, scope, fa.interner);
         let display = fqn.trim_start_matches('\\');
