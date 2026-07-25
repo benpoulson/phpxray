@@ -15,6 +15,83 @@ use serde::Deserialize;
 use std::fmt;
 use std::str::FromStr;
 
+/// Every top-level key [`Config`] accepts, in the spelling used in YAML.
+///
+/// Unknown keys stay **non-fatal** (forward compatibility is a settled
+/// decision), so this list exists only to *warn* about them — a silent no-op for
+/// a typo like `inferUntypedSignature` is a bad experience. `Config` derives only
+/// `Deserialize`, so the set cannot be enumerated automatically; keep this in
+/// sync when adding a field. `known_keys_are_all_accepted` guards against a
+/// stale entry.
+pub const KNOWN_KEYS: &[&str] = &[
+    "baseline",
+    "checkExplicitMixed",
+    "checkImplicitMixed",
+    "checkTooWideReturnTypesInProtectedAndPublicMethods",
+    "checkUninitializedProperties",
+    "earlyTerminatingFunctionCalls",
+    "earlyTerminatingMethodCalls",
+    "editorUrl",
+    "editorUrlTitle",
+    "exclude",
+    "excludePaths",
+    "extensions",
+    "ignore",
+    "inferUntypedSignatures",
+    "laravelAliases",
+    "level",
+    "paths",
+    "phpVersion",
+    "reportUnmatchedIgnored",
+    "resultCachePath",
+    "scanFiles",
+    "scanPaths",
+    "stubFiles",
+    "treatPhpDocTypesAsCertain",
+    "typeAliases",
+];
+
+/// Unknown top-level keys in `yaml`, each with a "did you mean" suggestion when a
+/// known key is within edit distance 2 (catching `inferUntypedSignature` for
+/// `inferUntypedSignatures`).
+///
+/// Returns `(key, suggestion)` pairs in file order.
+pub fn unknown_keys(yaml: &str) -> Vec<(String, Option<&'static str>)> {
+    let Ok(serde_yaml::Value::Mapping(map)) = serde_yaml::from_str::<serde_yaml::Value>(yaml)
+    else {
+        return Vec::new();
+    };
+    map.iter()
+        .filter_map(|(k, _)| k.as_str())
+        .filter(|k| !KNOWN_KEYS.contains(k))
+        .map(|k| {
+            let suggestion = KNOWN_KEYS
+                .iter()
+                .map(|c| (edit_distance(k, c), *c))
+                .filter(|(d, _)| *d <= 2)
+                .min_by_key(|(d, _)| *d)
+                .map(|(_, c)| c);
+            (k.to_string(), suggestion)
+        })
+        .collect()
+}
+
+/// Levenshtein distance, capped implicitly by the short inputs involved.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
 /// A resolved analyzer configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -703,5 +780,45 @@ ignore:
         assert!(m.is_excluded("generated/x.php"));
         assert!(!m.is_excluded("a/generated/sub/x.php"));
         assert!(!m.is_excluded("src/User.php"));
+    }
+}
+
+#[cfg(test)]
+mod unknown_key_tests {
+    use super::*;
+
+    /// A stale entry in [`KNOWN_KEYS`] would silently stop warning about a real
+    /// typo, so assert every listed key is actually accepted by `Config`.
+    #[test]
+    fn known_keys_are_all_accepted() {
+        for key in KNOWN_KEYS {
+            // A key `Config` does not know is reported by `unknown_keys`; a key
+            // it does know is not. That is exactly the property we need.
+            let yaml = format!("{key}: ~\n");
+            assert!(
+                unknown_keys(&yaml).is_empty(),
+                "KNOWN_KEYS lists {key:?} but unknown_keys() still flags it"
+            );
+        }
+    }
+
+    #[test]
+    fn flags_unknown_keys_with_a_suggestion() {
+        let found = unknown_keys("level: 5\ninferUntypedSignature: false\n");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, "inferUntypedSignature");
+        assert_eq!(found[0].1, Some("inferUntypedSignatures"));
+    }
+
+    #[test]
+    fn known_keys_produce_no_warning() {
+        assert!(unknown_keys("level: max\npaths:\n  - src\nlaravelAliases: true\n").is_empty());
+    }
+
+    #[test]
+    fn a_wildly_wrong_key_gets_no_suggestion() {
+        let found = unknown_keys("completelyUnrelated: 1\n");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, None);
     }
 }

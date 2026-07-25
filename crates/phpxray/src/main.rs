@@ -444,10 +444,25 @@ struct ConfigResolution {
 }
 
 fn load_config(path: impl AsRef<Path>) -> Result<Config, ExitCode> {
-    Config::load(path).map_err(|e| {
+    let path = path.as_ref();
+    let config = Config::load(path).map_err(|e| {
         eprintln!("error: {e}");
         ExitCode::from(2)
-    })
+    })?;
+    // Unknown keys stay non-fatal (forward compatibility), but a silent no-op
+    // for a typo is a bad experience — warn, with a did-you-mean.
+    if let Ok(text) = std::fs::read_to_string(path) {
+        for (key, suggestion) in php_config::unknown_keys(&text) {
+            match suggestion {
+                Some(known) => eprintln!(
+                    "warning: unknown config key `{key}` in {} — did you mean `{known}`?",
+                    path.display()
+                ),
+                None => eprintln!("warning: unknown config key `{key}` in {}", path.display()),
+            }
+        }
+    }
+    Ok(config)
 }
 
 fn target_config_root(cli: &Cli, cwd: &Path) -> Option<PathBuf> {
