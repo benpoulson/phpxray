@@ -2763,20 +2763,11 @@ fn walk_expr_local(e: &Expr, on_expr: &mut impl FnMut(&Expr)) {
 /// Does `class_fqn` (or its hierarchy) declare a magic `__get`/`__set` that would
 /// make any property access legal? If so we never flag undefined properties.
 fn has_magic_accessor(fqn: &str, fa: &FileAnalysis, write: bool) -> bool {
-    if is_dynamic_property_class(fqn) {
+    if members::allows_dynamic_properties(fqn) {
         return true;
     }
     let getset = if write { "__set" } else { "__get" };
     fa.reflection.find_method(fqn, getset).is_some()
-}
-
-/// A class that legally accepts *any* property, so undefined-property access must
-/// never be reported. `stdClass` is the canonical case — objects from
-/// `json_decode()`, `(object) [...]` casts, and DB row fetches are `stdClass` and
-/// idiomatically carry dynamic properties (phpstan never flags these).
-fn is_dynamic_property_class(fqn: &str) -> bool {
-    fqn.trim_start_matches('\\')
-        .eq_ignore_ascii_case("stdClass")
 }
 
 // --- AccessPropertiesRule (level 0, general receiver) ----------------------
@@ -3075,7 +3066,7 @@ fn check_property_access(
     let Some(class) = members::sole_class(&base_ty) else {
         return;
     };
-    if is_dynamic_property_class(&class) {
+    if members::allows_dynamic_properties(&class) {
         return;
     }
     if matches!(

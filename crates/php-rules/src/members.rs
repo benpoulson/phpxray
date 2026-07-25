@@ -228,6 +228,15 @@ impl<'a> MemberAccessResolver<'a> {
         {
             return ResolveStatus::Skipped;
         }
+        // A class that legally carries *dynamic* properties can never have an
+        // "undefined" one. `properties.rs` has always exempted these; this
+        // resolver did not, so the two member-resolution stacks disagreed about
+        // the §8p false-positive posture. Today `stdClass` happens to escape via
+        // the fully-known guard (it is absent from the class manifest), which
+        // makes the correct behaviour accidental rather than intended.
+        if allows_dynamic_properties(&receiver_fqn) {
+            return ResolveStatus::Skipped;
+        }
         ResolveStatus::Unknown
     }
 
@@ -302,6 +311,16 @@ const MAGIC_METHODS: &[&str] = &[
     "__debuginfo",
 ];
 
+/// Classes whose instances legally carry properties that are never declared, so
+/// an "undefined property" report on them is always a false positive.
+///
+/// `stdClass` is the canonical case: `json_decode()`, `(object) [...]` casts and
+/// database row fetches all produce one.
+pub(crate) fn allows_dynamic_properties(fqn: &str) -> bool {
+    fqn.trim_start_matches('\\')
+        .eq_ignore_ascii_case("stdClass")
+}
+
 pub(crate) fn sole_class(ty: &Type) -> Option<String> {
     match ty {
         Type::Named { fqn, .. } | Type::EnumCase { fqn, .. } => {
@@ -314,4 +333,56 @@ pub(crate) fn sole_class(ty: &Type) -> Option<String> {
 
 pub(crate) fn primary_name(r: &ResolvedRef) -> String {
     r.name.trim_start_matches('\\').to_string()
+}
+
+#[cfg(test)]
+mod resolver_tests {
+    use super::{MemberAccessResolver, ResolveStatus};
+    use crate::testutil::with_analysis;
+    use php_types::Type;
+
+    fn status(src: &str, class: &str, prop: &str) -> &'static str {
+        with_analysis(
+            src,
+            Default::default(),
+            |_| {},
+            |fa| {
+                let ty = Type::Named {
+                    fqn: class.into(),
+                    args: vec![],
+                };
+                match MemberAccessResolver::new(fa).instance_property(&ty, prop, false) {
+                    ResolveStatus::Known(_) => "known",
+                    ResolveStatus::Unknown => "unknown",
+                    ResolveStatus::Skipped => "skipped",
+                    ResolveStatus::Opaque => "opaque",
+                }
+            },
+        )
+    }
+
+    /// The two member-resolution stacks must agree on the §8p false-positive
+    /// posture. `properties.rs` always exempted dynamic-property classes; this
+    /// shared resolver did not, so a consumer reporting on `Unknown` (e.g. the
+    /// callback-context pass) could flag `$std->anything`.
+    ///
+    /// Today `stdClass` also escapes via the fully-known guard, because it is
+    /// absent from the builtin class manifest — declaring it here removes that
+    /// accident and tests the exemption itself.
+    #[test]
+    fn dynamic_property_classes_are_never_unknown() {
+        let src = "<?php class Bare {} class stdClass {}";
+        // A plain class with no such property stays reportable.
+        assert_eq!(status(src, "Bare", "anything"), "unknown");
+        // A dynamic-property class never is.
+        assert_eq!(status(src, "stdClass", "anything"), "skipped");
+        assert_eq!(status(src, "\\stdClass", "anything"), "skipped");
+    }
+
+    #[test]
+    fn declared_properties_still_resolve() {
+        let src = "<?php class C { public int $p = 1; }";
+        assert_eq!(status(src, "C", "p"), "known");
+        assert_eq!(status(src, "C", "nope"), "unknown");
+    }
 }
