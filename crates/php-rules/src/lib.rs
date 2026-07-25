@@ -17,6 +17,7 @@ pub(crate) mod fix;
 pub(crate) mod function_like;
 pub(crate) mod members;
 pub(crate) mod missing_type;
+pub(crate) mod param_out;
 mod registry;
 mod return_type;
 mod rules;

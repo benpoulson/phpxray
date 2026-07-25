@@ -42,6 +42,7 @@
 //! - `TooWidePropertyHookParameterType*` — needs hook-specific param-out tracking.
 
 use crate::members;
+use crate::param_out;
 use crate::{symbols, walk, FileAnalysis, RuleEntry};
 use php_ast::{
     ArrowFn, ClassDecl, ClosureExpr, Expr, ExprKind, FunctionDecl, HookBody, Member, MemberName,
@@ -50,10 +51,9 @@ use php_ast::{
 };
 use php_diagnostics::Diagnostic;
 use php_infer::TypeCtx;
-use php_reflect::{resolve_ast_type, resolve_doc_type, ParamReflection};
+use php_reflect::{resolve_ast_type, ParamReflection};
 use php_resolve::{for_each_region, Resolution, Scope};
 use php_types::Type;
-use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Shared return-type engine
@@ -1145,12 +1145,6 @@ fn static_class_may_be_current(class: &Expr, class_fqn: &str, ctx: &TypeCtx<'_>)
 // TooWideFunction/MethodParameterOutTypeRule — explicit @param-out subset
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
-struct ParamOutType {
-    name: String,
-    ty: Type,
-}
-
 fn run_function_parameter_out_type(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
@@ -1224,7 +1218,7 @@ fn check_function_param_out(
     out: &mut Vec<Diagnostic>,
 ) {
     let refl = fa.reflect_function(scope, f);
-    let templates = doc_templates(f.doc.as_deref());
+    let templates = param_out::doc_templates(f.doc.as_deref());
     let desc = format!("Function {}()", refl.fqn);
     check_param_out_too_wide_body(
         scope,
@@ -1297,7 +1291,7 @@ fn check_class_param_out_methods(
     };
     let class_fqn = scope.qualify(fa.interner.resolve(class_name));
     let class_refl = fa.reflect_class(scope, &class_fqn, c);
-    let class_templates = doc_templates(c.doc.as_deref());
+    let class_templates = param_out::doc_templates(c.doc.as_deref());
     for member in &c.members {
         let Member::Method(md) = member else {
             continue;
@@ -1316,7 +1310,7 @@ fn check_class_param_out_methods(
         else {
             continue;
         };
-        let templates = combined_templates(&class_templates, md.doc.as_deref());
+        let templates = param_out::combined_templates(&class_templates, md.doc.as_deref());
         let desc = format!("Method {}::{}()", class_refl.fqn, method_refl.name);
         check_param_out_too_wide_body(
             scope,
@@ -1346,16 +1340,17 @@ fn check_param_out_too_wide_body(
     fa: &FileAnalysis,
     out: &mut Vec<Diagnostic>,
 ) {
-    let param_outs = param_out_types(scope, doc, templates);
+    let param_outs = param_out::param_out_types(scope, doc, templates);
     if param_outs.is_empty() {
         return;
     }
-    let Some(final_vars) = straight_line_final_vars(body, params, scope, class_fqn, fa) else {
+    let Some(final_vars) = param_out::straight_line_final_vars(body, params, scope, class_fqn, fa)
+    else {
         return;
     };
 
     for po in param_outs {
-        if type_is_uncertain(&po.ty) {
+        if param_out::type_is_uncertain(&po.ty) {
             continue;
         }
         let Some(param) = params
@@ -1367,7 +1362,7 @@ fn check_param_out_too_wide_body(
         let Some(final_ty) = final_vars.get(&po.name) else {
             continue;
         };
-        if type_is_uncertain(final_ty) {
+        if param_out::type_is_uncertain(final_ty) {
             continue;
         }
         out.extend(param_out_unused_type_errors(
@@ -1375,7 +1370,7 @@ fn check_param_out_too_wide_body(
             final_ty,
             function_description,
             &param.name,
-            param_decl_span(ast_params, &param.name, fa.interner)
+            param_out::param_decl_span(ast_params, &param.name, fa.interner)
                 .unwrap_or_else(|| body.first().map_or(php_span::Span::at(0), |s| s.span)),
             fa,
         ));
@@ -1392,7 +1387,7 @@ fn param_out_unused_type_errors(
 ) -> Vec<Diagnostic> {
     let mut atoms = Vec::new();
     flatten_type_atoms(actual, &mut atoms);
-    if atoms.is_empty() || atoms.iter().any(type_is_uncertain) {
+    if atoms.is_empty() || atoms.iter().any(param_out::type_is_uncertain) {
         return Vec::new();
     }
 
@@ -1436,209 +1431,13 @@ fn param_out_unused_type_errors(
                 span,
                 format!(
                     "{function_description} never assigns {} to &${param_name} so it can be removed from the @param-out type.",
-                    phpstan_type(&member),
+                    param_out::phpstan_type(&member),
                 ),
             )
             .with_code("paramOut.unusedType"),
         );
     }
     out
-}
-
-fn param_out_types(scope: &Scope, doc: Option<&str>, templates: &[String]) -> Vec<ParamOutType> {
-    let Some(raw) = doc else {
-        return Vec::new();
-    };
-    let mut out: Vec<(i8, ParamOutType)> = Vec::new();
-    for tag in php_phpdoc::parse_block(raw).tags {
-        let (base, pri) = doc_tag_base_priority(&tag.name);
-        if base != "param-out" || pri == 1 {
-            continue;
-        }
-        let parsed = php_phpdoc::parse(&format!("/** @param {} */", tag.value));
-        let Some(param) = parsed.params.first() else {
-            continue;
-        };
-        let (Some(name), Some(doc_ty)) = (&param.name, &param.ty) else {
-            continue;
-        };
-        let ty = resolve_doc_type(scope, templates, doc_ty);
-        if let Some(existing) = out.iter_mut().find(|(_, p)| p.name == *name) {
-            if pri >= existing.0 {
-                *existing = (
-                    pri,
-                    ParamOutType {
-                        name: name.clone(),
-                        ty,
-                    },
-                );
-            }
-        } else {
-            out.push((
-                pri,
-                ParamOutType {
-                    name: name.clone(),
-                    ty,
-                },
-            ));
-        }
-    }
-    out.into_iter().map(|(_, p)| p).collect()
-}
-
-fn doc_templates(doc: Option<&str>) -> Vec<String> {
-    doc.map(php_phpdoc::parse)
-        .unwrap_or_default()
-        .templates
-        .into_iter()
-        .map(|t| t.name)
-        .collect()
-}
-
-fn combined_templates(class_templates: &[String], method_doc: Option<&str>) -> Vec<String> {
-    let mut templates = class_templates.to_vec();
-    templates.extend(doc_templates(method_doc));
-    templates
-}
-
-fn doc_tag_base_priority(name: &str) -> (&str, i8) {
-    if let Some(rest) = name.strip_prefix("phpstan-") {
-        (rest, 2)
-    } else if let Some(rest) = name.strip_prefix("psalm-") {
-        (rest, 1)
-    } else {
-        (name, 0)
-    }
-}
-
-fn straight_line_final_vars(
-    body: &[Stmt],
-    params: &[ParamReflection],
-    scope: &Scope,
-    class_fqn: Option<&str>,
-    fa: &FileAnalysis,
-) -> Option<HashMap<String, Type>> {
-    let mut ctx = TypeCtx::new(fa.reflection, scope, fa.interner);
-    ctx.class = class_fqn.map(ToString::to_string);
-    for p in params {
-        ctx.vars.insert(p.name.clone(), p.local_type());
-    }
-
-    for st in body {
-        match &st.kind {
-            StmtKind::Nop => {}
-            StmtKind::Expr(e) => {
-                let (name, rhs) = direct_variable_assignment(e, fa)?;
-                if !rhs_is_obvious(rhs) {
-                    return None;
-                }
-                let ty = ctx.infer(rhs);
-                ctx.vars.insert(name, ty);
-            }
-            _ => return None,
-        }
-    }
-
-    Some(ctx.vars)
-}
-
-fn direct_variable_assignment<'a>(e: &'a Expr, fa: &FileAnalysis) -> Option<(String, &'a Expr)> {
-    match &e.kind {
-        ExprKind::Paren(inner) => direct_variable_assignment(inner, fa),
-        ExprKind::Assign { target, rhs } => match &target.kind {
-            ExprKind::Variable(sym) => Some((fa.interner.resolve(*sym).to_string(), rhs)),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn rhs_is_obvious(e: &Expr) -> bool {
-    match &e.kind {
-        ExprKind::Paren(inner) => rhs_is_obvious(inner),
-        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Str(_) | ExprKind::Interpolated(_) => {
-            true
-        }
-        ExprKind::Variable(_) => true,
-        ExprKind::Name(n) => matches!(
-            n.text.to_ascii_lowercase().as_str(),
-            "true" | "false" | "null"
-        ),
-        ExprKind::Array { items, .. } => items.iter().all(|item| {
-            !item.by_ref
-                && !item.spread
-                && item.key.as_ref().is_none_or(rhs_is_obvious)
-                && item.value.as_ref().is_none_or(rhs_is_obvious)
-        }),
-        ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => rhs_is_obvious(expr),
-        ExprKind::Binary { lhs, rhs, .. } => rhs_is_obvious(lhs) && rhs_is_obvious(rhs),
-        _ => false,
-    }
-}
-
-fn type_is_uncertain(ty: &Type) -> bool {
-    match ty {
-        Type::Mixed
-        | Type::ExplicitMixed
-        | Type::Never
-        | Type::Void
-        | Type::SelfType
-        | Type::StaticType
-        | Type::Parent
-        | Type::TemplateVar(_)
-        | Type::Conditional { .. }
-        | Type::Unknown(_) => true,
-        Type::Nullable(inner)
-        | Type::List(inner)
-        | Type::ClassString(Some(inner))
-        | Type::NonEmpty(inner) => type_is_uncertain(inner),
-        Type::Union(parts) | Type::Intersection(parts) => parts.iter().any(type_is_uncertain),
-        Type::Array(Some(pair)) | Type::Iterable(Some(pair)) => {
-            type_is_uncertain(&pair.0) || type_is_uncertain(&pair.1)
-        }
-        Type::Shape { fields, .. } => fields.iter().any(|f| type_is_uncertain(&f.ty)),
-        Type::Callable(Some(sig)) => {
-            sig.params.iter().any(type_is_uncertain) || type_is_uncertain(&sig.ret)
-        }
-        Type::Named { args, .. } => args.iter().any(type_is_uncertain),
-        Type::Array(None)
-        | Type::Iterable(None)
-        | Type::Callable(None)
-        | Type::ClassString(None)
-        | Type::Null
-        | Type::Bool
-        | Type::True
-        | Type::False
-        | Type::Int
-        | Type::IntRange { .. }
-        | Type::Float
-        | Type::String
-        | Type::StringOf(_)
-        | Type::Object
-        | Type::Resource
-        | Type::LiteralInt(_)
-        | Type::LiteralString(_)
-        | Type::EnumCase { .. } => false,
-    }
-}
-
-fn phpstan_type(ty: &Type) -> String {
-    match ty {
-        Type::Nullable(inner) => format!("{}|null", phpstan_type(inner)),
-        Type::Union(parts) => parts.iter().map(phpstan_type).collect::<Vec<_>>().join("|"),
-        other => other.to_string(),
-    }
-}
-
-fn param_decl_span(
-    params: &[Param],
-    name: &str,
-    interner: &php_intern::Interner,
-) -> Option<php_span::Span> {
-    params
-        .iter()
-        .find(|p| interner.resolve(p.name) == name)
-        .map(|p| p.span)
 }
 
 // ---------------------------------------------------------------------------
