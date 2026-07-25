@@ -1,6 +1,6 @@
 //! phpstan category **Constants** — rule replication.
 //!
-//! Source: `phpstan-src/src/Rules/Constants/`. Checklist: docs/phpstan-rules.md.
+//! Source: `phpstan-src/src/Rules/Constants/`. The rule set's coverage truth is `cargo run -p xtask -- rule-manifest`.
 //! Each rule is a `RuleEntry` in `RULES`; diagnostics carry phpstan identifiers.
 //!
 //! Implemented:
@@ -60,7 +60,6 @@ use php_types::Type;
 // Shared: visit each class-like decl with the scope of its namespace region.
 // (Mirrors classes.rs::for_each_class; kept local since that one is private.)
 // ---------------------------------------------------------------------------
-
 
 /// The display label phpstan uses (`false` = without generics): a class's name.
 fn class_display(c: &ClassDecl, scope: &Scope, interner: &Interner) -> String {

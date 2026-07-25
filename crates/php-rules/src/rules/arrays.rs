@@ -1,7 +1,7 @@
 //! phpstan category **Arrays** — rule replication.
 //!
 //! Source: `phpstan-src/src/Rules/Arrays/` — 15 rule(s), most at level 0–2.
-//! Checklist: docs/phpstan-rules.md. Add each rule as a `RuleEntry` to `RULES`
+//! The rule set's coverage truth is `cargo run -p xtask -- rule-manifest`; for phpstan's behaviour read `phpstan-src/src/Rules/` directly. Add each rule as a `RuleEntry` to `RULES`
 //! (with a phpstan-style identifier on its diagnostics).
 //!
 //! Implemented (level 0, purely syntactic):

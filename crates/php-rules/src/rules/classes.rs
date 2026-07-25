@@ -1,7 +1,7 @@
 //! phpstan category **Classes** — rule replication.
 //!
 //! Source: `phpstan-src/src/Rules/Classes/` — 37 rule(s) at level(s) 0,1,2,4.
-//! Checklist: docs/phpstan-rules.md. Add each rule as a `RuleEntry` to `RULES`
+//! The rule set's coverage truth is `cargo run -p xtask -- rule-manifest`; for phpstan's behaviour read `phpstan-src/src/Rules/` directly. Add each rule as a `RuleEntry` to `RULES`
 //! (with a phpstan-style identifier on its diagnostics).
 //!
 //! Implemented here (all level 0 — structural / name-resolution only):
@@ -1312,7 +1312,7 @@ fn run_unused_constructor_params(fa: &FileAnalysis) -> Vec<Diagnostic> {
         let Some(cr) = fa.reflection.class(&class_fqn) else {
             return;
         };
-        if cr.attribute.is_some() || has_unknown_ancestor(fa, &class_fqn) {
+        if cr.attribute.is_some() || !fa.class_fully_known(&class_fqn) {
             return;
         }
         if implemented_interface_has_constructor(fa, &class_fqn) {
@@ -1753,7 +1753,7 @@ fn check_one_class_const(
     // Enum cases are constants too; phpstan models them via reflection. If the
     // class has a `__get`-less magic-const story we can't see, only flag when the
     // hierarchy is fully indexed (no unknown parents) — otherwise skip.
-    if has_unknown_ancestor(fa, &fqn) {
+    if !fa.class_fully_known(&fqn) {
         return;
     }
     let found = fa.reflection.find_constant(&fqn, const_name);
@@ -1812,40 +1812,6 @@ fn check_one_class_const(
             .with_code(code),
         );
     }
-}
-
-/// Whether `fqn`'s ancestor chain references a class the reflection index does
-/// not know — in which case a constant could be inherited from it and we must
-/// not claim it's undefined.
-fn has_unknown_ancestor(fa: &FileAnalysis, fqn: &str) -> bool {
-    fn walk(fa: &FileAnalysis, fqn: &str, seen: &mut Vec<String>) -> bool {
-        let key = fqn.trim_start_matches('\\').to_ascii_lowercase();
-        if seen.contains(&key) {
-            return false;
-        }
-        seen.push(key);
-        let Some(cr) = fa.reflection.class(fqn) else {
-            return true;
-        };
-        cr.parents
-            .iter()
-            .chain(&cr.interfaces)
-            .chain(&cr.traits)
-            .any(|p| match p {
-                Type::Named { fqn, .. } => walk(fa, fqn, seen),
-                _ => false,
-            })
-    }
-    let mut seen = Vec::new();
-    // The class itself is known (checked by the caller); test only its ancestors.
-    let Some(cr) = fa.reflection.class(fqn) else {
-        return true;
-    };
-    cr.parents
-        .iter()
-        .chain(&cr.interfaces)
-        .chain(&cr.traits)
-        .any(|p| matches!(p, Type::Named { fqn, .. } if walk(fa, fqn, &mut seen)))
 }
 
 /// Whether the enum at `fqn` declares a case named `name` (case-sensitive).
@@ -3002,7 +2968,7 @@ fn run_require_extends(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
         let Some(name) = c.name else { return };
         let class_fqn = scope.qualify(fa.interner.resolve(name));
-        if has_unknown_ancestor(fa, &class_fqn) {
+        if !fa.class_fully_known(&class_fqn) {
             return;
         }
         let class_display = display_fqn(&class_fqn);
@@ -3089,7 +3055,7 @@ fn run_require_implements(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
         let Some(name) = c.name else { return };
         let class_fqn = scope.qualify(fa.interner.resolve(name));
-        if has_unknown_ancestor(fa, &class_fqn) {
+        if !fa.class_fully_known(&class_fqn) {
             return;
         }
         let class_display = display_fqn(&class_fqn);
@@ -4363,6 +4329,34 @@ mod tests {
         let src = "<?php class C { private const A = 1; \
             function f() { return self::A; } }";
         assert!(codes(src, run_private_const_through_static).is_empty());
+    }
+
+    /// The member-existence false-positive guard (§8p) had two implementations:
+    /// `registry::class_fully_known`, which counts `@mixin` targets as part of
+    /// the hierarchy, and a local `has_unknown_ancestor` that did not. A class
+    /// mixing in an *unknown* class can inherit members from it, so claiming a
+    /// member is undefined there is a false positive — the conservative
+    /// (mixin-aware) guard is now the only one.
+    #[test]
+    fn an_unknown_mixin_suppresses_member_existence_findings() {
+        // Fully known hierarchy: the missing constant is reported.
+        let known = "<?php class C {} function f() { return C::MISSING; }";
+        assert_eq!(codes(known, run_class_constant), ["classConstant.notFound"]);
+
+        // The same access on a class mixing in something unindexed: the mixin
+        // could supply the constant, so we must stay silent.
+        let mixed_in = "<?php /** @mixin \\Vendor\\Unindexed */ class C {} \
+                        function f() { return C::MISSING; }";
+        assert!(
+            codes(mixed_in, run_class_constant).is_empty(),
+            "an unknown @mixin must suppress the finding: {:?}",
+            codes(mixed_in, run_class_constant)
+        );
+
+        // An unknown *parent* was already guarded; keep it that way.
+        let unknown_parent = "<?php class C extends \\Vendor\\Unindexed {} \
+                              function f() { return C::MISSING; }";
+        assert!(codes(unknown_parent, run_class_constant).is_empty());
     }
 
     // --- @mixin ----------------------------------------------------------

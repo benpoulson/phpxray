@@ -1,7 +1,7 @@
 //! phpstan category **Pure** — rule replication.
 //!
 //! Source: `phpstan-src/src/Rules/Pure/` — 2 rule(s) at level(s) 2.
-//! Checklist: docs/phpstan-rules.md. Add each rule as a `RuleEntry` to
+//! The rule set's coverage truth is `cargo run -p xtask -- rule-manifest`; for phpstan's behaviour read `phpstan-src/src/Rules/` directly. Add each rule as a `RuleEntry` to
 //! `RULES` (with a phpstan-style identifier on its diagnostics).
 
 use crate::{decls, FileAnalysis, RuleEntry};

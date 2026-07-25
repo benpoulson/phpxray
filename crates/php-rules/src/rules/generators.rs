@@ -1,7 +1,7 @@
 //! phpstan category **Generators** — rule replication.
 //!
 //! Source: `phpstan-src/src/Rules/Generators/` — 3 rule(s) at level 3.
-//! Checklist: docs/phpstan-rules.md. Add each rule as a `RuleEntry` to
+//! The rule set's coverage truth is `cargo run -p xtask -- rule-manifest`; for phpstan's behaviour read `phpstan-src/src/Rules/` directly. Add each rule as a `RuleEntry` to
 //! `RULES` (with a phpstan-style identifier on its diagnostics).
 //!
 //! A function containing `yield`/`yield from` is a *generator*: at runtime PHP

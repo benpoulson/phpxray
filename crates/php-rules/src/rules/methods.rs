@@ -1,6 +1,6 @@
 //! phpstan category **Methods** — rule replication.
 //!
-//! Source: `phpstan-src/src/Rules/Methods/`. Checklist: docs/phpstan-rules.md.
+//! Source: `phpstan-src/src/Rules/Methods/`. The rule set's coverage truth is `cargo run -p xtask -- rule-manifest`.
 //!
 //! These rules reason about method *declarations* and method *calls*. The
 //! declaration rules walk every class-like in the file together with its

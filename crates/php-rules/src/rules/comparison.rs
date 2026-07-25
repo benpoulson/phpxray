@@ -1,6 +1,6 @@
 //! phpstan category **Comparison** — rule replication.
 //!
-//! Source: `phpstan-src/src/Rules/Comparison/`. Checklist: docs/phpstan-rules.md.
+//! Source: `phpstan-src/src/Rules/Comparison/`. The rule set's coverage truth is `cargo run -p xtask -- rule-manifest`.
 //! Add each rule as a `RuleEntry` to `RULES` (with a phpstan-style identifier on
 //! its diagnostics).
 //!

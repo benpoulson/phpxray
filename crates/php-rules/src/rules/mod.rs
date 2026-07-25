@@ -1,7 +1,7 @@
 //! Rule implementations, **one module per phpstan category** (the subdirectories
 //! of `phpstan-src/src/Rules/`). Each category module exposes a `RULES` slice of
 //! [`RuleEntry`]; [`CATEGORY_RULES`] aggregates them for the registry's
-//! level-based selection. The full per-rule checklist is `docs/phpstan-rules.md`.
+//! level-based selection. The coverage truth is `cargo run -p xtask -- rule-manifest`; for phpstan's behaviour read `phpstan-src/src/Rules/` directly.
 //!
 //! Predefined categories (phpstan dir → module, with rule count @ levels):
 //! Functions→functions (41 @0–6), Classes→classes (37 @0,1,2,4),

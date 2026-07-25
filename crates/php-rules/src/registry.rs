@@ -208,10 +208,19 @@ impl FileAnalysis<'_> {
     }
 
     /// Whether `fqn` and *every* class it transitively extends/implements/uses/
-    /// mixes-in is present in the reflection index. Member-existence rules MUST
-    /// gate on this: a class with an unindexed parent (a vendor class, or a
-    /// built-in like `ArrayObject` — built-in *classes* aren't reflected) may
-    /// inherit the member, so reporting it absent would be a false positive.
+    /// mixes-in is present in the reflection index.
+    ///
+    /// **Member-existence rules MUST gate on this** (§8p): a class with an
+    /// unindexed ancestor — a vendor class outside the analyzed/scanned paths —
+    /// may inherit the member, so reporting it absent would be a false positive.
+    /// Built-in classes *are* reflected (methods/properties/constants/hierarchy,
+    /// §8m), so a built-in base like `ArrayObject` does **not** make a class
+    /// unknown; an earlier version of this comment claimed otherwise.
+    ///
+    /// `@mixin` targets count as part of the hierarchy, deliberately: a class
+    /// mixing in something unindexed can receive members from it. This is the
+    /// only implementation of the guard — a mixin-blind variant used to exist
+    /// alongside it in `classes.rs` and produced exactly that false positive.
     pub fn class_fully_known(&self, fqn: &str) -> bool {
         fn known(fa: &FileAnalysis, fqn: &str, seen: &mut Vec<String>) -> bool {
             let key = php_resolve::SymbolKey::class_like(fqn).into_string();

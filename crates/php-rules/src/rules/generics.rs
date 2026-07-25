@@ -1,7 +1,7 @@
 //! phpstan category **Generics** — rule replication.
 //!
 //! Source: `phpstan-src/src/Rules/Generics/` — 15 rule(s) at level(s) 2.
-//! Checklist: docs/phpstan-rules.md. Add each rule as a `RuleEntry` to
+//! The rule set's coverage truth is `cargo run -p xtask -- rule-manifest`; for phpstan's behaviour read `phpstan-src/src/Rules/` directly. Add each rule as a `RuleEntry` to
 //! `RULES` (with a phpstan-style identifier on its diagnostics).
 
 use crate::{symbols, walk, FileAnalysis, RuleEntry};

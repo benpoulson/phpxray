@@ -1,7 +1,7 @@
 //! phpstan category **Namespaces** — rule replication.
 //!
 //! Source: `phpstan-src/src/Rules/Namespaces/` — 2 rules at level 0.
-//! Checklist: docs/phpstan-rules.md.
+//! The rule set's coverage truth is `cargo run -p xtask -- rule-manifest`; for phpstan's behaviour read `phpstan-src/src/Rules/` directly.
 //!
 //! Replicates `ExistingNamesInUseRule` and `ExistingNamesInGroupUseRule`.
 //!

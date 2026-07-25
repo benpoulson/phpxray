@@ -69,9 +69,11 @@ pub fn unknown_symbols(index: &ProjectIndex, refs: &[ResolvedRef]) -> Vec<Diagno
             (RefKind::Class, _) => None,
         };
         if let Some((what, name)) = unknown {
+            // Only `class` and `constant` reach here: function existence is
+            // owned by the Functions category (see the `RefKind::Function` arm
+            // above), so there is no `function.notFound` case to handle.
             let code = match what {
                 "class" => "class.notFound",
-                "function" => "function.notFound",
                 _ => "constant.notFound",
             };
             out.push(Diagnostic::error(r.span, format!("unknown {what} `{name}`")).with_code(code));
@@ -80,9 +82,12 @@ pub fn unknown_symbols(index: &ProjectIndex, refs: &[ResolvedRef]) -> Vec<Diagno
     out
 }
 
-/// Whether a function/constant resolution refers to nothing the index knows,
-/// honouring the global fallback (a fallback is missing only if *both*
-/// candidates are absent).
+/// Whether a constant resolution refers to nothing the index knows, honouring
+/// the global fallback (a fallback is missing only if *both* candidates are
+/// absent).
+///
+/// Named for the function case it once also served; function existence moved to
+/// the Functions category rules, so the only remaining caller is constants.
 fn callable_missing(res: &Resolution, exists: impl Fn(&str) -> bool) -> bool {
     match res {
         Resolution::Fqn(fqn) => !exists(fqn),

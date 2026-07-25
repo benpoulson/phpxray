@@ -1,7 +1,7 @@
 //! phpstan category **Keywords** — rule replication.
 //!
 //! Source: `phpstan-src/src/Rules/Keywords/` — 5 rule(s), all level 0.
-//! Checklist: docs/phpstan-rules.md.
+//! The rule set's coverage truth is `cargo run -p xtask -- rule-manifest`; for phpstan's behaviour read `phpstan-src/src/Rules/` directly.
 //!
 //! Implemented (all purely syntactic / structural — Keywords are level 0):
 //! - `continue.outOfLoop` / `break.outOfLoop` (`ContinueBreakInLoopRule`) —
