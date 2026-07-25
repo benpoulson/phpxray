@@ -262,7 +262,8 @@ impl Session {
 
         // Decide between a hinted pass (stat only the reported paths) and a
         // full rediscovery (walk the tree and diff everything).
-        let use_hint = !self.first_pass
+        let was_first_pass = self.first_pass;
+        let use_hint = !was_first_pass
             && !discovery_changed
             && hint.is_some_and(|h| !h.saw_creates_or_removes && !h.paths.is_empty());
 
@@ -387,14 +388,17 @@ impl Session {
         let stub_programs: Vec<(String, php_ast::Program)> = stub_srcs
             .iter()
             .map(|(path, source, _)| {
-                (path.clone(), php_parser::parse_into(source, &self.interner).0)
+                (
+                    path.clone(),
+                    php_parser::parse_into(source, &self.interner).0,
+                )
             })
             .collect();
         let stub_now: Vec<(String, String)> = stub_srcs
             .iter()
             .map(|(path, source, _)| (path.clone(), source.clone()))
             .collect();
-        let stubs_changed = !self.first_pass && stub_now != self.stub_sources;
+        let stubs_changed = stubs_changed(was_first_pass, &stub_now, &self.stub_sources);
         self.stub_sources = stub_now;
 
         // Rebuild the shared indexes from cached artifacts (Arc merges).
@@ -655,6 +659,21 @@ impl Session {
 /// Record every name a `FileIndex` declares (classes, functions, constants)
 /// into the changed-surface set. Used when symbol *existence* may have changed
 /// — `has_class`/`has_function`/`has_constant` dependents must re-check.
+/// Did the configured stub files' content change since the previous pass?
+///
+/// `was_first_pass` must be the value captured **before** `Session::run` clears
+/// `self.first_pass`: on the very first pass `prev` is still empty, so a bare
+/// content comparison always reports a change. (Currently masked — the first
+/// pass analyzes everything regardless — but a wrong answer here silently
+/// forces a whole-project re-analysis.)
+fn stubs_changed(
+    was_first_pass: bool,
+    now: &[(String, String)],
+    prev: &[(String, String)],
+) -> bool {
+    !was_first_pass && now != prev
+}
+
 fn note_file_index_names(fi: &FileIndex, out: &mut HashSet<u64>) {
     for c in &fi.classes {
         out.insert(depsrec::symbol_hash(&c.fqn));
@@ -737,5 +756,33 @@ fn diff_artifacts(
         if !old_fns.contains_key(key) {
             changed_surface.insert(depsrec::symbol_hash(key));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stubs_changed;
+
+    fn stub(path: &str, src: &str) -> (String, String) {
+        (path.to_string(), src.to_string())
+    }
+
+    /// Regression: the guard read `self.first_pass` *after* `Session::run` had
+    /// already cleared it, so on a genuine first pass with stubs configured it
+    /// wrongly reported a stub change.
+    #[test]
+    fn first_pass_never_reports_a_stub_change() {
+        let now = vec![stub("stubs/lib.stub", "<?php class A {}")];
+        assert!(!stubs_changed(true, &now, &[]));
+        assert!(!stubs_changed(true, &now, &now));
+    }
+
+    #[test]
+    fn later_passes_compare_stub_content() {
+        let a = vec![stub("stubs/lib.stub", "<?php class A {}")];
+        let b = vec![stub("stubs/lib.stub", "<?php class B {}")];
+        assert!(!stubs_changed(false, &a, &a));
+        assert!(stubs_changed(false, &b, &a));
+        assert!(stubs_changed(false, &a, &[]));
     }
 }
