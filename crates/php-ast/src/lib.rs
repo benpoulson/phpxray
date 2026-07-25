@@ -465,6 +465,21 @@ pub enum UseKind {
 // Expressions
 // ---------------------------------------------------------------------------
 
+/// # Span-identity invariant
+///
+/// **No two distinct expression nodes may share a byte-identical span.**
+///
+/// Node identity is span-derived today (see `php_span::NodeKey`), so two nodes
+/// with the same span are indistinguishable to every span-keyed map — most
+/// visibly `php_infer`'s type map, where whichever node is recorded last
+/// silently wins. The usual way to break this is a wrapper node that consumes no
+/// extra source text; the fix is to give the wrapper the wider span it really
+/// covers (e.g. including a closing delimiter) or the child the tighter one.
+///
+/// `ExprKind::Error` is exempt: recovery nodes inherit the failed construct's
+/// span and nothing keys types on them.
+///
+/// `crates/php-parser/tests/span_identity.rs` audits the parser against this.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Expr {
     pub span: Span,

@@ -16,7 +16,12 @@ const MAX_DEPTH: u32 = 256;
 
 enum StaticMemberName {
     Property(MemberName),
-    DollarExpr(Expr),
+    /// `::$$expr` — carries the `$`'s offset so the synthesized
+    /// `VariableVariable` spans the member, not the whole `Class::$$x` expression.
+    DollarExpr {
+        dollar: u32,
+        inner: Expr,
+    },
     ConstOrMethod(MemberName),
 }
 
@@ -2373,9 +2378,12 @@ impl<'a> Parser<'a> {
                     )
                 }
             }
-            StaticMemberName::DollarExpr(inner) => {
+            StaticMemberName::DollarExpr { dollar, inner } => {
                 if self.at(T::LParen) {
-                    let m = self.node(start, ExprKind::VariableVariable(Box::new(inner)));
+                    // Spanned from the `$`: using `start` would make this node
+                    // cover `Class::` too, mis-anchoring diagnostics and giving
+                    // it a span that overlaps the whole static call.
+                    let m = self.node(dollar, ExprKind::VariableVariable(Box::new(inner)));
                     let name = MemberName::Expr(Box::new(m));
                     let args = self.parse_args();
                     self.node(
@@ -2464,7 +2472,13 @@ impl<'a> Parser<'a> {
             T::Variable => Some(StaticMemberName::Property(
                 self.parse_variable_member_name(),
             )),
-            T::Dollar => Some(StaticMemberName::DollarExpr(self.parse_static_prop_name())),
+            T::Dollar => {
+                let dollar = self.cur_start();
+                Some(StaticMemberName::DollarExpr {
+                    dollar,
+                    inner: self.parse_static_prop_name(),
+                })
+            }
             T::LBrace => Some(StaticMemberName::ConstOrMethod(
                 self.parse_braced_member_name(),
             )),
@@ -2707,7 +2721,7 @@ impl<'a> Parser<'a> {
                                 name,
                             },
                         ),
-                        Some(StaticMemberName::DollarExpr(inner)) => self.node(
+                        Some(StaticMemberName::DollarExpr { inner, .. }) => self.node(
                             start,
                             ExprKind::StaticProp {
                                 class: Box::new(e),
@@ -2923,7 +2937,10 @@ impl<'a> Parser<'a> {
         let e = if self.at(T::StringVarname) {
             let t = self.bump();
             let s = self.interner.intern(self.text(t));
-            let var = self.node(start, ExprKind::Variable(s));
+            // The variable spans just its name: sharing `start` with the
+            // enclosing `DollarBrace` would make the two collide in span-keyed
+            // maps (see `php_span::NodeKey`).
+            let var = Expr::new(t.span, ExprKind::Variable(s));
             let inner = if self.eat(T::LBracket) {
                 let index = self.parse_expr(0);
                 self.expect(T::RBracket, "`]`");
@@ -2937,6 +2954,10 @@ impl<'a> Parser<'a> {
             } else {
                 var
             };
+            // Closing brace consumed first so the wrapper's span covers `${…}`
+            // and is therefore strictly wider than its child's — two nodes with
+            // byte-identical spans are indistinguishable to span-keyed maps.
+            self.expect(T::RBrace, "`}`");
             self.node(start, ExprKind::DollarBrace(Box::new(inner)))
         } else {
             // The general `${ expr }` form. Wrap in DollarBrace so interpolation
@@ -2944,9 +2965,9 @@ impl<'a> Parser<'a> {
             // a `${…}` nested inside a `{…}` complex interpolation.
             let inner = self.parse_expr(0);
             let vv = self.node(start, ExprKind::VariableVariable(Box::new(inner)));
+            self.expect(T::RBrace, "`}`");
             self.node(start, ExprKind::DollarBrace(Box::new(vv)))
         };
-        self.expect(T::RBrace, "`}`");
         e
     }
 }
