@@ -85,9 +85,7 @@ use php_ast::{
 use php_diagnostics::Diagnostic;
 use php_intern::Interner;
 use php_phpdoc::DocType;
-use php_reflect::{
-    ClassReflection, Found, MethodReflection, ParamReflection, ReflectionIndex,
-};
+use php_reflect::{ClassReflection, Found, MethodReflection, ParamReflection, ReflectionIndex};
 use php_resolve::{for_each_region, Resolution, Scope};
 use php_span::Span;
 use php_types::Type;
@@ -1144,31 +1142,19 @@ fn check_member_call(
     let variadic = mr.params.iter().any(|p| p.variadic);
     let max = mr.params.len();
     let here = found.declaring_class.trim_start_matches('\\');
+    let phrase = crate::function_like::invoked_with(arg_count, required, max, variadic);
     if arg_count < required {
         out.push(
-            Diagnostic::error(
-                call.span,
-                format!(
-                    "Method {here}::{method}() invoked with {arg_count} parameter{}, {required} required.",
-                    plural(arg_count)
-                ),
-            )
-            .with_code("parameter.notOptional"),
+            Diagnostic::error(call.span, format!("Method {here}::{method}() {phrase}."))
+                .with_code("parameter.notOptional"),
         );
     } else if !variadic
         && arg_count > max
         && !body_reads_variadic_args(fa, found.declaring_class, method)
     {
         out.push(
-            Diagnostic::error(
-                call.span,
-                format!(
-                    "Method {here}::{method}() invoked with {arg_count} parameter{}, {}.",
-                    plural(arg_count),
-                    arity_phrase(required, max)
-                ),
-            )
-            .with_code("argument.unknown"),
+            Diagnostic::error(call.span, format!("Method {here}::{method}() {phrase}."))
+                .with_code("argument.unknown"),
         );
     }
 }
@@ -1180,43 +1166,9 @@ fn check_member_call(
 /// arguments" must not be reported. Only consulted when a call already exceeds
 /// the declared maximum, so the body scan is off the hot path.
 fn body_reads_variadic_args(fa: &FileAnalysis, declaring_class: &str, method: &str) -> bool {
-    let Some((body, _)) = fa.reflection.method_body(declaring_class, method) else {
-        return false;
-    };
-    let prog = php_ast::Program {
-        stmts: body.to_vec(),
-    };
-    let mut found = false;
-    crate::walk::for_each_expr(&prog, &mut |e| {
-        if let ExprKind::Call { callee, .. } = &e.kind {
-            if let ExprKind::Name(n) = &callee.kind {
-                let name = n.text.trim_start_matches('\\');
-                if name.eq_ignore_ascii_case("func_get_args")
-                    || name.eq_ignore_ascii_case("func_num_args")
-                    || name.eq_ignore_ascii_case("func_get_arg")
-                {
-                    found = true;
-                }
-            }
-        }
-    });
-    found
-}
-
-fn plural(n: usize) -> &'static str {
-    if n == 1 {
-        ""
-    } else {
-        "s"
-    }
-}
-
-fn arity_phrase(required: usize, max: usize) -> String {
-    if required == max {
-        format!("{max} expected")
-    } else {
-        format!("{required}-{max} expected")
-    }
+    fa.reflection
+        .method_body(declaring_class, method)
+        .is_some_and(|(body, _)| crate::function_like::body_reads_variadic_args(body))
 }
 
 /// Collect every expression contained in a single method-body statement, NOT
@@ -4078,6 +4030,35 @@ mod tests {
         assert!(codes(src, run_call_existence).contains(&"argument.unknown"));
     }
 
+    /// The method twin must use the exact same phpstan arity vocabulary as the
+    /// function rule ("R-M required" / "at least R required", never "expected").
+    #[test]
+    fn method_argument_count_messages_match_phpstan() {
+        let msg = |src: &str, want: &str| {
+            let d = run(src, run_call_existence)
+                .into_iter()
+                .find(|d| d.message.contains("invoked with"))
+                .expect("an arity diagnostic");
+            assert_eq!(d.message, want);
+        };
+        msg(
+            "<?php class C { public function a() { $this->need(1); } public function need($x, $y) {} }",
+            "Method C::need() invoked with 1 parameter, 2 required.",
+        );
+        msg(
+            "<?php class C { public function a() { $this->one(1, 2); } public function one($x) {} }",
+            "Method C::one() invoked with 2 parameters, 1 required.",
+        );
+        msg(
+            "<?php class C { public function a() { $this->r(1, 2, 3); } public function r($x, $y = 1) {} }",
+            "Method C::r() invoked with 3 parameters, 1-2 required.",
+        );
+        msg(
+            "<?php class C { public function a() { $this->v(1); } public function v($x, $y, ...$z) {} }",
+            "Method C::v() invoked with 1 parameter, at least 2 required.",
+        );
+    }
+
     #[test]
     fn extra_args_to_func_get_args_method_are_clean() {
         // `in($values)` collecting extras via `func_get_args()` (the Laravel
@@ -4183,7 +4164,8 @@ mod tests {
 
     #[test]
     fn fix_param_from_call_sites() {
-        let src = "<?php\nclass C {\n    public function f($x): void {}\n}\n$c = new C();\n$c->f('a');\n";
+        let src =
+            "<?php\nclass C {\n    public function f($x): void {}\n}\n$c = new C();\n$c->f('a');\n";
         let fx = fixes(src, run_missing_param_type);
         assert_eq!(fx.len(), 1);
         assert_eq!(fx[0].0, "@param string $x");
@@ -4267,7 +4249,10 @@ mod tests {
         // fence callers off every key. Whole-type empty shapes never fix.
         let src = "<?php\nclass C {\n    public function v(): ?array {\n        $version = [];\n        foreach ([1] as $r) {\n            if ($r === 1) { $version = ['id' => $r]; break; }\n        }\n        return $version;\n    }\n}\n";
         for d in run_fixes(src, run_missing_method_iterable_value) {
-            assert!(d.fix.is_none(), "empty-shape whole type must not be written");
+            assert!(
+                d.fix.is_none(),
+                "empty-shape whole type must not be written"
+            );
         }
     }
 

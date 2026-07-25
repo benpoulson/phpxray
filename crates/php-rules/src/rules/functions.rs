@@ -1170,25 +1170,18 @@ fn run_argument_count(fa: &FileAnalysis) -> Vec<Diagnostic> {
         let max = func.params.len();
         let display = members::primary_name(r);
 
-        if supplied < required {
-            let (s_word, want_word) = (plural(supplied, "parameter"), plural(required, "required"));
+        let too_many = !variadic
+            && supplied > max
+            // A body reading `func_get_args()` legitimately takes extras.
+            && !fa
+                .reflection
+                .function_body(&fqn)
+                .is_some_and(|(body, _)| crate::function_like::body_reads_variadic_args(body));
+        if supplied < required || too_many {
+            let phrase = crate::function_like::invoked_with(supplied, required, max, variadic);
             out.push(
-                Diagnostic::error(
-                    e.span,
-                    format!(
-                        "Function {display} invoked with {supplied} {s_word}, {required} {want_word}."
-                    ),
-                )
-                .with_code("arguments.count"),
-            );
-        } else if !variadic && supplied > max {
-            let s_word = plural(supplied, "parameter");
-            out.push(
-                Diagnostic::error(
-                    e.span,
-                    format!("Function {display} invoked with {supplied} {s_word}, {max} required."),
-                )
-                .with_code("arguments.count"),
+                Diagnostic::error(e.span, format!("Function {display} {phrase}."))
+                    .with_code("arguments.count"),
             );
         }
     });
@@ -1265,14 +1258,6 @@ fn run_argument_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
     });
     out
-}
-
-fn plural(n: usize, word: &str) -> String {
-    if n == 1 {
-        word.to_string()
-    } else {
-        format!("{word}s")
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3746,7 +3731,8 @@ mod tests {
     #[test]
     fn no_use_removal_fix_when_clause_is_ambiguous() {
         // A string constant containing a lookalike clause: two candidates.
-        let src = "<?php\n$a = 1;\n$f = function (string $x = 'use ($a)') use ($a) { return $x; };\n";
+        let src =
+            "<?php\n$a = 1;\n$f = function (string $x = 'use ($a)') use ($a) { return $x; };\n";
         for d in run_fixes(src, run_unused_closure_uses) {
             assert!(d.fix.is_none(), "ambiguous clause must not be edited");
         }
@@ -4334,6 +4320,44 @@ mod tests {
         assert_eq!(codes(src, run_argument_count), ["arguments.count"]);
     }
 
+    /// Regression: the message used to pluralize "required" ("2 requireds") and
+    /// the too-many branch reported `{max} required` even when some parameters
+    /// were optional. phpstan never pluralizes "required" and uses `R-M required`
+    /// for a range, `at least R required` for a variadic.
+    #[test]
+    fn argument_count_messages_match_phpstan() {
+        let msg = |src: &str| run(src, run_argument_count)[0].message.clone();
+        assert_eq!(
+            msg("<?php function needsTwo($a, $b) {} needsTwo(1);"),
+            "Function needsTwo invoked with 1 parameter, 2 required."
+        );
+        assert_eq!(
+            msg("<?php function needsTwo($a, $b) {} needsTwo();"),
+            "Function needsTwo invoked with 0 parameters, 2 required."
+        );
+        assert_eq!(
+            msg("<?php function range1($a, $b = 1) {} range1(1, 2, 3);"),
+            "Function range1 invoked with 3 parameters, 1-2 required."
+        );
+        assert_eq!(
+            msg("<?php function vari($a, $b, ...$rest) {} vari(1);"),
+            "Function vari invoked with 1 parameter, at least 2 required."
+        );
+    }
+
+    /// Regression: methods reading `func_get_args()` were exempt from
+    /// too-many-args but the function twin had no such guard.
+    #[test]
+    fn function_reading_func_get_args_accepts_extras() {
+        let src = "<?php function extras() { return func_get_args(); } extras(1, 2, 3);";
+        assert!(codes(src, run_argument_count).is_empty());
+        let src = "<?php function nums() { return func_num_args(); } nums(1, 2);";
+        assert!(codes(src, run_argument_count).is_empty());
+        // Too FEW arguments is still reported — the exemption is one-sided.
+        let src = "<?php function needs($a, $b) { return func_get_args(); } needs(1);";
+        assert_eq!(codes(src, run_argument_count), ["arguments.count"]);
+    }
+
     #[test]
     fn correct_argument_count_is_clean() {
         let src = "<?php function f($a, $b = 2) {} f(1); f(1, 2);";
@@ -4779,7 +4803,8 @@ mod tests {
 
     #[test]
     fn fix_function_return_in_namespace_uses_short_class_name() {
-        let src = "<?php\nnamespace App;\nclass User {}\nfunction u() {\n    return new User();\n}\n";
+        let src =
+            "<?php\nnamespace App;\nclass User {}\nfunction u() {\n    return new User();\n}\n";
         let fx = fixes(src, run_missing_function_return_type);
         assert_eq!(fx.len(), 1);
         assert_eq!(fx[0].0, "@return User");
