@@ -542,7 +542,9 @@ fn combine_string_key_statuses(statuses: impl Iterator<Item = StringKeyStatus>) 
 
 fn key_type_string_status(t: &Type) -> StringKeyStatus {
     match t {
-        Type::String | Type::StringOf(_) | Type::LiteralString(_) | Type::ClassString(_) => StringKeyStatus::Yes,
+        Type::String | Type::StringOf(_) | Type::LiteralString(_) | Type::ClassString(_) => {
+            StringKeyStatus::Yes
+        }
         Type::Union(parts) => combine_string_key_statuses(parts.iter().map(key_type_string_status)),
         Type::Nullable(inner) => match key_type_string_status(inner) {
             StringKeyStatus::No => StringKeyStatus::No,

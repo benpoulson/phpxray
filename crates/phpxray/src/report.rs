@@ -434,7 +434,12 @@ mod tests {
         let report = Report {
             findings: vec![
                 finding("src/A.php", 4, "bad return", "return.type"),
-                finding("(ignore)", 0, "Ignored pattern #x# was not matched in reported errors", "ignore.unmatched"),
+                finding(
+                    "(ignore)",
+                    0,
+                    "Ignored pattern #x# was not matched in reported errors",
+                    "ignore.unmatched",
+                ),
             ],
             files_analyzed: 1,
             files_scanned: 0,

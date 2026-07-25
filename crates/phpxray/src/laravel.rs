@@ -98,7 +98,8 @@ fn collect_config_aliases(
             let (Some(k), Some(v)) = (&a.key, &a.value) else {
                 continue;
             };
-            if let (Some(alias), Some(target)) = (str_literal(k), class_ref_fqn(v, scope, interner)) {
+            if let (Some(alias), Some(target)) = (str_literal(k), class_ref_fqn(v, scope, interner))
+            {
                 out.entry(alias).or_insert(target);
             }
         }

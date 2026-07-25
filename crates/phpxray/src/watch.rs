@@ -181,15 +181,22 @@ pub fn run_watch(
             }
             if matches!(
                 ev.kind,
-                EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+                EventKind::Create(_)
+                    | EventKind::Remove(_)
+                    | EventKind::Modify(ModifyKind::Name(_))
             ) {
                 saw_creates_or_removes = true;
             }
             for p in &ev.paths {
                 if config_file.as_deref().is_some_and(|cf| p == cf) {
                     config_changed = true;
-                } else if is_relevant(p, &canonical_root, &config, &exclude, config_file.as_deref())
-                    && !changed.contains(p)
+                } else if is_relevant(
+                    p,
+                    &canonical_root,
+                    &config,
+                    &exclude,
+                    config_file.as_deref(),
+                ) && !changed.contains(p)
                 {
                     changed.push(p.clone());
                 }
@@ -389,7 +396,11 @@ fn clock_local() -> String {
         .unwrap_or(0);
     let (h, m, s) = local_hms(secs).unwrap_or_else(|| {
         let tod = secs % 86_400;
-        ((tod / 3600) as u32, ((tod % 3600) / 60) as u32, (tod % 60) as u32)
+        (
+            (tod / 3600) as u32,
+            ((tod % 3600) / 60) as u32,
+            (tod % 60) as u32,
+        )
     });
     format!("{h:02}:{m:02}:{s:02}")
 }
@@ -499,13 +510,7 @@ mod tests {
         let ex = hard_exclude(&c);
         let root = Path::new("/proj");
         let config_file = Path::new("/proj/phpxray.yaml");
-        assert!(is_relevant(
-            config_file,
-            root,
-            &c,
-            &ex,
-            Some(config_file)
-        ));
+        assert!(is_relevant(config_file, root, &c, &ex, Some(config_file)));
         // A different yaml is not relevant.
         assert!(!is_relevant(
             Path::new("/proj/other.yaml"),

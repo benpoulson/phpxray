@@ -2792,7 +2792,8 @@ fn has_magic_accessor(fqn: &str, fa: &FileAnalysis, write: bool) -> bool {
 /// `json_decode()`, `(object) [...]` casts, and DB row fetches are `stdClass` and
 /// idiomatically carry dynamic properties (phpstan never flags these).
 fn is_dynamic_property_class(fqn: &str) -> bool {
-    fqn.trim_start_matches('\\').eq_ignore_ascii_case("stdClass")
+    fqn.trim_start_matches('\\')
+        .eq_ignore_ascii_case("stdClass")
 }
 
 // --- AccessPropertiesRule (level 0, general receiver) ----------------------
@@ -3602,7 +3603,9 @@ fn scan_uninit_expr(
         ExprKind::Assign { target, .. } | ExprKind::AssignRef { target, .. } => {
             note_uninit_target(fa, target, cand_syms, assigned, bail)
         }
-        ExprKind::AssignOp { target, .. } => note_uninit_target(fa, target, cand_syms, assigned, bail),
+        ExprKind::AssignOp { target, .. } => {
+            note_uninit_target(fa, target, cand_syms, assigned, bail)
+        }
         ExprKind::VariableVariable(_) => *bail = true,
         // Dynamic `$this->{$x}` / `$this->$v` could name any property.
         ExprKind::Prop {
@@ -3683,21 +3686,22 @@ fn run_missing_property_typehint(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 // `$this->prop = …` assignment evidence (private props only),
                 // else restate an overridden ancestor property's declared type.
                 if fa.collect_fixes && pd.props.len() == 1 && elem.hooks.is_none() {
-                    if let Some(fix) = crate::fix::infer_property_type(fa, scope, fqn, class, pd, elem)
-                        .or_else(|| {
-                            crate::fix::inherited_property_type(fa, scope, fqn, class, pd, elem)
-                        })
-                        .and_then(|ty| {
-                            crate::fix::typed_tag_fix(
-                                fa,
-                                scope,
-                                &ty,
-                                crate::fix::first_attr_span(&pd.attrs).unwrap_or(span_of(elem)),
-                                pd.doc.as_deref(),
-                                php_diagnostics::DocTagKind::Var,
-                                None,
-                            )
-                        })
+                    if let Some(fix) =
+                        crate::fix::infer_property_type(fa, scope, fqn, class, pd, elem)
+                            .or_else(|| {
+                                crate::fix::inherited_property_type(fa, scope, fqn, class, pd, elem)
+                            })
+                            .and_then(|ty| {
+                                crate::fix::typed_tag_fix(
+                                    fa,
+                                    scope,
+                                    &ty,
+                                    crate::fix::first_attr_span(&pd.attrs).unwrap_or(span_of(elem)),
+                                    pd.doc.as_deref(),
+                                    php_diagnostics::DocTagKind::Var,
+                                    None,
+                                )
+                            })
                     {
                         d = d.with_fix(fix);
                     }
@@ -4095,7 +4099,10 @@ mod tests {
             class C {
                 public int $x;
             }"#;
-        assert_eq!(codes(src, run_uninitialized_properties), ["property.uninitialized"]);
+        assert_eq!(
+            codes(src, run_uninitialized_properties),
+            ["property.uninitialized"]
+        );
     }
 
     #[test]
@@ -4130,7 +4137,10 @@ mod tests {
                 public int $y;
                 public function __construct() { $this->x = 1; }
             }"#;
-        assert_eq!(codes(src, run_uninitialized_properties), ["property.uninitialized"]);
+        assert_eq!(
+            codes(src, run_uninitialized_properties),
+            ["property.uninitialized"]
+        );
     }
 
     #[test]
@@ -5837,7 +5847,10 @@ mod tests {
         // the new `@var`; the conservative guard bails.
         let src = "<?php\nclass B {\n    /** @var int */\n    protected $n = 0;\n    public function set(int $v): void { $this->n = $v; }\n}\nclass C extends B {\n    protected $n = 5;\n}\nclass D extends C {\n    public function zap(): void { $this->n = 9; }\n}\n";
         for d in run_fixes(src, run_missing_property_typehint) {
-            assert!(d.fix.is_none(), "subclass write must bail the inherited fix");
+            assert!(
+                d.fix.is_none(),
+                "subclass write must bail the inherited fix"
+            );
         }
     }
 
@@ -5847,7 +5860,10 @@ mod tests {
         // `missingType.iterableValue` — the check_type gate rejects it.
         let src = "<?php\nclass B {\n    /** @var array */\n    protected $casts = [];\n    public function merge(array $c): void { $this->casts = $c; }\n}\nclass C extends B {\n    protected $casts = [];\n}\n";
         for d in run_fixes(src, run_missing_property_typehint) {
-            assert!(d.fix.is_none(), "bare-array ancestor type must not be restated");
+            assert!(
+                d.fix.is_none(),
+                "bare-array ancestor type must not be restated"
+            );
         }
     }
 
@@ -5855,7 +5871,10 @@ mod tests {
     fn no_fix_for_protected_property_on_extended_class() {
         let src = "<?php class B { protected $n = 0; } class C extends B {}";
         for d in run_fixes(src, run_missing_property_typehint) {
-            assert!(d.fix.is_none(), "subclass exists: protected prop must not be fixed");
+            assert!(
+                d.fix.is_none(),
+                "subclass exists: protected prop must not be fixed"
+            );
         }
     }
 

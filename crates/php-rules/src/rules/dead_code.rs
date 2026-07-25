@@ -289,11 +289,7 @@ fn record_refs_in_program(prog: &php_ast::Program, interner: &Interner, refs: &m
 /// class-body-only scan wrongly reports those members unused. Trait bodies live
 /// in the reflection index (often cross-file); this only ever *adds* to the used
 /// sets, so it can shrink but never grow the reported-unused set.
-fn collect_member_refs_incl_traits(
-    fa: &FileAnalysis,
-    scope: &Scope,
-    c: &ClassDecl,
-) -> MemberRefs {
+fn collect_member_refs_incl_traits(fa: &FileAnalysis, scope: &Scope, c: &ClassDecl) -> MemberRefs {
     let mut refs = collect_member_refs(c, fa.interner);
     let Some(class_fqn) = c.name.map(|n| scope.qualify(fa.interner.resolve(n))) else {
         return refs;

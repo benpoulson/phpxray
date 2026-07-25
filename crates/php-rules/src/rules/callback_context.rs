@@ -621,8 +621,7 @@ fn check_method_call_args(
     if found.member.magic {
         return;
     }
-    let short = members::sole_class(&recv_ty)
-        .unwrap_or_else(|| found.declaring_class.to_string());
+    let short = members::sole_class(&recv_ty).unwrap_or_else(|| found.declaring_class.to_string());
     for (i, arg) in args.iter().enumerate() {
         let Some(param) = found.member.params.get(i) else {
             break;

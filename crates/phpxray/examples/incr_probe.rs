@@ -2,8 +2,8 @@
 //! construction, per-file index adds, and suppression.
 //! Dev tool: `cargo run --release -p phpxray --example incr_probe -- <root>`
 
-use phpxray::{parse_files_with_mode, suppress, Report};
 use php_config::Config;
+use phpxray::{parse_files_with_mode, suppress, Report};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -79,6 +79,15 @@ fn main() {
         .map(|f| (f.path.as_str(), f.source.as_str()))
         .collect();
     let t = Instant::now();
-    let _ = suppress::apply(report, &config.ignore, config.report_unmatched_ignored, &sources);
-    println!("suppress (0 findings, {} ignores): {:>8.1?}", config.ignore.len(), t.elapsed());
+    let _ = suppress::apply(
+        report,
+        &config.ignore,
+        config.report_unmatched_ignored,
+        &sources,
+    );
+    println!(
+        "suppress (0 findings, {} ignores): {:>8.1?}",
+        config.ignore.len(),
+        t.elapsed()
+    );
 }

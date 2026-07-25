@@ -1,8 +1,8 @@
 //! Print the wall-clock breakdown of one analysis run over a project root.
 //! Dev tool: `cargo run --release -p phpxray --example timings -- <root>`
 
-use phpxray::{run_with_options, RunOptions};
 use php_config::Config;
+use phpxray::{run_with_options, RunOptions};
 use std::path::PathBuf;
 
 fn main() {

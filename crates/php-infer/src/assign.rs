@@ -40,9 +40,7 @@ impl Trinary {
 pub fn is_castable_to_string(index: &ReflectionIndex, ty: &Type) -> bool {
     use Type::*;
     match ty {
-        Array(_) | List(_) | Iterable(_) | Shape { .. } | Callable(_) | Void | NonEmpty(_) => {
-            false
-        }
+        Array(_) | List(_) | Iterable(_) | Shape { .. } | Callable(_) | Void | NonEmpty(_) => false,
         Nullable(inner) => is_castable_to_string(index, inner),
         Union(parts) => parts.iter().all(|p| is_castable_to_string(index, p)),
         // An object is castable iff it declares `__toString` (Stringable); be
@@ -385,10 +383,9 @@ fn assignable_atom(index: &ReflectionIndex, value: &Type, target: &Type) -> bool
         (_, NonEmpty(t)) => is_assignable(index, value, t),
 
         // --- enum cases (unit subtypes of their enum) ---
-        (
-            EnumCase { fqn: a, case: ca },
-            EnumCase { fqn: b, case: cb },
-        ) => a.eq_ignore_ascii_case(b) && ca == cb,
+        (EnumCase { fqn: a, case: ca }, EnumCase { fqn: b, case: cb }) => {
+            a.eq_ignore_ascii_case(b) && ca == cb
+        }
         // A case is an instance of its enum (and whatever the enum implements).
         (EnumCase { fqn, .. }, Named { .. } | Object) => is_assignable(
             index,
@@ -405,8 +402,14 @@ fn assignable_atom(index: &ReflectionIndex, value: &Type, target: &Type) -> bool
         // `callable` is structural; rejecting a `string`/`array` would false-flag
         // `array_map('trim', …)` and `[$this, 'm']`).
         (
-            Callable(_) | Named { .. } | Object | String | LiteralString(_) | StringOf(_)
-            | Array(_) | List(_),
+            Callable(_)
+            | Named { .. }
+            | Object
+            | String
+            | LiteralString(_)
+            | StringOf(_)
+            | Array(_)
+            | List(_),
             Callable(_),
         ) => true,
 
@@ -456,8 +459,8 @@ mod tests {
     fn array_key_widening_is_lenient_but_values_stay_strict() {
         let arr = |k: Type, v: Type| Type::Array(Some(Box::new((k, v))));
         let key = Type::union(vec![Type::Int, Type::String]); // array-key
-        // Key-only widening (`array<int|string, string>` → `array<int, string>`)
-        // is accepted; array keys are checked benevolently.
+                                                              // Key-only widening (`array<int|string, string>` → `array<int, string>`)
+                                                              // is accepted; array keys are checked benevolently.
         assert!(ok(
             arr(key.clone(), Type::String),
             arr(Type::Int, Type::String)
@@ -465,10 +468,7 @@ mod tests {
         // A real *value* mismatch is still rejected regardless of key widening.
         assert!(!ok(arr(key, Type::Int), arr(Type::Int, Type::String)));
         // A disjoint key type is still rejected (`string` keys vs `int` keys).
-        assert!(!ok(
-            arr(Type::String, Type::Int),
-            arr(Type::Int, Type::Int)
-        ));
+        assert!(!ok(arr(Type::String, Type::Int), arr(Type::Int, Type::Int)));
     }
 
     #[test]
@@ -512,7 +512,10 @@ mod tests {
     fn typed_arrays_fit_typed_iterables() {
         let it = |k: Type, v: Type| Type::Iterable(Some(Box::new((k, v))));
         // list<int> ⊑ iterable<int, int>
-        assert!(ok(Type::List(Box::new(Type::Int)), it(Type::Int, Type::Int)));
+        assert!(ok(
+            Type::List(Box::new(Type::Int)),
+            it(Type::Int, Type::Int)
+        ));
         // array<string, int> ⊑ iterable<string, int>
         assert!(ok(
             Type::Array(Some(Box::new((Type::String, Type::Int)))),
@@ -566,7 +569,7 @@ mod tests {
         assert!(!ok(ne.clone(), num.clone()));
         assert!(!ok(num.clone(), nf.clone())); // "0" is numeric and falsy
         assert!(!ok(lit.clone(), ne.clone())); // '' is a literal
-        // Literals satisfy refinements by value.
+                                               // Literals satisfy refinements by value.
         assert!(ok(Type::LiteralString("abc".into()), ne.clone()));
         assert!(!ok(Type::LiteralString("".into()), ne.clone()));
         assert!(ok(Type::LiteralString("42".into()), num.clone()));
@@ -701,7 +704,10 @@ mod tests {
     fn union_value_needs_all_members() {
         let v = Type::Union(vec![Type::Int, Type::String].into());
         assert!(!ok(v.clone(), Type::Int)); // string member fails
-        assert!(ok(v.clone(), Type::Union(vec![Type::Int, Type::String].into())));
+        assert!(ok(
+            v.clone(),
+            Type::Union(vec![Type::Int, Type::String].into())
+        ));
         assert!(ok(v, Type::Mixed));
     }
 

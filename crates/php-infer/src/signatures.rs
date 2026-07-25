@@ -261,7 +261,11 @@ fn infer_params_from_callsites(
         if c.builtin {
             continue;
         }
-        let Some(m) = c.methods.iter().find(|m| m.name.eq_ignore_ascii_case(&mname)) else {
+        let Some(m) = c
+            .methods
+            .iter()
+            .find(|m| m.name.eq_ignore_ascii_case(&mname))
+        else {
             continue;
         };
         let sig = build_param_sig(&m.params, &positions);
@@ -287,7 +291,11 @@ pub type ExplicitParamEvidence = HashMap<(String, String, usize), Type>;
 
 /// Canonical evidence-map key: lowercased, `\`-stripped function/class FQN,
 /// lowercased method name (empty for free functions), parameter index.
-pub fn evidence_key(class_or_fn: &str, method: Option<&str>, idx: usize) -> (String, String, usize) {
+pub fn evidence_key(
+    class_or_fn: &str,
+    method: Option<&str>,
+    idx: usize,
+) -> (String, String, usize) {
     (
         class_or_fn.trim_start_matches('\\').to_ascii_lowercase(),
         method.unwrap_or("").to_ascii_lowercase(),
@@ -338,7 +346,11 @@ pub fn explicit_iterable_param_evidence(
         if c.builtin {
             continue;
         }
-        let Some(m) = c.methods.iter().find(|m| m.name.eq_ignore_ascii_case(&mname)) else {
+        let Some(m) = c
+            .methods
+            .iter()
+            .find(|m| m.name.eq_ignore_ascii_case(&mname))
+        else {
             continue;
         };
         collect_explicit_iterable(&m.params, &positions, |idx, ty| {
@@ -410,10 +422,7 @@ fn harvest_file(
                 let mname = interner.resolve(*sym);
                 if let Some(found) = index.find_method(&class_fqn, mname) {
                     if !found.member.magic {
-                        let key = (
-                            found.declaring_class.to_string(),
-                            found.member.name.clone(),
-                        );
+                        let key = (found.declaring_class.to_string(), found.member.name.clone());
                         record_args(&map, args, method_args.entry(key).or_default());
                     }
                 }
@@ -473,10 +482,7 @@ fn build_param_sig(params: &[ParamReflection], positions: &[Vec<Type>]) -> Infer
             useful_inference(&u).then_some(u)
         })
         .collect();
-    InferredSig {
-        params,
-        ret: None,
-    }
+    InferredSig { params, ret: None }
 }
 
 // --- helpers ----------------------------------------------------------------
@@ -570,7 +576,9 @@ mod tests {
     }
 
     fn fparam(idx: &ReflectionIndex, fqn: &str, i: usize) -> String {
-        idx.function(fqn).expect("function").params[i].ty.to_string()
+        idx.function(fqn).expect("function").params[i]
+            .ty
+            .to_string()
     }
 
     #[test]
@@ -658,10 +666,8 @@ mod tests {
 
     #[test]
     fn method_return_inferred() {
-        let idx = run(
-            r#"class C { function make() { return 5; } }
-               function use_it(C $c) { return $c->make(); }"#,
-        );
+        let idx = run(r#"class C { function make() { return 5; } }
+               function use_it(C $c) { return $c->make(); }"#);
         let found = idx.find_method("C", "make").expect("method make");
         assert_eq!(found.member.return_type.to_string(), "5");
         assert_eq!(fret(&idx, "use_it"), "5");
@@ -669,10 +675,8 @@ mod tests {
 
     #[test]
     fn method_param_from_call_site() {
-        let idx = run(
-            r#"class C { function take($x) { return 1; } }
-               function caller(C $c) { return $c->take("hi"); }"#,
-        );
+        let idx = run(r#"class C { function take($x) { return 1; } }
+               function caller(C $c) { return $c->take("hi"); }"#);
         let found = idx.find_method("C", "take").expect("method take");
         assert_eq!(found.member.params[0].ty.to_string(), "string");
     }

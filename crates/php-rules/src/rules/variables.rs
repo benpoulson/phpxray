@@ -1109,7 +1109,11 @@ fn null_verdict(ty: &Type) -> Truth {
 fn falsy_verdict(ty: &Type) -> Truth {
     match ty {
         Type::Null | Type::False => Truth::Yes,
-        Type::True | Type::Object | Type::Named { .. } | Type::EnumCase { .. } | Type::ClassString(_) => Truth::No,
+        Type::True
+        | Type::Object
+        | Type::Named { .. }
+        | Type::EnumCase { .. }
+        | Type::ClassString(_) => Truth::No,
         Type::LiteralInt(0) => Truth::Yes,
         Type::LiteralInt(_) => Truth::No,
         Type::IntRange { min, max } if min == &Some(0) && max == &Some(0) => Truth::Yes,

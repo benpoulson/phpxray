@@ -1947,7 +1947,9 @@ mod tests {
         assert_eq!(codes(src, run_method_return), ["return.unusedType"]);
         // Still flagged with the public-methods flag off (final is unconditional).
         assert_eq!(
-            codes_with(src, run_method_return, |fa| fa.check_too_wide_return_public = false),
+            codes_with(src, run_method_return, |fa| fa
+                .check_too_wide_return_public =
+                false),
             ["return.unusedType"]
         );
     }
@@ -1967,7 +1969,8 @@ mod tests {
         assert_eq!(codes(src, run_method_return), ["return.unusedType"]);
         // With the flag off, non-final public methods stay skipped.
         assert!(codes_with(src, run_method_return, |fa| fa
-            .check_too_wide_return_public = false)
+            .check_too_wide_return_public =
+            false)
         .is_empty());
     }
 

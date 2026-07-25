@@ -22,9 +22,9 @@ use php_ast::{
 };
 use php_intern::Interner;
 use php_phpdoc::{Doc, DocType, MethodParam, PropertyAccess};
-use std::collections::HashMap;
 use php_resolve::{Resolution, Scope};
 use php_types::Type;
+use std::collections::HashMap;
 
 /// A reflected function or method parameter.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1021,11 +1021,7 @@ fn doc_is_pure(raw: Option<&str>) -> bool {
 }
 
 /// Resolve a docblock's `@phpstan-assert*` tags against the declaring scope.
-fn reflect_asserts(
-    scope: &Scope,
-    templates: &[String],
-    doc: &Doc,
-) -> Vec<AssertReflection> {
+fn reflect_asserts(scope: &Scope, templates: &[String], doc: &Doc) -> Vec<AssertReflection> {
     doc.asserts
         .iter()
         .map(|a| AssertReflection {
@@ -1065,9 +1061,7 @@ fn class_type_aliases(
         let rest = tag.value.trim_start();
         let name_len = rest
             .char_indices()
-            .find_map(|(i, ch)| {
-                (!(ch == '_' || ch.is_ascii_alphanumeric())).then_some(i)
-            })
+            .find_map(|(i, ch)| (!(ch == '_' || ch.is_ascii_alphanumeric())).then_some(i))
             .unwrap_or(rest.len());
         if name_len == 0 {
             continue;
@@ -1130,8 +1124,7 @@ fn class_imported_types(scope: &Scope, raw: Option<&str>) -> Vec<ImportedType> {
         }
         // `Name from Other` or `Name from Other as Alias`.
         let toks: Vec<&str> = tag.value.split_whitespace().collect();
-        let (Some(&name), Some(&kw), Some(&other)) =
-            (toks.first(), toks.get(1), toks.get(2))
+        let (Some(&name), Some(&kw), Some(&other)) = (toks.first(), toks.get(1), toks.get(2))
         else {
             continue;
         };

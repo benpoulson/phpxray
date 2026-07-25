@@ -284,9 +284,12 @@ fn never_bitnot_operand(t: &Type) -> bool {
             true
         }
         Type::Bool | Type::True | Type::False => true,
-        Type::Int | Type::Float | Type::String | Type::StringOf(_) | Type::LiteralInt(_) | Type::LiteralString(_) => {
-            false
-        }
+        Type::Int
+        | Type::Float
+        | Type::String
+        | Type::StringOf(_)
+        | Type::LiteralInt(_)
+        | Type::LiteralString(_) => false,
         Type::Union(parts) => parts.iter().all(never_bitnot_operand),
         Type::Nullable(inner) => never_bitnot_operand(inner),
         _ => false,

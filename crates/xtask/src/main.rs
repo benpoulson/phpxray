@@ -776,7 +776,10 @@ fn cmd_check_run(dir: Option<PathBuf>) -> ExitCode {
                 .split(',')
                 .any(|code| finding.identifier == Some(code))
             {
-                println!("DUMP {} {}: {}", finding.path, finding.line, finding.message);
+                println!(
+                    "DUMP {} {}: {}",
+                    finding.path, finding.line, finding.message
+                );
             }
         }
     }
@@ -1283,9 +1286,10 @@ fn serialize_class(
         .members
         .iter()
         .filter_map(|mem| match mem {
-            php_ast::Member::Method(md) => {
-                Some((interner.resolve(md.name).to_ascii_lowercase(), md.attrs.as_slice()))
-            }
+            php_ast::Member::Method(md) => Some((
+                interner.resolve(md.name).to_ascii_lowercase(),
+                md.attrs.as_slice(),
+            )),
             _ => None,
         })
         .collect();

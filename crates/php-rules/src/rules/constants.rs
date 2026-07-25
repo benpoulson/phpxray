@@ -270,8 +270,8 @@ fn run_missing_const_iterable_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 .with_code("missingType.iterableValue");
                 // `--fix`: a constant's type is exactly its literal value's type.
                 if fa.collect_fixes && cd.consts.len() == 1 {
-                    let value_ty = php_infer::TypeCtx::new(fa.reflection, scope, fa.interner)
-                        .infer(&ce.value);
+                    let value_ty =
+                        php_infer::TypeCtx::new(fa.reflection, scope, fa.interner).infer(&ce.value);
                     // Only refine: the evidence must actually carry a value type.
                     if crate::rules::functions::bare_iterable_word(&value_ty).is_none() {
                         if let Some(fix) = crate::fix::typed_tag_fix(

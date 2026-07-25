@@ -1211,7 +1211,10 @@ mod tests {
     fn unused_throws_empty_body_is_flagged() {
         let src = "<?php /** @throws \\RuntimeException */ function f(): void {}";
         let ds = run(src, run_too_wide_throw_type_function);
-        assert_eq!(codes(src, run_too_wide_throw_type_function), ["throws.unusedType"]);
+        assert_eq!(
+            codes(src, run_too_wide_throw_type_function),
+            ["throws.unusedType"]
+        );
         assert_eq!(
             ds[0].message,
             "Function f() has RuntimeException in PHPDoc @throws tag but it's not thrown."
@@ -1267,9 +1270,13 @@ mod tests {
 
     #[test]
     fn unused_throws_on_method_is_flagged() {
-        let src = "<?php class C { /** @throws \\RuntimeException */ public function m(): void {} }";
+        let src =
+            "<?php class C { /** @throws \\RuntimeException */ public function m(): void {} }";
         let ds = run(src, run_too_wide_throw_type_method);
-        assert_eq!(codes(src, run_too_wide_throw_type_method), ["throws.unusedType"]);
+        assert_eq!(
+            codes(src, run_too_wide_throw_type_method),
+            ["throws.unusedType"]
+        );
         assert_eq!(
             ds[0].message,
             "Method C::m() has RuntimeException in PHPDoc @throws tag but it's not thrown."

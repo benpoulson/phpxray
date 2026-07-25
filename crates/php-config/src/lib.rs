@@ -172,11 +172,7 @@ impl Config {
     /// Find a config file in `dir`, trying the standard names in order.
     pub fn discover(dir: impl AsRef<std::path::Path>) -> Option<std::path::PathBuf> {
         let dir = dir.as_ref();
-        for name in [
-            "phpxray.yaml",
-            "phpxray.yml",
-            "phpxray.dist.yaml",
-        ] {
+        for name in ["phpxray.yaml", "phpxray.yml", "phpxray.dist.yaml"] {
             let p = dir.join(name);
             if p.is_file() {
                 return Some(p);
@@ -486,7 +482,10 @@ fn de_php_version<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::
     enum Raw {
         Int(u64),
         Str(String),
-        Range { min: Option<Bound>, max: Option<Bound> },
+        Range {
+            min: Option<Bound>,
+            max: Option<Bound>,
+        },
     }
     fn norm(b: Bound) -> String {
         match b {
@@ -561,15 +560,24 @@ ignore:
     #[test]
     fn php_version_accepts_string_int_and_range() {
         assert_eq!(
-            Config::from_yaml("phpVersion: \"8.4\"").unwrap().php_version.as_deref(),
+            Config::from_yaml("phpVersion: \"8.4\"")
+                .unwrap()
+                .php_version
+                .as_deref(),
             Some("8.4")
         );
         assert_eq!(
-            Config::from_yaml("phpVersion: 80400").unwrap().php_version.as_deref(),
+            Config::from_yaml("phpVersion: 80400")
+                .unwrap()
+                .php_version
+                .as_deref(),
             Some("8.4")
         );
         assert_eq!(
-            Config::from_yaml("phpVersion: 70125").unwrap().php_version.as_deref(),
+            Config::from_yaml("phpVersion: 70125")
+                .unwrap()
+                .php_version
+                .as_deref(),
             Some("7.1")
         );
         assert_eq!(

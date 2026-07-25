@@ -228,11 +228,7 @@ fn strict_mixed_source(
 /// this is a top-level test: `Collection<mixed, mixed>` or `array<int, mixed>`
 /// merely *contain* mixed in a type argument — calling/indexing on them is
 /// fine, and phpstan does not report it. Unions stay unreported (conservative).
-fn receiver_is_mixed(
-    ty: &php_types::Type,
-    include_explicit: bool,
-    include_implicit: bool,
-) -> bool {
+fn receiver_is_mixed(ty: &php_types::Type, include_explicit: bool, include_implicit: bool) -> bool {
     match ty {
         php_types::Type::ExplicitMixed => include_explicit,
         php_types::Type::Mixed => include_implicit,

@@ -109,7 +109,10 @@ impl FileAnalysis<'_> {
             return Arc::clone(r);
         }
         let r = Arc::new(reflect_class(scope, self.interner, fqn, c));
-        self.reflect_cache.classes.borrow_mut().insert(key, Arc::clone(&r));
+        self.reflect_cache
+            .classes
+            .borrow_mut()
+            .insert(key, Arc::clone(&r));
         r
     }
 

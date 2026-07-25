@@ -59,9 +59,7 @@ pub fn parse_baseline(text: &str) -> Result<Vec<IgnoreEntry>, String> {
             return Err(format!("line {lineno}: expected `key: value`, got {kv:?}"));
         };
         let Some(entry) = cur.as_mut() else {
-            return Err(format!(
-                "line {lineno}: entry field before a `-` list item"
-            ));
+            return Err(format!("line {lineno}: entry field before a `-` list item"));
         };
         let value = scalar(value, lineno)?;
         match key.trim() {
@@ -79,11 +77,7 @@ pub fn parse_baseline(text: &str) -> Result<Vec<IgnoreEntry>, String> {
             "reportUnmatched" => match value.as_str() {
                 "true" | "yes" => entry.report_unmatched = Some(true),
                 "false" | "no" => entry.report_unmatched = Some(false),
-                other => {
-                    return Err(format!(
-                        "line {lineno}: invalid reportUnmatched {other:?}"
-                    ))
-                }
+                other => return Err(format!("line {lineno}: invalid reportUnmatched {other:?}")),
             },
             // Unknown keys (e.g. future phpstan additions) are skipped,
             // matching the YAML config's forward-compat posture.
@@ -195,8 +189,8 @@ mod tests {
 
     #[test]
     fn errors_are_line_numbered() {
-        let err = parse_baseline("parameters:\n\tignoreErrors:\n\t\t-\n\t\t\tcount: many\n")
-            .unwrap_err();
+        let err =
+            parse_baseline("parameters:\n\tignoreErrors:\n\t\t-\n\t\t\tcount: many\n").unwrap_err();
         assert!(err.contains("line 4"), "{err}");
     }
 

@@ -623,7 +623,10 @@ mod tests {
     fn smart_constructors_flatten_and_dedup() {
         assert_eq!(Type::union(vec![Type::Int]), Type::Int);
         assert_eq!(
-            Type::union(vec![Type::Int, Type::Union(vec![Type::String, Type::Int].into())]),
+            Type::union(vec![
+                Type::Int,
+                Type::Union(vec![Type::String, Type::Int].into())
+            ]),
             Type::Union(vec![Type::Int, Type::String].into())
         );
         assert_eq!(

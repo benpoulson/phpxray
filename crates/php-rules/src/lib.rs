@@ -13,13 +13,13 @@ use php_resolve::{RefKind, Resolution, ResolvedRef};
 pub(crate) mod compat;
 pub(crate) mod decls;
 mod facts;
+pub(crate) mod fix;
 pub(crate) mod function_like;
 pub(crate) mod members;
 pub(crate) mod missing_type;
 mod registry;
 mod return_type;
 mod rules;
-pub(crate) mod fix;
 pub(crate) mod symbols;
 pub use php_ast::walk;
 #[cfg(test)]

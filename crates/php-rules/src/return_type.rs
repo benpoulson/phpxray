@@ -228,10 +228,19 @@ mod tests {
         let mut index = ReflectionIndex::new();
         index.add_file(&r.program, &r.interner);
         let types = php_infer::type_map(&index, &r.program, &r.interner, true);
-        return_type_errors(&index, &r.program, &r.interner, &types, true, true, true, None)
-            .into_iter()
-            .map(|d| d.message)
-            .collect()
+        return_type_errors(
+            &index,
+            &r.program,
+            &r.interner,
+            &types,
+            true,
+            true,
+            true,
+            None,
+        )
+        .into_iter()
+        .map(|d| d.message)
+        .collect()
     }
 
     #[test]

@@ -432,7 +432,10 @@ mod tests {
         let mut idx = ProjectIndex::default();
         idx.add_alias("Sentry", "Sentry\\Laravel\\Facade");
         assert!(idx.has_class("Sentry"));
-        assert_eq!(idx.class("Sentry").unwrap().extends, ["Sentry\\Laravel\\Facade"]);
+        assert_eq!(
+            idx.class("Sentry").unwrap().extends,
+            ["Sentry\\Laravel\\Facade"]
+        );
 
         // A real declaration of the same name wins over a later alias.
         let real = php_parser::parse("<?php class Str { public static function of() {} }");

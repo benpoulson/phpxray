@@ -226,13 +226,11 @@ fn run_while_condition(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     "While loop condition is always false.",
                     "while.alwaysFalse",
                 )),
-                Some(true) if is_literal_true(cond) && !loop_body_exits(body, 0) => {
-                    out.push(diag(
-                        cond.span,
-                        "While loop condition is always true.",
-                        "while.alwaysTrue",
-                    ))
-                }
+                Some(true) if is_literal_true(cond) && !loop_body_exits(body, 0) => out.push(diag(
+                    cond.span,
+                    "While loop condition is always true.",
+                    "while.alwaysTrue",
+                )),
                 _ => {}
             }
         }
@@ -251,13 +249,11 @@ fn run_do_while_condition(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     "Do-while loop condition is always false.",
                     "doWhile.alwaysFalse",
                 )),
-                Some(true) if is_literal_true(cond) && !loop_body_exits(body, 0) => {
-                    out.push(diag(
-                        cond.span,
-                        "Do-while loop condition is always true.",
-                        "doWhile.alwaysTrue",
-                    ))
-                }
+                Some(true) if is_literal_true(cond) && !loop_body_exits(body, 0) => out.push(diag(
+                    cond.span,
+                    "Do-while loop condition is always true.",
+                    "doWhile.alwaysTrue",
+                )),
                 _ => {}
             }
         }
@@ -1412,9 +1408,7 @@ fn enum_case_set(fa: &FileAnalysis, ty: &Type) -> Option<(String, Vec<String>, b
             }
             Some((fqn.to_string(), cases, false))
         }
-        Type::EnumCase { fqn, case } => {
-            Some((fqn.to_string(), vec![case.to_string()], false))
-        }
+        Type::EnumCase { fqn, case } => Some((fqn.to_string(), vec![case.to_string()], false)),
         Type::Nullable(inner) => {
             let (fqn, cases, _) = enum_case_set(fa, inner)?;
             Some((fqn, cases, true))
@@ -2559,10 +2553,7 @@ mod tests {
             ("is_object($o)", "object $o"),
         ] {
             let src = format!("<?php function f({param}) {{ return {call}; }}");
-            assert!(
-                codes(&src, run_impossible_check_type).is_empty(),
-                "{call}"
-            );
+            assert!(codes(&src, run_impossible_check_type).is_empty(), "{call}");
         }
     }
 
