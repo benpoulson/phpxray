@@ -289,7 +289,12 @@ fn check_function_call_mixed(
                 continue;
             }
             let given = fa.type_of(&arg.value);
-            if crate::compat::strict_mixed_source(&given, include_explicit, include_implicit) {
+            if crate::compat::mixed_violates_target(
+                &given,
+                &param.ty,
+                include_explicit,
+                include_implicit,
+            ) {
                 out.push(
                     Diagnostic::error(
                         arg.value.span,
@@ -356,7 +361,12 @@ fn check_method_call_mixed(
                 continue;
             }
             let given = fa.type_of(&arg.value);
-            if crate::compat::strict_mixed_source(&given, include_explicit, include_implicit) {
+            if crate::compat::mixed_violates_target(
+                &given,
+                &param.ty,
+                include_explicit,
+                include_implicit,
+            ) {
                 out.push(
                     Diagnostic::error(
                         arg.value.span,
@@ -464,7 +474,12 @@ fn check_return_stmts(
     match &st.kind {
         StmtKind::Return(Some(value)) => {
             let given = fa.type_of(value);
-            if crate::compat::strict_mixed_source(&given, include_explicit, include_implicit) {
+            if crate::compat::mixed_violates_target(
+                &given,
+                target,
+                include_explicit,
+                include_implicit,
+            ) {
                 out.push(
                     Diagnostic::error(
                         value.span,
@@ -647,6 +662,28 @@ mod tests {
         // `json_encode(mixed $value, int $flags)` — same shape.
         let src = "<?php function f($x) { json_encode([1], $x); }";
         assert_eq!(codes(src, run_implicit_mixed_strictness), ["argument.type"]);
+    }
+
+    /// The rule-level half of the target-aware mixed check. The discriminating
+    /// pair is unit-tested directly on the predicate in `compat.rs`; here we pin
+    /// the two shapes reproducible through the full rule.
+    #[test]
+    fn nested_mixed_in_an_unconstrained_position_is_not_reported() {
+        // `count(array|Countable)` pins no value type.
+        let src = "<?php /** @param array<int, mixed> $a */ \
+                   function f(array $a) { count($a); }";
+        assert!(
+            codes(src, run_implicit_mixed_strictness).is_empty(),
+            "target does not constrain the value position: {:?}",
+            codes(src, run_implicit_mixed_strictness)
+        );
+
+        // A plainly `mixed` argument against a concrete target still reports.
+        let top_level = "<?php function f($x) { strlen($x); }";
+        assert_eq!(
+            codes(top_level, run_implicit_mixed_strictness),
+            ["argument.type"]
+        );
     }
 
     // --- union types ---------------------------------------------------------
