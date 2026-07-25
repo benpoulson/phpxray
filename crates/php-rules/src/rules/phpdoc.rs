@@ -689,7 +689,7 @@ fn run_assert_tags(fa: &FileAnalysis) -> Vec<Diagnostic> {
             match &st.kind {
                 StmtKind::Function(f) => {
                     if let Some(doc) = &f.doc {
-                        let (templates, _) = template_context(scope, &[doc.as_str()]);
+                        let (templates, _) = template_context(scope, &[&**doc]);
                         check_assert_doc(
                             fa, scope, &templates, doc, &f.params, false, st.span, &mut out,
                         );
@@ -701,7 +701,7 @@ fn run_assert_tags(fa: &FileAnalysis) -> Vec<Diagnostic> {
                         let Member::Method(mth) = m else { continue };
                         let Some(doc) = &mth.doc else { continue };
                         let mut docs = class_docs.clone();
-                        docs.push(doc.as_str());
+                        docs.push(&**doc);
                         let (templates, _) = template_context(scope, &docs);
                         check_assert_doc(
                             fa,
@@ -848,7 +848,7 @@ fn run_conditional_return_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
                         check_function_conditionals(
                             fa,
                             scope,
-                            &[doc.as_str()],
+                            &[&**doc],
                             doc,
                             &f.params,
                             st.span,
@@ -862,7 +862,7 @@ fn run_conditional_return_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
                         let Member::Method(mth) = m else { continue };
                         let Some(doc) = &mth.doc else { continue };
                         let mut docs = class_docs.clone();
-                        docs.push(doc.as_str());
+                        docs.push(&**doc);
                         check_function_conditionals(
                             fa,
                             scope,
@@ -2456,7 +2456,7 @@ fn run_self_out(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 }
 
                 let mut docs = class_docs.clone();
-                docs.push(doc.as_str());
+                docs.push(&**doc);
                 let (templates, _) = template_context(scope, &docs);
                 for tag in self_out_tags {
                     let ty = resolve_doc_type(scope, &templates, &tag);

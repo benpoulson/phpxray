@@ -39,7 +39,14 @@ pub struct Parser<'a> {
     /// Doc-comments are kept out of the parse stream (so they never disrupt
     /// parsing) and attached to following declarations/statements by source
     /// position. `(end, text)`, in source order.
-    docs: Vec<(u32, String)>,
+    ///
+    /// The text is `Arc<str>`, allocated **once** per doc-comment at harvest:
+    /// attaching it to a node is a refcount bump, and so is the parser's
+    /// re-dispatch through `parse_attributed_decl` / `parse_class_like`. It used
+    /// to be a `String` copied out of the source and then cloned again per
+    /// attachment — two allocations of the full doc text per declaration, over
+    /// 6MB of them across the corpus and stubs.
+    docs: Vec<(u32, std::sync::Arc<str>)>,
 }
 
 impl<'a> Parser<'a> {
@@ -49,7 +56,7 @@ impl<'a> Parser<'a> {
         let mut tokens = Vec::with_capacity(lexed.len());
         for t in lexed {
             if t.kind == T::DocComment {
-                docs.push((t.span.end, t.span.text(source).to_string()));
+                docs.push((t.span.end, std::sync::Arc::from(t.span.text(source))));
             } else {
                 tokens.push(t);
             }
@@ -73,7 +80,7 @@ impl<'a> Parser<'a> {
     /// walked past every doc-comment *after* `offset` on each call, which is
     /// quadratic in the number of docblocks per file — paid heavily by
     /// doc-dense sources like the stubs.
-    fn doc_before(&self, offset: u32) -> Option<String> {
+    fn doc_before(&self, offset: u32) -> Option<std::sync::Arc<str>> {
         let idx = self.docs.partition_point(|(end, _)| *end <= offset);
         let (end, text) = self.docs.get(idx.checked_sub(1)?)?;
         let gap = &self.src[*end as usize..offset as usize];
@@ -945,7 +952,7 @@ impl<'a> Parser<'a> {
         (self.member_ident(), self.span_to(start))
     }
 
-    fn parse_attributed_decl(&mut self, doc: Option<String>) -> StmtKind {
+    fn parse_attributed_decl(&mut self, doc: Option<std::sync::Arc<str>>) -> StmtKind {
         let attrs = self.parse_attributes();
         match self.peek() {
             T::Keyword(Kw::Function) if self.is_function_decl() => {
@@ -1001,7 +1008,7 @@ impl<'a> Parser<'a> {
     fn parse_function_decl(
         &mut self,
         attrs: Vec<AttributeGroup>,
-        doc: Option<String>,
+        doc: Option<std::sync::Arc<str>>,
     ) -> FunctionDecl {
         self.bump(); // function
         let by_ref = self.eat_amp();
@@ -1131,7 +1138,11 @@ impl<'a> Parser<'a> {
         v
     }
 
-    fn parse_class_like(&mut self, attrs: Vec<AttributeGroup>, doc: Option<String>) -> ClassDecl {
+    fn parse_class_like(
+        &mut self,
+        attrs: Vec<AttributeGroup>,
+        doc: Option<std::sync::Arc<str>>,
+    ) -> ClassDecl {
         let modifiers = self.parse_modifiers();
         let kind = match self.peek() {
             T::Keyword(Kw::Class) => ClassKind::Class,
@@ -1191,7 +1202,11 @@ impl<'a> Parser<'a> {
         members
     }
 
-    fn parse_member(&mut self, attrs: Vec<AttributeGroup>, doc: Option<String>) -> Member {
+    fn parse_member(
+        &mut self,
+        attrs: Vec<AttributeGroup>,
+        doc: Option<std::sync::Arc<str>>,
+    ) -> Member {
         // `var` is a legacy public-property marker.
         if self.at(T::Keyword(Kw::Var)) {
             self.bump();
@@ -1302,7 +1317,7 @@ impl<'a> Parser<'a> {
     fn parse_property(
         &mut self,
         attrs: Vec<AttributeGroup>,
-        doc: Option<String>,
+        doc: Option<std::sync::Arc<str>>,
         modifiers: Modifiers,
     ) -> PropertyDecl {
         let ty = if self.at(T::Variable) {

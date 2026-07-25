@@ -45,7 +45,7 @@ pub struct Stmt {
     /// A preceding `/** … */` doc-comment attached at statement position.
     /// Declaration nodes keep their own doc fields too; semantic passes decide
     /// whether a statement doc is meaningful, such as an inline `@var`.
-    pub doc: Option<String>,
+    pub doc: Option<std::sync::Arc<str>>,
 }
 
 impl Stmt {
@@ -159,7 +159,7 @@ pub enum StmtKind {
 #[derive(Clone, PartialEq, Debug)]
 pub struct FunctionDecl {
     pub attrs: Vec<AttributeGroup>,
-    pub doc: Option<String>,
+    pub doc: Option<std::sync::Arc<str>>,
     pub name: Symbol,
     /// Span of the function-name token (for declaration-precise diagnostics).
     pub name_span: Span,
@@ -172,7 +172,7 @@ pub struct FunctionDecl {
 #[derive(Clone, PartialEq, Debug)]
 pub struct ClassDecl {
     pub attrs: Vec<AttributeGroup>,
-    pub doc: Option<String>,
+    pub doc: Option<std::sync::Arc<str>>,
     pub kind: ClassKind,
     /// `None` for an anonymous class.
     pub name: Option<Symbol>,
@@ -208,7 +208,7 @@ pub enum Member {
 #[derive(Clone, PartialEq, Debug)]
 pub struct MethodDecl {
     pub attrs: Vec<AttributeGroup>,
-    pub doc: Option<String>,
+    pub doc: Option<std::sync::Arc<str>>,
     pub modifiers: Modifiers,
     pub by_ref: bool,
     pub name: Symbol,
@@ -223,7 +223,7 @@ pub struct MethodDecl {
 #[derive(Clone, PartialEq, Debug)]
 pub struct PropertyDecl {
     pub attrs: Vec<AttributeGroup>,
-    pub doc: Option<String>,
+    pub doc: Option<std::sync::Arc<str>>,
     pub modifiers: Modifiers,
     pub ty: Option<Type>,
     pub props: Vec<PropElem>,
@@ -243,7 +243,7 @@ pub struct PropElem {
 #[derive(Clone, PartialEq, Debug)]
 pub struct PropertyHook {
     pub attrs: Vec<AttributeGroup>,
-    pub doc: Option<String>,
+    pub doc: Option<std::sync::Arc<str>>,
     pub modifiers: Modifiers,
     /// `&get` — by-reference hook.
     pub by_ref: bool,
@@ -269,7 +269,7 @@ pub enum HookBody {
 #[derive(Clone, PartialEq, Debug)]
 pub struct ClassConstDecl {
     pub attrs: Vec<AttributeGroup>,
-    pub doc: Option<String>,
+    pub doc: Option<std::sync::Arc<str>>,
     pub modifiers: Modifiers,
     pub ty: Option<Type>,
     pub consts: Vec<ConstElem>,
@@ -286,7 +286,7 @@ pub struct ConstElem {
 #[derive(Clone, PartialEq, Debug)]
 pub struct EnumCaseDecl {
     pub attrs: Vec<AttributeGroup>,
-    pub doc: Option<String>,
+    pub doc: Option<std::sync::Arc<str>>,
     pub name: Symbol,
     /// Span of the case-name token.
     pub name_span: Span,
