@@ -53,7 +53,6 @@ use php_ast::{
     Param, Program, PropElem, PropertyDecl, PropertyHook, Stmt, StmtKind, Visibility,
 };
 use php_diagnostics::Diagnostic;
-use php_infer::TypeCtx;
 use php_phpdoc::PropertyAccess;
 use php_resolve::{for_each_region, Scope};
 use php_span::Span;
@@ -3778,9 +3777,6 @@ fn check_property_defaults_stmt(
                 .map(|n| scope.qualify(fa.interner.resolve(n)))
                 .unwrap_or_else(|| "class@anonymous".to_string());
             let class = fa.reflect_class(scope, &fqn, c);
-            let ctx = TypeCtx::new(fa.reflection, scope, fa.interner);
-            let mut native_ctx = TypeCtx::new(fa.reflection, scope, fa.interner);
-            native_ctx.native = true;
             for m in &c.members {
                 let Member::Property(pd) = m else { continue };
                 for elem in &pd.props {
@@ -3791,14 +3787,14 @@ fn check_property_defaults_stmt(
                     let Some(prop) = class.properties.iter().find(|p| p.name == pname) else {
                         continue;
                     };
-                    let value = ctx.infer(default);
+                    let value = fa.type_of_isolated(scope, default);
                     if pd.ty.is_none() && matches!(value, Type::Null) {
                         continue;
                     }
                     if is_empty_array_expr(default) && is_array_or_iterable_type(&prop.ty) {
                         continue;
                     }
-                    let native_value = native_ctx.infer(default);
+                    let native_value = fa.native_type_of_isolated(scope, default);
                     if !compat::value_mismatch(
                         fa,
                         &value,

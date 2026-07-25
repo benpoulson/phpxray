@@ -166,6 +166,38 @@ impl FileAnalysis<'_> {
             .unwrap_or(Type::Mixed)
     }
 
+    /// The type of `e` evaluated **on its own**, with no variable environment.
+    ///
+    /// Use this only where the expression genuinely has no surrounding flow to
+    /// consult — a property default, a class-constant value, or a node the type
+    /// map does not record (a `yield` operand's children). Any variable in `e`
+    /// infers as `mixed`, since nothing here knows what it holds; literals,
+    /// arrays, `new`, and calls still resolve.
+    ///
+    /// Prefer [`type_of`](Self::type_of) everywhere else: it reads the
+    /// flow-sensitive map and is strictly better informed.
+    pub fn type_of_isolated(&self, scope: &Scope, e: &Expr) -> Type {
+        self.type_of_isolated_in(scope, None, e)
+    }
+
+    /// [`type_of_isolated`](Self::type_of_isolated) with a class context, so
+    /// `self::CONST` / `static::` inside the expression resolve. Pass the FQN of
+    /// the class the expression is written in.
+    pub fn type_of_isolated_in(&self, scope: &Scope, class: Option<&str>, e: &Expr) -> Type {
+        let mut ctx = php_infer::TypeCtx::new(self.reflection, scope, self.interner);
+        ctx.class = class.map(ToString::to_string);
+        ctx.infer(e)
+    }
+
+    /// [`type_of_isolated`](Self::type_of_isolated) restricted to native types,
+    /// ignoring PHPDoc refinement. Only meaningful under
+    /// `treatPhpDocTypesAsCertain: false`, like [`native_type_of`](Self::native_type_of).
+    pub fn native_type_of_isolated(&self, scope: &Scope, e: &Expr) -> Type {
+        let mut ctx = php_infer::TypeCtx::new(self.reflection, scope, self.interner);
+        ctx.native = true;
+        ctx.infer(e)
+    }
+
     /// Whether expression `e` may be assigned/passed/returned where `target`
     /// (native form `native_target`) is expected, honouring this run's
     /// `treatPhpDocTypesAsCertain`. Use this in the type-compatibility rules. When
@@ -852,5 +884,68 @@ mod tests {
             .collect();
         assert!(l3.contains(&"class.notFound"));
         assert!(l3.contains(&"return.type"));
+    }
+
+    /// The contract every `type_of_isolated` caller depends on: literals resolve,
+    /// but a variable is `mixed` because there is no environment to consult.
+    /// Callers use it only where that is the honest answer.
+    #[test]
+    fn isolated_inference_resolves_literals_but_not_variables() {
+        crate::testutil::with_analysis(
+            "<?php $bound = 42; $x = [42, $bound];",
+            crate::testutil::Harness::default(),
+            |_| {},
+            |fa| {
+                let scope = Scope::global();
+                let mut seen = Vec::new();
+                php_ast::walk::for_each_expr(fa.program, &mut |e| match &e.kind {
+                    php_ast::ExprKind::Int(_) | php_ast::ExprKind::Variable(_) => {
+                        seen.push((
+                            fa.source[e.span.start as usize..e.span.end as usize].to_string(),
+                            fa.type_of_isolated(&scope, e).to_string(),
+                        ));
+                    }
+                    _ => {}
+                });
+                assert!(
+                    seen.contains(&("42".to_string(), "42".to_string())),
+                    "{seen:?}"
+                );
+                // `$bound` is `int` to the flow map, but isolated inference has no
+                // environment, so it must answer `mixed`.
+                assert!(
+                    seen.iter()
+                        .all(|(src, ty)| src != "$bound" || ty == "mixed"),
+                    "{seen:?}"
+                );
+            },
+        );
+    }
+
+    /// `self::` only resolves when the caller supplies the class the expression
+    /// is written in — the whole reason both entry points exist.
+    #[test]
+    fn isolated_inference_needs_a_class_for_self_references() {
+        crate::testutil::with_analysis(
+            "<?php class C { const int N = 5; public function m() { $x = self::N; } }",
+            crate::testutil::Harness::default(),
+            |_| {},
+            |fa| {
+                let scope = Scope::global();
+                let mut found = false;
+                php_ast::walk::for_each_expr(fa.program, &mut |e| {
+                    if !matches!(e.kind, php_ast::ExprKind::ClassConst { .. }) {
+                        return;
+                    }
+                    found = true;
+                    assert_eq!(fa.type_of_isolated(&scope, e).to_string(), "mixed");
+                    assert_eq!(
+                        fa.type_of_isolated_in(&scope, Some("\\C"), e).to_string(),
+                        "5"
+                    );
+                });
+                assert!(found, "expected a class-constant expression");
+            },
+        );
     }
 }

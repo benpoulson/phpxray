@@ -816,9 +816,7 @@ fn check_property_elem(
     let prop_name = fa.interner.resolve(elem.name);
     let is_static = pd.modifiers.is_static;
     let mut assigned = Vec::new();
-    let mut ctx = TypeCtx::new(fa.reflection, scope, fa.interner);
-    ctx.class = Some(class_fqn.to_string());
-    assigned.push(ctx.infer(default));
+    assigned.push(fa.type_of_isolated_in(scope, Some(class_fqn), default));
 
     let Some(mut writes) = collect_property_writes(c, class_fqn, prop_name, is_static, fa, scope)
     else {

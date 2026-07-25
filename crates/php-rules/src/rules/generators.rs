@@ -539,7 +539,7 @@ fn yield_operand_type(fa: &FileAnalysis, scope: &Scope, e: &Expr) -> Type {
     // its key/value children can be absent from the map. A local expression
     // inference with an empty variable environment recovers concrete literals,
     // arrays, calls, and `new` expressions while leaving variables as `mixed`.
-    php_infer::TypeCtx::new(fa.reflection, scope, fa.interner).infer(e)
+    fa.type_of_isolated(scope, e)
 }
 
 fn check_yield_slot(

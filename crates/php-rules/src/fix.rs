@@ -843,8 +843,7 @@ fn own_write_evidence(
 ) -> Option<Evidence> {
     let mut evidence = Evidence::default();
     if let Some(default) = &elem.default {
-        let ctx = php_infer::TypeCtx::new(fa.reflection, scope, fa.interner);
-        evidence.push(default, ctx.infer(default));
+        evidence.push(default, fa.type_of_isolated(scope, default));
     }
     let mut bail = false;
     for m in &c.members {
