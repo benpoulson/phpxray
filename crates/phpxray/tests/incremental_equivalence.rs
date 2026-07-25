@@ -564,6 +564,88 @@ fn inferred_signature_change_invalidates_dependents() {
     );
 }
 
+/// One scenario per **analysis-affecting config input**: change it mid-session
+/// and assert the session's report still equals a fresh batch run.
+///
+/// This is the inventory safety net for item 3. Analysis inputs currently have
+/// to be mirrored across four uncoupled sites (the batch engine, the Session,
+/// `AnalysisFingerprint`, and the result-cache key); `laravelAliases` reached
+/// only one of them and watch mode silently lost the feature. Every input in
+/// `AnalysisFingerprint` gets a case here, so an input that forgets a site is
+/// caught by construction rather than by someone thinking to write a scenario.
+#[test]
+fn every_analysis_input_change_stays_equivalent() {
+    // Sensitive to phpdoc-vs-native typing, untyped-signature inference,
+    // mixed strictness, uninitialized properties, wide return types, a
+    // configurable terminator, and a type alias.
+    let files: &[(&str, &str)] = &[
+        (
+            "src/model.php",
+            "<?php\nclass Model {\n    public int $id;\n    private $untypedProp;\n\
+             /** @return UserId */\n    public function id() { return $this->id; }\n\
+             public function wide(): ?string { return 'x'; }\n\
+             public function guard($v) { if ($v === null) { bail(); } return $v; }\n}\n",
+        ),
+        (
+            "src/app.php",
+            "<?php\nfunction untyped($a) { return $a; }\n\
+             function use_it(Model $m) { return untyped($m->id()) + strlen($m->wide()); }\n\
+             function bail() { exit(1); }\n",
+        ),
+    ];
+
+    type Mutate = fn(&mut Config);
+    let cases: &[(&str, Mutate)] = &[
+        ("phpVersion", |c| c.php_version = Some("8.1".into())),
+        ("treatPhpDocTypesAsCertain", |c| {
+            c.treat_phpdoc_types_as_certain = false
+        }),
+        ("inferUntypedSignatures", |c| {
+            c.infer_untyped_signatures = false
+        }),
+        ("checkExplicitMixed", |c| {
+            c.check_explicit_mixed = Some(true)
+        }),
+        ("checkImplicitMixed", |c| {
+            c.check_implicit_mixed = Some(true)
+        }),
+        ("checkUninitializedProperties", |c| {
+            c.check_uninitialized_properties = true
+        }),
+        ("checkTooWideReturnPublic", |c| {
+            c.check_too_wide_return_public = true
+        }),
+        ("earlyTerminatingFunctionCalls", |c| {
+            c.early_terminating_function_calls = vec!["bail".into()]
+        }),
+        ("earlyTerminatingMethodCalls", |c| {
+            c.early_terminating_method_calls
+                .insert("Model".into(), vec!["fail".into()]);
+        }),
+        ("typeAliases", |c| {
+            c.type_aliases.insert("UserId".into(), "int".into());
+        }),
+        ("laravelAliases", |c| c.laravel_aliases = true),
+        ("stubFiles", |c| c.stub_files = vec!["stubs/x.stub".into()]),
+    ];
+
+    let mut changed_any = false;
+    for (label, mutate) in cases {
+        let mut p = Project::new("max", files);
+        p.write("stubs/x.stub", "<?php\nfunction untyped(int $a): int {}\n");
+        let before = p.check(&format!("{label}: initial"), None);
+        mutate(&mut p.config);
+        let after = p.check(&format!("{label}: after change"), None);
+        changed_any |= before != after;
+    }
+    // If NO input moved the report, the fixture stopped exercising them and the
+    // scenarios would be passing vacuously.
+    assert!(
+        changed_any,
+        "no analysis input changed the report — the fixture is no longer sensitive"
+    );
+}
+
 #[test]
 fn level_change_reanalyzes_everything() {
     let mut p = Project::new(
