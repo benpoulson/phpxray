@@ -69,14 +69,26 @@ pub struct AnalysisInputs {
 
 impl AnalysisInputs {
     /// Resolve the analysis inputs for a run. The one constructor.
+    /// The effective PHP version for `config` — **the** place the raw string is
+    /// parsed.
+    ///
+    /// It used to be parsed at four sites. That is a copy `hash_into`'s
+    /// exhaustive destructure cannot catch, because it lives outside the struct:
+    /// if a future `--php-version` override reached only one of them, the version
+    /// the builtin manifests load would silently diverge from the version hashed
+    /// into the cache key and fingerprint.
+    pub fn php_version_of(config: &Config) -> PhpVersion {
+        config
+            .php_version
+            .as_deref()
+            .and_then(PhpVersion::parse)
+            .unwrap_or_default()
+    }
+
     pub fn resolve(config: &Config, root: &Path) -> Self {
         AnalysisInputs {
             level: config.level.value(),
-            php_version: config
-                .php_version
-                .as_deref()
-                .and_then(PhpVersion::parse)
-                .unwrap_or_default(),
+            php_version: Self::php_version_of(config),
             php_version_raw: config.php_version.clone(),
             treat_phpdoc_types_as_certain: config.treat_phpdoc_types_as_certain,
             infer_untyped_signatures: config.infer_untyped_signatures,

@@ -348,17 +348,14 @@ fn run_pipeline(config: &Config, root: &Path, options: RunOptions) -> (Report, V
     if let Some(t) = &mut timings {
         t.read = started.elapsed();
     }
-    let php_version = config
-        .php_version
-        .as_deref()
-        .and_then(php_rules::PhpVersion::parse)
-        .unwrap_or_default();
     // One resolution of the analysis inputs, shared by the pipeline options, the
-    // result-cache key, and (in the incremental engine) the fingerprint.
+    // result-cache key, and (in the incremental engine) the fingerprint. The PHP
+    // version lives *inside* it — parsing the config a second time here was a
+    // copy `hash_into`'s exhaustive destructure could never have caught, because
+    // it sat outside the struct.
     let analysis_inputs = crate::inputs::AnalysisInputs::resolve(config, root);
     let analysis_options = AnalyzeParsedOptions {
         inputs: analysis_inputs.clone(),
-        php_version,
         collect_fixes: options.collect_fixes,
         debug: options.debug,
     };
@@ -473,7 +470,6 @@ pub fn analyze_parsed(
                 rule_options: Level(level).rule_options(),
                 ..crate::inputs::AnalysisInputs::defaults_for(level, php_version)
             },
-            php_version,
             collect_fixes: false,
             debug: false,
         },
@@ -486,9 +482,6 @@ pub fn analyze_parsed(
 struct AnalyzeParsedOptions {
     /// Every analysis-affecting input, resolved once. See [`crate::inputs`].
     inputs: crate::inputs::AnalysisInputs,
-    /// The parsed `php_version` — kept alongside `inputs` because index
-    /// construction needs it before the context is built.
-    php_version: php_rules::PhpVersion,
     /// Attach machine-applicable fixes to supported diagnostics (`--fix` runs).
     /// Not an analysis *input*: it adds data to findings, it does not change which
     /// findings exist, so it is deliberately outside the cache key.
@@ -507,8 +500,8 @@ fn analyze_parsed_progress(
     // Build the shared immutable indexes once, over the one shared interner.
     let started = Instant::now();
     let indexing = progress.counter(parsed.len(), "Indexing files");
-    let mut project = ProjectIndex::with_builtins_for(options.php_version);
-    let mut reflection = ReflectionIndex::with_builtins_for(options.php_version);
+    let mut project = ProjectIndex::with_builtins_for(options.inputs.php_version);
+    let mut reflection = ReflectionIndex::with_builtins_for(options.inputs.php_version);
     for f in parsed {
         pipeline::index_parsed_file(
             &mut project,
@@ -537,7 +530,12 @@ fn analyze_parsed_progress(
         let started = Instant::now();
         let inferring = progress.spinner("Inferring untyped signatures");
         let programs: Vec<&php_ast::Program> = parsed.iter().map(|f| &f.program).collect();
-        pipeline::infer_signatures(&mut reflection, &programs, interner);
+        pipeline::infer_signatures(
+            &mut reflection,
+            &programs,
+            interner,
+            options.inputs.terminators.clone(),
+        );
         inferring.finish();
         if let Some(t) = &mut timings {
             t.infer_signatures = started.elapsed();

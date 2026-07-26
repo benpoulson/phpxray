@@ -179,11 +179,7 @@ pub struct PassStats {
 
 impl Session {
     pub fn new(config: &Config) -> Self {
-        let php_version = config
-            .php_version
-            .as_deref()
-            .and_then(php_rules::PhpVersion::parse)
-            .unwrap_or_default();
+        let php_version = crate::inputs::AnalysisInputs::php_version_of(config);
         Session {
             interner: php_intern::Interner::new(),
             files: BTreeMap::new(),
@@ -220,11 +216,7 @@ impl Session {
         let analysis_changed = analysis_fp != self.analysis_fingerprint;
         if analysis_fp.php_version_raw != self.analysis_fingerprint.php_version_raw {
             // New builtin universe: rebuild the bases.
-            self.php_version = config
-                .php_version
-                .as_deref()
-                .and_then(php_rules::PhpVersion::parse)
-                .unwrap_or_default();
+            self.php_version = crate::inputs::AnalysisInputs::php_version_of(config);
             self.project_base = ProjectIndex::with_builtins_for(self.php_version);
             self.reflect_base = ReflectionIndex::with_builtins_for(self.php_version);
         }
@@ -457,8 +449,12 @@ impl Session {
                 .iter()
                 .chain(stub_programs.iter().map(|(_, p)| p))
                 .collect();
-            let inferred =
-                crate::pipeline::infer_signatures(&mut reflection, &prog_refs, &self.interner);
+            let inferred = crate::pipeline::infer_signatures(
+                &mut reflection,
+                &prog_refs,
+                &self.interner,
+                inputs.terminators.clone(),
+            );
             if let Some(prev) = &self.prev_inferred {
                 diff_inferred(prev, &inferred, &mut changed_surface);
             }
