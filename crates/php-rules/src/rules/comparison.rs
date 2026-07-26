@@ -757,7 +757,7 @@ struct AssertMethod {
 /// `(declaring-class-lower, method-lower, is-static)`.
 fn assertion_methods(fa: &FileAnalysis) -> HashMap<(String, String, bool), AssertMethod> {
     let mut out = HashMap::new();
-    for_each_class(fa, |_scope, class_fqn, c| {
+    crate::decls::for_each_class_like(fa, |_scope, class_fqn, c| {
         for m in methods(c) {
             let Some(assertion) = method_assertion(fa, class_fqn, m) else {
                 continue;
@@ -1012,79 +1012,6 @@ fn static_call_class(
         Resolution::Fallback { .. } | Resolution::LateStatic(_) | Resolution::BuiltinType(_) => {
             None
         }
-    }
-}
-
-fn for_each_class(fa: &FileAnalysis, mut f: impl FnMut(&Scope, &str, &ClassDecl)) {
-    for_each_region(&fa.program.stmts, fa.interner, |scope, region| {
-        for st in region {
-            walk_class_stmt(st, scope, fa.interner, &mut f);
-        }
-    });
-}
-
-fn walk_class_stmt(
-    st: &Stmt,
-    scope: &Scope,
-    interner: &php_intern::Interner,
-    f: &mut impl FnMut(&Scope, &str, &ClassDecl),
-) {
-    match &st.kind {
-        StmtKind::Class(c) => {
-            if let Some(name) = c.name {
-                let fqn = scope.qualify(interner.resolve(name));
-                f(scope, &fqn, c);
-            }
-        }
-        StmtKind::Block(b) => b
-            .iter()
-            .for_each(|s| walk_class_stmt(s, scope, interner, f)),
-        StmtKind::Function(fd) => fd
-            .body
-            .iter()
-            .for_each(|s| walk_class_stmt(s, scope, interner, f)),
-        StmtKind::If {
-            then, elseifs, els, ..
-        } => {
-            walk_class_stmt(then, scope, interner, f);
-            for e in elseifs {
-                walk_class_stmt(&e.body, scope, interner, f);
-            }
-            if let Some(e) = els {
-                walk_class_stmt(e, scope, interner, f);
-            }
-        }
-        StmtKind::While { body, .. }
-        | StmtKind::DoWhile { body, .. }
-        | StmtKind::For { body, .. }
-        | StmtKind::Foreach { body, .. } => walk_class_stmt(body, scope, interner, f),
-        StmtKind::Switch { cases, .. } => {
-            for c in cases {
-                for s in &c.body {
-                    walk_class_stmt(s, scope, interner, f);
-                }
-            }
-        }
-        StmtKind::Try {
-            body,
-            catches,
-            finally,
-        } => {
-            for s in body {
-                walk_class_stmt(s, scope, interner, f);
-            }
-            for c in catches {
-                for s in &c.body {
-                    walk_class_stmt(s, scope, interner, f);
-                }
-            }
-            if let Some(fin) = finally {
-                for s in fin {
-                    walk_class_stmt(s, scope, interner, f);
-                }
-            }
-        }
-        _ => {}
     }
 }
 
