@@ -2149,7 +2149,12 @@ impl<'a> Parser<'a> {
         let mut k = 0;
         loop {
             match self.nth(k) {
-                T::LParen | T::LBracket | T::LBrace => depth += 1,
+                // `#[` is an opening bracket closed by a plain `]`; without
+                // counting it, an attribute before the first top-level comma
+                // (`clone(#[A] fn() => 1, $x)`) makes the scan hit `depth == 1`
+                // on the attribute's own `]` and misread the call as a
+                // construct.
+                T::LParen | T::LBracket | T::LBrace | T::Attribute => depth += 1,
                 T::RParen | T::RBracket | T::RBrace => {
                     if depth == 1 {
                         return false; // matching `)` with a single, comma-less expr
@@ -2204,9 +2209,22 @@ impl<'a> Parser<'a> {
                      // `yield` has no operand when followed by a terminator, or by an infix
                      // operator that cannot also start an expression (so `yield * -1` parses
                      // as `(yield) * -1`, while `yield +1` yields `+1`).
+        // `Colon` and `DoubleArrow` terminate too: neither can start an
+        // expression, and neither carries an infix power. They appear after a
+        // bare `yield` in `$a ? yield : 2`, `[yield => 1]` and `case yield:`
+        // — the keyed `yield $k => $v` form is only reached once an operand has
+        // parsed, so it is unaffected.
         let no_operand = matches!(
             self.peek(),
-            T::Semicolon | T::RParen | T::RBracket | T::RBrace | T::CloseTag | T::Eof | T::Comma
+            T::Semicolon
+                | T::RParen
+                | T::RBracket
+                | T::RBrace
+                | T::CloseTag
+                | T::Eof
+                | T::Comma
+                | T::Colon
+                | T::DoubleArrow
         ) || (infix_power(self.peek()).is_some()
             && !matches!(self.peek(), T::Plus | T::Minus));
         if no_operand {
