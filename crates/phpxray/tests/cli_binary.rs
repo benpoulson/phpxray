@@ -596,6 +596,27 @@ class T {
     assert!(!out.contains("$y might not be defined"), "{out}");
 }
 
+/// A stray `@phpstan-ignore` in vendored code must not fail the build.
+///
+/// phpstan only honours (and validates) inline ignores in analyzed files. We
+/// used to scan every parsed file, so prose or a malformed marker in a vendored
+/// library produced an Error-severity `ignore.parseError` — and exit code 1 —
+/// for a path the user had explicitly excluded from analysis.
+#[test]
+fn inline_ignore_in_a_scanned_file_does_not_fail_the_run() {
+    let p = TempProject::new("vendor-marker");
+    write_config(&p, "level: 0\npaths:\n  - src\nscanPaths:\n  - vendor\n");
+    p.write("src/ok.php", "<?php\nclass C {}\n");
+    p.write(
+        "vendor/lib.php",
+        "<?php\n// see @phpstan-ignore in the docs\nclass V {}\n",
+    );
+    let run = p.run(["--no-progress"]);
+    let out = stdout(&run);
+    assert!(!out.contains("ignore.parseError"), "{out}");
+    assert!(run.status.success(), "should exit clean: {out}");
+}
+
 #[test]
 fn clear_result_cache_subcommand() {
     let p = TempProject::new("clear-cache");

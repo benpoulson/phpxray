@@ -568,9 +568,14 @@ impl Session {
             .flat_map(|e| e.findings.iter().cloned())
             .collect();
         let files_analyzed = self.files.values().filter(|e| e.analyze).count();
+        // Analyzed files only — matching the batch engine. An inline ignore
+        // suppresses findings in its own file, and a scan-only file produces
+        // none; scanning them also turns a stray marker in vendored code into a
+        // user-visible `ignore.parseError` on a path they excluded.
         let inline_refs: HashMap<&str, &InlineIgnores> = self
             .files
             .iter()
+            .filter(|(_, e)| e.analyze)
             .map(|(rel, e)| (rel.as_str(), &e.inline))
             .collect();
         suppress::apply_compiled(

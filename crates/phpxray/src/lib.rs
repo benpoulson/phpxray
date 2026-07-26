@@ -421,8 +421,16 @@ fn run_pipeline(config: &Config, root: &Path, options: RunOptions) -> (Report, V
         timings.as_mut(),
     );
     report.timings = timings;
+    // Only *analyzed* files: an inline `@phpstan-ignore` suppresses findings in
+    // the file it is written in, and a scan-only file (vendor, a stub) produces
+    // none. Including them also meant a malformed marker in vendored code — or
+    // merely the string appearing in prose — emitted an Error-severity
+    // `ignore.parseError` for a path the user excluded from analysis, which can
+    // fail CI after a `composer update`. The Session builds its map from
+    // analyzed files only, so this is also what keeps the two engines equal.
     let sources: HashMap<&str, &str> = parsed
         .iter()
+        .filter(|f| f.analyze)
         .map(|f| (f.path.as_str(), f.source.as_str()))
         .collect();
     let report = suppress::apply(
