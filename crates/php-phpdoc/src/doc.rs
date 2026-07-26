@@ -269,14 +269,12 @@ fn push_type(out: &mut Vec<DocType>, value: &str) {
 
 /// Strip a `phpstan-`/`psalm-` prefix and return the base tag + its precedence
 /// (phpstan = 2, psalm = 1, plain = 0).
+///
+/// Delegates to [`crate::query::base_priority`] — this was a byte-for-byte
+/// reimplementation of it in the same crate, so a third vendor prefix would have
+/// had to be added in two places.
 fn normalize(name: &str) -> (&str, i8) {
-    if let Some(rest) = name.strip_prefix("phpstan-") {
-        (rest, 2)
-    } else if let Some(rest) = name.strip_prefix("psalm-") {
-        (rest, 1)
-    } else {
-        (name, 0)
-    }
+    crate::query::base_priority(name)
 }
 
 /// Parse a leading type from `s`, returning it and the remaining text. When `s`
