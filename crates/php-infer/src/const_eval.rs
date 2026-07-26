@@ -175,21 +175,16 @@ fn arith(op: BinOp, l: &ConstVal, r: &ConstVal) -> Option<ConstVal> {
             BinOp::Add => Int(a.checked_add(*b)?),
             BinOp::Sub => Int(a.checked_sub(*b)?),
             BinOp::Mul => Int(a.checked_mul(*b)?),
+            // `checked_*` covers division by zero and the `i64::MIN / -1`
+            // overflow; an unrepresentable result folds to nothing.
             BinOp::Div => {
-                if *b == 0 {
-                    return None;
-                } else if a % b == 0 {
-                    Int(a / b)
+                if a.checked_rem(*b)? == 0 {
+                    Int(a.checked_div(*b)?)
                 } else {
                     Float(*a as f64 / *b as f64)
                 }
             }
-            BinOp::Mod => {
-                if *b == 0 {
-                    return None;
-                }
-                Int(a % b)
-            }
+            BinOp::Mod => Int(a.checked_rem(*b)?),
             _ => return None,
         });
     }
@@ -259,6 +254,16 @@ mod tests {
         assert_eq!(val("10 - 4 * 2"), Some(ConstVal::Int(2)));
         assert_eq!(val("7 % 3"), Some(ConstVal::Int(1)));
         assert_eq!(val("'a' . 'b'"), Some(ConstVal::Str(b"ab".to_vec())));
+    }
+
+    #[test]
+    fn declines_unrepresentable_division() {
+        // Division by zero and the one overflowing division fold to nothing
+        // instead of panicking on the way there.
+        assert_eq!(val("1 % 0"), None);
+        assert_eq!(val("1 / 0"), None);
+        assert_eq!(val("(-9223372036854775807 - 1) % -1"), None);
+        assert_eq!(val("(-9223372036854775807 - 1) / -1"), None);
     }
 
     #[test]
