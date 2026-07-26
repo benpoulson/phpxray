@@ -1811,6 +1811,40 @@ mod tests {
     }
 
     #[test]
+    fn catch_only_assignment_is_maybe_not_definite() {
+        // The catch is a real path into the continuation, so `$x` is possibly
+        // defined — never a level-0 "Undefined variable".
+        let src = "<?php function f() { try { risky(); } catch (\\Exception $e) { $x = 1; } echo $x; }";
+        assert!(codes(src, run_defined_variable).is_empty());
+        assert_eq!(
+            codes(src, run_maybe_undefined_variable),
+            ["variable.undefined"]
+        );
+    }
+
+    #[test]
+    fn assignment_in_try_survives_a_terminating_catch() {
+        // The catch can't fall through, so it contributes no path: `$x` is
+        // definite afterwards and neither rule fires.
+        let src = "<?php function f() { try { $x = risky(); } catch (\\Exception $e) { return; } echo $x; }";
+        assert!(codes(src, run_defined_variable).is_empty());
+        assert!(codes(src, run_maybe_undefined_variable).is_empty());
+    }
+
+    #[test]
+    fn assignment_in_finally_is_definite() {
+        let src = "<?php function f() { try { risky(); } catch (\\Exception $e) { } finally { $x = 1; } echo $x; }";
+        assert!(codes(src, run_defined_variable).is_empty());
+        assert!(codes(src, run_maybe_undefined_variable).is_empty());
+    }
+
+    #[test]
+    fn catch_variable_is_defined_in_its_body() {
+        let src = "<?php function f() { try { risky(); } catch (\\Exception $e) { echo $e; } }";
+        assert!(codes(src, run_defined_variable).is_empty());
+    }
+
+    #[test]
     fn foreach_binding_is_defined_in_body() {
         let src = "<?php function f(array $a) { foreach ($a as $v) { echo $v; } }";
         assert!(codes(src, run_defined_variable).is_empty());

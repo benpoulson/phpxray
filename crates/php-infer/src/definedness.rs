@@ -219,14 +219,27 @@ impl Analyzer<'_> {
                 catches,
                 finally,
             } => {
+                // The try body's definitions stay `Definite`: a body that threw
+                // part-way is the lenient case we deliberately don't model, and
+                // downgrading it would report the ubiquitous
+                // `try { $x = f(); } catch (E $e) { return; } use($x);`.
+                // A catch body, though, is a real path into the continuation, so
+                // each one that can fall through merges in — that is what makes a
+                // variable defined only in a catch `Maybe` instead of absent.
                 self.exec_block(body, env);
+                let mut envs = vec![env.clone()];
                 for c in catches {
                     let mut ce = env.clone();
                     if let Some(v) = c.var {
                         ce.insert(self.interner.resolve(v).to_string(), Def::Definite);
                     }
                     self.exec_block(&c.body, &mut ce);
+                    if !c.body.last().is_some_and(|s| self.always_terminates(s)) {
+                        envs.push(ce);
+                    }
                 }
+                *env = merge(envs);
+                // `finally` always runs, so its definitions are unconditional.
                 if let Some(f) = finally {
                     self.exec_block(f, env);
                 }
