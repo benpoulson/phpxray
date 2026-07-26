@@ -74,9 +74,27 @@ pub fn infer_and_apply(
     interner: &Interner,
     opts: InferOpts,
 ) -> InferredSignatures {
-    // Phase A — parameter types from call sites (one pass; the expensive part, as
-    // it builds a type map per file). Apply before returns so bodies see them.
-    let mut combined = infer_params_from_callsites(index, programs, interner, &opts.terminators);
+    let mut evidence = CallSiteEvidence::default();
+    evidence.harvest_batch(index, programs, interner, &opts.terminators);
+    infer_and_apply_from_evidence(index, evidence, interner, opts)
+}
+
+/// [`infer_and_apply`] over call-site evidence gathered separately, so a caller
+/// that cannot hold every `Program` at once can stream them.
+///
+/// The whole-project batch engine does exactly that: it harvests in ordered
+/// batches, dropping each batch's ASTs as it goes, which keeps ~1 GB of scan-only
+/// AST from piling up on a large vendor tree. Phase B needs no programs at all —
+/// it reads the bodies already stored in `index`.
+pub fn infer_and_apply_from_evidence(
+    index: &mut ReflectionIndex,
+    evidence: CallSiteEvidence,
+    interner: &Interner,
+    opts: InferOpts,
+) -> InferredSignatures {
+    // Phase A — parameter types from the harvested call sites. Applied before
+    // returns so bodies see them.
+    let mut combined = params_from_evidence(index, evidence);
     index.apply_inferred(&combined);
 
     // Phase B — return types from bodies, to a small fixpoint so a function whose
@@ -233,32 +251,51 @@ fn is_generator(body: &[Stmt]) -> bool {
 
 // --- parameter inference from call sites ------------------------------------
 
-fn infer_params_from_callsites(
-    index: &ReflectionIndex,
-    programs: &[&Program],
-    interner: &Interner,
-    terminators: &std::sync::Arc<crate::Terminators>,
-) -> InferredSignatures {
-    // Harvest per file in parallel (the throwaway per-file type map is the
-    // expensive part), then merge **in file order**: observation order feeds
-    // `Type::union`'s order-preserving dedup, so the merged result must be
-    // byte-identical to the old sequential pass.
-    let per_file: Vec<(FnArgs, MethodArgs)> = programs
-        .par_iter()
-        .map(|program| harvest_file(index, program, interner, terminators))
-        .collect();
+/// Observed call-site argument types, accumulated across one or more ordered
+/// batches of files.
+///
+/// Batches must be harvested in **file order**: observation order feeds
+/// `Type::union`'s order-preserving dedup, so streaming in a different order
+/// would silently change inferred unions.
+#[derive(Default)]
+pub struct CallSiteEvidence {
+    fn_args: FnArgs,
+    method_args: MethodArgs,
+}
 
-    // Observed argument types per (target, position).
-    let mut fn_args: FnArgs = HashMap::new();
-    let mut method_args: MethodArgs = HashMap::new();
-    for (file_fns, file_methods) in per_file {
-        for (fqn, positions) in file_fns {
-            merge_positions(fn_args.entry(fqn).or_default(), positions);
-        }
-        for (key, positions) in file_methods {
-            merge_positions(method_args.entry(key).or_default(), positions);
+impl CallSiteEvidence {
+    /// Harvest one batch of programs (in parallel within the batch) and merge the
+    /// observations in, preserving file order.
+    pub fn harvest_batch(
+        &mut self,
+        index: &ReflectionIndex,
+        programs: &[&Program],
+        interner: &Interner,
+        terminators: &std::sync::Arc<crate::Terminators>,
+    ) {
+        // The throwaway per-file type map is the expensive part, so files fan out;
+        // the merge below then runs in order.
+        let per_file: Vec<(FnArgs, MethodArgs)> = programs
+            .par_iter()
+            .map(|program| harvest_file(index, program, interner, terminators))
+            .collect();
+        for (file_fns, file_methods) in per_file {
+            for (fqn, positions) in file_fns {
+                merge_positions(self.fn_args.entry(fqn).or_default(), positions);
+            }
+            for (key, positions) in file_methods {
+                merge_positions(self.method_args.entry(key).or_default(), positions);
+            }
         }
     }
+}
+
+/// Turn accumulated call-site observations into parameter signatures.
+fn params_from_evidence(index: &ReflectionIndex, evidence: CallSiteEvidence) -> InferredSignatures {
+    let CallSiteEvidence {
+        fn_args,
+        method_args,
+    } = evidence;
 
     let mut out = InferredSignatures::default();
     for (fqn, positions) in fn_args {

@@ -109,6 +109,30 @@ pub(crate) fn finalize_indexes(
 /// inference/rules see them, and returns them so the incremental engine can
 /// diff against the previous pass (a call-site edit in one file can change
 /// another file's *inferred* signature without touching it).
+/// [`infer_signatures`] over evidence the caller harvested itself.
+///
+/// The streaming engine cannot hand over every `Program` at once, so it collects
+/// call-site evidence batch by batch and finishes here. Both entry points build
+/// the same [`php_infer::InferOpts`] for the same reason the rest of this module
+/// exists: an option that reached one engine and not the other is the bug shape
+/// §8i of CLAUDE.md documents.
+pub(crate) fn infer_signatures_from_evidence(
+    reflection: &mut ReflectionIndex,
+    evidence: php_infer::CallSiteEvidence,
+    interner: &Interner,
+    terminators: std::sync::Arc<php_rules::Terminators>,
+) -> php_reflect::InferredSignatures {
+    php_infer::infer_and_apply_from_evidence(
+        reflection,
+        evidence,
+        interner,
+        php_infer::InferOpts {
+            terminators,
+            ..php_infer::InferOpts::default()
+        },
+    )
+}
+
 pub(crate) fn infer_signatures(
     reflection: &mut ReflectionIndex,
     programs: &[&php_ast::Program],

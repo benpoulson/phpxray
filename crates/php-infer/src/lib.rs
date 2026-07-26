@@ -40,8 +40,9 @@ pub use definedness::{
 };
 pub use refine::{strip_false, strip_falsy, strip_null_lenient, strip_null_strict};
 pub use signatures::{
-    evidence_key, explicit_iterable_param_evidence, infer_and_apply, useful_inference,
-    widen_literals, ExplicitParamEvidence, InferOpts,
+    evidence_key, explicit_iterable_param_evidence, infer_and_apply,
+    infer_and_apply_from_evidence, useful_inference, widen_literals, CallSiteEvidence,
+    ExplicitParamEvidence, InferOpts,
 };
 pub use type_map::{contextual_body_type_map, type_map, type_map_with, Facets, TypeMap};
 pub use util::last_segment;

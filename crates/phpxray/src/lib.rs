@@ -397,26 +397,66 @@ fn run_pipeline(config: &Config, root: &Path, options: RunOptions) -> (Report, V
             return (report, Vec::new());
         }
     }
-    let started = Instant::now();
-    let (mut parsed, interner) = parse_files_with_mode_progress(inputs, &progress);
-    // Mark the trailing stub entries (appended last above): they are indexed but
-    // never analyzed, and excluded from the scanned-file count.
-    if stub_count > 0 {
-        let start = parsed.len() - stub_count;
-        for f in &mut parsed[start..] {
-            f.stub = true;
+    // Which engine analyzes this run. Both produce identical reports; they differ
+    // only in whether every AST is held at once.
+    //
+    // Streaming trades wall-clock for peak memory: it re-parses the scan-only
+    // files a second time for the call-site harvest (which cannot run until the
+    // index is complete), measured at +56% wall for -35% peak on a 21k-file
+    // Laravel project. That is the right trade only where memory is actually
+    // scarce, so small projects — where the eager peak is a couple of hundred MB
+    // anyway — keep the faster path.
+    //
+    // `--fix` always takes the eager path: its cross-file evidence pass wants
+    // every AST at once. Otherwise `PHPXRAY_STREAM` overrides the size heuristic
+    // (`1` forces streaming, `0` forces eager), mirroring `PHPXRAY_WATCH_FULL` for
+    // the incremental engine. The engines must always agree, so the override is
+    // both an escape hatch and what lets a test assert that equality on a fixture
+    // far below the threshold.
+    let eager = if options.collect_fixes {
+        true
+    } else {
+        match std::env::var("PHPXRAY_STREAM").ok().as_deref() {
+            Some("1") => false,
+            Some("0") => true,
+            _ => inputs.len() <= STREAM_THRESHOLD,
         }
-    }
-    if let Some(t) = &mut timings {
-        t.parse = started.elapsed();
-    }
-    let mut report = analyze_parsed_progress(
-        &parsed,
-        &interner,
-        analysis_options,
-        &progress,
-        timings.as_mut(),
-    );
+    };
+    let (mut report, parsed, interner) = if eager {
+        let started = Instant::now();
+        let (mut parsed, interner) = parse_files_with_mode_progress(inputs, &progress);
+        // Mark the trailing stub entries (appended last above): they are indexed
+        // but never analyzed, and excluded from the scanned-file count.
+        if stub_count > 0 {
+            let start = parsed.len() - stub_count;
+            for f in &mut parsed[start..] {
+                f.stub = true;
+            }
+        }
+        if let Some(t) = &mut timings {
+            t.parse = started.elapsed();
+        }
+        let report = analyze_parsed_progress(
+            &parsed,
+            &interner,
+            analysis_options,
+            &progress,
+            timings.as_mut(),
+        );
+        (report, parsed, interner)
+    } else {
+        analyze_streaming(
+            inputs,
+            stub_count,
+            analysis_options,
+            &progress,
+            timings.as_mut(),
+        )
+    };
+    // Bound, not used again: the interner has to outlive the analysis that
+    // resolved symbols through it, so it is dropped with this scope rather than
+    // inside the engine that created it.
+    let _interner = interner;
     report.timings = timings;
     // Only *analyzed* files: an inline `@phpstan-ignore` suppresses findings in
     // the file it is written in, and a scan-only file (vendor, a stub) produces
@@ -549,27 +589,281 @@ fn analyze_parsed_progress(
         php_infer::explicit_iterable_param_evidence(&reflection, &programs, interner)
     });
 
+    let stub_count = parsed.iter().filter(|f| f.stub).count();
     let analyzed_count = parsed.iter().filter(|f| f.analyze).count();
+    analyze_with_indexes(
+        parsed,
+        FileCounts {
+            analyzed: analyzed_count,
+            // Stub files are indexed but neither analyzed nor user-facing "scanned".
+            scanned: parsed.len() - analyzed_count - stub_count,
+        },
+        &project,
+        &reflection,
+        interner,
+        &options,
+        iterable_param_evidence.as_ref(),
+        progress,
+        timings,
+    )
+}
+
+/// Batch size for the streaming engine: big enough to keep every rayon worker
+/// busy, small enough that one batch of ASTs is a rounding error beside the
+/// indexes they feed.
+const STREAM_BATCH: usize = 512;
+
+/// File count above which [`analyze_streaming`] is preferred over the eager
+/// engine.
+///
+/// Peak memory scales with the number of files indexed — roughly 90 KB of live
+/// heap per PHP file in the eager engine, so ~450 MB here and ~1.9 GB at 21k
+/// files. Below this, the eager peak is small enough that paying streaming's
+/// extra parse pass would be a pure loss; above it, memory is what runs out
+/// first (a 4 GB CI step whose services claim 3 GB leaves ~1 GB for analysis).
+const STREAM_THRESHOLD: usize = 5_000;
+
+/// Where a file's `Program` lives during the streaming engine's second pass.
+enum Slot {
+    /// An analyzed file, whose AST is kept for the rules to run over.
+    Analyzed(usize),
+    /// A scan-only or stub file, whose AST was dropped after indexing and is
+    /// re-parsed from retained source text when the harvest needs it.
+    Deferred(usize),
+}
+
+/// A file whose AST was dropped after indexing, keeping only its text.
+///
+/// Keeping the text and re-parsing costs far less than keeping the AST: on a
+/// 21k-file Laravel project the sources are ~120 MB against ~1.2 GB of AST.
+struct DeferredFile {
+    source: String,
+}
+
+/// Whole-project analysis that never holds every AST at once.
+///
+/// Scan-only files (vendor, and user stub files) are parsed, indexed, and then
+/// dropped batch by batch. Their ASTs are the single largest live allocation in a
+/// vendor-heavy run — measured at ~900 MB of a 1.45 GB live heap on a 21k-file
+/// Laravel project — and once indexed, nothing reads them except the signature
+/// pre-pass's call-site harvest.
+///
+/// That harvest cannot run during the first pass, because it resolves callees
+/// against the index and so needs every declaration already in place. It
+/// therefore gets a second streaming pass that re-parses the deferred files from
+/// their retained text, one batch live at a time.
+///
+/// Function and method bodies survive the drop: they are `Arc`-shared into the
+/// reflection index (see `FunctionDecl::body`), which is what interprocedural
+/// inference reads. Phase B of the pre-pass needs no programs at all.
+///
+/// Ordering is preserved exactly — batches are processed in input order and the
+/// harvest merges in that order, because observation order feeds `Type::union`'s
+/// order-preserving dedup.
+fn analyze_streaming(
+    inputs: Vec<(String, String, bool)>,
+    stub_count: usize,
+    options: AnalyzeParsedOptions,
+    progress: &Progress,
+    mut timings: Option<&mut AnalysisTimings>,
+) -> (Report, Vec<ParsedFile>, php_intern::Interner) {
+    let interner = php_intern::Interner::new();
+    let mut project = ProjectIndex::with_builtins_for(options.inputs.php_version);
+    let mut reflection = ReflectionIndex::with_builtins_for(options.inputs.php_version);
+
+    let total = inputs.len();
+    // Stub entries are the trailing inputs and must be indexed last so they win
+    // for the symbols they declare; in-order batching preserves that.
+    let stub_from = total - stub_count;
+
+    let mut retained: Vec<ParsedFile> = Vec::new();
+    let mut deferred: Vec<DeferredFile> = Vec::new();
+    let mut order: Vec<Slot> = Vec::with_capacity(total);
+    let mut analyzed_count = 0usize;
+    let mut scanned_count = 0usize;
+
+    let counter = progress.counter(total, "Parsing and indexing files");
+    let mut parse_elapsed = std::time::Duration::ZERO;
+    let mut index_elapsed = std::time::Duration::ZERO;
+
+    let mut it = inputs.into_iter();
+    let mut first = 0usize;
+    loop {
+        let batch: Vec<(String, String, bool)> = it.by_ref().take(STREAM_BATCH).collect();
+        if batch.is_empty() {
+            break;
+        }
+        let started = Instant::now();
+        let mut parsed_batch: Vec<ParsedFile> = batch
+            .into_par_iter()
+            .map(|(path, source, analyze)| {
+                let (program, diagnostics) = php_parser::parse_into(&source, &interner);
+                ParsedFile {
+                    path,
+                    analyze,
+                    stub: false,
+                    source,
+                    program,
+                    diagnostics,
+                }
+            })
+            .collect();
+        parse_elapsed += started.elapsed();
+        for (i, f) in parsed_batch.iter_mut().enumerate() {
+            f.stub = first + i >= stub_from;
+        }
+
+        let started = Instant::now();
+        for f in &parsed_batch {
+            pipeline::index_parsed_file(
+                &mut project,
+                &mut reflection,
+                &interner,
+                &f.path,
+                &f.program,
+                f.analyze,
+                f.stub,
+            );
+            counter.inc(1);
+        }
+        index_elapsed += started.elapsed();
+
+        // Keep the ASTs the rules will run over; drop the rest, retaining only
+        // the text the harvest pass needs.
+        for f in parsed_batch {
+            if f.analyze {
+                order.push(Slot::Analyzed(retained.len()));
+                analyzed_count += 1;
+                retained.push(f);
+            } else {
+                if !f.stub {
+                    scanned_count += 1;
+                }
+                order.push(Slot::Deferred(deferred.len()));
+                deferred.push(DeferredFile { source: f.source });
+            }
+        }
+        first += STREAM_BATCH;
+    }
+    counter.finish();
+    pipeline::register_facade_aliases(&mut project, options.inputs.facade_aliases());
+    pipeline::finalize_indexes(&mut reflection, &options.inputs.type_aliases);
+    if let Some(t) = &mut timings {
+        t.parse = parse_elapsed;
+        t.index = index_elapsed;
+    }
+
+    if options.inputs.infer_untyped_signatures {
+        let started = Instant::now();
+        let inferring = progress.counter(total, "Inferring untyped signatures");
+        let mut evidence = php_infer::CallSiteEvidence::default();
+        for slots in order.chunks(STREAM_BATCH) {
+            let reparsed: Vec<Option<php_ast::Program>> = slots
+                .par_iter()
+                .map(|slot| match slot {
+                    Slot::Analyzed(_) => None,
+                    Slot::Deferred(j) => {
+                        Some(php_parser::parse_into(&deferred[*j].source, &interner).0)
+                    }
+                })
+                .collect();
+            let programs: Vec<&php_ast::Program> = slots
+                .iter()
+                .zip(reparsed.iter())
+                .map(|(slot, re)| match slot {
+                    Slot::Analyzed(i) => &retained[*i].program,
+                    // `reparsed` is `Some` for exactly the deferred slots.
+                    Slot::Deferred(_) => re.as_ref().expect("deferred slot was re-parsed"),
+                })
+                .collect();
+            evidence.harvest_batch(
+                &reflection,
+                &programs,
+                &interner,
+                &options.inputs.terminators,
+            );
+            inferring.inc(slots.len() as u64);
+            // `reparsed` drops here: only one batch of scan-only ASTs is ever live.
+        }
+        inferring.finish();
+        pipeline::infer_signatures_from_evidence(
+            &mut reflection,
+            evidence,
+            &interner,
+            options.inputs.terminators.clone(),
+        );
+        if let Some(t) = &mut timings {
+            t.infer_signatures = started.elapsed();
+        }
+    }
+    // The harvest is the last reader of scan-only text.
+    drop(deferred);
+
+    let report = analyze_with_indexes(
+        &retained,
+        FileCounts {
+            analyzed: analyzed_count,
+            scanned: scanned_count,
+        },
+        &project,
+        &reflection,
+        &interner,
+        &options,
+        None,
+        progress,
+        timings,
+    );
+    (report, retained, interner)
+}
+
+/// The file counts a [`Report`] reports.
+///
+/// Carried explicitly because the streaming engine drops scan-only files as it
+/// indexes them and so cannot count them from a slice afterwards.
+#[derive(Clone, Copy, Default)]
+struct FileCounts {
+    analyzed: usize,
+    scanned: usize,
+}
+
+/// Run the rules over `files` against already-built indexes.
+///
+/// The second half of analysis, shared by the eager and streaming engines so the
+/// two cannot drift in what a rule sees — the failure mode §8i of CLAUDE.md
+/// describes. `files` need only contain the files to be analyzed; the streaming
+/// engine passes just those, having already dropped the scan-only ones.
+#[allow(clippy::too_many_arguments)]
+fn analyze_with_indexes(
+    files: &[ParsedFile],
+    counts: FileCounts,
+    project: &ProjectIndex,
+    reflection: &ReflectionIndex,
+    interner: &php_intern::Interner,
+    options: &AnalyzeParsedOptions,
+    iterable_param_evidence: Option<&php_infer::ExplicitParamEvidence>,
+    progress: &Progress,
+    mut timings: Option<&mut AnalysisTimings>,
+) -> Report {
     let workers = rayon::current_num_threads();
     let analyzing = progress.counter(
-        analyzed_count,
+        counts.analyzed,
         format!("Analyzing files on {workers} workers"),
     );
     let ctx = build_analysis_context(
         &options.inputs,
         interner,
-        &project,
-        &reflection,
-        parsed
+        project,
+        reflection,
+        files
             .iter()
             .filter(|f| f.analyze)
             .map(|f| (f.path.as_str(), f.source.as_str()))
             .collect(),
-        iterable_param_evidence.as_ref(),
+        iterable_param_evidence,
         options.collect_fixes,
     );
     let started = Instant::now();
-    let mut findings_by_file = parsed
+    let mut findings_by_file = files
         .par_iter()
         .enumerate()
         .filter(|(_, f)| f.analyze)
@@ -594,12 +888,10 @@ fn analyze_parsed_progress(
         .flat_map(|(_, findings, _)| findings)
         .collect();
     analyzing.finish();
-    let stub_count = parsed.iter().filter(|f| f.stub).count();
     Report {
         findings,
-        files_analyzed: analyzed_count,
-        // Stub files are indexed but neither analyzed nor user-facing "scanned".
-        files_scanned: parsed.len() - analyzed_count - stub_count,
+        files_analyzed: counts.analyzed,
+        files_scanned: counts.scanned,
         timings: None,
     }
 }

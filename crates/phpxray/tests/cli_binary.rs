@@ -47,6 +47,16 @@ impl Drop for TempProject {
     }
 }
 
+/// Run with the streaming/eager engine forced (see `PHPXRAY_STREAM`).
+fn run_with_engine(project: &TempProject, stream: bool, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_phpxray"))
+        .current_dir(&project.root)
+        .env("PHPXRAY_STREAM", if stream { "1" } else { "0" })
+        .args(args)
+        .output()
+        .unwrap()
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -907,4 +917,59 @@ fn result_cache_notices_laravel_alias_source_edits() {
     p.write("config/app.php", with_alias);
     let restored = p.run(["--no-progress"]);
     assert_eq!(restored.status.code(), Some(0), "{}", stdout(&restored));
+}
+
+/// The streaming and eager engines must produce byte-identical reports.
+///
+/// Ordinary runs choose between them by project size, so every fixture here sits
+/// far below the threshold and would only ever exercise the eager path; this
+/// forces both.
+///
+/// The fixture is built so a *scan-only* call site changes what is reported in an
+/// *analyzed* file — precisely what streaming risks losing, since it drops vendor
+/// ASTs after indexing and re-parses them for the call-site harvest. `untyped()`
+/// is called with an int from vendor, widening its inferred parameter (and so its
+/// inferred return) to `int|string`, which is imprecise enough that returning it
+/// from `g(): int` is left alone. Lose that vendor call site and the inferred type
+/// collapses to `string`, a `return.type` error appears, and the two engines
+/// disagree.
+#[test]
+fn streaming_and_eager_engines_agree() {
+    let project = TempProject::new("engine_equivalence");
+    write_config(
+        &project,
+        "level: 6\npaths:\n  - app\nscanPaths:\n  - vendor\n",
+    );
+    project.write(
+        "vendor/lib.php",
+        "<?php\nfunction untyped($x) { return $x; }\n",
+    );
+    project.write("vendor/caller.php", "<?php\nuntyped(5);\n");
+    project.write(
+        "app/App.php",
+        "<?php\nfunction g(): int { return untyped('s'); }\nfunction needs_int(int $n): int { return $n; }\nfunction always_bad(): int { return needs_int('nope'); }\n",
+    );
+
+    let streamed = run_with_engine(&project, true, &["--error-format", "json"]);
+    let eager = run_with_engine(&project, false, &["--error-format", "json"]);
+
+    assert_eq!(
+        stdout(&streamed),
+        stdout(&eager),
+        "streaming and eager reports diverged"
+    );
+    assert_eq!(streamed.status.code(), eager.status.code());
+    // Analysis actually ran and reported something...
+    assert!(
+        stdout(&streamed).contains("argument.type"),
+        "expected the always-present finding, got: {}",
+        stdout(&streamed)
+    );
+    // ...and the scan-only call site reached the harvest, so the widened inferred
+    // type suppressed this one. Its presence means vendor call sites were lost.
+    assert!(
+        !stdout(&streamed).contains("return.type"),
+        "scan-only call site was not harvested: {}",
+        stdout(&streamed)
+    );
 }
