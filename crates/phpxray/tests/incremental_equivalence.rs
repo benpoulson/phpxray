@@ -799,3 +799,100 @@ fn unhinted_passes_match_hinted_passes() {
     // No hint at all: the session must rediscover and still match the batch.
     p.check("unhinted edit", None);
 }
+
+/// A file demoted from analyzed to scan-only must lose its findings.
+///
+/// The Session keeps parse artifacts for scan-only files (they still feed the
+/// index) but skips them when choosing what to re-analyze, while report assembly
+/// flat-maps the findings of *every* entry. So without clearing them on demotion
+/// the file's last findings were reported on every subsequent pass, forever,
+/// until the watcher restarted.
+#[test]
+fn demoting_a_file_to_scan_only_drops_its_findings() {
+    let mut p = Project::new(
+        "max",
+        &[(
+            "src/bad.php",
+            "<?php function bad() { return new TotallyMissing(); }\n",
+        )],
+    );
+    let before = p.check("initial", None);
+    assert!(
+        before.iter().any(|f| f.contains("class.notFound")),
+        "expected a finding to remove: {before:?}"
+    );
+
+    // Demote it: `excludePaths.analyse` keeps the file indexed but stops it
+    // being analyzed.
+    p.config.exclude_paths.analyse = vec!["src/bad.php".into()];
+    let after = p.check("demoted to scan-only", None);
+    assert!(
+        after.is_empty(),
+        "findings survived the demotion: {after:?}"
+    );
+
+    // And promoting it back brings them straight back.
+    p.config.exclude_paths.analyse.clear();
+    let restored = p.check("promoted back", None);
+    assert_eq!(restored, before);
+}
+
+/// Discovery-affecting config edits (which files are analyzed at all) must keep
+/// the Session equivalent to a fresh batch run. The pre-existing config
+/// scenarios only covered *analysis* inputs, never the file set.
+#[test]
+fn discovery_config_changes_stay_equivalent() {
+    let mut p = Project::new(
+        "max",
+        &[
+            ("src/a.php", "<?php function a() { return new GoneA(); }\n"),
+            ("lib/b.php", "<?php function b() { return new GoneB(); }\n"),
+        ],
+    );
+    p.check("initial", None);
+
+    // Widen the analyzed set.
+    p.config.paths.push("lib".into());
+    p.check("paths widened", None);
+
+    // Move a directory from analyzed to scan-only.
+    p.config.paths.retain(|x| x != "lib");
+    p.config.scan_paths.push("lib".into());
+    p.check("lib becomes scan-only", None);
+
+    // Narrow the analyzed set entirely.
+    p.config.paths.clear();
+    p.check("paths emptied", None);
+
+    // And restore it.
+    p.config.paths.push("src".into());
+    p.check("paths restored", None);
+}
+
+/// A malformed `@phpstan-ignore` in a scan-only file must not be reported.
+///
+/// The batch engine used to scan *every* parsed file for inline markers,
+/// including stubs and vendored code, while the Session only ever scanned
+/// analyzed files — so the two disagreed. Suppression belongs to the file it is
+/// written in, and a scan-only file produces no findings to suppress.
+#[test]
+fn inline_ignore_markers_outside_analyzed_files_are_ignored() {
+    let mut p = Project::new_with_config(
+        "level: max\npaths:\n  - src\nscanPaths:\n  - vendor\nstubFiles:\n  - stubs/x.stub\n",
+        &[("src/a.php", "<?php function a(): int { return 1; }\n")],
+    );
+    // Both carry a marker with no identifier — malformed if it were honoured.
+    p.write(
+        "vendor/lib.php",
+        "<?php\n// @phpstan-ignore\nfunction vend(): int { return 1; }\n",
+    );
+    p.write(
+        "stubs/x.stub",
+        "<?php\n// @phpstan-ignore\nfunction stubbed(int $a): int {}\n",
+    );
+    let out = p.check("markers in non-analyzed files", None);
+    assert!(
+        !out.iter().any(|f| f.contains("ignore.parseError")),
+        "a marker outside the analyzed set was reported: {out:?}"
+    );
+}
