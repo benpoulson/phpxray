@@ -239,7 +239,10 @@ fn doc_generic(scope: &Scope, templates: &[String], base: &str, args: &[DocType]
         "non-empty-list" => Type::non_empty(Type::List(Box::new(
             resolved.into_iter().last().unwrap_or(Type::Mixed),
         ))),
-        "class-string" | "interface-string" => {
+        // All four spellings take a type argument. Listing only two here (while
+        // the bare-keyword arm accepts all four) silently dropped the argument
+        // of `enum-string<Suit>` / `trait-string<T>`.
+        "class-string" | "interface-string" | "trait-string" | "enum-string" => {
             Type::ClassString(resolved.into_iter().next().map(Box::new))
         }
         // `int<0, 100>` — a bounded integer range. Bounds are literal ints or
@@ -529,6 +532,15 @@ mod tests {
         let s = Scope::global();
         assert_eq!(doc(&s, &[], "array-key").to_string(), "int|string");
         assert_eq!(doc(&s, &[], "class-string"), Type::ClassString(None));
+        // All four `*-string` spellings take a type argument. The generic arm
+        // used to list only two, silently dropping the others' argument.
+        for kw in ["class-string", "interface-string", "trait-string", "enum-string"] {
+            assert_eq!(
+                doc(&s, &[], &format!("{kw}<Foo>")).to_string(),
+                "class-string<Foo>",
+                "{kw} dropped its type argument"
+            );
+        }
         assert_eq!(doc(&s, &[], "list"), Type::List(Box::new(Type::Mixed)));
         assert_eq!(doc(&s, &[], "positive-int"), Type::int_range(Some(1), None));
         assert_eq!(
