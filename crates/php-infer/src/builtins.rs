@@ -38,6 +38,47 @@ pub(crate) fn is_variable_escape_fn(lowercased_name: &str) -> bool {
     VARIABLE_ESCAPE_FUNCTIONS.contains(&lowercased_name)
 }
 
+/// Drop every string conversion from a `sprintf` format, keeping literal text
+/// (including the `%` that `%%` emits) and all other specifiers.
+///
+/// Used to prove a formatted result is non-empty: `%s` can expand to nothing,
+/// and so can its width/precision forms — `%.0s` truncates to zero characters
+/// while containing no `%s` substring at all. Every other conversion emits at
+/// least one character, so whatever survives here is a lower bound on the
+/// output.
+fn strip_string_conversions(fmt: &str) -> String {
+    let mut out = String::new();
+    let mut rest = fmt;
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        // `%%` is an escaped literal percent, not a conversion.
+        if let Some(tail) = after.strip_prefix('%') {
+            out.push('%');
+            rest = tail;
+            continue;
+        }
+        // Flags, width and precision are non-alphabetic; the first ASCII letter
+        // is the conversion character.
+        match after.find(|c: char| c.is_ascii_alphabetic()) {
+            Some(e) if after.as_bytes()[e] == b's' => rest = &after[e + 1..],
+            Some(e) => {
+                out.push('%');
+                out.push_str(&after[..=e]);
+                rest = &after[e + 1..];
+            }
+            // A trailing `%` with no conversion: keep it verbatim.
+            None => {
+                out.push('%');
+                out.push_str(after);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Built-in functions known to be pure / side-effect-free.
 ///
 /// A conservative subset of phpstan's `@phpstan-pure` stub annotations — chosen so
@@ -201,11 +242,11 @@ impl TypeCtx<'_> {
         // subject yields a string, an array subject an array. The stub can only
         // say `string|array`, which then poisons every downstream string use.
         if let Some(idx) = match fname {
-            "str_replace"
-            | "str_ireplace"
-            | "preg_replace"
-            | "preg_replace_callback"
-            | "preg_replace_callback_array" => Some(2),
+            "str_replace" | "str_ireplace" | "preg_replace" | "preg_replace_callback" => Some(2),
+            // `preg_replace_callback_array(array $pattern, $subject, …)` takes
+            // the subject one slot earlier than the rest of the family — index 2
+            // is its `$limit`.
+            "preg_replace_callback_array" => Some(1),
             "substr_replace" => Some(0),
             _ => None,
         } {
@@ -356,10 +397,29 @@ impl TypeCtx<'_> {
             // `array_values(array<K,V>)` → `list<V>`.
             "array_values" => Some(Type::List(Box::new(self.array_value_type(args.first()?)?))),
             "array_column" => self.array_column_return(args),
-            // These keep the value type AND re-index integer keys (default
-            // flags), so a list stays a list; returning the input type holds.
+            // These keep the value type and, with default flags, re-index
+            // integer keys — so a list stays a list.
+            //
+            // `array_reverse`/`array_slice` take a `preserve_keys` flag, though:
+            // with it on the original integer keys survive, so a list comes back
+            // with holes (`array<int, V>`, exactly like the filter family
+            // below). Claiming `list` there makes `array_values()` of the result
+            // look like a no-op and `arrayValues.list` reports a meaningful call.
+            // `array_splice`/`array_pad` have no such flag.
             "array_reverse" | "array_slice" | "array_splice" | "array_pad" => {
+                let preserve_arg = match fname {
+                    "array_reverse" => args.get(1),
+                    "array_slice" => args.get(3),
+                    _ => None,
+                };
+                // Absent, or provably `false`, means keys are re-indexed.
+                let reindexes = preserve_arg.is_none_or(|a| {
+                    matches!(crate::eval_const(&a.value), Some(crate::ConstVal::Bool(false)))
+                });
                 match self.infer(&args.first()?.value) {
+                    Type::List(v) if !reindexes => {
+                        Some(Type::Array(Some(Box::new((Type::Int, *v)))))
+                    }
                     t @ (Type::Array(_) | Type::List(_)) => Some(t),
                     _ => None,
                 }
@@ -472,10 +532,10 @@ impl TypeCtx<'_> {
         let non_empty_string = || Type::StringOf(php_types::StringRefinement::NonEmpty);
         Some(match fname {
             // A `%`-free literal format is the result verbatim; with
-            // conversions, every specifier but `%s` emits at least one char, so
-            // stripping `%%` and `%s` from a literal format proves
-            // non-emptiness when anything remains (positional `%1$s` forms are
-            // skipped via the `$` guard).
+            // conversions, every specifier *except* a string one emits at least
+            // one character, so a literal format proves non-emptiness when
+            // anything survives stripping `%%` and the `%…s` forms (positional
+            // `%1$s` forms are skipped via the `$` guard).
             "sprintf" | "vsprintf" => {
                 let fmt = lit(0)?;
                 if !fmt.contains('%') {
@@ -487,8 +547,7 @@ impl TypeCtx<'_> {
                 if fmt.contains('$') {
                     return None;
                 }
-                let stripped = fmt.replace("%%", "").replace("%s", "");
-                if stripped.is_empty() {
+                if strip_string_conversions(&fmt).is_empty() {
                     return None;
                 }
                 non_empty_string()
@@ -546,13 +605,17 @@ impl TypeCtx<'_> {
                     Type::IntRange { min: Some(m), .. } if m >= 1 => None,
                     _ => return None,
                 };
+                // A literal count keeps the subject non-empty only if it repeats
+                // at least once — `str_repeat($nonEmpty, 0)` is `''`. (`None`
+                // here is the `IntRange` case, already known to be ≥ 1.)
+                let repeats = times.is_none_or(|n| n >= 1);
                 match (lit(0), times) {
                     (Some(s), Some(n))
                         if n >= 0 && s.len().saturating_mul(n as usize) <= FOLD_CAP =>
                     {
                         Type::LiteralString(s.repeat(n as usize).into())
                     }
-                    _ if arg_non_empty(0) => non_empty_string(),
+                    _ if repeats && arg_non_empty(0) => non_empty_string(),
                     _ => return None,
                 }
             }

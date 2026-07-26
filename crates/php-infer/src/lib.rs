@@ -2611,6 +2611,49 @@ mod tests {
         // drop everything.
         assert_eq!(infer("sprintf('%s', 'x');"), "string");
         assert_eq!(infer("explode(',', 'a,b', -1);"), "list<string>");
+        // A precision on a string conversion can truncate to nothing, and it
+        // contains no literal `%s` to strip.
+        assert_eq!(infer("sprintf('%.0s', 'x');"), "string");
+        assert_eq!(infer("sprintf('%-5.2s', 'x');"), "string");
+        // Other conversions still prove non-emptiness, width or not.
+        assert_eq!(infer("sprintf('%05.2f', 1.5);"), "non-empty-string");
+        // `%%` is a literal percent character.
+        assert_eq!(infer("sprintf('%%%s', 'x');"), "non-empty-string");
+    }
+
+    #[test]
+    fn preserve_keys_stops_a_list_staying_a_list() {
+        let list = Type::List(Box::new(Type::String));
+        let with = |src: &str| infer_with(src, &[("l", list.clone())], None);
+        // Default flags re-index, so a list stays a list.
+        assert_eq!(with("array_reverse($l);"), "list<string>");
+        assert_eq!(with("array_reverse($l, false);"), "list<string>");
+        assert_eq!(with("array_slice($l, 1);"), "list<string>");
+        // `preserve_keys` keeps the original integer keys, so the result has
+        // holes — `array<int, V>`, which makes a following `array_values()`
+        // meaningful rather than a no-op.
+        assert_eq!(with("array_reverse($l, true);"), "array<int, string>");
+        assert_eq!(with("array_slice($l, 1, 2, true);"), "array<int, string>");
+        // Not provably false (a runtime flag) is treated as preserving.
+        assert_eq!(with("array_reverse($l, $flag);"), "array<int, string>");
+        // These two have no `preserve_keys` parameter at all.
+        assert_eq!(with("array_splice($l, 1);"), "list<string>");
+        assert_eq!(with("array_pad($l, 5, 'x');"), "list<string>");
+    }
+
+    #[test]
+    fn str_repeat_zero_times_is_not_non_empty() {
+        // `str_repeat($nonEmpty, 0)` is `''` — a non-empty subject proves
+        // nothing unless the count is provably at least one.
+        let ne = Type::StringOf(php_types::StringRefinement::NonEmpty);
+        assert_eq!(
+            infer_with("str_repeat($s, 0);", &[("s", ne.clone())], None),
+            "string"
+        );
+        assert_eq!(
+            infer_with("str_repeat($s, 2);", &[("s", ne)], None),
+            "non-empty-string"
+        );
     }
 
     #[test]
