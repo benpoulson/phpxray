@@ -5,6 +5,13 @@ members = ["cargo:."]
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.32.0"
+# release.yml carries hand-added "Stamp the workspace version from the tag" steps
+# (see .github/scripts/stamp-version.sh) so that releases are triggered by pushing
+# a version tag alone, with no manual Cargo.toml bump. dist would otherwise refuse
+# to run against a workflow it did not generate verbatim. The cost: dist no longer
+# tells us when release.yml is stale, so after bumping cargo-dist-version, run
+# `dist init` and re-add those four steps by hand.
+allow-dirty = ["ci"]
 # CI backends to support
 ci = "github"
 # The installers to generate for each app.
