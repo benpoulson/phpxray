@@ -1970,6 +1970,10 @@ fn null_truth(t: &Type) -> Option<bool> {
     match t {
         Type::Null => Some(true),
         Type::Nullable(_) | Type::Mixed | Type::ExplicitMixed | Type::Unknown(_) => None,
+        // An unbound template says nothing about nullability: `T` may still be
+        // instantiated `?User`, so claiming it cannot be null would prune the
+        // null arm of a `@return T|null` body.
+        Type::TemplateVar(_) => None,
         Type::Union(parts) if parts.contains(&Type::Null) => None,
         _ => Some(false),
     }
