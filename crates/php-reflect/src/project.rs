@@ -2086,6 +2086,22 @@ mod tests {
     }
 
     #[test]
+    fn enums_implement_the_implicit_enum_interfaces() {
+        // PHP implies these; nothing in the source mentions them. Without the
+        // implication a userland enum compares as unrelated to `BackedEnum`,
+        // which `is_assignable` reports as a *confident* mismatch.
+        let idx = index("<?php enum Suit: string { case Hearts = 'H'; } enum Plain { case A; }");
+        assert!(idx.is_subclass_of("Suit", "UnitEnum"));
+        assert!(idx.is_subclass_of("Suit", "BackedEnum"));
+        assert!(idx.is_subclass_of("Plain", "UnitEnum"));
+        // A pure enum is not backed, so it is not a `BackedEnum`.
+        assert!(!idx.is_subclass_of("Plain", "BackedEnum"));
+        // Ordinary classes are unaffected.
+        let plain = index("<?php class C {}");
+        assert!(!plain.is_subclass_of("C", "UnitEnum"));
+    }
+
+    #[test]
     fn scan_file_does_not_override_builtin_function() {
         let r = php_parser::parse("<?php function strlen(): bool {}");
         assert!(!r.has_errors(), "parse errors");

@@ -509,7 +509,12 @@ pub fn reflect_class(
         is_final: c.modifiers.is_final,
         is_readonly: c.modifiers.is_readonly,
         parents: parents_with_generics(scope, &class_templates, &c.extends, &doc.extends),
-        interfaces: parents_with_generics(scope, &class_templates, &c.implements, &doc.implements),
+        interfaces: {
+            let mut ifaces =
+                parents_with_generics(scope, &class_templates, &c.implements, &doc.implements);
+            implicit_enum_interfaces(c, &mut ifaces);
+            ifaces
+        },
         traits: parents_with_generics(scope, &class_templates, &traits, &doc.uses),
         mixins: doc
             .mixins
@@ -531,6 +536,31 @@ pub fn reflect_class(
         imported_types,
         builtin: false,
     }
+}
+
+/// Add the interfaces PHP gives an enum without an `implements` clause: every
+/// enum is a `UnitEnum`, and a backed one is additionally a `BackedEnum`.
+///
+/// Writing either explicitly is a fatal error in PHP ("cannot implement
+/// previously implemented interface"), so there is nothing to deduplicate — but
+/// without them a userland enum reflects as unrelated to both, and
+/// `is_assignable`'s both-classes-indexed arm turns that into a *confident*
+/// negative. The builtin manifests already list both on built-in enums; this is
+/// what keeps userland enums consistent with them.
+fn implicit_enum_interfaces(c: &ClassDecl, interfaces: &mut Vec<Type>) {
+    if c.kind != ClassKind::Enum {
+        return;
+    }
+    if c.backing.is_some() {
+        interfaces.push(Type::Named {
+            fqn: "BackedEnum".into(),
+            args: Vec::new(),
+        });
+    }
+    interfaces.push(Type::Named {
+        fqn: "UnitEnum".into(),
+        args: Vec::new(),
+    });
 }
 
 fn synthesize_enum_members(
