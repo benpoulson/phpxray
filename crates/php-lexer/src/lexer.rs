@@ -257,16 +257,23 @@ impl<'a> Lexer<'a> {
             return;
         }
 
-        // Binary-string prefix on a non-interpolated literal: `b"..."` / `b'...'`.
+        // Binary-string prefix: `b"..."` / `b'...'`.
         if (c == b'b' || c == b'B') && matches!(self.at(1), b'"' | b'\'') {
             let q = self.at(1);
+            let start = self.pos;
             if q == b'\'' || !self.double_quoted_interpolated(self.pos + 1) {
-                let start = self.pos;
                 self.pos += 1; // prefix; cursor now on the quote
                 self.lex_string(start);
                 return;
             }
-            // Interpolated `b"..."` is rare; fall through and let `b` lex as a name.
+            // Interpolated: the opening delimiter is the two bytes `b"` (PHP
+            // emits them as one token), then the usual interpolation machinery.
+            // Letting `b` lex as a name instead dropped the entire string from
+            // the token stream, and with it from the AST.
+            self.pos += 2;
+            self.push(TokenKind::DoubleQuote, start);
+            self.states.push(State::DoubleQuotes);
+            return;
         }
 
         // String literals.
