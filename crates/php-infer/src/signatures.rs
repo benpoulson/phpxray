@@ -452,7 +452,7 @@ fn merge_positions(acc: &mut Vec<Vec<Type>>, file: Vec<Vec<Type>>) {
 fn record_args(map: &TypeMap, args: &[Arg], positions: &mut Vec<Vec<Type>>) {
     if args
         .iter()
-        .any(|a| a.spread || a.placeholder || a.name.is_some())
+        .any(|a| a.spread || a.is_placeholder() || a.name.is_some())
     {
         return;
     }

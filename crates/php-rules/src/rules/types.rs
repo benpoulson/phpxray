@@ -255,7 +255,7 @@ fn check_function_call_mixed(
         };
         if args
             .iter()
-            .any(|a| a.spread || a.placeholder || a.name.is_some())
+            .any(|a| a.spread || a.is_placeholder() || a.name.is_some())
         {
             return;
         }
@@ -327,7 +327,7 @@ fn check_method_call_mixed(
         };
         if args
             .iter()
-            .any(|a| a.spread || a.placeholder || a.name.is_some())
+            .any(|a| a.spread || a.is_placeholder() || a.name.is_some())
         {
             return;
         }

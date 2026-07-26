@@ -83,7 +83,7 @@ pub(crate) fn args_are_plain_positional(args: &[php_ast::Arg]) -> bool {
 
 /// [`args_are_plain_positional`] for a single argument.
 pub(crate) fn arg_is_plain_positional(a: &php_ast::Arg) -> bool {
-    !a.spread && !a.placeholder && a.name.is_none()
+    !a.spread && !a.is_placeholder() && a.name.is_none()
 }
 
 /// The last `\`-separated segment of a (possibly qualified) name.

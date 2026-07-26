@@ -1674,7 +1674,7 @@ fn cast_type(kind: CastKind) -> Type {
 }
 
 fn is_first_class_callable(args: &[php_ast::Arg]) -> bool {
-    args.iter().any(|a| a.placeholder)
+    args.iter().any(|a| a.is_placeholder())
 }
 
 fn collection_method(name: &str) -> Option<CollectionMethod> {

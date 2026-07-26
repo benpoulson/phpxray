@@ -91,7 +91,7 @@ fn run_first_class_callable_version(fa: &FileAnalysis) -> Vec<Diagnostic> {
     }
     let mut out = Vec::new();
     for call in fa.facts.function_calls() {
-        if call.args.iter().any(|a| a.placeholder) {
+        if call.args.iter().any(|a| a.is_placeholder()) {
             out.push(
                 Diagnostic::error(
                     call.expr.span,
@@ -102,7 +102,7 @@ fn run_first_class_callable_version(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
     }
     for call in fa.facts.method_calls() {
-        if call.args.iter().any(|a| a.placeholder) {
+        if call.args.iter().any(|a| a.is_placeholder()) {
             out.push(
                 Diagnostic::error(
                     call.expr.span,
@@ -113,7 +113,7 @@ fn run_first_class_callable_version(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
     }
     for call in fa.facts.static_calls() {
-        if call.args.iter().any(|a| a.placeholder) {
+        if call.args.iter().any(|a| a.is_placeholder()) {
             out.push(
                 Diagnostic::error(
                     call.expr.span,
@@ -794,7 +794,7 @@ fn run_define_parameters(fa: &FileAnalysis) -> Vec<Diagnostic> {
         {
             return;
         }
-        if args.iter().any(|a| a.spread || a.placeholder) {
+        if args.iter().any(|a| a.spread || a.is_placeholder()) {
             return;
         }
         if args.len() >= 3 {
@@ -824,7 +824,7 @@ fn run_invoke_non_callable(fa: &FileAnalysis) -> Vec<Diagnostic> {
         };
         // A named call (`foo()`) is a function reference, not a value invocation;
         // `f(...)` is a first-class-callable, not an invocation.
-        if matches!(callee.kind, ExprKind::Name(_)) || args.iter().any(|a| a.placeholder) {
+        if matches!(callee.kind, ExprKind::Name(_)) || args.iter().any(|a| a.is_placeholder()) {
             return;
         }
         let t = fa.type_of(callee);
@@ -847,7 +847,7 @@ fn run_invoke_maybe_non_callable(fa: &FileAnalysis) -> Vec<Diagnostic> {
         let ExprKind::Call { callee, args } = &e.kind else {
             return;
         };
-        if matches!(callee.kind, ExprKind::Name(_)) || args.iter().any(|a| a.placeholder) {
+        if matches!(callee.kind, ExprKind::Name(_)) || args.iter().any(|a| a.is_placeholder()) {
             return;
         }
         let t = fa.type_of(callee);
@@ -919,7 +919,7 @@ fn run_implode_castable(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
         if args
             .iter()
-            .any(|a| a.spread || a.placeholder || a.name.is_some())
+            .any(|a| a.spread || a.is_placeholder() || a.name.is_some())
         {
             return;
         }
@@ -980,7 +980,7 @@ fn run_printf_parameters(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
         if args
             .iter()
-            .any(|a| a.spread || a.placeholder || a.name.is_some())
+            .any(|a| a.spread || a.is_placeholder() || a.name.is_some())
         {
             return; // unpacking / named args: count is indeterminate.
         }
@@ -1144,7 +1144,7 @@ fn run_argument_count(fa: &FileAnalysis) -> Vec<Diagnostic> {
         // Spread/first-class-callable/named args: count is indeterminate or N/A.
         if args
             .iter()
-            .any(|a| a.spread || a.placeholder || a.name.is_some())
+            .any(|a| a.spread || a.is_placeholder() || a.name.is_some())
         {
             return;
         }
@@ -1214,7 +1214,7 @@ fn run_argument_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
         // positional pairing).
         if args
             .iter()
-            .any(|a| a.spread || a.placeholder || a.name.is_some())
+            .any(|a| a.spread || a.is_placeholder() || a.name.is_some())
         {
             return;
         }
@@ -1264,7 +1264,7 @@ fn run_function_callable(fa: &FileAnalysis) -> Vec<Diagnostic> {
             return;
         };
         // First-class-callable form: a single `...` placeholder argument.
-        if args.len() != 1 || !args[0].placeholder {
+        if args.len() != 1 || !args[0].is_placeholder() {
             return;
         }
         let Some(r) = members::resolved_callee(callee, &fmap) else {
@@ -1319,7 +1319,7 @@ fn run_printf_array_parameters(fa: &FileAnalysis) -> Vec<Diagnostic> {
         };
         if args
             .iter()
-            .any(|a| a.spread || a.placeholder || a.name.is_some())
+            .any(|a| a.spread || a.is_placeholder() || a.name.is_some())
         {
             return;
         }
@@ -2149,7 +2149,7 @@ fn run_call_statement_no_side_effects(fa: &FileAnalysis) -> Vec<Diagnostic> {
         };
         // First-class-callable `foo(...)` produces a Closure — that *is* a value
         // worth keeping, so skip.
-        if args.len() == 1 && args[0].placeholder {
+        if args.len() == 1 && args[0].is_placeholder() {
             return;
         }
         let Some(r) = members::resolved_callee(callee, &fmap) else {
@@ -2204,7 +2204,7 @@ fn run_call_statement_no_discard(fa: &FileAnalysis) -> Vec<Diagnostic> {
             let ExprKind::Call { callee, args } = &call.kind else {
                 return;
             };
-            if !from_pipe && args.iter().any(|a| a.placeholder) {
+            if !from_pipe && args.iter().any(|a| a.is_placeholder()) {
                 return;
             }
             match function_no_discard_target(fa, callee, &fmap) {
@@ -2298,7 +2298,7 @@ fn function_call_for_no_discard(e: &Expr) -> Option<(&Expr, bool, bool)> {
 fn pipe_function_call_for_no_discard(rhs: &Expr) -> Option<(&Expr, bool)> {
     let rhs = php_ast::queries::peel_paren(rhs);
     match &rhs.kind {
-        ExprKind::Call { args, .. } if args.iter().any(|a| a.placeholder) => Some((rhs, true)),
+        ExprKind::Call { args, .. } if args.iter().any(|a| a.is_placeholder()) => Some((rhs, true)),
         ExprKind::ArrowFn(a)
             if matches!(
                 &php_ast::queries::peel_paren(&a.body).kind,
@@ -2615,7 +2615,7 @@ fn run_useless_return_value(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
         if args
             .iter()
-            .any(|a| a.spread || a.placeholder || a.name.is_some())
+            .any(|a| a.spread || a.is_placeholder() || a.name.is_some())
         {
             return;
         }
@@ -2676,7 +2676,7 @@ fn run_array_values(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
         if args
             .iter()
-            .any(|a| a.spread || a.placeholder || a.name.is_some())
+            .any(|a| a.spread || a.is_placeholder() || a.name.is_some())
         {
             return;
         }
@@ -2724,7 +2724,7 @@ fn run_array_filter(fa: &FileAnalysis) -> Vec<Diagnostic> {
         if args.len() != 1
             || args
                 .iter()
-                .any(|a| a.spread || a.placeholder || a.name.is_some())
+                .any(|a| a.spread || a.is_placeholder() || a.name.is_some())
         {
             return;
         }
@@ -2869,7 +2869,7 @@ fn run_parameter_castable_to_string(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
         if args
             .iter()
-            .any(|a| a.spread || a.placeholder || a.name.is_some())
+            .any(|a| a.spread || a.is_placeholder() || a.name.is_some())
         {
             return;
         }
@@ -2924,7 +2924,7 @@ fn run_sort_castable_to_string(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
         if args
             .iter()
-            .any(|a| a.spread || a.placeholder || a.name.is_some())
+            .any(|a| a.spread || a.is_placeholder() || a.name.is_some())
         {
             return;
         }
@@ -2992,7 +2992,7 @@ fn run_parameter_castable_to_number(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
         if args
             .iter()
-            .any(|a| a.spread || a.placeholder || a.name.is_some())
+            .any(|a| a.spread || a.is_placeholder() || a.name.is_some())
         {
             return;
         }
@@ -3042,7 +3042,7 @@ fn run_random_int_parameters(fa: &FileAnalysis) -> Vec<Diagnostic> {
             || args
                 .iter()
                 .take(2)
-                .any(|a| a.spread || a.placeholder || a.name.is_some())
+                .any(|a| a.spread || a.is_placeholder() || a.name.is_some())
         {
             return;
         }
@@ -3250,7 +3250,7 @@ fn run_filter_var(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
         if args
             .iter()
-            .any(|a| a.spread || a.placeholder || a.name.is_some())
+            .any(|a| a.spread || a.is_placeholder() || a.name.is_some())
         {
             return;
         }
@@ -3318,7 +3318,7 @@ fn run_call_user_func(fa: &FileAnalysis) -> Vec<Diagnostic> {
         }
         if args
             .iter()
-            .any(|a| a.spread || a.placeholder || a.name.is_some())
+            .any(|a| a.spread || a.is_placeholder() || a.name.is_some())
         {
             return;
         }

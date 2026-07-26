@@ -1032,7 +1032,7 @@ fn check_call_expr(
                 // Spread/named args make arity opaque — skip arity but still check existence.
                 let opaque = args
                     .iter()
-                    .any(|a| a.spread || a.name.is_some() || a.placeholder);
+                    .any(|a| a.spread || a.name.is_some() || a.is_placeholder());
                 check_member_call(
                     e,
                     fa,
@@ -1056,7 +1056,7 @@ fn check_call_expr(
             if let MemberName::Ident(name) = method {
                 let opaque = args
                     .iter()
-                    .any(|a| a.spread || a.name.is_some() || a.placeholder);
+                    .any(|a| a.spread || a.name.is_some() || a.is_placeholder());
                 check_member_call(
                     e,
                     fa,
@@ -1383,7 +1383,7 @@ fn run_method_argument_types(fa: &FileAnalysis) -> Vec<Diagnostic> {
         if call
             .args
             .iter()
-            .any(|a| a.spread || a.name.is_some() || a.placeholder)
+            .any(|a| a.spread || a.name.is_some() || a.is_placeholder())
         {
             continue;
         }
@@ -2769,7 +2769,7 @@ fn run_method_no_discard(fa: &FileAnalysis) -> Vec<Diagnostic> {
             else {
                 return;
             };
-            if !from_pipe && args.iter().any(|a| a.placeholder) {
+            if !from_pipe && args.iter().any(|a| a.is_placeholder()) {
                 return;
             }
             let MemberName::Ident(name) = method else {
@@ -2817,7 +2817,7 @@ fn run_static_method_no_discard(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 else {
                     return;
                 };
-                if !from_pipe && args.iter().any(|a| a.placeholder) {
+                if !from_pipe && args.iter().any(|a| a.is_placeholder()) {
                     return;
                 }
                 let MemberName::Ident(name) = method else {
@@ -2890,7 +2890,7 @@ fn static_method_call_for_no_discard(e: &Expr) -> Option<(&Expr, bool, bool)> {
 fn pipe_method_call_for_no_discard(rhs: &Expr) -> Option<(&Expr, bool)> {
     let rhs = php_ast::queries::peel_paren(rhs);
     match &rhs.kind {
-        ExprKind::MethodCall { args, .. } if args.iter().any(|a| a.placeholder) => {
+        ExprKind::MethodCall { args, .. } if args.iter().any(|a| a.is_placeholder()) => {
             Some((rhs, true))
         }
         ExprKind::ArrowFn(a)
@@ -2908,7 +2908,7 @@ fn pipe_method_call_for_no_discard(rhs: &Expr) -> Option<(&Expr, bool)> {
 fn pipe_static_method_call_for_no_discard(rhs: &Expr) -> Option<(&Expr, bool)> {
     let rhs = php_ast::queries::peel_paren(rhs);
     match &rhs.kind {
-        ExprKind::StaticCall { args, .. } if args.iter().any(|a| a.placeholder) => {
+        ExprKind::StaticCall { args, .. } if args.iter().any(|a| a.is_placeholder()) => {
             Some((rhs, true))
         }
         ExprKind::ArrowFn(a)

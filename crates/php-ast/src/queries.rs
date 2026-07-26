@@ -74,7 +74,6 @@ mod tests {
                     value: None,
                 }),
                 spread: false,
-                placeholder: false,
             }],
         });
         assert!(contains_yield_in_expr_scope(&expr));

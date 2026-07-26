@@ -522,7 +522,7 @@ fn callable_first_param(
             .first()
             .map(|p| (p.by_ref, fa.interner.resolve(p.name).to_string())),
         // First-class-callable `f(...)`.
-        ExprKind::Call { callee, args } if args.iter().any(|a| a.placeholder) => {
+        ExprKind::Call { callee, args } if args.iter().any(|a| a.is_placeholder()) => {
             let ExprKind::Name(n) = &callee.kind else {
                 return None;
             };

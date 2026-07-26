@@ -2572,7 +2572,6 @@ impl<'a> Parser<'a> {
                 name: None,
                 value: Expr::new(self.span_to(astart), ExprKind::CallablePlaceholder),
                 spread: false,
-                placeholder: true,
             });
             return args;
         }
@@ -2594,7 +2593,6 @@ impl<'a> Parser<'a> {
                 name,
                 value,
                 spread,
-                placeholder: false,
             });
             if !self.eat(T::Comma) {
                 break;

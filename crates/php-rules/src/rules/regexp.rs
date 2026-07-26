@@ -135,7 +135,7 @@ fn check_pattern_call_with_refs(
     let Some(arg0) = call.args.first() else {
         return;
     };
-    if arg0.spread || arg0.placeholder || arg0.name.is_some() {
+    if arg0.spread || arg0.is_placeholder() || arg0.name.is_some() {
         return;
     }
     // Fold the pattern to a constant string. Only a constant string can be
@@ -230,7 +230,7 @@ fn pattern_arg<'a>(
 ) -> Option<&'a Expr> {
     // PHP 8 named-arg spelling, e.g. preg_split(subject: $s, pattern: '...').
     for arg in args {
-        if arg.spread || arg.placeholder {
+        if arg.spread || arg.is_placeholder() {
             continue;
         }
         if let Some(name) = arg.name {
@@ -241,7 +241,7 @@ fn pattern_arg<'a>(
     }
 
     let arg0 = args.first()?;
-    if arg0.spread || arg0.placeholder || arg0.name.is_some() {
+    if arg0.spread || arg0.is_placeholder() || arg0.name.is_some() {
         return None;
     }
     Some(&arg0.value)
@@ -252,7 +252,7 @@ fn preg_quote_delimiter_arg<'a>(
     interner: &php_intern::Interner,
 ) -> Option<Option<&'a Expr>> {
     for arg in args {
-        if arg.spread || arg.placeholder {
+        if arg.spread || arg.is_placeholder() {
             return None;
         }
         if let Some(name) = arg.name {
@@ -263,7 +263,7 @@ fn preg_quote_delimiter_arg<'a>(
     }
 
     let positional = args.iter().filter(|a| a.name.is_none()).collect::<Vec<_>>();
-    if positional.iter().any(|a| a.spread || a.placeholder) {
+    if positional.iter().any(|a| a.spread || a.is_placeholder()) {
         return None;
     }
     Some(positional.get(1).map(|a| &a.value))

@@ -621,7 +621,7 @@ impl TypeCtx<'_> {
                 // Named/spread args break positional mapping.
                 if args
                     .iter()
-                    .any(|x| x.name.is_some() || x.spread || x.placeholder)
+                    .any(|x| x.name.is_some() || x.spread || x.is_placeholder())
                 {
                     continue;
                 }
@@ -1212,7 +1212,7 @@ impl TypeCtx<'_> {
         let Some(arg) = args.get(2) else {
             return;
         };
-        if arg.spread || arg.name.is_some() || arg.placeholder {
+        if arg.spread || arg.name.is_some() || arg.is_placeholder() {
             return;
         }
         let ExprKind::Variable(sym) = &arg.value.kind else {
@@ -1300,7 +1300,7 @@ impl TypeCtx<'_> {
     /// mutated by the callee — their narrowing survives).
     fn invalidate_object_args(&mut self, args: &[Arg]) {
         for a in args {
-            if a.placeholder {
+            if a.is_placeholder() {
                 continue;
             }
             let Some(base) = self.invalidation_base(&a.value) else {
@@ -1362,7 +1362,7 @@ impl TypeCtx<'_> {
         };
         for (i, a) in args.iter().enumerate() {
             // Named/spread args break positional mapping; skip (sound: no widening).
-            if a.placeholder || a.spread || a.name.is_some() {
+            if a.is_placeholder() || a.spread || a.name.is_some() {
                 continue;
             }
             let idx = if i < params.len() {

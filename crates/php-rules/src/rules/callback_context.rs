@@ -925,12 +925,12 @@ fn literal_str(bytes: &[u8]) -> Option<String> {
 }
 
 fn is_first_class_callable(args: &[Arg]) -> bool {
-    args.iter().any(|a| a.placeholder)
+    args.iter().any(|a| a.is_placeholder())
 }
 
 fn args_are_plain_positional(args: &[Arg]) -> bool {
     args.iter()
-        .all(|a| !a.spread && !a.placeholder && a.name.is_none())
+        .all(|a| !a.spread && !a.is_placeholder() && a.name.is_none())
 }
 
 fn int_lit(e: &Expr) -> Option<i64> {

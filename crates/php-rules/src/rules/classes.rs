@@ -173,7 +173,7 @@ fn run_instantiation(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     return;
                 };
                 // First-class-callable instantiation `new X(...)` is its own rule.
-                if args.iter().any(|a| a.placeholder) {
+                if args.iter().any(|a| a.is_placeholder()) {
                     return;
                 }
                 let ExprKind::Name(name) = &class.kind else {
@@ -239,7 +239,7 @@ fn collect_exprs_in_stmt(st: &Stmt, f: &mut impl FnMut(&Expr)) {
 fn run_instantiation_callable(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for new_expr in fa.facts.news() {
-        if new_expr.args.iter().any(|a| a.placeholder) {
+        if new_expr.args.iter().any(|a| a.is_placeholder()) {
             out.push(
                 Diagnostic::error(
                     new_expr.expr.span,

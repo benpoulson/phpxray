@@ -456,7 +456,7 @@ fn render_args(args: &[Arg], i: &Interner) -> String {
     let parts: Vec<_> = args
         .iter()
         .map(|a| {
-            if a.placeholder {
+            if a.is_placeholder() {
                 return "...".to_string();
             }
             let v = render(&a.value, i);

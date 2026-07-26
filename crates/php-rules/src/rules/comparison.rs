@@ -677,7 +677,7 @@ fn check_impossible_check_type_with_refs(
     let Some(arg0) = call.args.first() else {
         return;
     };
-    if arg0.spread || arg0.placeholder || arg0.name.is_some() {
+    if arg0.spread || arg0.is_placeholder() || arg0.name.is_some() {
         return;
     }
     let Some(vcat) = category(&fa.type_of(&arg0.value)) else {
@@ -972,7 +972,7 @@ fn assertion_call_is_false(
     let Some(arg) = args.get(param_index) else {
         return false;
     };
-    if arg.spread || arg.placeholder || arg.name.is_some() {
+    if arg.spread || arg.is_placeholder() || arg.name.is_some() {
         return false;
     }
     let Some(actual) = category(&fa.type_of(&arg.value)) else {

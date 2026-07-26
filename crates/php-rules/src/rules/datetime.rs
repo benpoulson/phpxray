@@ -79,7 +79,7 @@ fn datetime_class(class: &Expr, scope: &Scope) -> Option<(&'static str, &'static
 
 fn first_datetime_arg<'a>(args: &'a [Arg], fa: &FileAnalysis) -> Option<&'a Arg> {
     let arg = args.first()?;
-    if arg.spread || arg.placeholder {
+    if arg.spread || arg.is_placeholder() {
         return None;
     }
     if let Some(name) = arg.name {

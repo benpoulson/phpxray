@@ -724,8 +724,20 @@ pub struct Arg {
     pub value: Expr,
     /// `...$args` spread.
     pub spread: bool,
-    /// The lone `...` first-class-callable placeholder (`f(...)`).
-    pub placeholder: bool,
+}
+
+impl Arg {
+    /// Whether this argument is the lone `...` first-class-callable placeholder
+    /// (`f(...)`).
+    ///
+    /// Derived from the value rather than stored beside it: a `placeholder: bool`
+    /// field and [`ExprKind::CallablePlaceholder`] encoded the same fact twice,
+    /// with the pairing held together by a single construction site. A consumer
+    /// checking one while a builder set the other would have drifted silently —
+    /// the hand-synchronisation shape this codebase keeps getting bitten by.
+    pub fn is_placeholder(&self) -> bool {
+        matches!(self.value.kind, ExprKind::CallablePlaceholder)
+    }
 }
 
 /// An array element. `value` is `None` only for elision in destructuring.

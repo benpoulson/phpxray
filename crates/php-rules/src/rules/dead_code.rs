@@ -577,7 +577,7 @@ fn run_pure_function_statement_without_impure_points(fa: &FileAnalysis) -> Vec<D
                 let ExprKind::Call { callee, args } = &e.kind else {
                     return;
                 };
-                if args.iter().any(|a| a.placeholder) {
+                if args.iter().any(|a| a.is_placeholder()) {
                     return;
                 }
                 let Some(key) = function_call_key(scope, callee) else {
@@ -1012,7 +1012,7 @@ fn expression_effect(
 ) -> ExprEffect {
     match &e.kind {
         ExprKind::Call { callee, args } => {
-            if args.iter().any(|a| a.placeholder) {
+            if args.iter().any(|a| a.is_placeholder()) {
                 return ExprEffect::Impure;
             }
             function_call_key(scope, callee).map_or(ExprEffect::Impure, ExprEffect::Dependency)

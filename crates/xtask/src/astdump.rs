@@ -892,7 +892,7 @@ impl<'a> Dumper<'a> {
                         && args.len() == 1
                         && !args[0].spread
                         && args[0].name.is_none()
-                        && !args[0].placeholder
+                        && !args[0].is_placeholder()
                     {
                         return node("CLONE", vec![("expr", self.expr(&args[0].value))]);
                     }
@@ -1288,7 +1288,7 @@ impl<'a> Dumper<'a> {
     }
 
     fn args(&self, args: &[Arg]) -> C {
-        if args.iter().any(|a| a.placeholder) {
+        if args.iter().any(|a| a.is_placeholder()) {
             return C::N("CALLABLE_CONVERT".into(), vec![]);
         }
         let kids: Vec<_> = args
