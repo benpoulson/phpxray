@@ -421,10 +421,13 @@ fn astdiff_run(args: &[String]) -> ExitCode {
         }
     }
 
-    let denom = checked.max(1);
+    if checked == 0 {
+        eprintln!("AST differential compared 0 files — refusing to report this as a pass");
+        return ExitCode::FAILURE;
+    }
     println!(
         "\nAST differential: {matched}/{checked} match ({:.2}%); {we_errored} we-error-but-PHP-ok",
-        100.0 * matched as f64 / denom as f64
+        100.0 * matched as f64 / checked as f64
     );
     let mut rows: Vec<_> = buckets.into_iter().collect();
     rows.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
