@@ -13,6 +13,27 @@ pub struct PhptCase {
     pub expects_parse_error: bool,
 }
 
+/// Load the corpus, or explain why there is nothing to load.
+///
+/// Every corpus command is meaningless over an empty set: with `php-src` absent
+/// or the path mis-pointed they otherwise walk zero files, report a perfect
+/// score and exit 0. That silent pass is not hypothetical — `astdiff` printing
+/// `0/0 (0.00%)` and succeeding has already cost a debugging session. Commands
+/// must treat "nothing to check" as failure, never as success.
+pub fn phpt_cases_checked(dir: &Path) -> Result<Vec<PhptCase>, String> {
+    if !dir.is_dir() {
+        return Err(format!(
+            "corpus dir not found: {} — is the php-src checkout present?",
+            dir.display()
+        ));
+    }
+    let cases = phpt_cases(dir);
+    if cases.is_empty() {
+        return Err(format!("no .phpt cases found under {}", dir.display()));
+    }
+    Ok(cases)
+}
+
 pub fn phpt_cases(dir: &Path) -> Vec<PhptCase> {
     let mut paths: Vec<PathBuf> = WalkDir::new(dir)
         .into_iter()

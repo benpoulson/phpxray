@@ -20,6 +20,22 @@ use xtask::{corpus, phpt};
 
 mod astdump;
 
+/// Load the `.phpt` corpus, or abandon the command with a failure exit code.
+///
+/// "Nothing to check" must never look like "everything passed" — see
+/// [`corpus::phpt_cases_checked`].
+macro_rules! corpus_cases {
+    ($dir:expr) => {
+        match corpus::phpt_cases_checked(&$dir) {
+            Ok(cases) => cases,
+            Err(msg) => {
+                eprintln!("{msg}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+}
+
 fn workspace_root() -> PathBuf {
     // crates/xtask -> crates -> <root>
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -234,7 +250,7 @@ fn cmd_difftokens(args: &[String]) -> ExitCode {
     let mut by_oracle: BTreeMap<String, usize> = BTreeMap::new();
     let mut examples: Vec<String> = Vec::new();
 
-    for case in corpus::phpt_cases(&dir).into_iter().take(limit) {
+    for case in corpus_cases!(dir).into_iter().take(limit) {
         let Some(golden_text) = run_php_tokens(&helper, &case.source) else {
             continue;
         };
@@ -346,11 +362,23 @@ fn astdiff_run(args: &[String]) -> ExitCode {
         eprintln!("`php` not found on PATH");
         return ExitCode::FAILURE;
     }
+    // `php` alone is not enough: the oracle is the php-ast extension. Without it
+    // every `run_php` call fails, and since failures are skipped the run would
+    // otherwise compare nothing, print `0/0 (0.00%)` and exit 0. Probe once, up
+    // front, so the reason is stated instead of inferred.
+    if run_php(&helper, "<?php $x = 1;").is_none() {
+        eprintln!(
+            "the php-ast extension is unavailable, so there is no AST oracle to compare against\n\
+             (`{}` failed on trivial input; install with `pecl install ast`)",
+            helper.display()
+        );
+        return ExitCode::FAILURE;
+    }
 
     let (mut checked, mut matched, mut we_errored) = (0usize, 0usize, 0usize);
     let mut buckets: BTreeMap<String, (usize, String)> = BTreeMap::new();
 
-    for case in corpus::phpt_cases(&dir).into_iter().take(limit) {
+    for case in corpus_cases!(dir).into_iter().take(limit) {
         let Some(oracle) = run_php(&helper, &case.source) else {
             continue;
         };
@@ -471,7 +499,7 @@ fn cmd_resolve(dir: Option<PathBuf>) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let (mut files, mut panics, mut classes, mut refs, mut diags) = (0u64, 0u64, 0u64, 0u64, 0u64);
-    for case in corpus::phpt_cases(&dir) {
+    for case in corpus_cases!(dir) {
         files += 1;
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let r = php_parser::parse(&case.source);
@@ -513,7 +541,7 @@ fn cmd_index(dir: Option<PathBuf>) -> ExitCode {
     }
     let mut index = php_index::ProjectIndex::new();
     let mut files = 0u64;
-    for case in corpus::phpt_cases(&dir) {
+    for case in corpus_cases!(dir) {
         files += 1;
         let label = case
             .path
@@ -552,7 +580,7 @@ fn cmd_reflect(dir: Option<PathBuf>) -> ExitCode {
     }
     let mut index = php_reflect::ReflectionIndex::new();
     let (mut files, mut panics) = (0u64, 0u64);
-    for case in corpus::phpt_cases(&dir) {
+    for case in corpus_cases!(dir) {
         files += 1;
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let r = php_parser::parse(&case.source);
@@ -607,7 +635,7 @@ fn cmd_infer_run(dir: Option<PathBuf>) -> ExitCode {
     // re-parse in pass 2).
     let mut index = ReflectionIndex::new();
     let mut sources: Vec<(String, String)> = Vec::new();
-    for case in corpus::phpt_cases(&dir) {
+    for case in corpus_cases!(dir) {
         let label = case.path.display().to_string();
         let r = php_parser::parse(&case.source);
         index.add_file(&r.program, &r.interner);
@@ -753,7 +781,7 @@ fn cmd_check_run(dir: Option<PathBuf>) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let cases = corpus::phpt_cases(&dir);
+    let cases = corpus_cases!(dir);
     let inputs = cases
         .iter()
         .map(|case| (case.label.clone(), case.source.clone()));
@@ -928,7 +956,7 @@ fn cmd_corpus(dir: Option<PathBuf>) -> ExitCode {
     println!("scanning {}", dir.display());
 
     let mut s = CorpusStats::default();
-    for case in corpus::phpt_cases(&dir) {
+    for case in corpus_cases!(dir) {
         s.total += 1;
         if case.expects_parse_error {
             s.expects_error += 1;
@@ -988,7 +1016,7 @@ fn cmd_triage(dir: Option<PathBuf>) -> ExitCode {
     let mut by_msg: BTreeMap<String, (usize, Vec<String>)> = BTreeMap::new();
     let mut total = 0usize;
 
-    for case in corpus::phpt_cases(&dir) {
+    for case in corpus_cases!(dir) {
         if case.expects_parse_error {
             continue; // intentional error — not our worklist
         }
