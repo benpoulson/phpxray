@@ -445,14 +445,21 @@ fn run_pipeline(config: &Config, root: &Path, options: RunOptions) -> (Report, V
     (report, parsed)
 }
 
-/// Analyze already-parsed files at `level`. Pure over its inputs (no disk I/O) —
-/// the testable core of [`run`], and the Phase-2 parallelism/caching boundary.
+/// Analyze already-parsed files at `level`. Pure over its inputs (no disk I/O,
+/// and nothing read from the environment) — the testable core of [`run`], and
+/// the Phase-2 parallelism/caching boundary.
+///
+/// `infer_untyped_signatures` is a parameter rather than an env lookup: reading
+/// `PHPXRAY_NO_INFER` in here made every caller and every test of the
+/// "pure" core silently environment-dependent. The dev affordance now lives at
+/// the one place that wants it (`xtask`).
 pub fn analyze_parsed(
     parsed: &[ParsedFile],
     interner: &php_intern::Interner,
     level: u8,
     php_version: php_rules::PhpVersion,
     treat_phpdoc_types_as_certain: bool,
+    infer_untyped_signatures: bool,
 ) -> Report {
     analyze_parsed_progress(
         parsed,
@@ -462,9 +469,7 @@ pub fn analyze_parsed(
                 level,
                 php_version,
                 treat_phpdoc_types_as_certain,
-                // Dev affordance (mirrors PHPXRAY_WATCH_FULL): `PHPXRAY_NO_INFER=1`
-                // disables untyped-signature inference for batch tooling / audits.
-                infer_untyped_signatures: std::env::var_os("PHPXRAY_NO_INFER").is_none(),
+                infer_untyped_signatures,
                 rule_options: Level(level).rule_options(),
                 ..crate::inputs::AnalysisInputs::defaults_for(level, php_version)
             },
@@ -1034,6 +1039,7 @@ mod tests {
             level,
             php_rules::PhpVersion::default(),
             true,
+            true,
         )
     }
 
@@ -1048,6 +1054,7 @@ mod tests {
             &interner,
             level,
             php_rules::PhpVersion::default(),
+            true,
             true,
         )
     }
@@ -1065,6 +1072,7 @@ mod tests {
             level,
             php_rules::PhpVersion::default(),
             treat_phpdoc_types_as_certain,
+            true,
         )
     }
 

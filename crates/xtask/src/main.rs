@@ -797,7 +797,12 @@ fn cmd_check_run(dir: Option<PathBuf>) -> ExitCode {
         .build()
         .expect("build check thread pool");
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        pool.install(|| phpxray::analyze_parsed(&parsed, &interner, level, php_version, true))
+        // Dev affordance (mirrors PHPXRAY_WATCH_FULL): `PHPXRAY_NO_INFER=1`
+        // disables untyped-signature inference for corpus audits.
+        let infer = std::env::var_os("PHPXRAY_NO_INFER").is_none();
+        pool.install(|| {
+            phpxray::analyze_parsed(&parsed, &interner, level, php_version, true, infer)
+        })
     }));
     let (files, diags, panics, findings) = match outcome {
         Ok(report) => (
