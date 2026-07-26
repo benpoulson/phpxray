@@ -3535,7 +3535,7 @@ fn check_uninitialized_class(
     for m in &class.members {
         let Member::Method(md) = m else { continue };
         let Some(body) = &md.body else { continue };
-        for st in body {
+        for st in body.iter() {
             walk::for_each_expr_in_scope(st, &mut |e| {
                 scan_uninit_expr(fa, e, &cand_syms, &mut assigned, &mut bail);
             });

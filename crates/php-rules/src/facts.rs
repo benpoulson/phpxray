@@ -534,7 +534,7 @@ impl<'a> FileFacts<'a> {
                     scope: scope.clone(),
                     decl: function,
                 });
-                for child in &function.body {
+                for child in function.body.iter() {
                     self.collect_decls(interner, scope, child);
                 }
             }
@@ -641,7 +641,7 @@ impl<'a> FileFacts<'a> {
                         decl: method,
                     });
                     if let Some(body) = &method.body {
-                        for child in body {
+                        for child in body.iter() {
                             self.collect_decls(interner, scope, child);
                         }
                     }

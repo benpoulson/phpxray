@@ -1041,7 +1041,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let body = self.parse_brace_block();
+        let body = self.parse_brace_block().into();
         FunctionDecl {
             attrs,
             doc,
@@ -1284,7 +1284,7 @@ impl<'a> Parser<'a> {
                     None
                 };
                 let body = if self.at(T::LBrace) {
-                    Some(self.parse_brace_block())
+                    Some(self.parse_brace_block().into())
                 } else {
                     self.eat_stmt_end(); // abstract / interface method
                     None

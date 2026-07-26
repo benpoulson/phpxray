@@ -1518,7 +1518,7 @@ fn run_constant_condition_in_trait(fa: &FileAnalysis) -> Vec<Diagnostic> {
         for m in &info.class.members {
             let Member::Method(method) = m else { continue };
             let Some(body) = &method.body else { continue };
-            for st in body {
+            for st in body.iter() {
                 visit_trait_context_stmt(fa, &info, using_classes, &const_values, st, &mut out);
             }
         }

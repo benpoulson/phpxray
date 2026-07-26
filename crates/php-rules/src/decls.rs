@@ -206,7 +206,7 @@ fn visit_class_decl<'a>(class: &'a ClassDecl, f: &mut impl FnMut(Decl<'a>)) {
     for member in &class.members {
         if let Member::Method(method) = member {
             if let Some(body) = &method.body {
-                for st in body {
+                for st in body.iter() {
                     visit_decl_stmt(st, f);
                 }
             }
@@ -245,7 +245,7 @@ fn visit_decl_stmt<'a>(st: &'a Stmt, f: &mut impl FnMut(Decl<'a>)) {
     match &st.kind {
         StmtKind::Function(func) => {
             f(Decl::Function(func));
-            for st in &func.body {
+            for st in func.body.iter() {
                 visit_decl_stmt(st, f);
             }
         }

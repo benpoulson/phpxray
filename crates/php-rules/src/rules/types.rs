@@ -415,7 +415,7 @@ fn collect_return_scopes(
         StmtKind::Function(f) => {
             let refl = fa.reflect_function(scope, f);
             if crate::compat::concrete_target(&refl.return_type) {
-                for s in &f.body {
+                for s in f.body.iter() {
                     check_return_stmts(
                         fa,
                         &format!("function {}()", refl.fqn),
@@ -446,7 +446,7 @@ fn collect_return_scopes(
                 if !crate::compat::concrete_target(&mr.return_type) {
                     continue;
                 }
-                for s in body {
+                for s in body.iter() {
                     check_return_stmts(
                         fa,
                         &format!("{fqn}::{}()", mr.name),

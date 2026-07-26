@@ -272,7 +272,7 @@ fn inner_stmt(s: &Stmt, in_fn: bool, out: &mut Vec<Diagnostic>) {
                 );
             }
             inner_params(&fd.params, out);
-            for st in &fd.body {
+            for st in fd.body.iter() {
                 inner_stmt(st, true, out);
             }
         }
@@ -281,7 +281,7 @@ fn inner_stmt(s: &Stmt, in_fn: bool, out: &mut Vec<Diagnostic>) {
                 if let Member::Method(md) = m {
                     inner_params(&md.params, out);
                     if let Some(body) = &md.body {
-                        for st in body {
+                        for st in body.iter() {
                             inner_stmt(st, true, out);
                         }
                     }
@@ -386,7 +386,7 @@ fn inner_expr(e: &Expr, _in_fn: bool, out: &mut Vec<Diagnostic>) {
                     if let Member::Method(md) = m {
                         inner_params(&md.params, out);
                         if let Some(body) = &md.body {
-                            for st in body {
+                            for st in body.iter() {
                                 inner_stmt(st, true, out);
                             }
                         }

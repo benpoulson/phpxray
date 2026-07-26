@@ -1988,7 +1988,7 @@ fn check_var_tag_missing_types_in_stmt(
         }
         StmtKind::Function(f) => {
             let fn_env = TemplateEnv::function(f.doc.as_deref());
-            for s in &f.body {
+            for s in f.body.iter() {
                 check_var_tag_missing_types_in_stmt(fa, scope, &fn_env, s, out);
             }
         }
@@ -2008,7 +2008,7 @@ fn check_var_tag_missing_types_in_stmt(
                     class_templates.clone(),
                     mth.doc.as_deref(),
                 );
-                for s in body {
+                for s in body.iter() {
                     check_var_tag_missing_types_in_stmt(fa, scope, &method_env, s, out);
                 }
             }

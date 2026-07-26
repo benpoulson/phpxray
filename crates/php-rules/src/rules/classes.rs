@@ -329,7 +329,7 @@ fn run_new_static(fa: &FileAnalysis) -> Vec<Diagnostic> {
         for m in &c.members {
             let Member::Method(md) = m else { continue };
             let Some(body) = &md.body else { continue };
-            for st in body {
+            for st in body.iter() {
                 find_new_static(st, &mut out);
             }
         }
@@ -1561,7 +1561,7 @@ fn run_class_constant(fa: &FileAnalysis) -> Vec<Diagnostic> {
         for m in &c.members {
             let Member::Method(md) = m else { continue };
             let Some(body) = &md.body else { continue };
-            for st in body {
+            for st in body.iter() {
                 scan_const_fetches(
                     st,
                     scope,
@@ -1618,7 +1618,7 @@ fn find_nested_function_bodies(
 ) {
     match &st.kind {
         StmtKind::Function(f) => {
-            for s in &f.body {
+            for s in f.body.iter() {
                 scan_const_fetches(s, scope, fa, None, None, out);
                 find_nested_function_bodies(s, scope, fa, out);
             }
@@ -1862,7 +1862,7 @@ fn run_private_const_through_static(fa: &FileAnalysis) -> Vec<Diagnostic> {
         for m in &c.members {
             let Member::Method(md) = m else { continue };
             let Some(body) = &md.body else { continue };
-            for st in body {
+            for st in body.iter() {
                 collect_exprs_in_stmt(st, &mut |e| {
                     let ExprKind::ClassConst { class, name } = &e.kind else {
                         return;
@@ -2916,7 +2916,7 @@ fn run_new_static_abstract(fa: &FileAnalysis) -> Vec<Diagnostic> {
             }
             let method = fa.interner.resolve(md.name).to_string();
             let Some(body) = &md.body else { continue };
-            for st in body {
+            for st in body.iter() {
                 collect_exprs_in_stmt(st, &mut |e| {
                     let ExprKind::New { class, .. } = &e.kind else {
                         return;

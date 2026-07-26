@@ -769,7 +769,7 @@ fn collect_pure_candidates_stmt(
     match &st.kind {
         StmtKind::Function(f) => {
             collect_function_candidate(fa, scope, f, out);
-            for s in &f.body {
+            for s in f.body.iter() {
                 collect_pure_candidates_stmt(fa, scope, s, out);
             }
         }

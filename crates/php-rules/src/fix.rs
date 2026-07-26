@@ -851,7 +851,7 @@ fn own_write_evidence(
             continue;
         };
         let Some(body) = &md.body else { continue };
-        for st in body {
+        for st in body.iter() {
             crate::walk::for_each_stmt_in_stmt(st, &mut |s| {
                 // A foreach key/value target is a write we don't type.
                 if let php_ast::StmtKind::Foreach { key, value, .. } = &s.kind {

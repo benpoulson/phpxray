@@ -317,7 +317,7 @@ fn visit_stmt(fa: &FileAnalysis, st: &Stmt, ctx: MagicCtx, out: &mut Vec<Diagnos
                         // Default values / attributes of params are evaluated in
                         // the class context but NOT the function context.
                         if let Some(body) = &md.body {
-                            for s in body {
+                            for s in body.iter() {
                                 visit_stmt(fa, s, mctx, out);
                             }
                         }
@@ -356,7 +356,7 @@ fn visit_stmt(fa: &FileAnalysis, st: &Stmt, ctx: MagicCtx, out: &mut Vec<Diagnos
                 in_trait: false,
                 ..ctx
             };
-            for s in &f.body {
+            for s in f.body.iter() {
                 visit_stmt(fa, s, inner, out);
             }
             // Param defaults are in the enclosing (non-function) scope.

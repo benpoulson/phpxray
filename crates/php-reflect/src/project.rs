@@ -42,9 +42,15 @@ pub struct Found<'a, T: Clone> {
 /// Stored AST body metadata for a reflected function or method.
 #[derive(Debug, Clone)]
 struct BodyRecord {
-    body: Vec<Stmt>,
-    scope: Scope,
-    path: Option<String>,
+    /// Shared with the AST it was reflected from: storing this used to deep-copy
+    /// every function and method body out of the `Program`, so each body existed
+    /// twice for the whole run.
+    body: std::sync::Arc<[Stmt]>,
+    /// Shared per namespace region rather than cloned per body: a class with 20
+    /// methods used to hold 20 copies of the same import table.
+    scope: std::sync::Arc<Scope>,
+    /// Shared per file rather than cloned per body.
+    path: Option<std::sync::Arc<str>>,
     source_kind: SourceKind,
 }
 
@@ -61,7 +67,7 @@ pub struct BodyMetadata<'a> {
 impl BodyRecord {
     fn metadata(&self) -> BodyMetadata<'_> {
         BodyMetadata {
-            body: self.body.as_slice(),
+            body: &self.body,
             scope: &self.scope,
             path: self.path.as_deref(),
             source_kind: self.source_kind,
@@ -129,7 +135,7 @@ fn visit_reflectable_decls<'a>(
     match &st.kind {
         StmtKind::Function(func) => {
             f(scope, ReflectableDecl::Function(func));
-            for st in &func.body {
+            for st in func.body.iter() {
                 visit_reflectable_decls(scope, st, f);
             }
         }
@@ -138,7 +144,7 @@ fn visit_reflectable_decls<'a>(
             for member in &class.members {
                 if let Member::Method(method) = member {
                     if let Some(body) = &method.body {
-                        for st in body {
+                        for st in body.iter() {
                             visit_reflectable_decls(scope, st, f);
                         }
                     }
@@ -856,7 +862,7 @@ impl ReflectionIndex {
     /// return inference).
     pub fn function_body(&self, fqn: &str) -> Option<(&[Stmt], &Scope)> {
         depsrec::note_body(fqn);
-        with_ci_key(fqn, |key| self.bodies.get(key)).map(|r| (r.body.as_slice(), &r.scope))
+        with_ci_key(fqn, |key| self.bodies.get(key)).map(|r| (&*r.body, &*r.scope))
     }
 
     /// Full body metadata for a free function, including source path/kind when
@@ -871,7 +877,7 @@ impl ReflectionIndex {
     pub fn method_body(&self, declaring_class: &str, name: &str) -> Option<(&[Stmt], &Scope)> {
         depsrec::note_body(declaring_class);
         with_method_key(declaring_class, name, |key| self.bodies.get(key))
-            .map(|r| (r.body.as_slice(), &r.scope))
+            .map(|r| (&*r.body, &*r.scope))
     }
 
     /// Full body metadata for a method on `declaring_class`.
@@ -1056,7 +1062,12 @@ pub fn reflect_artifact(
     kind: SourceKind,
 ) -> FileReflectionArtifact {
     let mut entries = Vec::new();
+    // One allocation per file / per region, shared by every body reflected from
+    // it -- `visit_reflectable_decls` hands the same region scope to every
+    // declaration it finds, including nested ones.
+    let path: Option<Arc<str>> = path.map(Arc::from);
     for_each_region(&program.stmts, interner, |scope, region| {
+        let region_scope = Arc::new(scope.clone());
         for st in region {
             visit_reflectable_decls(scope, st, &mut |scope, decl| match decl {
                 ReflectableDecl::Function(f) => {
@@ -1064,9 +1075,9 @@ pub fn reflect_artifact(
                     let key = function_key(&r.fqn);
                     entries.push(ArtifactEntry::Function {
                         body: Arc::new(BodyRecord {
-                            body: f.body.clone(),
-                            scope: scope.clone(),
-                            path: path.map(str::to_string),
+                            body: Arc::clone(&f.body),
+                            scope: Arc::clone(&region_scope),
+                            path: path.clone(),
                             source_kind: kind,
                         }),
                         key,
@@ -1088,9 +1099,9 @@ pub fn reflect_artifact(
                                 bodies.push((
                                     format!("{key}::{mname}"),
                                     Arc::new(BodyRecord {
-                                        body: body.clone(),
-                                        scope: scope.clone(),
-                                        path: path.map(str::to_string),
+                                        body: Arc::clone(body),
+                                        scope: Arc::clone(&region_scope),
+                                        path: path.clone(),
                                         source_kind: kind,
                                     }),
                                 ));

@@ -1002,7 +1002,7 @@ fn run_call_existence(fa: &FileAnalysis) -> Vec<Diagnostic> {
         for m in methods(c) {
             let Some(body) = &m.body else { continue };
             let mut exprs: Vec<&Expr> = Vec::new();
-            for st in body {
+            for st in body.iter() {
                 collect_exprs_in_stmt(st, &mut exprs);
             }
             for e in exprs {
@@ -1684,7 +1684,7 @@ fn run_static_call_named(fa: &FileAnalysis) -> Vec<Diagnostic> {
         for m in methods(c) {
             let Some(body) = &m.body else { continue };
             let mut exprs: Vec<&Expr> = Vec::new();
-            for st in body {
+            for st in body.iter() {
                 collect_exprs_in_stmt(st, &mut exprs);
             }
             for e in exprs {
@@ -2118,7 +2118,7 @@ fn run_private_through_static(fa: &FileAnalysis) -> Vec<Diagnostic> {
         for m in methods(c) {
             let Some(body) = &m.body else { continue };
             let mut exprs: Vec<&Expr> = Vec::new();
-            for st in body {
+            for st in body.iter() {
                 collect_exprs_in_stmt(st, &mut exprs);
             }
             for e in exprs {

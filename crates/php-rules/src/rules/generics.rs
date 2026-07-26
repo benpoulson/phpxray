@@ -1240,7 +1240,7 @@ fn visit_anonymous_classes(
         for member in &class.members {
             if let Member::Method(method) = member {
                 if let Some(body) = &method.body {
-                    for st in body {
+                    for st in body.iter() {
                         walk::for_each_expr_in_scope(st, &mut |inner| {
                             visit_anonymous_classes(scope, inner, f)
                         });

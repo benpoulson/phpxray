@@ -318,7 +318,7 @@ fn collect_function_decls(st: &Stmt, fa: &FileAnalysis, scope: &Scope, out: &mut
     match &st.kind {
         StmtKind::Function(f) => {
             check_named_function(f, fa, scope, out);
-            for inner in &f.body {
+            for inner in f.body.iter() {
                 collect_function_decls(inner, fa, scope, out);
             }
         }
@@ -411,7 +411,7 @@ fn collect_method_decls(st: &Stmt, fa: &FileAnalysis, scope: &Scope, out: &mut V
             }
         }
         StmtKind::Function(f) => {
-            for s in &f.body {
+            for s in f.body.iter() {
                 collect_method_decls(s, fa, scope, out);
             }
         }
@@ -733,7 +733,7 @@ fn collect_property_decls(st: &Stmt, fa: &FileAnalysis, scope: &Scope, out: &mut
             }
         }
         StmtKind::Function(f) => {
-            for s in &f.body {
+            for s in f.body.iter() {
                 collect_property_decls(s, fa, scope, out);
             }
         }
@@ -887,7 +887,7 @@ fn collect_property_writes(
                             .unwrap_or(Type::Mixed);
                     ctx.vars.insert(fa.interner.resolve(p.name).to_string(), ty);
                 }
-                for st in body {
+                for st in body.iter() {
                     scan_property_writes_stmt(
                         st,
                         class_fqn,
@@ -1162,7 +1162,7 @@ fn collect_function_param_out_decls(
     match &st.kind {
         StmtKind::Function(f) => {
             check_function_param_out(f, fa, scope, out);
-            for inner in &f.body {
+            for inner in f.body.iter() {
                 collect_function_param_out_decls(inner, fa, scope, out);
             }
         }
@@ -1267,7 +1267,7 @@ fn collect_method_param_out_decls(
             }
         }
         StmtKind::Function(f) => {
-            for s in &f.body {
+            for s in f.body.iter() {
                 collect_method_param_out_decls(s, fa, scope, out);
             }
         }

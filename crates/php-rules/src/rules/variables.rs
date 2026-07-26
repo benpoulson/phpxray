@@ -141,7 +141,7 @@ fn visit_for_this_assign(
         for m in &c.members {
             let Member::Method(md) = m else { continue };
             let Some(body) = &md.body else { continue };
-            for s in body {
+            for s in body.iter() {
                 scan_stmt_exprs_for_this_assign(s, fa, fqn.as_deref(), out);
             }
         }
@@ -1083,7 +1083,7 @@ fn collect_all_bound_stmt(s: &Stmt, i: &Interner, bound: &mut HashSet<String>, c
             for p in &f.params {
                 bound.insert(i.resolve(p.name).to_string());
             }
-            for st in &f.body {
+            for st in f.body.iter() {
                 collect_all_bound_stmt(st, i, bound, count_unset);
             }
         }
@@ -1094,7 +1094,7 @@ fn collect_all_bound_stmt(s: &Stmt, i: &Interner, bound: &mut HashSet<String>, c
                         bound.insert(i.resolve(p.name).to_string());
                     }
                     if let Some(b) = &md.body {
-                        for st in b {
+                        for st in b.iter() {
                             collect_all_bound_stmt(st, i, bound, count_unset);
                         }
                     }

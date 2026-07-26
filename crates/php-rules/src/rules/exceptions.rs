@@ -663,7 +663,7 @@ fn walk_function_decls<'a>(
     match &st.kind {
         StmtKind::Function(fd) => {
             f(scope, fd);
-            for s in &fd.body {
+            for s in fd.body.iter() {
                 walk_function_decls(s, scope, f);
             }
         }
@@ -671,7 +671,7 @@ fn walk_function_decls<'a>(
             for m in &c.members {
                 if let Member::Method(md) = m {
                     if let Some(body) = &md.body {
-                        for s in body {
+                        for s in body.iter() {
                             walk_function_decls(s, scope, f);
                         }
                     }
@@ -749,7 +749,7 @@ fn walk_method_decls<'a>(
                 if let Member::Method(md) = m {
                     f(scope, c, md);
                     if let Some(body) = &md.body {
-                        for s in body {
+                        for s in body.iter() {
                             walk_method_decls(s, scope, f);
                         }
                     }
@@ -757,7 +757,7 @@ fn walk_method_decls<'a>(
             }
         }
         StmtKind::Function(fd) => {
-            for s in &fd.body {
+            for s in fd.body.iter() {
                 walk_method_decls(s, scope, f);
             }
         }
