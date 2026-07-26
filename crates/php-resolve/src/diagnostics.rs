@@ -102,12 +102,20 @@ fn used_aliases(scope: &crate::Scope, stmts: &[Stmt]) -> Vec<(UseKind, String)> 
         if r.fq != NameFq::NotFq {
             continue;
         }
+        // A *qualified* name's first segment is a namespace, so it credits the
+        // class import table whatever the reference itself is — matching how
+        // `resolve_callable` resolves it. Only an unqualified name consults the
+        // table of its own kind.
+        let (first, rest) = match r.name.split_once('\\') {
+            Some((first, _)) => (first, true),
+            None => (r.name.as_str(), false),
+        };
         let kind = match r.kind {
+            _ if rest => UseKind::Class,
             RefKind::Class => UseKind::Class,
             RefKind::Function => UseKind::Function,
             RefKind::Const => UseKind::Const,
         };
-        let first = r.name.split('\\').next().unwrap_or(&r.name);
         let key = (kind, fold(kind, first));
         if !used.contains(&key) {
             used.push(key);
@@ -164,6 +172,26 @@ mod tests {
             "#,
         );
         assert!(d.is_empty(), "unexpected diagnostics: {d:?}");
+    }
+
+    #[test]
+    fn class_import_is_used_by_a_qualified_function_call() {
+        // The Guzzle shape: the class import supplies the namespace prefix for a
+        // qualified function call, so it is used — and the function import that
+        // would look like the match is not consulted at all.
+        let d = diags(r#"<?php namespace App; use GuzzleHttp\Psr7; echo Psr7\str("x");"#);
+        assert!(d.is_empty(), "qualified call must credit the import: {d:?}");
+    }
+
+    #[test]
+    fn function_import_unused_by_a_qualified_call_of_the_same_name() {
+        // `use function Other\helper;` does not bind `helper\x()` — that is the
+        // current namespace's `helper\x`, so the import really is unused.
+        let d = diags(r#"<?php namespace App; use function Other\helper; echo helper\x();"#);
+        assert_eq!(
+            d,
+            [("unused-import".into(), "unused import: `helper`".into())]
+        );
     }
 
     #[test]

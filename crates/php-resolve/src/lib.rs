@@ -178,8 +178,13 @@ impl Scope {
                             None => Resolution::Fqn(text.to_string()),
                         }
                     }
-                    // Qualified: first segment may be an import alias.
-                    (first, Some(rest)) => match lookup(first) {
+                    // Qualified: the first segment names a *namespace*, so it
+                    // resolves through the class/namespace import table — never
+                    // through `use function`/`use const`, which apply to
+                    // unqualified names only. So `use Other\Util; Util\helper()`
+                    // is `Other\Util\helper`, while `use function Other\helper;
+                    // helper\x()` is the current namespace's `helper\x`.
+                    (first, Some(rest)) => match lookup_ci(&self.use_class, first) {
                         Some(fqn) => Resolution::Fqn(format!("{fqn}\\{rest}")),
                         None => Resolution::Fqn(self.prefix(text)),
                     },
@@ -423,6 +428,41 @@ mod tests {
         assert_eq!(
             s.resolve_function(&unq("util\\f")),
             Resolution::Fqn("App\\util\\f".into())
+        );
+    }
+
+    #[test]
+    fn qualified_function_resolves_through_a_class_import() {
+        // `use Other\Util; Util\helper()` is `Other\Util\helper` — the first
+        // segment of a qualified name is a namespace, so it goes through the
+        // class import table (oracle-verified against PHP 8.5).
+        let mut s = Scope::in_namespace("App");
+        s.add_class_use("Util", "Other\\Util");
+        assert_eq!(
+            s.resolve_function(&unq("Util\\helper")),
+            Resolution::Fqn("Other\\Util\\helper".into())
+        );
+        assert_eq!(
+            s.resolve_const(&unq("Util\\FOO")),
+            Resolution::Fqn("Other\\Util\\FOO".into())
+        );
+    }
+
+    #[test]
+    fn function_import_does_not_apply_to_qualified_names() {
+        // `use function Other\helper; helper\x()` is `App\helper\x`: function and
+        // constant imports bind unqualified names only.
+        let mut s = Scope::in_namespace("App");
+        s.add_function_use("helper", "Other\\helper");
+        assert_eq!(
+            s.resolve_function(&unq("helper\\x")),
+            Resolution::Fqn("App\\helper\\x".into())
+        );
+        let mut c = Scope::in_namespace("App");
+        c.add_const_use("C", "Other\\C");
+        assert_eq!(
+            c.resolve_const(&unq("C\\FOO")),
+            Resolution::Fqn("App\\C\\FOO".into())
         );
     }
 
