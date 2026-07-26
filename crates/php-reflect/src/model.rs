@@ -1137,9 +1137,15 @@ fn parents_with_generics(
         .iter()
         .filter_map(|n| {
             let fqn: std::sync::Arc<str> = scope.resolve_class(n).fqn()?.into();
+            // PHP class names are case-insensitive, so the `@extends` tag need
+            // not spell the parent the way the `extends` clause does. Matching
+            // byte-wise silently dropped the type arguments of
+            // `@extends \arrayobject<int, User>` over `extends \ArrayObject`,
+            // and the inherited members then came back holding raw template
+            // variables.
             let args = doc_args
                 .iter()
-                .find(|(f, _)| *f == fqn)
+                .find(|(f, _)| f.eq_ignore_ascii_case(&fqn))
                 .map(|(_, a)| a.clone())
                 .unwrap_or_default();
             Some(Type::Named { fqn, args })

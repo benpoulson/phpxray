@@ -538,6 +538,11 @@ impl ReflectionIndex {
                 Some((Type::union(keys), Type::union(values)))
             }
             Type::Nullable(inner) => self.iterable_key_value(inner, visited),
+            // Non-emptiness says nothing about the element types, and the caller
+            // only peels it at the *top* level — so a union arm like
+            // `non-empty-list<int>|list<string>` used to fail extraction outright
+            // and fall the whole `foreach` back to `mixed`.
+            Type::NonEmpty(inner) => self.iterable_key_value(inner, visited),
             Type::Union(parts) => {
                 if parts.is_empty() {
                     return None;
@@ -2052,6 +2057,36 @@ mod tests {
             .classes
             .iter()
             .any(|c| c.reflection.fqn == "MethodClass"));
+    }
+
+    #[test]
+    fn generic_args_attach_regardless_of_parent_name_casing() {
+        // PHP class names are case-insensitive, so the `@extends` tag need not
+        // match the `extends` clause byte-for-byte. A byte-wise match dropped
+        // the args and left inherited members holding raw template variables.
+        let idx = index(
+            "<?php
+            class User {}
+            /** @template T */
+            class Collection { /** @return T */ public function first() {} }
+            /** @extends collection<User> */
+            class Users extends Collection {}",
+        );
+        let found = idx.find_method("Users", "first").expect("first");
+        assert_eq!(found.member.return_type.to_string(), "User");
+    }
+
+    #[test]
+    fn non_empty_union_arms_still_extract_key_and_value() {
+        // `NonEmpty` is peeled at the top level only, so a union arm carrying it
+        // used to fail extraction outright and fall `foreach` back to `mixed`.
+        let idx = index("<?php class C {}");
+        let ne_list = Type::non_empty(Type::List(Box::new(Type::Int)));
+        let list = Type::List(Box::new(Type::String));
+        let u = Type::union(vec![ne_list, list]);
+        let (k, v) = idx.iterable_key_value_on_type(&u).expect("extractable");
+        assert_eq!(k.to_string(), "int");
+        assert_eq!(v.to_string(), "int|string");
     }
 
     #[test]
