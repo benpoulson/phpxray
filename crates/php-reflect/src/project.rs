@@ -1300,13 +1300,16 @@ fn subst_type(ty: &Type, subst: &Subst) -> Type {
     if subst.is_empty() {
         return ty.clone();
     }
+    // Binding `T := int|string` inside a union used to nest it, so this mapper
+    // carried Union/Intersection arms that re-flattened by hand. `Type::map` now
+    // rebuilds composites through the smart constructors itself, which fixes it
+    // for *every* mapper — including the alias expanders that never had the
+    // compensating arms and were producing nested unions.
     ty.clone().map(&mut |part| match part {
         Type::TemplateVar(name) => subst
             .get(&*name)
             .cloned()
             .unwrap_or(Type::TemplateVar(name)),
-        Type::Union(parts) => Type::union(parts.to_vec()),
-        Type::Intersection(parts) => Type::intersection(parts.to_vec()),
         other => other,
     })
 }

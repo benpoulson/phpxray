@@ -366,12 +366,20 @@ impl Type {
     /// as [`Type`] grows.
     pub fn map(self, mapper: &mut impl FnMut(Type) -> Type) -> Type {
         let rebuilt = match self {
-            Type::Nullable(inner) => Type::Nullable(Box::new(inner.map(mapper))),
+            // Composites rebuild through the *smart* constructors. A mapper that
+            // substitutes a union into a union (template binding, `@phpstan-type`
+            // alias expansion, late-static binding) otherwise nests it:
+            // `UserId|null` with `UserId = int|string` became
+            // `Union([Union([int, string]), null])`, which renders as a duplicate
+            // ("int|string|int" for `UserId|int`) and compares unequal to the flat
+            // spelling — so the incremental Session's `PartialEq` reflection diff
+            // sees a change that isn't one.
+            Type::Nullable(inner) => Type::nullable(inner.map(mapper)),
             Type::Union(parts) => {
-                Type::Union(parts.iter().map(|p| p.clone().map(mapper)).collect())
+                Type::union(parts.iter().map(|p| p.clone().map(mapper)).collect())
             }
             Type::Intersection(parts) => {
-                Type::Intersection(parts.iter().map(|p| p.clone().map(mapper)).collect())
+                Type::intersection(parts.iter().map(|p| p.clone().map(mapper)).collect())
             }
             Type::Array(Some(kv)) => {
                 let (k, v) = *kv;
@@ -687,5 +695,60 @@ mod tests {
         assert!(rendered.contains("callable(Base): Current"));
         assert!(rendered.contains("array{item: ?Late, ...}"));
         assert!(rendered.contains("($x is Base ? Current : Late)"));
+    }
+
+    #[test]
+    fn map_rebuilds_composites_through_the_smart_constructors() {
+        // Substituting a union *into* a union must stay flat: template binding
+        // and `@phpstan-type` alias expansion both do exactly this, and a nested
+        // result renders as a duplicate ("int|string|int") and compares unequal
+        // to the flat spelling.
+        let alias = Type::union(vec![Type::Int, Type::String]);
+        let subst = |t: Type| {
+            let mut m = |p: Type| match p {
+                Type::TemplateVar(ref n) if &**n == "T" => alias.clone(),
+                other => other,
+            };
+            t.map(&mut m)
+        };
+        let tv = || Type::TemplateVar("T".into());
+
+        // `T|null` → `int|string|null`, not `(int|string)|null`.
+        let got = subst(Type::union(vec![tv(), Type::Null]));
+        assert_eq!(got.to_string(), "int|string|null");
+        assert_eq!(got, Type::union(vec![Type::Int, Type::String, Type::Null]));
+
+        // `T|int` → `int|string`: the duplicate `int` is absorbed.
+        assert_eq!(subst(Type::union(vec![tv(), Type::Int])).to_string(), "int|string");
+
+        // Nullable collapses too: `?T` where `T := ?X` must not double up.
+        let nullable_x = Type::nullable(Type::Named {
+            fqn: "X".into(),
+            args: vec![],
+        });
+        let inner = |t: Type| {
+            let mut m = |p: Type| match p {
+                Type::TemplateVar(ref n) if &**n == "T" => nullable_x.clone(),
+                other => other,
+            };
+            t.map(&mut m)
+        };
+        assert_eq!(inner(Type::nullable(tv())).to_string(), "?X");
+
+        // An intersection flattens on the same path.
+        let ab = Type::intersection(vec![
+            Type::Named { fqn: "A".into(), args: vec![] },
+            Type::Named { fqn: "B".into(), args: vec![] },
+        ]);
+        let mut m = |p: Type| match p {
+            Type::TemplateVar(ref n) if &**n == "T" => ab.clone(),
+            other => other,
+        };
+        let got = Type::intersection(vec![
+            tv(),
+            Type::Named { fqn: "C".into(), args: vec![] },
+        ])
+        .map(&mut m);
+        assert_eq!(got.to_string(), "A&B&C");
     }
 }
