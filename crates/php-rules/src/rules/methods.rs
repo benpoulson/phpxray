@@ -1630,6 +1630,11 @@ fn run_call_methods_typed(fa: &FileAnalysis) -> Vec<Diagnostic> {
         if is_this(recv, fa) {
             return;
         }
+        // Below level 2, phpstan only resolves a `$this` receiver's type
+        // (`checkThisOnly`), so a call on any other receiver is not checked.
+        if fa.check_this_only {
+            return;
+        }
         let recv_ty = fa.type_of(recv);
         if fa.check_nullables && super::type_contains_null(&recv_ty) {
             return;

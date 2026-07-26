@@ -88,6 +88,10 @@ pub struct FileAnalysis<'a> {
     /// checking it — so passing a nullable value where a non-null type is expected
     /// is not reported until level 8 (matching phpstan exactly).
     pub check_nullables: bool,
+    /// phpstan's `checkThisOnly` gate — true below level 2, where member
+    /// existence is only judged on a `$this` receiver. An arbitrary receiver's
+    /// members are not checked until the type checks proper begin at level 2.
+    pub check_this_only: bool,
     /// phpstan's explicit `mixed` strictness gate (level 9+).
     pub check_explicit_mixed: bool,
     /// phpstan's implicit `mixed` strictness gate (`max`).
@@ -461,6 +465,26 @@ pub fn located_rules_for_level(level: u8) -> impl Iterator<Item = &'static Locat
 /// The dispatcher entry for a registry rule, if it has one. Callers iterate
 /// `rules_for_level`, so the level filter has already been applied by the
 /// `RuleEntry` that owns it.
+/// Rule names that intentionally appear on more than one [`RuleEntry`] — the
+/// same check implemented separately for functions and methods, or split across
+/// declaration kinds. They share an *identifier*, which is the user-facing
+/// contract, not an implementation.
+///
+/// Any name here MUST NOT gain a [`FactRuleEntry`]: the dispatcher joins the two
+/// tables by name, so a duplicated name would bind the same handler to every
+/// entry sharing it and dispatch it once per entry — silently duplicating every
+/// diagnostic it produces. `duplicate_rule_names_have_no_fact_handler` enforces
+/// exactly that.
+#[cfg(test)]
+const INTENTIONAL_DUPLICATE_RULE_NAMES: &[&str] = &[
+    "argument.type",
+    "missingType.iterableValue",
+    "missingType.parameter",
+    "missingType.return",
+    "parameter.defaultValue",
+    "throws.unusedType",
+];
+
 fn fact_rule_for_name(name: &str) -> Option<&'static FactRuleEntry> {
     crate::rules::FACT_CATEGORY_RULES
         .iter()
@@ -846,6 +870,7 @@ mod tests {
             php_version: PhpVersion::default(),
             treat_phpdoc_types_as_certain: true,
             report_maybes: true,
+            check_this_only: false,
             check_nullables: true,
             check_explicit_mixed: true,
             check_implicit_mixed: true,
@@ -934,6 +959,52 @@ mod tests {
                 });
                 assert!(found, "expected a class-constant expression");
             },
+        );
+    }
+
+    /// The dispatcher joins `RuleEntry` to `FactRuleEntry` **by name**, so a
+    /// name carried by two rule entries would bind one handler to both and run
+    /// it twice — duplicating every diagnostic it emits. Duplicated names are
+    /// allowed (a check implemented once for functions and once for methods
+    /// shares an identifier), but only while none of them is fact-dispatched.
+    #[test]
+    fn duplicate_rule_names_have_no_fact_handler() {
+        use std::collections::HashMap;
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for cat in crate::rules::CATEGORY_RULES {
+            for r in cat.iter() {
+                *counts.entry(r.name).or_default() += 1;
+            }
+        }
+        let duplicated: Vec<&str> = {
+            let mut v: Vec<&str> = counts
+                .iter()
+                .filter(|(_, n)| **n > 1)
+                .map(|(name, _)| *name)
+                .collect();
+            v.sort_unstable();
+            v
+        };
+
+        for name in &duplicated {
+            assert!(
+                fact_rule_for_name(name).is_none(),
+                "{name} is registered {} times AND has a fact handler — the \
+                 dispatcher would run it once per entry, duplicating its output",
+                counts[name]
+            );
+        }
+
+        // Keep the allowlist honest in both directions: a new duplicate must be
+        // a deliberate decision, and a name that stops being duplicated should
+        // leave the list.
+        let mut expected = INTENTIONAL_DUPLICATE_RULE_NAMES.to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            duplicated, expected,
+            "the set of duplicated rule names changed; update \
+             INTENTIONAL_DUPLICATE_RULE_NAMES once you have confirmed the \
+             duplication is intended"
         );
     }
 }

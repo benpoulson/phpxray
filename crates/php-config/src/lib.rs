@@ -293,6 +293,10 @@ impl Level {
             // Strict mixed checks turn on after nullable checks.
             check_explicit_mixed: self.0 >= 9,
             check_implicit_mixed: self.0 >= Self::MAX.0,
+            // phpstan's `checkThisOnly` defaults to true (`conf/config.neon`)
+            // and level 2 turns it off (`conf/config.level2.neon`): below 2 only
+            // `$this->` receivers have their members checked for existence.
+            check_this_only: self.0 < 2,
             // Not level-derived — off unless `checkUninitializedProperties` is set.
             check_uninitialized_properties: false,
             check_too_wide_return_public: false,
@@ -305,6 +309,10 @@ impl Level {
 pub struct RuleOptions {
     pub report_maybes: bool,
     pub check_nullables: bool,
+    /// Only check member existence on a `$this` receiver. phpstan's
+    /// `checkThisOnly`, on below level 2 — an arbitrary receiver's members are
+    /// not judged until the type checks proper begin.
+    pub check_this_only: bool,
     pub check_explicit_mixed: bool,
     pub check_implicit_mixed: bool,
     pub check_uninitialized_properties: bool,

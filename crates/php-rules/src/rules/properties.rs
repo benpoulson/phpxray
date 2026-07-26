@@ -3063,6 +3063,13 @@ fn check_property_access(
     if matches!(&base.kind, ExprKind::Variable(v) if fa.interner.resolve(*v) == "this") {
         return;
     }
+    // Below level 2 phpstan resolves a receiver's type only for `$this`
+    // (`checkThisOnly`, see `RuleLevelHelper::findTypeToCheck`), so an arbitrary
+    // receiver's members are not judged at all. `$this` already returned above,
+    // so everything reaching here is the gated case.
+    if fa.check_this_only {
+        return;
+    }
     let MemberName::Ident(p) = name else { return }; // dynamic `$o->$x` — skip.
     let prop = fa.interner.resolve(*p);
 

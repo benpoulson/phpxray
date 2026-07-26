@@ -103,6 +103,7 @@ pub(crate) fn with_analysis<R>(
         check_explicit_mixed: h.options.check_explicit_mixed,
         check_implicit_mixed: h.options.check_implicit_mixed,
         check_uninitialized_properties: h.options.check_uninitialized_properties,
+        check_this_only: h.options.check_this_only,
         check_too_wide_return_public: h.options.check_too_wide_return_public,
         collect_fixes: h.collect_fixes,
         iterable_param_evidence: evidence.as_ref(),
