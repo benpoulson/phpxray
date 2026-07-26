@@ -22,6 +22,14 @@ pub(crate) fn refine_return(
     if caller.depth >= crate::limits::MAX_REFINE_DEPTH || !refinable {
         return declared.clone();
     }
+    // Parameters are bound positionally below, which only describes the call
+    // when every argument *is* positional. A named argument (`f(b: $x)`) or a
+    // spread would bind the wrong parameter, and since refinement prunes
+    // branches on those bindings the result is an over-narrow: `?Name` collapses
+    // to `Name` for a call that really can return null.
+    if !crate::util::args_are_plain_positional(args) {
+        return declared.clone();
+    }
     // The callee's body is analysed in the callee's namespace scope, one level
     // deeper; everything else is inherited config (see `TypeCtx::child_scoped`).
     let mut sub = caller.child_scoped(callee_scope);
@@ -189,6 +197,13 @@ pub(crate) fn static_truth(ctx: &TypeCtx<'_>, cond: &Expr) -> Option<bool> {
                 .trim_start_matches('\\')
                 .eq_ignore_ascii_case("is_null")
             {
+                return None;
+            }
+            // A userland `is_null` shadowing the builtin decides its own truth,
+            // so the builtin's meaning must not be assumed. This is the guard
+            // `builtins.rs` requires of every consumer of builtin knowledge —
+            // pruning a branch on a shadowed name is an over-narrow.
+            if !ctx.resolves_to_builtin(n) {
                 return None;
             }
             crate::null_truth(&ctx.infer(&args.first()?.value))

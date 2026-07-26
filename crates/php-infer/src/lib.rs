@@ -2431,6 +2431,46 @@ mod tests {
     }
 
     #[test]
+    fn interprocedural_return_is_not_refined_through_named_arguments() {
+        // `$a` is left at its default `null` — only `$b` is supplied — so the
+        // guard holds and the call really can return null. Binding args
+        // positionally would hand `$a` the `b:` argument's type, prune the
+        // `return null`, and over-narrow to `Name`.
+        let src = "class Name {
+            public static function pick(?Name $a = null, ?Name $b = null): ?Name {
+                if ($a === null) { return null; }
+                return $a;
+            }
+        }
+        Name::pick(b: $x);";
+        let named = Type::Named {
+            fqn: "Name".into(),
+            args: vec![],
+        };
+        // The declared type comes back unrefined.
+        assert_eq!(infer_with(src, &[("x", named)], None), "?Name");
+    }
+
+    #[test]
+    fn shadowed_is_null_does_not_prune_a_branch() {
+        // A userland `is_null` decides its own truth, so the null path stays
+        // live even though the argument's type is non-null.
+        let src = "class Name {}
+        function is_null($x) { return true; }
+        function pick(?Name $a): ?Name {
+            if (is_null($a)) { return null; }
+            return $a;
+        }
+        pick($v);";
+        let named = Type::Named {
+            fqn: "Name".into(),
+            args: vec![],
+        };
+        let got = infer_with(src, &[("v", named)], None);
+        assert!(got.contains("null"), "expected nullable, got {got}");
+    }
+
+    #[test]
     fn interprocedural_return_prunes_on_int_constant_guard() {
         // A `?Name` helper that returns null only when `$type !== TYPE_NORMAL`.
         // Called with `$type = TYPE_NORMAL`, that guard is statically false → the

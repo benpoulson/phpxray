@@ -1198,7 +1198,7 @@ impl TypeCtx<'_> {
             return;
         };
         // Skip a userland function that shadows the builtin name.
-        if self.function_reflection(n).is_some_and(|f| !f.builtin) {
+        if !self.resolves_to_builtin(n) {
             return;
         }
         let matches_ty = match last_segment(&n.text).to_ascii_lowercase().as_str() {
