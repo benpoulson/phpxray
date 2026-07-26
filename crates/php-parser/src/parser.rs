@@ -957,6 +957,17 @@ impl<'a> Parser<'a> {
         (self.member_ident(), self.span_to(start))
     }
 
+    /// Whether the cursor sits on a closure or arrow function — the only
+    /// expressions PHP lets an attribute decorate (an anonymous class is
+    /// attributed after `new`, handled in [`Self::parse_new`]).
+    fn at_attributable_closure(&self) -> bool {
+        match self.peek() {
+            T::Keyword(Kw::Function | Kw::Fn) => true,
+            T::Keyword(Kw::Static) => matches!(self.nth(1), T::Keyword(Kw::Function | Kw::Fn)),
+            _ => false,
+        }
+    }
+
     fn parse_attributed_decl(&mut self, doc: Option<std::sync::Arc<str>>) -> StmtKind {
         let attrs = self.parse_attributes();
         match self.peek() {
@@ -979,7 +990,13 @@ impl<'a> Parser<'a> {
             }
             _ => {
                 // Attributes on an expression (e.g. a closure) — parse the expr;
-                // the attributes are not yet attached to expression nodes.
+                // the attributes are not yet attached to expression nodes. Only
+                // a closure or arrow function may carry them, so anything else
+                // (`#[A] new Foo();`) is the parse error PHP reports, not a
+                // silent drop.
+                if !self.at_attributable_closure() {
+                    self.error_here(MISPLACED_ATTRIBUTE);
+                }
                 let e = self.parse_expr(0);
                 self.eat_stmt_end();
                 StmtKind::Expr(e)
@@ -1924,7 +1941,15 @@ impl<'a> Parser<'a> {
                         self.bump();
                         self.parse_arrow(start, true, attrs)
                     }
-                    _ => self.parse_prefix(),
+                    // PHP allows an attribute here only on a closure or an
+                    // arrow function (and, via `parse_new`, an anonymous class).
+                    // Anywhere else is a parse error, so say so — silently
+                    // dropping the attributes accepted invalid code *and* left
+                    // an attribute in the source with no trace in the AST.
+                    _ => {
+                        self.error_here(MISPLACED_ATTRIBUTE);
+                        self.parse_prefix()
+                    }
                 }
             }
             _ => {
@@ -2681,6 +2706,12 @@ impl<'a> Parser<'a> {
             let modifiers = self.parse_modifiers();
             return self.parse_anon_class(start, attrs, modifiers);
         }
+        // `new #[A] Foo()` is a parse error in PHP: an attribute after `new`
+        // belongs to an anonymous class and nothing else. Report it rather than
+        // dropping the attributes on the floor.
+        if !attrs.is_empty() {
+            self.error_here("attributes are only allowed on an anonymous class here");
+        }
         let class = self.parse_class_ref();
         let args = if self.at(T::LParen) {
             self.parse_args()
@@ -3144,6 +3175,12 @@ fn cast_kind(k: T) -> Option<CastKind> {
 }
 
 // --- literal value decoding ------------------------------------------------
+
+/// Reported where PHP rejects an attribute outright, so the attribute is never
+/// just dropped: invalid source stayed silent, and the AST then claimed nothing
+/// had been written.
+const MISPLACED_ATTRIBUTE: &str =
+    "attributes are not allowed here (only on a closure, arrow function or anonymous class)";
 
 fn stmt_allows_raw_doc(kind: &StmtKind) -> bool {
     !matches!(kind, StmtKind::Function(_) | StmtKind::Class(_))

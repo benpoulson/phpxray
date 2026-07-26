@@ -248,3 +248,29 @@ fn interpolated_binary_strings_reach_the_ast() {
     assert_eq!(interps, 1, "the binary string should be an interpolation");
     assert_eq!(names, 0, "the `b` prefix must not become a constant name");
 }
+
+/// An attribute in a position PHP rejects must produce a diagnostic, not vanish.
+///
+/// Silently dropping it accepted invalid code *and* left the AST claiming no
+/// attribute was written — a lie to any attribute-scanning rule.
+#[test]
+fn misplaced_attributes_are_reported() {
+    for src in [
+        "<?php #[A] new Foo();",
+        "<?php $x = #[A] 1 + 2;",
+        "<?php $x = new #[A] Foo();",
+    ] {
+        let r = php_parser::parse(src);
+        assert!(r.has_errors(), "{src} should be rejected");
+    }
+    // The three positions PHP does allow stay clean.
+    for src in [
+        "<?php #[A] function () {};",
+        "<?php #[A] fn() => 1;",
+        "<?php $x = new #[A] class {};",
+        "<?php $x = new #[A] readonly class {};",
+    ] {
+        let r = php_parser::parse(src);
+        assert!(!r.has_errors(), "{src} should parse cleanly: {:?}", r.diagnostics);
+    }
+}
