@@ -26,7 +26,7 @@
 //! converges.
 
 use crate::returns::collect_returns;
-use crate::{type_map, TypeCtx, TypeMap};
+use crate::{TypeCtx, TypeMap};
 use php_ast::{walk, Arg, Expr, ExprKind, MemberName, Program, Stmt};
 use php_intern::Interner;
 use php_reflect::{InferredSig, InferredSignatures, ParamReflection, ReflectionIndex};
@@ -36,16 +36,25 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 
 /// Tuning for [`infer_and_apply`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct InferOpts {
     /// Maximum return-inference fixpoint rounds (converges earlier when stable).
     pub rounds: u32,
+    /// The user-configured `earlyTerminating*` calls.
+    ///
+    /// The same set the engine analyzes with. Leaving it empty here meant an
+    /// analysis input reached one consumer and not another — the shape
+    /// `AnalysisInputs` exists to prevent. The effect is widening-only (a branch
+    /// that should have ended keeps flowing, so an inferred return is broader),
+    /// which is why it went unnoticed.
+    pub terminators: std::sync::Arc<crate::Terminators>,
 }
 
 impl Default for InferOpts {
     fn default() -> Self {
         InferOpts {
             rounds: crate::limits::SIGNATURE_INFERENCE_ROUNDS,
+            terminators: Default::default(),
         }
     }
 }
@@ -67,14 +76,14 @@ pub fn infer_and_apply(
 ) -> InferredSignatures {
     // Phase A — parameter types from call sites (one pass; the expensive part, as
     // it builds a type map per file). Apply before returns so bodies see them.
-    let mut combined = infer_params_from_callsites(index, programs, interner);
+    let mut combined = infer_params_from_callsites(index, programs, interner, &opts.terminators);
     index.apply_inferred(&combined);
 
     // Phase B — return types from bodies, to a small fixpoint so a function whose
     // return is another untyped function's result converges.
     let mut prev = InferredSignatures::default();
     for _ in 0..opts.rounds.max(1) {
-        let returns = infer_returns_from_bodies(index, interner);
+        let returns = infer_returns_from_bodies(index, interner, &opts.terminators);
         if returns == prev {
             break;
         }
@@ -98,7 +107,11 @@ fn merge_returns(combined: &mut InferredSignatures, returns: InferredSignatures)
 
 // --- return inference -------------------------------------------------------
 
-fn infer_returns_from_bodies(index: &ReflectionIndex, interner: &Interner) -> InferredSignatures {
+fn infer_returns_from_bodies(
+    index: &ReflectionIndex,
+    interner: &Interner,
+    terminators: &std::sync::Arc<crate::Terminators>,
+) -> InferredSignatures {
     let mut out = InferredSignatures::default();
 
     // Each function/method is independent — infer returns in parallel and
@@ -113,7 +126,7 @@ fn infer_returns_from_bodies(index: &ReflectionIndex, interner: &Interner) -> In
             }
             let params = param_seeds(&f.params);
             let (body, scope) = index.function_body(&fqn)?;
-            let ret = body_return_type(index, interner, body, scope, None, &params)?;
+            let ret = body_return_type(index, interner, body, scope, None, &params, terminators)?;
             Some((fqn, ret))
         })
         .collect();
@@ -146,7 +159,7 @@ fn infer_returns_from_bodies(index: &ReflectionIndex, interner: &Interner) -> In
                 if let Some((body, scope)) = index.method_body(&class_fqn, &mname) {
                     let class = Some(class_fqn.clone());
                     if let Some(ret) =
-                        body_return_type(index, interner, body, scope, class, &params)
+                        body_return_type(index, interner, body, scope, class, &params, terminators)
                     {
                         rets.push(((class_fqn.clone(), mname), ret));
                     }
@@ -173,6 +186,7 @@ fn param_seeds(params: &[ParamReflection]) -> Vec<(String, Type)> {
 /// Union of the value-`return` types reachable in `body`, or `None` when the
 /// function has no value returns or the union is not more precise than `mixed`.
 /// Skips generators (a `yield` body returns a `Generator`, not its yield values).
+#[allow(clippy::too_many_arguments)]
 fn body_return_type(
     index: &ReflectionIndex,
     interner: &Interner,
@@ -180,6 +194,7 @@ fn body_return_type(
     scope: &Scope,
     class: Option<String>,
     params: &[(String, Type)],
+    terminators: &std::sync::Arc<crate::Terminators>,
 ) -> Option<Type> {
     if is_generator(body) {
         return None;
@@ -189,6 +204,7 @@ fn body_return_type(
     // depth 1 so any nested per-call refinement stays shallow (one more level).
     ctx.depth = crate::limits::CALLEE_ANALYSIS_DEPTH;
     ctx.vars = params.iter().cloned().collect();
+    ctx.terminators = terminators.clone();
 
     let mut returns = Vec::new();
     collect_returns(&mut ctx, body, &mut returns);
@@ -221,6 +237,7 @@ fn infer_params_from_callsites(
     index: &ReflectionIndex,
     programs: &[&Program],
     interner: &Interner,
+    terminators: &std::sync::Arc<crate::Terminators>,
 ) -> InferredSignatures {
     // Harvest per file in parallel (the throwaway per-file type map is the
     // expensive part), then merge **in file order**: observation order feeds
@@ -228,7 +245,7 @@ fn infer_params_from_callsites(
     // byte-identical to the old sequential pass.
     let per_file: Vec<(FnArgs, MethodArgs)> = programs
         .par_iter()
-        .map(|program| harvest_file(index, program, interner))
+        .map(|program| harvest_file(index, program, interner, terminators))
         .collect();
 
     // Observed argument types per (target, position).
@@ -314,9 +331,13 @@ pub fn explicit_iterable_param_evidence(
     programs: &[&Program],
     interner: &Interner,
 ) -> ExplicitParamEvidence {
+    // `--fix`-only evidence gathering, which has no configured terminator set to
+    // hand down; the empty default only widens (a branch that should have ended
+    // keeps flowing), never narrows.
+    let terminators = std::sync::Arc::<crate::Terminators>::default();
     let per_file: Vec<(FnArgs, MethodArgs)> = programs
         .par_iter()
-        .map(|program| harvest_file(index, program, interner))
+        .map(|program| harvest_file(index, program, interner, &terminators))
         .collect();
     let mut fn_args: FnArgs = HashMap::new();
     let mut method_args: MethodArgs = HashMap::new();
@@ -401,10 +422,11 @@ fn harvest_file(
     index: &ReflectionIndex,
     program: &Program,
     interner: &Interner,
+    terminators: &std::sync::Arc<crate::Terminators>,
 ) -> (FnArgs, MethodArgs) {
     let mut fn_args: FnArgs = HashMap::new();
     let mut method_args: MethodArgs = HashMap::new();
-    let map = type_map(index, program, interner, false);
+    let map = crate::type_map_with(index, program, interner, false, terminators);
     let refs = resolve_references(program, interner);
     let fmap = function_ref_map(&refs);
     walk::for_each_expr(program, &mut |e| match &e.kind {

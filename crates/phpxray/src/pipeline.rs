@@ -113,11 +113,18 @@ pub(crate) fn infer_signatures(
     reflection: &mut ReflectionIndex,
     programs: &[&php_ast::Program],
     interner: &Interner,
+    terminators: std::sync::Arc<php_rules::Terminators>,
 ) -> php_reflect::InferredSignatures {
     php_infer::infer_and_apply(
         reflection,
         programs,
         interner,
-        php_infer::InferOpts::default(),
+        php_infer::InferOpts {
+            // The same terminator set the rules run with: an analysis input that
+            // reached one consumer and not the other is the shape
+            // `AnalysisInputs` exists to prevent.
+            terminators,
+            ..php_infer::InferOpts::default()
+        },
     )
 }
