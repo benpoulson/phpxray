@@ -719,7 +719,10 @@ mod tests {
         assert_eq!(got, Type::union(vec![Type::Int, Type::String, Type::Null]));
 
         // `T|int` → `int|string`: the duplicate `int` is absorbed.
-        assert_eq!(subst(Type::union(vec![tv(), Type::Int])).to_string(), "int|string");
+        assert_eq!(
+            subst(Type::union(vec![tv(), Type::Int])).to_string(),
+            "int|string"
+        );
 
         // Nullable collapses too: `?T` where `T := ?X` must not double up.
         let nullable_x = Type::nullable(Type::Named {
@@ -737,8 +740,14 @@ mod tests {
 
         // An intersection flattens on the same path.
         let ab = Type::intersection(vec![
-            Type::Named { fqn: "A".into(), args: vec![] },
-            Type::Named { fqn: "B".into(), args: vec![] },
+            Type::Named {
+                fqn: "A".into(),
+                args: vec![],
+            },
+            Type::Named {
+                fqn: "B".into(),
+                args: vec![],
+            },
         ]);
         let mut m = |p: Type| match p {
             Type::TemplateVar(ref n) if &**n == "T" => ab.clone(),
@@ -746,7 +755,10 @@ mod tests {
         };
         let got = Type::intersection(vec![
             tv(),
-            Type::Named { fqn: "C".into(), args: vec![] },
+            Type::Named {
+                fqn: "C".into(),
+                args: vec![],
+            },
         ])
         .map(&mut m);
         assert_eq!(got.to_string(), "A&B&C");

@@ -664,7 +664,13 @@ mod tests {
             $o::${dynamic()};
             "#,
         );
-        for want in ["App\\helper", "App\\MY_CONST", "App\\other", "App\\OTHER_CONST", "App\\dynamic"] {
+        for want in [
+            "App\\helper",
+            "App\\MY_CONST",
+            "App\\other",
+            "App\\OTHER_CONST",
+            "App\\dynamic",
+        ] {
             assert!(
                 got.iter().any(|(_, fqn)| fqn == want),
                 "missing {want} in {got:?}"

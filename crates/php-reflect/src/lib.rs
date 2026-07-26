@@ -534,7 +534,12 @@ mod tests {
         assert_eq!(doc(&s, &[], "class-string"), Type::ClassString(None));
         // All four `*-string` spellings take a type argument. The generic arm
         // used to list only two, silently dropping the others' argument.
-        for kw in ["class-string", "interface-string", "trait-string", "enum-string"] {
+        for kw in [
+            "class-string",
+            "interface-string",
+            "trait-string",
+            "enum-string",
+        ] {
             assert_eq!(
                 doc(&s, &[], &format!("{kw}<Foo>")).to_string(),
                 "class-string<Foo>",

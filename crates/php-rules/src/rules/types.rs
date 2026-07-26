@@ -494,13 +494,29 @@ fn check_return_stmts(
         }
         StmtKind::Block(body) => {
             for s in body {
-                check_return_stmts(fa, label, target, s, include_explicit, include_implicit, out);
+                check_return_stmts(
+                    fa,
+                    label,
+                    target,
+                    s,
+                    include_explicit,
+                    include_implicit,
+                    out,
+                );
             }
         }
         StmtKind::If {
             then, elseifs, els, ..
         } => {
-            check_return_stmts(fa, label, target, then, include_explicit, include_implicit, out);
+            check_return_stmts(
+                fa,
+                label,
+                target,
+                then,
+                include_explicit,
+                include_implicit,
+                out,
+            );
             for elseif in elseifs {
                 check_return_stmts(
                     fa,
@@ -513,7 +529,15 @@ fn check_return_stmts(
                 );
             }
             if let Some(els) = els {
-                check_return_stmts(fa, label, target, els, include_explicit, include_implicit, out);
+                check_return_stmts(
+                    fa,
+                    label,
+                    target,
+                    els,
+                    include_explicit,
+                    include_implicit,
+                    out,
+                );
             }
         }
         StmtKind::While { body, .. }
@@ -522,11 +546,27 @@ fn check_return_stmts(
         | StmtKind::Foreach { body, .. }
         | StmtKind::Declare {
             body: Some(body), ..
-        } => check_return_stmts(fa, label, target, body, include_explicit, include_implicit, out),
+        } => check_return_stmts(
+            fa,
+            label,
+            target,
+            body,
+            include_explicit,
+            include_implicit,
+            out,
+        ),
         StmtKind::Switch { cases, .. } => {
             for case in cases {
                 for s in &case.body {
-                    check_return_stmts(fa, label, target, s, include_explicit, include_implicit, out);
+                    check_return_stmts(
+                        fa,
+                        label,
+                        target,
+                        s,
+                        include_explicit,
+                        include_implicit,
+                        out,
+                    );
                 }
             }
         }
@@ -536,16 +576,40 @@ fn check_return_stmts(
             finally,
         } => {
             for s in body {
-                check_return_stmts(fa, label, target, s, include_explicit, include_implicit, out);
+                check_return_stmts(
+                    fa,
+                    label,
+                    target,
+                    s,
+                    include_explicit,
+                    include_implicit,
+                    out,
+                );
             }
             for catch in catches {
                 for s in &catch.body {
-                    check_return_stmts(fa, label, target, s, include_explicit, include_implicit, out);
+                    check_return_stmts(
+                        fa,
+                        label,
+                        target,
+                        s,
+                        include_explicit,
+                        include_implicit,
+                        out,
+                    );
                 }
             }
             if let Some(finally) = finally {
                 for s in finally {
-                    check_return_stmts(fa, label, target, s, include_explicit, include_implicit, out);
+                    check_return_stmts(
+                        fa,
+                        label,
+                        target,
+                        s,
+                        include_explicit,
+                        include_implicit,
+                        out,
+                    );
                 }
             }
         }

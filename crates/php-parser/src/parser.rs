@@ -2239,11 +2239,11 @@ impl<'a> Parser<'a> {
                      // `yield` has no operand when followed by a terminator, or by an infix
                      // operator that cannot also start an expression (so `yield * -1` parses
                      // as `(yield) * -1`, while `yield +1` yields `+1`).
-        // `Colon` and `DoubleArrow` terminate too: neither can start an
-        // expression, and neither carries an infix power. They appear after a
-        // bare `yield` in `$a ? yield : 2`, `[yield => 1]` and `case yield:`
-        // — the keyed `yield $k => $v` form is only reached once an operand has
-        // parsed, so it is unaffected.
+                     // `Colon` and `DoubleArrow` terminate too: neither can start an
+                     // expression, and neither carries an infix power. They appear after a
+                     // bare `yield` in `$a ? yield : 2`, `[yield => 1]` and `case yield:`
+                     // — the keyed `yield $k => $v` form is only reached once an operand has
+                     // parsed, so it is unaffected.
         let no_operand = matches!(
             self.peek(),
             T::Semicolon

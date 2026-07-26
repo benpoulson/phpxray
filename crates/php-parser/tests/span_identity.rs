@@ -271,6 +271,10 @@ fn misplaced_attributes_are_reported() {
         "<?php $x = new #[A] readonly class {};",
     ] {
         let r = php_parser::parse(src);
-        assert!(!r.has_errors(), "{src} should parse cleanly: {:?}", r.diagnostics);
+        assert!(
+            !r.has_errors(),
+            "{src} should parse cleanly: {:?}",
+            r.diagnostics
+        );
     }
 }

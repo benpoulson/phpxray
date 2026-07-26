@@ -604,11 +604,18 @@ mod tests {
         assert!(!is_assignable(&idx, &ab, &c), "A&B should not satisfy C");
 
         // An intersection *target* demands every arm.
-        assert!(!is_assignable(&idx, &a, &ab), "A alone should not satisfy A&B");
+        assert!(
+            !is_assignable(&idx, &a, &ab),
+            "A alone should not satisfy A&B"
+        );
         assert!(is_assignable(&idx, &ab, &ab));
 
         // A union target still accepts an intersection value via any arm.
-        assert!(is_assignable(&idx, &ab, &Type::union(vec![a.clone(), c.clone()])));
+        assert!(is_assignable(
+            &idx,
+            &ab,
+            &Type::union(vec![a.clone(), c.clone()])
+        ));
     }
 
     fn named(s: &str) -> Type {

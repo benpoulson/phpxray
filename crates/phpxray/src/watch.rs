@@ -661,7 +661,12 @@ mod tests {
 
         // Their directories are registered with the watcher.
         let targets = watch_targets(&c, root, Some(config_file));
-        for dir in ["/proj", "/proj/stubs", "/proj/config", "/proj/vendor/composer"] {
+        for dir in [
+            "/proj",
+            "/proj/stubs",
+            "/proj/config",
+            "/proj/vendor/composer",
+        ] {
             assert!(
                 targets.iter().any(|(p, _)| p == Path::new(dir)),
                 "{dir} not watched: {targets:?}"

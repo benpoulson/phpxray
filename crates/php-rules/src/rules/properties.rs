@@ -4842,7 +4842,10 @@ mod tests {
             class P { private string $x = 'a'; private static int $y = 1; }
             class C extends P { private int $x = 1; private string $y = 'b'; }";
         let got = codes(src, run_overriding_property);
-        assert!(got.is_empty(), "private prototypes must be skipped: {got:?}");
+        assert!(
+            got.is_empty(),
+            "private prototypes must be skipped: {got:?}"
+        );
     }
 
     #[test]

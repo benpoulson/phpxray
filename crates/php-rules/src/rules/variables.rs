@@ -1814,7 +1814,8 @@ mod tests {
     fn catch_only_assignment_is_maybe_not_definite() {
         // The catch is a real path into the continuation, so `$x` is possibly
         // defined — never a level-0 "Undefined variable".
-        let src = "<?php function f() { try { risky(); } catch (\\Exception $e) { $x = 1; } echo $x; }";
+        let src =
+            "<?php function f() { try { risky(); } catch (\\Exception $e) { $x = 1; } echo $x; }";
         assert!(codes(src, run_defined_variable).is_empty());
         assert_eq!(
             codes(src, run_maybe_undefined_variable),

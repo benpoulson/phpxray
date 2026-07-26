@@ -4,11 +4,11 @@
 //! rule families common whole-file views without repeatedly walking the AST, but
 //! it does not replace flow-sensitive per-scope walkers.
 
+use crate::symbols::ANONYMOUS_CLASS;
 use php_ast::{
     Arg, ArrayItem, BinOp, CastKind, ClassDecl, Expr, ExprKind, FunctionDecl, Member, MemberName,
     MethodDecl, Program, PropElem, PropertyDecl, Stmt, StmtKind, UnOp,
 };
-use crate::symbols::ANONYMOUS_CLASS;
 use php_intern::Interner;
 use php_resolve::{for_each_region, Scope};
 

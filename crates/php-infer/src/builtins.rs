@@ -414,7 +414,10 @@ impl TypeCtx<'_> {
                 };
                 // Absent, or provably `false`, means keys are re-indexed.
                 let reindexes = preserve_arg.is_none_or(|a| {
-                    matches!(crate::eval_const(&a.value), Some(crate::ConstVal::Bool(false)))
+                    matches!(
+                        crate::eval_const(&a.value),
+                        Some(crate::ConstVal::Bool(false))
+                    )
                 });
                 match self.infer(&args.first()?.value) {
                     Type::List(v) if !reindexes => {
