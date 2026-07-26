@@ -118,6 +118,11 @@ pub fn type_map_with(
     facet(merged, native)
 }
 
+/// The FQN placeholder for an anonymous class — deliberately not a name any
+/// index can resolve, so member lookups on `$this` inside one stay lenient
+/// rather than being judged against a definition that was never registered.
+const ANONYMOUS_CLASS: &str = "class@anonymous";
+
 /// The shared empty terminator set (the no-config default).
 fn empty_terminators() -> &'static std::sync::Arc<crate::Terminators> {
     static EMPTY: std::sync::OnceLock<std::sync::Arc<crate::Terminators>> =
@@ -228,6 +233,25 @@ fn build(
                     &mut map,
                 )
             });
+            // Anonymous classes are expressions, so the statement walk above
+            // never reaches their method bodies. Without this the bodies get no
+            // recorded types at all, and every rule that asks `type_of` inside
+            // one silently sees `mixed` — which is why `new class { … }` used to
+            // produce no diagnostics whatsoever.
+            walk::for_each_expr_in_stmt(st, &mut |e| {
+                if let php_ast::ExprKind::NewAnon { class, .. } = &e.kind {
+                    collect_class_scopes(
+                        reflection,
+                        scope,
+                        interner,
+                        ANONYMOUS_CLASS,
+                        class,
+                        native,
+                        terminators,
+                        &mut map,
+                    );
+                }
+            });
         }
     });
     map
@@ -326,57 +350,81 @@ fn collect_scope(
         StmtKind::Class(c) => {
             let Some(name) = c.name else { return };
             let fqn = scope.qualify(interner.resolve(name));
-            // Prefer the stored index reflection (see the function arm above).
-            let fresh;
-            let cls = match reflection.class(&fqn) {
-                Some(s) => s,
-                None => {
-                    fresh = reflect_class(scope, interner, &fqn, c);
-                    &fresh
-                }
-            };
-            for m in &c.members {
-                let Member::Method(md) = m else { continue };
-                let Some(body) = &md.body else { continue };
-                let mname = interner.resolve(md.name);
-                let Some(mr) = cls
-                    .methods
-                    .iter()
-                    .find(|x| !x.magic && x.name.eq_ignore_ascii_case(mname))
-                else {
-                    continue;
-                };
-                let mut vars: HashMap<String, Type> = mr
-                    .params
-                    .iter()
-                    .map(|p| (p.name.clone(), seed_type(p, native)))
-                    .collect();
-                vars.insert(
-                    "this".to_string(),
-                    Type::Named {
-                        fqn: fqn.as_str().into(),
-                        args: Vec::new(),
-                    },
-                );
-                record_scope(
-                    reflection,
-                    scope,
-                    interner,
-                    Some(fqn.clone()),
-                    vars,
-                    native,
-                    crate::generator_send_type(if native {
-                        &mr.native_return
-                    } else {
-                        &mr.return_type
-                    }),
-                    terminators,
-                    body,
-                    map,
-                );
-            }
+            collect_class_scopes(
+                reflection,
+                scope,
+                interner,
+                &fqn,
+                c,
+                native,
+                terminators,
+                map,
+            );
         }
         _ => {}
+    }
+}
+
+/// Record a scope for every method body of `c`, keyed by `fqn`.
+#[allow(clippy::too_many_arguments)]
+fn collect_class_scopes(
+    reflection: &ReflectionIndex,
+    scope: &Scope,
+    interner: &Interner,
+    fqn: &str,
+    c: &php_ast::ClassDecl,
+    native: bool,
+    terminators: &std::sync::Arc<crate::Terminators>,
+    map: &mut RawMap,
+) {
+    // Prefer the stored index reflection (see the function arm above).
+    let fresh;
+    let cls = match reflection.class(fqn) {
+        Some(s) => s,
+        None => {
+            fresh = reflect_class(scope, interner, fqn, c);
+            &fresh
+        }
+    };
+    for m in &c.members {
+        let Member::Method(md) = m else { continue };
+        let Some(body) = &md.body else { continue };
+        let mname = interner.resolve(md.name);
+        let Some(mr) = cls
+            .methods
+            .iter()
+            .find(|x| !x.magic && x.name.eq_ignore_ascii_case(mname))
+        else {
+            continue;
+        };
+        let mut vars: HashMap<String, Type> = mr
+            .params
+            .iter()
+            .map(|p| (p.name.clone(), seed_type(p, native)))
+            .collect();
+        vars.insert(
+            "this".to_string(),
+            Type::Named {
+                fqn: fqn.into(),
+                args: Vec::new(),
+            },
+        );
+        record_scope(
+            reflection,
+            scope,
+            interner,
+            Some(fqn.to_string()),
+            vars,
+            native,
+            crate::generator_send_type(if native {
+                &mr.native_return
+            } else {
+                &mr.return_type
+            }),
+            terminators,
+            body,
+            map,
+        );
     }
 }
 
