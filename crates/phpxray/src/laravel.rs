@@ -23,9 +23,17 @@ use std::path::Path;
 /// the incremental fingerprint cannot notice them changing unless they are
 /// carried explicitly — editing `config/app.php` used to serve a stale cached
 /// report. See [`crate::inputs::AnalysisInputs`].
+/// The files the alias map is derived from, relative to the project root.
+///
+/// Shared with the watcher: these sit outside the analyzed file set, so they
+/// have to be named explicitly both to be hashed into the cache key and to be
+/// watched for changes.
+pub(crate) const ALIAS_SOURCE_FILES: [&str; 2] =
+    ["vendor/composer/installed.json", "config/app.php"];
+
 pub(crate) fn alias_inputs(root: &Path) -> crate::inputs::LaravelAliasInputs {
     let mut sources = Vec::new();
-    for rel in ["vendor/composer/installed.json", "config/app.php"] {
+    for rel in ALIAS_SOURCE_FILES {
         if let Ok(text) = std::fs::read_to_string(root.join(rel)) {
             sources.push((rel.to_string(), text));
         }

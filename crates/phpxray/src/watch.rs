@@ -29,22 +29,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Whether a changed `path` should trigger a re-run.
 ///
-/// True for the config file (editing `level`/`paths`/`ignore` must re-analyze)
-/// and for any file whose extension is analyzed and whose root-relative path is
-/// not hard-excluded. Everything else (editor temp files, `.swp`, excluded
-/// directories) is ignored. `root` and `config_file` are expected to be
-/// canonical, matching the absolute paths the OS watcher reports.
+/// True for any [`auxiliary_files`] entry (the config file, stubs, the baseline,
+/// the Laravel alias sources) and for any file whose extension is analyzed and
+/// whose root-relative path is not hard-excluded. Everything else (editor temp
+/// files, `.swp`, excluded directories) is ignored. `root` and the auxiliary
+/// paths are expected to be canonical, matching what the OS watcher reports.
 pub fn is_relevant(
     path: &Path,
     root: &Path,
     config: &Config,
     exclude: &ExcludeMatcher,
-    config_file: Option<&Path>,
+    auxiliary: &[PathBuf],
 ) -> bool {
-    if let Some(cf) = config_file {
-        if path == cf {
-            return true;
-        }
+    if auxiliary.iter().any(|a| a == path) {
+        return true;
     }
     let ext_ok = path
         .extension()
@@ -93,15 +91,49 @@ pub fn watch_targets(
     for entry in &config.scan_files {
         add(root.join(entry), RecursiveMode::NonRecursive);
     }
-    if let Some(cf) = config_file {
-        // Watch the config file's directory so atomic saves (write-temp +
-        // rename) are observed; `is_relevant` filters back down to the file.
-        match cf.parent().filter(|p| !p.as_os_str().is_empty()) {
+    // Watch each auxiliary file via its *directory* so atomic saves (write-temp
+    // + rename) are observed; `is_relevant` filters back down to the file.
+    for aux in auxiliary_files(config, root, config_file) {
+        match aux.parent().filter(|p| !p.as_os_str().is_empty()) {
             Some(dir) => add(dir.to_path_buf(), RecursiveMode::NonRecursive),
-            None => add(cf.to_path_buf(), RecursiveMode::NonRecursive),
+            None => add(aux, RecursiveMode::NonRecursive),
         }
     }
     targets
+}
+
+/// Files outside the analyzed source set whose contents still change analysis
+/// output: the config file, `stubFiles`, the baseline, and — with
+/// `laravelAliases` on — the alias sources.
+///
+/// They need naming explicitly because neither of the usual mechanisms sees
+/// them: they carry arbitrary extensions (`.stub`, `.yaml`, `.json`) so
+/// `is_relevant`'s extension check rejects them, and they live outside
+/// `paths`/`scanPaths` so no watch is ever registered for them. Editing one used
+/// to do nothing at all until some unrelated `.php` save happened to trigger a
+/// pass — results were silently stale in between.
+pub fn auxiliary_files(config: &Config, root: &Path, config_file: Option<&Path>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut add = |p: PathBuf| {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    if let Some(cf) = config_file {
+        add(cf.to_path_buf());
+    }
+    for stub in &config.stub_files {
+        add(root.join(stub));
+    }
+    if let Some(baseline) = &config.baseline {
+        add(root.join(baseline));
+    }
+    if config.laravel_aliases {
+        for rel in crate::laravel::ALIAS_SOURCE_FILES {
+            add(root.join(rel));
+        }
+    }
+    out
 }
 
 /// Run the analysis in a loop, re-running on each debounced batch of relevant
@@ -175,6 +207,7 @@ pub fn run_watch(
         let mut changed: Vec<PathBuf> = Vec::new();
         let mut config_changed = false;
         let mut saw_creates_or_removes = false;
+        let auxiliary = auxiliary_files(&config, &canonical_root, config_file.as_deref());
         for ev in &events {
             if matches!(ev.kind, EventKind::Access(_)) {
                 continue;
@@ -188,20 +221,28 @@ pub fn run_watch(
                 saw_creates_or_removes = true;
             }
             for p in &ev.paths {
-                if config_file.as_deref().is_some_and(|cf| p == cf) {
+                // The config file and the baseline both feed `reload()`: a
+                // regenerated baseline changes the ignore set, and nothing else
+                // would ever pick that up.
+                let is_config = config_file.as_deref().is_some_and(|cf| p == cf);
+                let is_baseline = config
+                    .baseline
+                    .as_ref()
+                    .is_some_and(|b| *p == canonical_root.join(b));
+                if is_config || is_baseline {
                     config_changed = true;
-                } else if is_relevant(
-                    p,
-                    &canonical_root,
-                    &config,
-                    &exclude,
-                    config_file.as_deref(),
-                ) && !changed.contains(p)
+                } else if is_relevant(p, &canonical_root, &config, &exclude, &auxiliary)
+                    && !changed.contains(p)
                 {
                     changed.push(p.clone());
                 }
             }
         }
+        // A directory rename or removal reports only the directory path, which
+        // matches no analyzed extension — so `changed` stays empty even though
+        // the file set moved. Fall through to a hint-less pass rather than
+        // skipping the batch entirely and leaving the old paths' findings up.
+        let structural_only = changed.is_empty() && !config_changed && saw_creates_or_removes;
         if config_changed {
             // Pick up edits to level/ignore/exclude/extensions on the fly.
             if let Some(fresh) = reload() {
@@ -209,14 +250,14 @@ pub fn run_watch(
                 exclude = hard_exclude(&config);
             }
         }
-        if !changed.is_empty() || config_changed {
+        if !changed.is_empty() || config_changed || structural_only {
             // Immediate feedback so a slow re-analysis doesn't look like a hang.
             let reason = changed
                 .first()
                 .map(|p| rel_path(p, &canonical_root))
                 .unwrap_or_else(|| "config".to_string());
             // A config change may alter discovery — no hint forces a full diff.
-            let hint = (!config_changed).then_some(ChangeHint {
+            let hint = (!config_changed && !structural_only).then_some(ChangeHint {
                 paths: changed,
                 saw_creates_or_removes,
             });
@@ -465,7 +506,7 @@ mod tests {
             root,
             &c,
             &ex,
-            None
+            &[]
         ));
     }
 
@@ -479,14 +520,14 @@ mod tests {
             root,
             &c,
             &ex,
-            None
+            &[]
         ));
         assert!(!is_relevant(
             Path::new("/proj/src/Foo.tmp"),
             root,
             &c,
             &ex,
-            None
+            &[]
         ));
     }
 
@@ -500,7 +541,7 @@ mod tests {
             root,
             &c,
             &ex,
-            None
+            &[]
         ));
     }
 
@@ -510,14 +551,15 @@ mod tests {
         let ex = hard_exclude(&c);
         let root = Path::new("/proj");
         let config_file = Path::new("/proj/phpxray.yaml");
-        assert!(is_relevant(config_file, root, &c, &ex, Some(config_file)));
+        let aux = vec![config_file.to_path_buf()];
+        assert!(is_relevant(config_file, root, &c, &ex, &aux));
         // A different yaml is not relevant.
         assert!(!is_relevant(
             Path::new("/proj/other.yaml"),
             root,
             &c,
             &ex,
-            Some(config_file)
+            &aux
         ));
     }
 
@@ -577,5 +619,70 @@ mod tests {
             std::env::temp_dir().join(format!("phpxray-{label}-{}-{now}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Files that change analysis output but are neither PHP sources nor inside
+    /// `paths`/`scanPaths` must still be watched and still count as relevant.
+    ///
+    /// Each of these used to be invisible: a stub edit did nothing until an
+    /// unrelated `.php` save happened to trigger a pass, and a regenerated
+    /// baseline was never picked up at all.
+    #[test]
+    fn auxiliary_files_are_watched_and_relevant() {
+        let c = Config {
+            paths: vec!["app".into()],
+            extensions: vec!["php".into()],
+            stub_files: vec!["stubs/lib.stub".into()],
+            baseline: Some("phpxray-baseline.yaml".into()),
+            laravel_aliases: true,
+            ..Config::default()
+        };
+        let ex = hard_exclude(&c);
+        let root = Path::new("/proj");
+        let config_file = Path::new("/proj/phpxray.yaml");
+        let aux = auxiliary_files(&c, root, Some(config_file));
+
+        for p in [
+            "/proj/phpxray.yaml",
+            "/proj/stubs/lib.stub",
+            "/proj/phpxray-baseline.yaml",
+            "/proj/config/app.php",
+            "/proj/vendor/composer/installed.json",
+        ] {
+            assert!(
+                aux.contains(&PathBuf::from(p)),
+                "{p} missing from auxiliary_files: {aux:?}"
+            );
+            assert!(
+                is_relevant(Path::new(p), root, &c, &ex, &aux),
+                "{p} should be relevant"
+            );
+        }
+
+        // Their directories are registered with the watcher.
+        let targets = watch_targets(&c, root, Some(config_file));
+        for dir in ["/proj", "/proj/stubs", "/proj/config", "/proj/vendor/composer"] {
+            assert!(
+                targets.iter().any(|(p, _)| p == Path::new(dir)),
+                "{dir} not watched: {targets:?}"
+            );
+        }
+
+        // An unrelated file of the same shape is still ignored.
+        assert!(!is_relevant(
+            Path::new("/proj/stubs/other.stub"),
+            root,
+            &c,
+            &ex,
+            &aux
+        ));
+    }
+
+    /// With the features off, nothing extra is watched.
+    #[test]
+    fn auxiliary_files_are_opt_in() {
+        let c = cfg();
+        let aux = auxiliary_files(&c, Path::new("/proj"), None);
+        assert!(aux.is_empty(), "{aux:?}");
     }
 }
