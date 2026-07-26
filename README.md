@@ -41,9 +41,35 @@ one file, no shared-library dependencies, runs on any distro (Ubuntu, Alpine, RH
 containers.
 
 ```sh
-# macOS + Linux — installs into ~/.cargo/bin
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/benpoulson/phpxray/releases/latest/download/phpxray-installer.sh | sh
+# macOS + Linux — installs into /usr/local/bin
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://github.com/benpoulson/phpxray/releases/latest/download/install.sh | sh
+```
+
+The installer verifies the download's sha256, then installs to `/usr/local/bin`. If that
+directory isn't writable it escalates with `sudo` (or `doas`) — prompting only when a terminal
+is actually attached, so it never hangs in a pipeline. Running as root, as in a Docker build,
+it doesn't escalate at all. It never edits your shell profiles.
+
+```sh
+# somewhere else — no escalation needed
+curl -fsSL https://github.com/benpoulson/phpxray/releases/latest/download/install.sh \
+  | sh -s -- --dir "$HOME/.local/bin"
+
+# pin a version (recommended for Dockerfiles and CI)
+curl -fsSL https://github.com/benpoulson/phpxray/releases/latest/download/install.sh \
+  | sh -s -- --version 0.2.0
+```
+
+`--dir`, `--version`, `--no-sudo`, `--skip-checksum` and `--quiet` are also readable from
+`PHPXRAY_INSTALL_DIR`, `PHPXRAY_VERSION`, `PHPXRAY_NO_SUDO` and `PHPXRAY_SKIP_CHECKSUM`.
+Run the script with `--help` for the full list.
+
+In a Dockerfile:
+
+```dockerfile
+RUN curl -fsSL https://github.com/benpoulson/phpxray/releases/latest/download/install.sh \
+      | sh -s -- --version 0.2.0
 ```
 
 Or via Homebrew (macOS + Linux):
@@ -51,6 +77,9 @@ Or via Homebrew (macOS + Linux):
 ```sh
 brew install benpoulson/tap/phpxray
 ```
+
+Or grab a tarball from the [Releases](https://github.com/benpoulson/phpxray/releases) page and
+put the single `phpxray` binary wherever you like.
 
 ### From source
 

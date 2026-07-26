@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A real installer at `install.sh`, attached to each release: it verifies the
+  download's sha256 and installs system-wide to `/usr/local/bin`, escalating via
+  `sudo`/`doas` only when needed and only prompting when a terminal is attached.
+  Works unprivileged in a Docker build, non-interactively in CI, and on busybox
+  (`ash`/`wget`/no `install`). Replaces cargo-dist's shell installer, which could
+  only install into `~/.cargo/bin` and edited shell profiles to fix up PATH.
+
 ## [0.2.0] - 2026-07-26
 
 ### Added

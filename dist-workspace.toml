@@ -14,8 +14,12 @@ cargo-dist-version = "0.32.0"
 allow-dirty = ["ci"]
 # CI backends to support
 ci = "github"
-# The installers to generate for each app.
-installers = ["shell", "homebrew"]
+# The installers to generate for each app. dist's own "shell" installer is
+# deliberately NOT used: it only installs user-locally (CARGO_HOME or ~/subdir),
+# never escalates, and edits shell profiles to fix up PATH -- none of which suits
+# a system-wide install, a Docker build or a CI job. ./install.sh replaces it and
+# is attached to every release via [[dist.extra-artifacts]] below.
+installers = ["homebrew"]
 # The Homebrew tap to publish the generated formula into.
 tap = "benpoulson/homebrew-tap"
 # Actually push the formula to the tap on release (needs the HOMEBREW_TAP_TOKEN
@@ -25,9 +29,16 @@ publish-jobs = ["homebrew"]
 # Linux uses musl for fully-static, dependency-free binaries that run on any
 # distro (Alpine, old glibc, scratch/distroless containers) unchanged.
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-musl", "x86_64-apple-darwin", "x86_64-unknown-linux-musl"]
-# Path that installers should place binaries in
-install-path = "CARGO_HOME"
 # Where to host releases
 hosting = "github"
 # Whether to install an updater program
 install-updater = false
+
+# Attach ./install.sh to every release, so the documented URL
+# https://github.com/benpoulson/phpxray/releases/latest/download/install.sh
+# serves the installer that shipped with that release. The build command is a
+# syntax check: a release fails rather than publishing a broken installer.
+[[dist.extra-artifacts]]
+working-dir = "."
+build = ["sh", "-n", "install.sh"]
+artifacts = ["install.sh"]
