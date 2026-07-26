@@ -1,0 +1,13 @@
+# Stable is what the release pipeline and CI build with, so a green local build
+# predicts a green CI run. The crates use no nightly features.
+#
+# Unpinned, a contributor whose rustup default is nightly builds something CI
+# never sees — which is exactly the situation this repo was in: rustup's default
+# was nightly while the `cargo` first on PATH was a Homebrew stable, so "the
+# toolchain" depended on which binary you happened to invoke.
+#
+# No patch version: pinning one means chasing it, and nothing here needs a
+# specific stable.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

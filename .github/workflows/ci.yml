@@ -33,7 +33,7 @@ jobs:
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       # Caches the cargo registry, git deps, and target/ keyed on Cargo.lock +
       # rustc version. PRs read-share the base branch's cache. cache-on-failure
@@ -43,6 +43,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: "true"
+
+      # Formatting was previously unenforced, so unformatted code landed and the
+      # next `cargo fmt` mixed churn into an unrelated diff. Runs first: it is
+      # the cheapest check and needs no compilation.
+      - name: Format check
+        run: cargo fmt --all -- --check
 
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
