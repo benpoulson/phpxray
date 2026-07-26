@@ -51,6 +51,14 @@ fn attribute_arguments_are_walked_on_every_node_kind() {
             "property hook",
             "<?php class C { public $p { #[A(Marker::HERE)] get => 1; } }",
         ),
+        (
+            "promoted-param hook attribute",
+            "<?php class C { public function __construct(public int $p = 1 { #[A(Marker::HERE)] get => 1; }) {} }",
+        ),
+        (
+            "promoted-param hook body",
+            "<?php class C { public function __construct(public int $p = 1 { get => Marker::HERE; }) {} }",
+        ),
         ("closure", "<?php $f = #[A(Marker::HERE)] function () {};"),
         ("arrow fn", "<?php $f = #[A(Marker::HERE)] fn () => 1;"),
         ("top-level const", "<?php #[A(Marker::HERE)] const K = 1;"),

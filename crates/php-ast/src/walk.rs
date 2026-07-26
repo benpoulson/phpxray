@@ -207,6 +207,13 @@ where
             walk_expr(d, on_s, on_e, true);
         }
         walk_attrs(&p.attrs, on_s, on_e);
+        // A promoted property may carry hooks, and their bodies are ordinary
+        // code: skipping them made every expression inside invisible to the
+        // walkers, and so to FileFacts, the type map and every rule built on
+        // them. The declared-property path already walks these (`walk_class`).
+        for h in &p.hooks {
+            walk_hook(h, on_s, on_e);
+        }
     }
 }
 
