@@ -375,6 +375,43 @@ mod generic_class_tests {
         assert!(generic_builtin_class("NotABuiltin").is_none());
     }
 
+    /// Each class must be declared before any of its members, and only once.
+    ///
+    /// `php_reflect::builtins` synthesises a stub `ClassReflection` when a
+    /// member record arrives first, then pushes a *second* entry when the real
+    /// `class` line shows up — and the later insert wins, silently discarding
+    /// every member attached to the stub. Nothing else pins the order, so a
+    /// regenerated or hand-edited manifest could reintroduce it with no test
+    /// failure anywhere.
+    #[test]
+    fn manifest_declares_each_class_once_and_before_its_members() {
+        for id in [80400u32, 80500, 80600] {
+            let v = PhpVersion::from_id(id).expect("version id");
+            let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for r in class_records_for(v) {
+                match r {
+                    BuiltinClassRecord::Class { fqn, .. } => {
+                        let key = fqn.trim_start_matches('\\').to_ascii_lowercase();
+                        assert!(
+                            declared.insert(key.clone()),
+                            "{id}: class {key:?} is declared twice — the second entry \
+                             replaces the first and drops its members"
+                        );
+                    }
+                    BuiltinClassRecord::Method { class, .. }
+                    | BuiltinClassRecord::Property { class, .. }
+                    | BuiltinClassRecord::Constant { class, .. } => {
+                        let key = class.trim_start_matches('\\').to_ascii_lowercase();
+                        assert!(
+                            declared.contains(&key),
+                            "{id}: a member of {key:?} appears before its `class` line"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Every entry must name a class the stub manifests actually ship, or the
     /// curated genericity silently applies to nothing.
     #[test]
