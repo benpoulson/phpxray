@@ -170,3 +170,81 @@ fn first_class_callables_contain_no_error_nodes() {
     let bad = php_parser::parse("<?php $x = ;");
     assert!(bad.has_errors());
 }
+
+/// Valid PHP must not produce parse errors. Each of these is `php -l`-clean but
+/// used to hit a gap in a lookahead set or a bracket-matching scan.
+#[test]
+fn accepted_by_php_parses_cleanly() {
+    for src in [
+        // A bare `yield` before `:` or `=>` — neither token can start an
+        // expression, so the operand lookahead has to treat them as terminators.
+        "<?php function g() { $a = 1; $b = $a ? yield : 2; }",
+        "<?php function g() { $x = [yield => 1]; }",
+        "<?php function g() { switch (1) { case yield: break; } }",
+        // The keyed form still parses (the operand is read first).
+        "<?php function g() { $c = yield 5 => 6; }",
+        // An attribute inside a `clone` argument list: `#[` opens a bracket the
+        // call-vs-construct scan must balance, or its `]` ends the scan early.
+        "<?php $c = clone($a, $b);",
+        "<?php $c = clone(#[A] fn() => 1, $x);",
+    ] {
+        let r = php_parser::parse(src);
+        assert!(
+            !r.has_errors(),
+            "{src} should parse cleanly, got {:?}",
+            r.diagnostics
+        );
+    }
+}
+
+/// A doc-comment attaches across whitespace, comments and attributes, but not
+/// across real code.
+#[test]
+fn doc_comments_attach_through_comment_runs() {
+    let doc_of = |src: &str| {
+        let r = php_parser::parse(src);
+        assert!(!r.has_errors(), "parse errors in: {src}");
+        r.program.stmts.iter().find_map(|s| match &s.kind {
+            php_ast::StmtKind::Function(f) => Some(f.doc.is_some()),
+            _ => None,
+        })
+    };
+    for src in [
+        "<?php /** @return int */ function f() {}",
+        "<?php /** @return int */\n\nfunction f() {}",
+        // The everyday shape that used to lose its types.
+        "<?php /** @return int */\n// note\nfunction f() {}",
+        "<?php /** @return int */\n# note\nfunction f() {}",
+        "<?php /** @return int */\n/* note */\nfunction f() {}",
+        "<?php /** @return int */\n// one\n/* two */\n// three\nfunction f() {}",
+        "<?php /** @return int */\n#[Attr]\nfunction f() {}",
+    ] {
+        assert_eq!(doc_of(src), Some(true), "should attach: {src}");
+    }
+    for src in [
+        // Real code intervened: the block is not documenting `f`.
+        "<?php /** @return int */\n$x = 1;\nfunction f() {}",
+        "<?php /** @return int */\nconst A = 1;\nfunction f() {}",
+        // Leaving PHP is not trivia.
+        "<?php /** @return int */ ?>\n<p>x</p>\n<?php function f() {}",
+    ] {
+        assert_eq!(doc_of(src), Some(false), "should not attach: {src}");
+    }
+}
+
+/// An interpolated binary string must reach the AST. Letting the `b` prefix lex
+/// as a name dropped the whole literal: `$y = b"a$x";` parsed as `$y = b`.
+#[test]
+fn interpolated_binary_strings_reach_the_ast() {
+    let r = php_parser::parse("<?php $x = 1; $y = b\"a$x\";");
+    assert!(!r.has_errors(), "{:?}", r.diagnostics);
+    let mut interps = 0;
+    let mut names = 0;
+    walk::for_each_expr(&r.program, &mut |e| match &e.kind {
+        ExprKind::Interpolated(_) => interps += 1,
+        ExprKind::Name(_) => names += 1,
+        _ => {}
+    });
+    assert_eq!(interps, 1, "the binary string should be an interpolation");
+    assert_eq!(names, 0, "the `b` prefix must not become a constant name");
+}
