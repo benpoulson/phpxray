@@ -91,7 +91,15 @@ impl TypeCtx<'_> {
                 // any later call site.
                 self.widen_closure_ref_captures(rhs);
                 let callable = self.callable_alias_from_expr(rhs);
-                let bound = if matches!(&peel_paren(rhs).kind, ExprKind::Str(_)) {
+                // A function-name *string* stays a string. `$cb = 'f'` keeps
+                // `'f'` because the literal is right there; `$b = $cb` must keep
+                // it too, or aliasing one hop turns the value into a `callable`
+                // that no longer satisfies `string` — every `strlen($b)` and
+                // `$b === 'f'` downstream then reports. The alias itself is
+                // still tracked for callback resolution (`callable` above).
+                let stays_string = matches!(&peel_paren(rhs).kind, ExprKind::Str(_))
+                    || matches!(&t, Type::LiteralString(_));
+                let bound = if stays_string {
                     t
                 } else {
                     self.callable_expr_type(rhs).unwrap_or(t)
@@ -968,13 +976,18 @@ impl TypeCtx<'_> {
         };
         // The effective op for this branch (negate when the condition is false).
         let eff = if truthy { op } else { negate_cmp(op) };
-        // `place eff lit` ⇒ a half-bounded int range.
-        let (min, max) = match eff {
-            BinOp::Lt => (None, Some(lit - 1)),
-            BinOp::LtEq => (None, Some(lit)),
-            BinOp::Gt => (Some(lit + 1), None),
-            BinOp::GtEq => (Some(lit), None),
+        // `place eff lit` ⇒ a half-bounded int range. An adjusted bound that would
+        // overflow means the branch cannot be taken at all, so narrow nothing
+        // rather than wrap around into a range that says the opposite.
+        let bound = match eff {
+            BinOp::Lt => lit.checked_sub(1).map(|v| (None, Some(v))),
+            BinOp::LtEq => Some((None, Some(lit))),
+            BinOp::Gt => lit.checked_add(1).map(|v| (Some(v), None)),
+            BinOp::GtEq => Some((Some(lit), None)),
             _ => return,
+        };
+        let Some((min, max)) = bound else {
+            return;
         };
         // Only narrow a value that's currently int-like (avoid clobbering unknowns).
         let cur = self.infer(place_expr);
@@ -3697,6 +3710,25 @@ mod tests {
         // After `if ($n < 2) return;`, `$n` is `int<2, max>`.
         let src = "function f(int $n) { if ($n < 2) { return; } $y = $n; }";
         assert_eq!(var_after(src, "y"), "int<2, max>");
+    }
+
+    #[test]
+    fn aliasing_a_function_name_string_keeps_it_a_string() {
+        // `$cb` holds a string that happens to name a function; copying it must
+        // not retype the copy as `callable`, which is not assignable to string.
+        let src = "function f() { $cb = 'make_child'; $y = $cb; } \
+                   function make_child($r) { return 1; }";
+        assert_eq!(var_after(src, "y"), "'make_child'");
+    }
+
+    #[test]
+    fn bound_at_the_int_limit_narrows_nothing() {
+        // `$n > PHP_INT_MAX` can never hold, so its branch gets no range fact —
+        // computing one would overflow, and a wrapped bound would claim the
+        // opposite of what the guard says. `$n` stays plain `int` (the `mixed`
+        // arm is the branch not taken, not a narrowing).
+        let src = "function f(int $n) { if ($n > 9223372036854775807) { $y = $n; } }";
+        assert_eq!(var_after(src, "y"), "int|mixed");
     }
 
     #[test]
