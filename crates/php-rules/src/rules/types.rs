@@ -420,6 +420,7 @@ fn collect_return_scopes(
                 for s in &f.body {
                     check_return_stmts(
                         fa,
+                        &format!("function {}()", refl.fqn),
                         &refl.return_type,
                         s,
                         include_explicit,
@@ -450,6 +451,7 @@ fn collect_return_scopes(
                 for s in body {
                     check_return_stmts(
                         fa,
+                        &format!("{fqn}::{}()", mr.name),
                         &mr.return_type,
                         s,
                         include_explicit,
@@ -465,6 +467,7 @@ fn collect_return_scopes(
 
 fn check_return_stmts(
     fa: &FileAnalysis,
+    label: &str,
     target: &php_types::Type,
     st: &Stmt,
     include_explicit: bool,
@@ -483,7 +486,7 @@ fn check_return_stmts(
                 out.push(
                     Diagnostic::error(
                         value.span,
-                        format!("Function should return {target} but returns mixed."),
+                        format!("{label} should return {target} but returns mixed."),
                     )
                     .with_code("return.type"),
                 );
@@ -491,16 +494,17 @@ fn check_return_stmts(
         }
         StmtKind::Block(body) => {
             for s in body {
-                check_return_stmts(fa, target, s, include_explicit, include_implicit, out);
+                check_return_stmts(fa, label, target, s, include_explicit, include_implicit, out);
             }
         }
         StmtKind::If {
             then, elseifs, els, ..
         } => {
-            check_return_stmts(fa, target, then, include_explicit, include_implicit, out);
+            check_return_stmts(fa, label, target, then, include_explicit, include_implicit, out);
             for elseif in elseifs {
                 check_return_stmts(
                     fa,
+                    label,
                     target,
                     &elseif.body,
                     include_explicit,
@@ -509,7 +513,7 @@ fn check_return_stmts(
                 );
             }
             if let Some(els) = els {
-                check_return_stmts(fa, target, els, include_explicit, include_implicit, out);
+                check_return_stmts(fa, label, target, els, include_explicit, include_implicit, out);
             }
         }
         StmtKind::While { body, .. }
@@ -518,11 +522,11 @@ fn check_return_stmts(
         | StmtKind::Foreach { body, .. }
         | StmtKind::Declare {
             body: Some(body), ..
-        } => check_return_stmts(fa, target, body, include_explicit, include_implicit, out),
+        } => check_return_stmts(fa, label, target, body, include_explicit, include_implicit, out),
         StmtKind::Switch { cases, .. } => {
             for case in cases {
                 for s in &case.body {
-                    check_return_stmts(fa, target, s, include_explicit, include_implicit, out);
+                    check_return_stmts(fa, label, target, s, include_explicit, include_implicit, out);
                 }
             }
         }
@@ -532,16 +536,16 @@ fn check_return_stmts(
             finally,
         } => {
             for s in body {
-                check_return_stmts(fa, target, s, include_explicit, include_implicit, out);
+                check_return_stmts(fa, label, target, s, include_explicit, include_implicit, out);
             }
             for catch in catches {
                 for s in &catch.body {
-                    check_return_stmts(fa, target, s, include_explicit, include_implicit, out);
+                    check_return_stmts(fa, label, target, s, include_explicit, include_implicit, out);
                 }
             }
             if let Some(finally) = finally {
                 for s in finally {
-                    check_return_stmts(fa, target, s, include_explicit, include_implicit, out);
+                    check_return_stmts(fa, label, target, s, include_explicit, include_implicit, out);
                 }
             }
         }
