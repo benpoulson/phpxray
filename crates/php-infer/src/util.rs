@@ -91,7 +91,7 @@ pub(crate) fn arg_is_plain_positional(a: &php_ast::Arg) -> bool {
 /// A leading `\` needs no special handling: the last segment of `\A\b` and
 /// `A\b` is `b` either way. The two former copies differed only in whether they
 /// trimmed it first — see `last_segment_ignores_a_leading_separator`.
-pub(crate) fn last_segment(name: &str) -> &str {
+pub fn last_segment(name: &str) -> &str {
     name.rsplit('\\').next().unwrap_or(name)
 }
 

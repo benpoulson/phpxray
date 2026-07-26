@@ -41,22 +41,33 @@ pub struct UndefVar {
 }
 
 /// PHP superglobals + always-available variables — never reported.
-const ALWAYS_DEFINED: &[&str] = &[
-    "GLOBALS",
-    "_SERVER",
-    "_GET",
-    "_POST",
-    "_FILES",
-    "_COOKIE",
-    "_SESSION",
-    "_REQUEST",
-    "_ENV",
+/// PHP's superglobals — visible in every scope without `global`. Names carry no
+/// leading `$`.
+///
+/// The canonical list for the workspace: php-rules consumed a hand-copied twin
+/// until this was exported. It sits here because php-rules depends on php-infer,
+/// so the dependency edge points the right way.
+pub const SUPERGLOBALS: &[&str] = &[
+    "GLOBALS", "_SERVER", "_GET", "_POST", "_FILES", "_COOKIE", "_SESSION", "_REQUEST", "_ENV",
+];
+
+/// Variables populated by the engine rather than by any statement the analyzer
+/// can see. **Not** superglobals — a deliberately different question — but
+/// equally never "possibly undefined".
+const ENGINE_POPULATED: &[&str] = &[
     "this",
     "http_response_header",
     "argc",
     "argv",
     "php_errormsg",
 ];
+
+/// Whether `name` (without `$`) is always defined: a superglobal, or
+/// engine-populated. Keeping the superglobal half shared means the two questions
+/// cannot disagree about which names are actually superglobals.
+pub fn is_always_defined(name: &str) -> bool {
+    SUPERGLOBALS.contains(&name) || ENGINE_POPULATED.contains(&name)
+}
 
 /// Function names whose presence means we can't reason about definedness in the
 /// enclosing scope (they can introduce or require arbitrary variables).
@@ -444,7 +455,7 @@ impl Analyzer<'_> {
 
     /// Record a read of `$name` if it isn't definitely defined.
     fn check_read(&mut self, name: &str, span: Span, env: &Env) {
-        if ALWAYS_DEFINED.contains(&name) {
+        if is_always_defined(name) {
             return;
         }
         match env.get(name) {

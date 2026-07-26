@@ -15,6 +15,7 @@ use crate::{
 use php_ast::{Arg, Expr, ExprKind, MemberName, Name, Stmt};
 use php_diagnostics::Diagnostic;
 use php_infer::builtins::{callback_spec, CallbackSeed};
+use php_infer::last_segment;
 use php_infer::{arrays, contextual_body_type_map, TypeMap};
 use php_reflect::{FunctionReflection, MethodReflection, ParamReflection, SourceKind};
 use php_resolve::{Resolution, Scope};
@@ -943,13 +944,6 @@ fn int_lit(e: &Expr) -> Option<i64> {
 fn global_const_text(text: &str) -> Option<&str> {
     let stripped = text.strip_prefix('\\').unwrap_or(text);
     (!stripped.contains('\\')).then_some(stripped)
-}
-
-fn last_segment(name: &str) -> &str {
-    name.trim_start_matches('\\')
-        .rsplit('\\')
-        .next()
-        .unwrap_or(name)
 }
 
 fn span_key(e: &Expr) -> php_span::NodeKey {

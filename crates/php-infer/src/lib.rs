@@ -18,8 +18,8 @@ mod limits;
 mod util;
 pub(crate) use php_ast::queries::peel_paren;
 pub(crate) use util::{
-    arg_is_plain_positional, args_are_plain_positional, last_segment, param_local_type,
-    strip_this_vars, ParamFallback,
+    arg_is_plain_positional, args_are_plain_positional, param_local_type, strip_this_vars,
+    ParamFallback,
 };
 mod assign;
 mod const_eval;
@@ -35,13 +35,16 @@ pub use assign::{
     Trinary,
 };
 pub use const_eval::{eval_const, ConstVal};
-pub use definedness::{undefined_variables, undefined_variables_with, UndefVar};
+pub use definedness::{
+    is_always_defined, undefined_variables, undefined_variables_with, UndefVar, SUPERGLOBALS,
+};
 pub use refine::{strip_false, strip_falsy, strip_null_lenient, strip_null_strict};
 pub use signatures::{
     evidence_key, explicit_iterable_param_evidence, infer_and_apply, useful_inference,
     widen_literals, ExplicitParamEvidence, InferOpts,
 };
 pub use type_map::{contextual_body_type_map, type_map, type_map_with, Facets, TypeMap};
+pub use util::last_segment;
 
 use crate::limits::{FOLD_CAP, MAX_SHAPE_FIELDS};
 use php_ast::{

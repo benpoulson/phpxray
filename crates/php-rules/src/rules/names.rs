@@ -138,12 +138,11 @@ fn check_uses(
 }
 
 /// The last `\`-separated segment of a name (its default import alias).
+///
+/// Owned, unlike the shared borrowing [`php_infer::last_segment`], because the
+/// callers store it.
 fn last_segment(text: &str) -> String {
-    text.trim_start_matches('\\')
-        .rsplit('\\')
-        .next()
-        .unwrap_or(text)
-        .to_string()
+    php_infer::last_segment(text).to_string()
 }
 
 pub(crate) static RULES: &[RuleEntry] = &[RuleEntry {
