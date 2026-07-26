@@ -3429,7 +3429,11 @@ pub(crate) static RULES: &[RuleEntry] = &[
     // Level 5 — arguments: count + types.
     RuleEntry {
         name: "arguments.count",
-        level: 5,
+        // phpstan's `CallToFunctionParametersRule` is `#[RegisteredRule(level: 0)]`
+        // and its *count* half is not gated by `checkFunctionArgumentTypes` — only
+        // the argument-type half is. Our method-call arity already ran at 0, so
+        // this was also inconsistent with itself.
+        level: 0,
         run: run_argument_count,
     },
     RuleEntry {
