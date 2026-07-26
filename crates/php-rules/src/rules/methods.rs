@@ -35,9 +35,10 @@
 //!   `final` parent), `method.nonStatic`/`method.static` (static-ness flip), and
 //!   `method.visibility` (narrowing a parent method's visibility).
 //! - `CallMethodsRule` / `CallStaticMethodsRule` existence + arity (level 0) —
-//!   `method.notFound`/`staticMethod.notFound`, `parameter.notOptional` (too few
-//!   required args), `argument.unknown` (too many positional args). Argument
-//!   *types* are NOT checked here.
+//!   `method.notFound`/`staticMethod.notFound`, and `arguments.count` for both
+//!   too-few and too-many positional args (what phpstan emits for a call; the
+//!   identifiers it reserves for override comparison and unknown named
+//!   arguments are *not* these). Argument *types* are NOT checked here.
 //! - `missingType.return` (`MissingMethodReturnTypehintRule`, level 6) — a method
 //!   with no native/PHPDoc return type.
 //! - `missingType.parameter` (`MissingMethodParameterTypehintRule`, level 6) — a
@@ -1150,18 +1151,21 @@ fn check_member_call(
     let max = mr.params.len();
     let here = found.declaring_class.trim_start_matches('\\');
     let phrase = crate::function_like::invoked_with(arg_count, required, max, variadic);
-    if arg_count < required {
-        out.push(
-            Diagnostic::error(call.span, format!("Method {here}::{method}() {phrase}."))
-                .with_code("parameter.notOptional"),
-        );
-    } else if !variadic
+    // Both directions are `arguments.count`, matching phpstan
+    // (`FunctionCallParametersCheck`, which emits it for too-few *and* too-many)
+    // and our own function-call path. The identifiers this used to emit mean
+    // different things there — `parameter.notOptional` is an override-signature
+    // comparison (`MethodParameterComparisonHelper`) and `argument.unknown` is an
+    // unknown *named* argument — so an `@phpstan-ignore arguments.count` or a
+    // migrated baseline entry never matched a method call.
+    let too_few = arg_count < required;
+    let too_many = !variadic
         && arg_count > max
-        && !body_reads_variadic_args(fa, found.declaring_class, method)
-    {
+        && !body_reads_variadic_args(fa, found.declaring_class, method);
+    if too_few || too_many {
         out.push(
             Diagnostic::error(call.span, format!("Method {here}::{method}() {phrase}."))
-                .with_code("argument.unknown"),
+                .with_code("arguments.count"),
         );
     }
 }
@@ -4056,14 +4060,14 @@ mod tests {
     fn too_few_arguments_flagged() {
         let src =
             "<?php class C { public function a() { $this->need(1); } public function need($x, $y) {} }";
-        assert!(codes(src, run_call_existence).contains(&"parameter.notOptional"));
+        assert!(codes(src, run_call_existence).contains(&"arguments.count"));
     }
 
     #[test]
     fn too_many_arguments_flagged() {
         let src =
             "<?php class C { public function a() { $this->one(1, 2); } public function one($x) {} }";
-        assert!(codes(src, run_call_existence).contains(&"argument.unknown"));
+        assert!(codes(src, run_call_existence).contains(&"arguments.count"));
     }
 
     /// The method twin must use the exact same phpstan arity vocabulary as the
@@ -4125,7 +4129,7 @@ mod tests {
         let src = "<?php class C { \
             public function a() { self::in('x', 'y', 'z'); } \
             public static function in($values) { return func_get_args(); } }";
-        assert!(!codes(src, run_call_existence).contains(&"argument.unknown"));
+        assert!(!codes(src, run_call_existence).contains(&"arguments.count"));
     }
 
     #[test]
