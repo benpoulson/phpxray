@@ -137,6 +137,10 @@ pub fn parse(raw: &str) -> Doc {
     // Param/return precedence: track the priority that set each.
     let mut return_pri: i8 = -1;
     let mut param_pri: Vec<i8> = Vec::new();
+    let mut var_pri: Vec<i8> = Vec::new();
+    // `pri > 0` is the "prefixed form only" gate these tags carry; starting at 1
+    // keeps a bare `@self-out` out while letting psalm/phpstan compete.
+    let mut self_out_pri: i8 = 1;
 
     for tag in &block.tags {
         let (base, pri) = normalize(&tag.name);
@@ -158,15 +162,16 @@ pub fn parse(raw: &str) -> Doc {
                     }
                 }
             }
-            "var" => doc.vars.push(parse_var(&tag.value)),
+            "var" => upsert_var(&mut doc.vars, &mut var_pri, parse_var(&tag.value), pri),
             "param-out" => doc.param_outs.push(parse_param(&tag.value)),
             // `@phpstan-self-out`/`-this-out` carry type effect only in their
             // prefixed forms (a bare `@self-out` is not a standard tag).
-            "self-out" | "this-out" if pri > 0 => {
-                if doc.self_out.is_none() {
-                    if let Some((ty, _)) = parse_type_prefix(&tag.value) {
-                        doc.self_out = Some(ty);
-                    }
+            // Highest priority wins, not first: a `@psalm-self-out` appearing
+            // above a `@phpstan-self-out` must not shadow it.
+            "self-out" | "this-out" if pri >= self_out_pri => {
+                if let Some((ty, _)) = parse_type_prefix(&tag.value) {
+                    doc.self_out = Some(ty);
+                    self_out_pri = pri;
                 }
             }
             "throws" => {
@@ -497,6 +502,25 @@ fn take_var_name(s: &str) -> (Option<String>, &str) {
 
 /// Insert or replace a param, keyed by name, keeping the highest-priority source.
 /// Unnamed params are always appended.
+/// Record a `@var`, letting a higher-priority vendor prefix replace a plain one.
+///
+/// Keyed by name so `/** @var Foo $a @var Bar $b */` keeps both, while
+/// `/** @var array @phpstan-var list<int> */` keeps only the phpstan form — the
+/// consumer takes `.first()`, so simply pushing meant the *plain* tag won and
+/// the precise one was silently discarded. The nameless form (the common
+/// property/inline case) shares one slot via `None == None`.
+fn upsert_var(vars: &mut Vec<Var>, pris: &mut Vec<i8>, new: Var, pri: i8) {
+    if let Some(i) = vars.iter().position(|v| v.name == new.name) {
+        if pri >= pris[i] {
+            vars[i] = new;
+            pris[i] = pri;
+        }
+        return;
+    }
+    vars.push(new);
+    pris.push(pri);
+}
+
 fn upsert_param(params: &mut Vec<Param>, pris: &mut Vec<i8>, new: Param, pri: i8) {
     if let Some(name) = &new.name {
         if let Some(i) = params.iter().position(|p| p.name.as_deref() == Some(name)) {
@@ -749,5 +773,38 @@ mod tests {
                 args: vec![named("User")]
             }]
         );
+    }
+
+    /// Vendor-prefixed tags outrank plain ones regardless of order.
+    ///
+    /// The module already did this for `@param` and `@return`; `@var` merely
+    /// pushed, and the consumer takes `.first()` — so a plain `@var array` above
+    /// a `@phpstan-var list<int>` silently won and the precise type was lost.
+    #[test]
+    fn vendor_prefixes_win_for_var_and_self_out() {
+        let d = parse("/** @var array\n * @phpstan-var list<int> */");
+        assert_eq!(d.vars.len(), 1, "{:?}", d.vars);
+        assert_eq!(d.vars[0].ty, parse_type("list<int>"));
+
+        // Order must not matter.
+        let d = parse("/** @phpstan-var list<int>\n * @var array */");
+        assert_eq!(d.vars.len(), 1, "{:?}", d.vars);
+        assert_eq!(d.vars[0].ty, parse_type("list<int>"));
+
+        // psalm loses to phpstan, either way round.
+        let d = parse("/** @psalm-var array\n * @phpstan-var list<int> */");
+        assert_eq!(d.vars[0].ty, parse_type("list<int>"));
+        let d = parse("/** @phpstan-var list<int>\n * @psalm-var array */");
+        assert_eq!(d.vars[0].ty, parse_type("list<int>"));
+
+        // Distinct *named* vars are all kept.
+        let d = parse("/** @var int $a\n * @var string $b */");
+        assert_eq!(d.vars.len(), 2, "{:?}", d.vars);
+
+        // `@self-out`: highest priority wins, not first.
+        let d = parse("/** @psalm-self-out A\n * @phpstan-self-out B */");
+        assert_eq!(d.self_out, parse_type("B"));
+        let d = parse("/** @phpstan-self-out B\n * @psalm-self-out A */");
+        assert_eq!(d.self_out, parse_type("B"));
     }
 }
