@@ -86,10 +86,19 @@ impl AnalysisInputs {
             check_uninitialized_properties: config.check_uninitialized_properties,
             check_too_wide_return_public: config.check_too_wide_return_public,
             terminators: Arc::new(Terminators {
+                // Stored as last segments because that is what the probe builds
+                // (see `php_infer::Terminators`): the call site only has the name
+                // as written, so a namespaced entry like `App\Helpers\dd` could
+                // never match if it were stored whole.
                 functions: config
                     .early_terminating_function_calls
                     .iter()
-                    .map(|f| f.trim_start_matches('\\').to_ascii_lowercase())
+                    .map(|f| {
+                        f.rsplit('\\')
+                            .next()
+                            .unwrap_or(f.as_str())
+                            .to_ascii_lowercase()
+                    })
                     .collect(),
                 methods: config
                     .early_terminating_method_calls

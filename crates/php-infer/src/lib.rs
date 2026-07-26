@@ -146,9 +146,14 @@ pub struct TypeCtx<'a> {
 /// User-configured always-terminating calls (phpstan's
 /// `earlyTerminatingFunctionCalls` / `earlyTerminatingMethodCalls`): a
 /// statement calling one ends its branch like `throw`/`exit` (PHPUnit's
-/// `$this->fail()`, Laravel's `abort()`). Matching is syntactic — function
-/// names by resolved last segment, method names without re-checking the
-/// receiver class (configure distinctive names).
+/// `$this->fail()`, Laravel's `abort()`).
+///
+/// Matching is **syntactic and by last segment only** — the call site carries
+/// the name as written, with no scope to resolve it against, so a configured
+/// `App\Helpers\dd` matches any `dd()`, and method names match without
+/// re-checking the receiver class. Configure distinctive names. Whoever builds
+/// this set must store last segments too, or namespaced entries silently never
+/// match (`phpxray::inputs`).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Terminators {
     /// Lowercased function names.

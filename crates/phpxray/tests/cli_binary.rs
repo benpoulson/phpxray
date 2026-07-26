@@ -584,6 +584,16 @@ class T {
     );
     let out = stdout(&p.run(["--no-progress"]));
     assert!(!out.contains("might not be defined"), "{out}");
+
+    // A namespaced entry must work too: matching is by last segment, so
+    // `App\Helpers\myDd` configures the same call. Storing the whole name
+    // instead made every namespaced entry a silent no-op.
+    write_config(
+        &p,
+        "level: 1\npaths:\n  - src\nearlyTerminatingFunctionCalls:\n  - App\\Helpers\\myDd\nearlyTerminatingMethodCalls:\n  T:\n    - fail\n",
+    );
+    let out = stdout(&p.run(["--no-progress"]));
+    assert!(!out.contains("$y might not be defined"), "{out}");
 }
 
 #[test]
