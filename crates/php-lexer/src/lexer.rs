@@ -1226,7 +1226,6 @@ impl<'a> Lexer<'a> {
             b')' => (RParen, 1),
             b'[' => (LBracket, 1),
             b']' => (RBracket, 1),
-            b'`' => (Backtick, 1),
             _ => {
                 self.diags.push(
                     Diagnostic::error(
