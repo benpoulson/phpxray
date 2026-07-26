@@ -281,7 +281,25 @@ fn assignable_verdict(index: &ReflectionIndex, value: &Type, target: &Type) -> V
         Union(parts) => {
             return Verdict::any(parts.iter().map(|t| assignable_verdict(index, value, t)));
         }
+        // An intersection target demands *every* arm: `V ⊑ A&B` iff `V ⊑ A` and
+        // `V ⊑ B`. This must be decided before the intersection-*value* rule
+        // below, or `A&B ⊑ A&C` would ask "does some arm of the value satisfy
+        // the whole target" and answer no even when `B ⊑ C`.
+        Intersection(parts) => {
+            return Verdict::all(parts.iter().map(|t| assignable_verdict(index, value, t)));
+        }
         _ => {}
+    }
+
+    // An intersection *value* satisfies its target if *any* arm does: the value
+    // is every one of its arms at once, so being an `A` is enough to be accepted
+    // where an `A` is wanted. Without this arm an intersection fell through to
+    // the atom check, which does not model intersections at all — so `A&B` was
+    // rejected against `A` whenever `A` was indexed, and accepted only when it
+    // was not (the leniency default). Same shape, opposite answers, decided by
+    // whether the class happened to be in the index.
+    if let Intersection(parts) = value {
+        return Verdict::any(parts.iter().map(|p| assignable_verdict(index, p, target)));
     }
 
     Verdict::from_bool(assignable_atom(index, value, target))
@@ -568,6 +586,29 @@ mod tests {
 
     fn ok(v: Type, t: Type) -> bool {
         is_assignable(&empty_index(), &v, &t)
+    }
+
+    #[test]
+    fn an_intersection_satisfies_each_of_its_own_arms() {
+        // Both classes indexed, so neither side can fall back on leniency.
+        let (idx, _i) = index_of("interface A {} interface B {} interface C {}");
+        let a = named("A");
+        let b = named("B");
+        let c = named("C");
+        let ab = Type::intersection(vec![a.clone(), b.clone()]);
+
+        // The defining property: a value that is both an A and a B is an A.
+        assert!(is_assignable(&idx, &ab, &a), "A&B should satisfy A");
+        assert!(is_assignable(&idx, &ab, &b), "A&B should satisfy B");
+        // ...but it says nothing about an unrelated interface.
+        assert!(!is_assignable(&idx, &ab, &c), "A&B should not satisfy C");
+
+        // An intersection *target* demands every arm.
+        assert!(!is_assignable(&idx, &a, &ab), "A alone should not satisfy A&B");
+        assert!(is_assignable(&idx, &ab, &ab));
+
+        // A union target still accepts an intersection value via any arm.
+        assert!(is_assignable(&idx, &ab, &Type::union(vec![a.clone(), c.clone()])));
     }
 
     fn named(s: &str) -> Type {
