@@ -795,19 +795,73 @@ ignore:
 mod unknown_key_tests {
     use super::*;
 
-    /// A stale entry in [`KNOWN_KEYS`] would silently stop warning about a real
-    /// typo, so assert every listed key is actually accepted by `Config`.
+    /// [`KNOWN_KEYS`] must list exactly the keys `Config` deserializes.
+    ///
+    /// A **stale** entry silently stops warning about a real typo; a **missing**
+    /// one warns about a key that works fine. Neither can be caught by feeding
+    /// `unknown_keys` a key from `KNOWN_KEYS` — that filters the list through
+    /// itself and can never fail, which is what this test used to do.
+    ///
+    /// `Config` derives only `Deserialize`, so its fields cannot be enumerated
+    /// at runtime; serde also ignores unknown fields by design (forward
+    /// compatibility), so a bogus key deserializes cleanly. Reading the struct
+    /// definition is therefore the only way to check the real property without
+    /// adding a dependency.
     #[test]
-    fn known_keys_are_all_accepted() {
-        for key in KNOWN_KEYS {
-            // A key `Config` does not know is reported by `unknown_keys`; a key
-            // it does know is not. That is exactly the property we need.
-            let yaml = format!("{key}: ~\n");
-            assert!(
-                unknown_keys(&yaml).is_empty(),
-                "KNOWN_KEYS lists {key:?} but unknown_keys() still flags it"
-            );
+    fn known_keys_match_the_config_fields() {
+        let src = include_str!("lib.rs");
+        let decl = src
+            .find("pub struct Config {")
+            .expect("Config struct definition");
+        // Start *after* the declaration line so `pub struct Config {` is not
+        // itself scraped as a field.
+        let start = decl + src[decl..].find('\n').expect("newline");
+        let body = &src[start..][..src[start..].find("\n}\n").expect("end of Config")];
+
+        let mut fields: Vec<String> = Vec::new();
+        let mut rename: Option<String> = None;
+        for line in body.lines() {
+            let t = line.trim();
+            // An explicit `#[serde(rename = "…")]` overrides the camelCase rule.
+            if let Some(r) = t.strip_prefix("#[serde(rename = \"") {
+                rename = r.split('"').next().map(str::to_string);
+                continue;
+            }
+            let Some(decl) = t.strip_prefix("pub ") else {
+                continue;
+            };
+            let Some(name) = decl.split(':').next() else {
+                continue;
+            };
+            fields.push(rename.take().unwrap_or_else(|| camel(name)));
         }
+        fields.sort();
+
+        let mut known: Vec<String> = KNOWN_KEYS.iter().map(|k| k.to_string()).collect();
+        known.sort();
+
+        assert_eq!(
+            known, fields,
+            "KNOWN_KEYS has drifted from Config's fields — a stale entry stops \
+             warning about a real typo, a missing one warns about a valid key"
+        );
+    }
+
+    /// snake_case -> camelCase, matching `#[serde(rename_all = "camelCase")]`.
+    fn camel(s: &str) -> String {
+        let mut out = String::new();
+        let mut up = false;
+        for c in s.chars() {
+            if c == '_' {
+                up = true;
+            } else if up {
+                out.extend(c.to_uppercase());
+                up = false;
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 
     #[test]
