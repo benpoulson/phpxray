@@ -294,15 +294,25 @@ pub fn render_github(report: &Report) -> String {
             Severity::Warning => "warning",
         };
         let id = f.identifier.map(|i| format!(" ({i})")).unwrap_or_default();
-        // Escape per GitHub's workflow-command rules.
+        // Escape per GitHub's workflow-command rules. Message and *property*
+        // values escape differently: a property additionally escapes `,` and
+        // `:`, which otherwise terminate the property list — so a path
+        // containing a comma corrupted the annotation.
         let msg = f
             .message
             .replace('%', "%25")
             .replace('\r', "%0D")
             .replace('\n', "%0A");
+        let file = f
+            .path
+            .replace('%', "%25")
+            .replace('\r', "%0D")
+            .replace('\n', "%0A")
+            .replace(',', "%2C")
+            .replace(':', "%3A");
         out.push_str(&format!(
-            "::{level} file={},line={},col={}::{msg}{id}\n",
-            f.path, f.line, f.column
+            "::{level} file={file},line={},col={}::{msg}{id}\n",
+            f.line, f.column
         ));
     }
     out
@@ -470,6 +480,22 @@ mod tests {
         let xml = render_checkstyle(&report);
         assert!(xml.contains("<file name=\"src/A.php\">"));
         assert!(xml.contains("severity=\"error\" message=\"bad return\" source=\"return.type\""));
+    }
+
+    /// A workflow-command *property* escapes `,` and `:` as well, or the value
+    /// terminates the property list and the annotation lands on the wrong file.
+    #[test]
+    fn github_escapes_property_separators_in_the_path() {
+        let report = Report {
+            findings: vec![finding("src/od,d:name.php", 4, "bad return", "return.type")],
+            files_analyzed: 1,
+            files_scanned: 0,
+            timings: None,
+        };
+        assert_eq!(
+            render_github(&report).trim(),
+            "::error file=src/od%2Cd%3Aname.php,line=4,col=1::bad return (return.type)"
+        );
     }
 
     #[test]
