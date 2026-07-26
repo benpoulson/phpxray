@@ -342,6 +342,18 @@ impl Session {
                 deps: RecordedDeps::default(),
                 emitted_into: Vec::new(),
             });
+            // A file demoted from analyzed to scan-only keeps its parse
+            // artifacts (it is still indexed) but must lose everything that
+            // belongs to *having been analyzed*. Nothing else clears these: the
+            // invalid set skips non-analyzed entries, so the file is never
+            // re-analyzed, while report assembly flat-maps the findings of every
+            // entry — so its last findings would be reported forever, on every
+            // pass, until the watcher restarted.
+            if entry.analyze && !analyze {
+                entry.findings.clear();
+                entry.emitted_into.clear();
+                entry.deps = RecordedDeps::default();
+            }
             entry.abs = abs;
             entry.analyze = analyze;
             entry.source = source.clone();
