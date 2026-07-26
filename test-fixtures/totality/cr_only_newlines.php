@@ -1,0 +1,1 @@
+<?php $x = <<<EOTbodyEOT;$y = 1;

@@ -1,0 +1,1 @@
+<?php $x = "never closed

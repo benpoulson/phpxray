@@ -49,3 +49,11 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+      # The full Tier-C corpus (xtask corpus / astdiff / difftokens) needs the
+      # gitignored php-src checkout and a local PHP with the php-ast extension,
+      # so it cannot run here. `cargo test` above already covers the committed
+      # canary; this step names it so a green CI is not mistaken for having
+      # verified parser totality against the real 5.3k-file corpus.
+      - name: Parser totality canary (stand-in for Tier C)
+        run: cargo test -p php-parser --test totality
