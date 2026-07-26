@@ -12,8 +12,12 @@
 //! TooWideTypehints→too_wide_typehints (7), Traits→traits (4), Keywords→keywords (4),
 //! Generators→generators (3), Regexp→regexp (2), Namespaces→namespaces (2),
 //! EnumCases→enum_cases (2), Pure→pure (2), Types→types (1), Names→names (1),
-//! Missing→missing (1), Whitespace→whitespace (1), DateTimeInstantiation→datetime (1),
-//! (root)→misc (1).
+//! Missing→missing (1), Whitespace→whitespace (1), DateTimeInstantiation→datetime (1).
+//!
+//! Not ported: phpstan's one rule directly under `src/Rules/` (level 5). It had
+//! an empty `misc` module aggregated into `CATEGORY_RULES`, which cost a
+//! traversal slot and read as coverage that did not exist; the module is gone
+//! and this note is the record. Re-add it when the rule lands, not before.
 //!
 //! Skipped (phpstan-internal, not user-code analysis): **Api** (phpstan
 //! extension-development API) and **Ignore** (phpstan's own ignore-comment
@@ -37,7 +41,6 @@ mod generators;
 mod generics;
 mod keywords;
 mod methods;
-mod misc;
 mod missing;
 mod names;
 mod namespaces;
@@ -68,7 +71,6 @@ pub(crate) static CATEGORY_RULES: &[&[RuleEntry]] = &[
     generics::RULES,
     keywords::RULES,
     methods::RULES,
-    misc::RULES,
     missing::RULES,
     names::RULES,
     namespaces::RULES,

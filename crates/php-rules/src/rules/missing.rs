@@ -17,12 +17,8 @@
 //! statements, dynamic flow). We flag only when there is a *clearly* missing
 //! return.
 
-#![allow(unused_imports)]
 use crate::{walk, FileAnalysis, RuleEntry};
-use php_ast::{
-    ClassDecl, ClosureExpr, Expr, ExprKind, FunctionDecl, Member, MethodDecl, Stmt, StmtKind, Type,
-    TypeKind,
-};
+use php_ast::{ClassDecl, Expr, ExprKind, Member, Stmt, StmtKind, Type, TypeKind};
 use php_diagnostics::Diagnostic;
 use php_intern::Interner;
 use php_span::Span;

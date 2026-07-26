@@ -44,11 +44,9 @@
 //!   values against *configured* expected types of known constants — needs the
 //!   ConstantResolver config table we don't model.
 
-#![allow(unused_imports)]
 use crate::{compat, walk, FileAnalysis, RuleEntry};
 use php_ast::{
-    ClassConstDecl, ClassDecl, ClassKind, Expr, ExprKind, Member, MemberName, Name, Stmt, StmtKind,
-    Visibility,
+    ClassDecl, ClassKind, Expr, ExprKind, Member, MemberName, Name, Stmt, StmtKind, Visibility,
 };
 use php_diagnostics::Diagnostic;
 use php_intern::Interner;

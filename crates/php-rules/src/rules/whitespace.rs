@@ -17,7 +17,6 @@
 //! is byte-for-byte equivalent and avoids depending on how the lexer treats a
 //! leading BOM.
 
-#![allow(unused_imports)]
 use crate::{FileAnalysis, RuleEntry};
 use php_ast::{Stmt, StmtKind};
 use php_diagnostics::Diagnostic;

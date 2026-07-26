@@ -25,9 +25,8 @@
 //! carries builtin function/constant names alongside project declarations, so a
 //! `use function strlen;` / `use const PHP_EOL;` of a builtin is never flagged.
 
-#![allow(unused_imports)]
 use crate::{walk, FileAnalysis, RuleEntry};
-use php_ast::{Name, StmtKind, UseItem, UseKind};
+use php_ast::{Name, StmtKind, UseKind};
 use php_diagnostics::Diagnostic;
 
 /// `\Foo\Bar` and `Foo\Bar` denote the same FQN in a `use`; strip the leading

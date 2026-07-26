@@ -12,16 +12,14 @@
 //!   visited: function/method params + returns, typed properties, closures,
 //!   arrow functions, and property-hook params (incl. promoted ctor params).
 
-#![allow(unused_imports)]
 use crate::members;
 use crate::{walk, FileAnalysis, RuleEntry};
 use php_ast::{
-    ArrowFn, ClassDecl, ClosureExpr, Expr, ExprKind, FunctionDecl, Member, MemberName, MethodDecl,
-    Param, PropertyHook, Stmt, StmtKind, Type, TypeKind,
+    ArrowFn, ClassDecl, ClosureExpr, ExprKind, FunctionDecl, Member, MemberName, MethodDecl, Param,
+    PropertyHook, Stmt, StmtKind, Type, TypeKind,
 };
 use php_diagnostics::Diagnostic;
-use php_resolve::{for_each_region, RefKind, Resolution, ResolvedRef, Scope};
-use std::collections::HashMap;
+use php_resolve::{for_each_region, Resolution, ResolvedRef, Scope};
 
 /// The reserved keywords that may only appear *standalone*, never as a member of
 /// a union or nullable type. Mirrors phpstan's `ONLY_STANDALONE_TYPES`.

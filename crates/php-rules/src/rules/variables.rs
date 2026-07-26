@@ -860,7 +860,7 @@ fn isset_type(fa: &FileAnalysis, expr: &Expr) -> Type {
 }
 
 fn type_message(kind: IssetLike, ty: &Type) -> Option<&'static str> {
-    if type_is_uncertain(ty) || matches!(ty, Type::Never | Type::Void) {
+    if type_is_imprecise(ty) || matches!(ty, Type::Never | Type::Void) {
         return None;
     }
     match kind {
@@ -989,20 +989,27 @@ where
     }
 }
 
-fn type_is_uncertain(ty: &Type) -> bool {
+/// Whether `ty` is too imprecise for the isset-family rules to make a claim.
+///
+/// A **narrower** question than [`crate::param_out::type_is_uncertain`], which
+/// also treats `never`/`void`/`self`/`static`/`parent`/explicit-`mixed` as
+/// uncertain. The two shared a name until they were renamed apart — they are
+/// distinct predicates, not duplicates, and merging them would change behaviour
+/// (`type_message` deliberately adds `never`/`void` back at its call site).
+fn type_is_imprecise(ty: &Type) -> bool {
     match ty {
         Type::Mixed | Type::Unknown(_) | Type::TemplateVar(_) | Type::Conditional { .. } => true,
-        Type::Nullable(inner) => type_is_uncertain(inner),
-        Type::Union(parts) | Type::Intersection(parts) => parts.iter().any(type_is_uncertain),
+        Type::Nullable(inner) => type_is_imprecise(inner),
+        Type::Union(parts) | Type::Intersection(parts) => parts.iter().any(type_is_imprecise),
         Type::Array(Some(kv)) | Type::Iterable(Some(kv)) => {
-            type_is_uncertain(&kv.0) || type_is_uncertain(&kv.1)
+            type_is_imprecise(&kv.0) || type_is_imprecise(&kv.1)
         }
-        Type::List(inner) | Type::ClassString(Some(inner)) => type_is_uncertain(inner),
+        Type::List(inner) | Type::ClassString(Some(inner)) => type_is_imprecise(inner),
         Type::Callable(Some(sig)) => {
-            sig.params.iter().any(type_is_uncertain) || type_is_uncertain(&sig.ret)
+            sig.params.iter().any(type_is_imprecise) || type_is_imprecise(&sig.ret)
         }
-        Type::Named { args, .. } => args.iter().any(type_is_uncertain),
-        Type::Shape { fields, .. } => fields.iter().any(|f| type_is_uncertain(&f.ty)),
+        Type::Named { args, .. } => args.iter().any(type_is_imprecise),
+        Type::Shape { fields, .. } => fields.iter().any(|f| type_is_imprecise(&f.ty)),
         _ => false,
     }
 }

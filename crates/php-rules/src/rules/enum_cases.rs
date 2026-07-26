@@ -17,7 +17,6 @@
 //!   a thin wrapper around that shared check rather than an EnumCases-specific
 //!   rule, so it belongs with the attribute rules — deferred here.
 
-#![allow(unused_imports)]
 use crate::{FileAnalysis, RuleEntry};
 use php_ast::{ClassDecl, ClassKind, Member, Stmt, StmtKind};
 use php_diagnostics::Diagnostic;
