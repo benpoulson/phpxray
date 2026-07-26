@@ -184,7 +184,7 @@ fn visit_class_like_stmt(
 fn class_like_fqn(interner: &Interner, scope: &Scope, class: &ClassDecl) -> String {
     match class.name {
         Some(name) => scope.qualify(interner.resolve(name)),
-        None => "class@anonymous".to_string(),
+        None => crate::symbols::ANONYMOUS_CLASS.to_string(),
     }
 }
 

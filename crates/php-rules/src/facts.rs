@@ -8,6 +8,7 @@ use php_ast::{
     Arg, ArrayItem, BinOp, CastKind, ClassDecl, Expr, ExprKind, FunctionDecl, Member, MemberName,
     MethodDecl, Program, PropElem, PropertyDecl, Stmt, StmtKind, UnOp,
 };
+use crate::symbols::ANONYMOUS_CLASS;
 use php_intern::Interner;
 use php_resolve::{for_each_region, Scope};
 
@@ -236,6 +237,7 @@ impl<'a> FileFacts<'a> {
         for_each_region(&program.stmts, interner, |scope, region| {
             for st in region {
                 facts.collect_decls(interner, scope, st);
+                facts.collect_decls_in_exprs(interner, scope, st);
                 php_ast::walk::for_each_expr_in_stmt(st, &mut |expr| {
                     facts.collect_scoped_expr(scope, expr);
                 });
@@ -539,44 +541,7 @@ impl<'a> FileFacts<'a> {
             StmtKind::Class(class) => {
                 if let Some(name) = class.name {
                     let fqn = scope.qualify(interner.resolve(name));
-                    self.classes.push(ClassDeclFact {
-                        scope: scope.clone(),
-                        fqn: fqn.clone(),
-                        decl: class,
-                    });
-                    for member in &class.members {
-                        match member {
-                            Member::Method(method) => {
-                                self.methods.push(MethodDeclFact {
-                                    scope: scope.clone(),
-                                    class_fqn: fqn.clone(),
-                                    class,
-                                    decl: method,
-                                });
-                                if let Some(body) = &method.body {
-                                    for child in body {
-                                        self.collect_decls(interner, scope, child);
-                                    }
-                                }
-                            }
-                            Member::Property(property) => {
-                                self.properties.push(PropertyDeclFact {
-                                    class_fqn: fqn.clone(),
-                                    class,
-                                    decl: property,
-                                });
-                                for elem in &property.props {
-                                    self.property_elems.push(PropertyElemFact {
-                                        class_fqn: fqn.clone(),
-                                        class,
-                                        property,
-                                        elem,
-                                    });
-                                }
-                            }
-                            Member::ClassConst(_) | Member::EnumCase(_) | Member::TraitUse(_) => {}
-                        }
-                    }
+                    self.collect_class_facts(interner, scope, fqn, class);
                 }
             }
             StmtKind::Block(body)
@@ -650,6 +615,84 @@ impl<'a> FileFacts<'a> {
             | StmtKind::InlineHtml(_)
             | StmtKind::Nop
             | StmtKind::Error => {}
+        }
+    }
+
+    /// Record `class` and its members under `fqn`, descending into method bodies.
+    fn collect_class_facts(
+        &mut self,
+        interner: &Interner,
+        scope: &Scope,
+        fqn: String,
+        class: &'a ClassDecl,
+    ) {
+        self.classes.push(ClassDeclFact {
+            scope: scope.clone(),
+            fqn: fqn.clone(),
+            decl: class,
+        });
+        for member in &class.members {
+            match member {
+                Member::Method(method) => {
+                    self.methods.push(MethodDeclFact {
+                        scope: scope.clone(),
+                        class_fqn: fqn.clone(),
+                        class,
+                        decl: method,
+                    });
+                    if let Some(body) = &method.body {
+                        for child in body {
+                            self.collect_decls(interner, scope, child);
+                        }
+                    }
+                }
+                Member::Property(property) => {
+                    self.properties.push(PropertyDeclFact {
+                        class_fqn: fqn.clone(),
+                        class,
+                        decl: property,
+                    });
+                    for elem in &property.props {
+                        self.property_elems.push(PropertyElemFact {
+                            class_fqn: fqn.clone(),
+                            class,
+                            property,
+                            elem,
+                        });
+                    }
+                }
+                Member::ClassConst(_) | Member::EnumCase(_) | Member::TraitUse(_) => {}
+            }
+        }
+    }
+
+    /// Declarations that live in *expression* position — anonymous classes, and
+    /// anything declared inside a closure body — which [`Self::collect_decls`]
+    /// cannot reach because it never descends into expressions.
+    ///
+    /// Kept in step with `decls::visit_decls_in_exprs`, which does the same job
+    /// for the program-walking variants: the fact views and the `*_in` helpers
+    /// must agree on what a declaration *is*, or a rule sees different classes
+    /// depending on which one it happens to call.
+    ///
+    /// This walk crosses scopes, so one call per top-level statement reaches any
+    /// depth; its results are disjoint from the statement walk's, so nothing is
+    /// recorded twice.
+    fn collect_decls_in_exprs(&mut self, interner: &Interner, scope: &Scope, stmt: &'a Stmt) {
+        let mut anon: Vec<&'a ClassDecl> = Vec::new();
+        let mut closure_bodies: Vec<&'a [Stmt]> = Vec::new();
+        php_ast::walk::for_each_expr_in_stmt(stmt, &mut |e| match &e.kind {
+            php_ast::ExprKind::NewAnon { class, .. } => anon.push(class),
+            php_ast::ExprKind::Closure(c) => closure_bodies.push(&c.body),
+            _ => {}
+        });
+        for class in anon {
+            self.collect_class_facts(interner, scope, ANONYMOUS_CLASS.to_string(), class);
+        }
+        for body in closure_bodies {
+            for child in body {
+                self.collect_decls(interner, scope, child);
+            }
         }
     }
 }
