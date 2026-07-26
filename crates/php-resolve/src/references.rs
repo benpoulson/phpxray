@@ -86,8 +86,15 @@ impl Collector {
 
     fn const_ref(&mut self, scope: &Scope, name: &Name) {
         // `true`/`false`/`null` and the magic `__X__` constants resolve specially
-        // and are never namespaced — not user constant references.
-        if name.fq == NameFq::NotFq && is_reserved_const(&name.text) {
+        // — not user constant references. `\TRUE` is legal and means `true`;
+        // `\__LINE__` is not, so the magic names are unqualified-only.
+        let bare = name.text.strip_prefix('\\').unwrap_or(&name.text);
+        let reserved = match name.fq {
+            NameFq::NotFq => is_bool_or_null_const(bare) || is_magic_const(bare),
+            NameFq::Fq => is_bool_or_null_const(bare),
+            NameFq::Relative => false,
+        };
+        if reserved {
             return;
         }
         let resolution = scope.resolve_const(name);
@@ -475,13 +482,21 @@ impl Collector {
     }
 }
 
-/// `true`/`false`/`null` and the magic `__LINE__`-style constants are language
-/// constants, never namespaced.
-fn is_reserved_const(text: &str) -> bool {
+/// `true`/`false`/`null`: case-insensitive language constants that are never
+/// namespaced, so `\TRUE` resolves to the same value as `true`.
+fn is_bool_or_null_const(text: &str) -> bool {
     matches!(
         text.to_ascii_lowercase().as_str(),
         "true" | "false" | "null"
-    ) || (text.starts_with("__") && text.ends_with("__"))
+    )
+}
+
+/// The magic `__LINE__`-style constants. Unlike `\TRUE`, these are substituted
+/// by the compiler only in unqualified form — `\__LINE__` and
+/// `namespace\__LINE__` are both a fatal "Undefined constant" in PHP, so the
+/// caller must not treat a qualified spelling as reserved.
+fn is_magic_const(text: &str) -> bool {
+    text.starts_with("__") && text.ends_with("__")
 }
 
 #[cfg(test)]
@@ -599,6 +614,31 @@ mod tests {
         assert!(got.contains(&(RefKind::Class, "App\\Widget".into())));
         assert!(got.contains(&(RefKind::Class, "App\\Gadget".into())));
         assert!(got.contains(&(RefKind::Class, "App\\Deep".into())));
+    }
+
+    #[test]
+    fn bool_and_null_constants_are_reserved_in_either_spelling() {
+        // PHP accepts `\TRUE`/`\NULL` as the language constants (verified against
+        // the 8.5 oracle), so neither spelling is a user constant reference.
+        let got = refs(r#"<?php namespace App; var_dump(TRUE, \FALSE, \Null, null);"#);
+        assert!(
+            !got.iter().any(|(k, _)| *k == RefKind::Const),
+            "reserved constants must not be reported as references: {got:?}"
+        );
+    }
+
+    #[test]
+    fn qualified_magic_constants_are_ordinary_references() {
+        // `\__LINE__` is a fatal "Undefined constant" in PHP — unlike `\TRUE`,
+        // the magic names are substituted only in unqualified form, so the
+        // qualified spelling must resolve (and be checkable) as a real constant.
+        let got = refs(r#"<?php namespace App; echo __LINE__; echo \__LINE__;"#);
+        let consts: Vec<_> = got
+            .iter()
+            .filter(|(k, _)| *k == RefKind::Const)
+            .cloned()
+            .collect();
+        assert_eq!(consts, vec![(RefKind::Const, "__LINE__".to_string())]);
     }
 
     #[test]
