@@ -11,7 +11,8 @@
 //! **constants** — each with its own `use` table and its own rules. Class and
 //! function names match case-insensitively; constants are case-sensitive. This
 //! module's [`Scope`] holds the per-namespace-block context and resolves names
-//! within it; building a `Scope` by walking a program is a later milestone.
+//! within it; [`crate::index::for_each_region`] builds one per namespace region
+//! by walking a program.
 
 use php_ast::{Name, NameFq};
 

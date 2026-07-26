@@ -87,18 +87,40 @@ fn main() -> ExitCode {
 }
 
 fn usage() {
+    // Kept complete on purpose: the previous list named 7 of the 18 commands,
+    // so the ones that matter most for verification (astdiff, check, corpus's
+    // siblings) were undiscoverable from the tool itself.
     eprintln!(
         "usage: cargo run -p xtask -- <command>\n\
          \n\
-         commands:\n\
-         \x20 corpus [DIR]        parse every .phpt under DIR (default php-src/Zend/tests)\n\
+         corpus / oracles (need ./php-src; PHP where noted):\n\
+         \x20 corpus [DIR]        parse every .phpt under DIR; assert no panics\n\
+         \x20 astdiff [DIR] [--limit N]\n\
+         \x20                     structural AST differential vs PHP (needs PHP + php-ast ext)\n\
+         \x20 astone FILE         print our AST dump for one .phpt\n\
          \x20 difftokens [DIR] [--limit N]\n\
-         \x20                     diff our tokens vs PHP token_get_all over the corpus (requires PHP)\n\
+         \x20                     diff our tokens vs PHP token_get_all (needs PHP)\n\
+         \x20 triage [DIR]        bucket corpus parse failures\n\
+         \x20 diag FILE           print diagnostics for one .phpt\n\
+         \n\
+         analysis layers over the corpus (assert no panics):\n\
+         \x20 resolve [DIR]       run name resolution\n\
+         \x20 index [DIR]         aggregate into one ProjectIndex\n\
+         \x20 reflect [DIR]       build the ReflectionIndex\n\
+         \x20 infer [DIR]         run type inference over every scope\n\
+         \x20 check [DIR]         whole-project driver: all rules at level max\n\
+         \x20 phpdoc              sweep PHPDoc over the stubs\n\
+         \n\
+         generators (need PHP / the phpstorm-stubs submodule):\n\
+         \x20 gen-tokens          regenerate golden token fixtures\n\
+         \x20 gen-stubs           regenerate builtin manifests from phpstorm-stubs\n\
+         \n\
+         misc:\n\
          \x20 phpt-extract FILE   print the --FILE-- body of a .phpt\n\
-         \x20 rule-manifest       print analyzer rule/strictness manifest for docs\n\
+         \x20 rule-manifest       print the registered rules (the coverage truth)\n\
          \x20 rule-timings [--path PATH]\n\
-         \x20                     run analyzer timing instrumentation over a path/config\n\
-         \x20 gen-tokens          generate golden token fixtures (requires PHP; M1)"
+         \x20                     per-phase timing instrumentation\n\
+         \x20 php ...             run the bundled PHP helper scripts"
     );
 }
 

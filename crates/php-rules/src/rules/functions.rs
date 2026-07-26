@@ -38,17 +38,14 @@
 //! - `callable.nonCallable` (`FunctionCallableRule`, subset) — `Foo::class(...)`
 //!   first-class-callable on a non-existent function.
 //!
-//! Deferred (need expression *type* inference):
-//! - `CallToFunctionParametersRule` (argument TYPE checking) — only the count
-//!   subset is done here.
-//! - `CallCallablesRule`, `CallUserFuncRule`, `RandomIntParametersRule`,
-//!   `ArrayValuesRule`, `ArrayFilterRule`, `FilterVarRule`, `ImplodeParameter*`,
-//!   `Parameter*CastableTo*`, `SortParameter*`, `PrintfParameterType*`,
-//!   `Incompatible*DefaultParameterTypeRule`, `UselessFunctionReturnValueRule`,
-//!   closure/arrow callable NoDiscard metadata propagation,
-//!   `CallToFunctionStatementWithoutSideEffectsRule`, `ReturnNullsafeByRefRule`,
-//!   `MissingFunctionParameter/ReturnTypehintRule`, `ExistingClassesIn*Typehints`
-//!   (latter handled by unknown-symbol resolution) — all need the type system.
+//! This module used to carry a "Deferred (need expression type inference)"
+//! list. It had gone stale — `CallCallablesRule`, `RandomIntParametersRule`,
+//! `ArrayValuesRule`, `FilterVarRule`, the castable-to-string family and the
+//! missing-typehint rules were all implemented here while still being listed as
+//! not done. A hand-maintained coverage list beside the code it describes is a
+//! second source of truth that nothing checks, so it is gone: run
+//! `cargo run -p xtask -- rule-manifest` for what is actually registered, and
+//! read `phpstan-src/src/Rules/Functions/` for what is not.
 
 use crate::{
     compat, function_like,
