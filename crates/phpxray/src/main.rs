@@ -147,11 +147,11 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     if cli.notify && cli.fix {
-        eprintln!("error: --watch cannot be combined with --fix");
+        eprintln!("error: --notify cannot be combined with --fix");
         return ExitCode::from(2);
     }
     if cli.notify && cli.generate_baseline.is_some() {
-        eprintln!("error: --watch cannot be combined with --generate-baseline");
+        eprintln!("error: --notify cannot be combined with --generate-baseline");
         return ExitCode::from(2);
     }
 
