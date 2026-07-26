@@ -733,7 +733,13 @@ fn vis_word(v: Visibility) -> &'static str {
 }
 
 /// Find the nearest non-magic method named `name` strictly above `class` in the
-/// hierarchy (parents, then interfaces).
+/// hierarchy (parents, then interfaces) that `class` actually overrides.
+///
+/// A **private** ancestor method is not a prototype: PHP gives the child its own
+/// slot, so redeclaring it with any signature, staticness or visibility is legal.
+/// phpstan encodes the same rule (`Rules/Methods/MethodPrototypeFinder.php`:
+/// `if ($method->isPrivate()) { return null; }`). Interfaces cannot declare
+/// private methods, so only the parent chain is affected.
 fn find_parent_method<'a>(
     refl: &'a ReflectionIndex,
     class: &ClassReflection,
@@ -2566,34 +2572,8 @@ fn constructor_type_decidable(fa: &FileAnalysis, ty: &Type) -> bool {
 /// `function f(int $x = 'str')`. Lenient: `null` defaults are always allowed (PHP
 /// makes the parameter implicitly nullable), and only definitively-incompatible
 /// concrete defaults are flagged (`is_assignable` is the same lenient relation the
-/// argument-type rules use).
-/// The type of a parameter's default-value expression (constant-folded). Param
-/// defaults aren't in the flow type-map, so we evaluate the literal directly;
-/// a non-constant default yields `mixed` (skipped, false-positive-safe).
-/// Whether `t` (under one level of nullable) is array/iterable-like.
-fn is_array_or_iterable(t: &Type) -> bool {
-    match t {
-        Type::Array(_) | Type::Iterable(_) | Type::List(_) | Type::Shape { .. } => true,
-        Type::Nullable(inner) => is_array_or_iterable(inner),
-        _ => false,
-    }
-}
-
-fn const_default_type(e: &php_ast::Expr) -> Type {
-    use php_infer::ConstVal;
-    match php_infer::eval_const(e) {
-        Some(ConstVal::Int(_)) => Type::Int,
-        Some(ConstVal::Float(_)) => Type::Float,
-        Some(ConstVal::Bool(_)) => Type::Bool,
-        Some(ConstVal::Str(_)) => Type::String,
-        Some(ConstVal::Null) => Type::Null,
-        None => match &e.kind {
-            ExprKind::Array { .. } => Type::Array(None),
-            _ => Type::Mixed,
-        },
-    }
-}
-
+/// argument-type rules use). Default folding is shared with the function-level
+/// twin (`function_like::const_default_type`) so the two cannot disagree.
 fn run_incompatible_default_param(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for_each_class(fa, |_, fqn, c| {
@@ -2604,21 +2584,25 @@ fn run_incompatible_default_param(fa: &FileAnalysis) -> Vec<Diagnostic> {
         for (md, mr) in zip_methods(fa.interner, c, class) {
             for (i, (p, pr)) in md.params.iter().zip(&mr.params).enumerate() {
                 let Some(default) = &p.default else { continue };
-                // A literal `null` default implicitly nullablizes the parameter.
-                if matches!(&default.kind, ExprKind::Name(n) if n.text.eq_ignore_ascii_case("null"))
-                {
-                    continue;
-                }
                 // No declared type → nothing to check.
                 if pr.ty.is_mixed() {
                     continue;
                 }
                 // Param defaults aren't in the body type-map; fold the literal.
-                let given = const_default_type(default);
+                // A non-constant default says nothing about compatibility.
+                let Some(given) = crate::function_like::const_default_type(default) else {
+                    continue;
+                };
+                // A literal `null` default implicitly nullablizes the parameter.
+                if given == Type::Null {
+                    continue;
+                }
                 // An array-literal default is compatible with any array/iterable
                 // parameter (empty `[]` fits any `array<K,V>`; element precision is
                 // intentionally under-reported rather than false-flagged).
-                if matches!(given, Type::Array(_)) && is_array_or_iterable(&pr.ty) {
+                if matches!(given, Type::Array(_))
+                    && crate::function_like::is_array_or_iterable(&pr.ty)
+                {
                     continue;
                 }
                 if !compat::value_mismatch(fa, &given, Some(&given), &pr.ty, &pr.native_ty) {
@@ -4948,6 +4932,23 @@ mod tests {
     #[test]
     fn untyped_param_default_clean() {
         let src = "<?php class C { public function f($x = 'str'): void {} }";
+        assert!(codes(src, run_incompatible_default_param).is_empty());
+    }
+
+    #[test]
+    fn parenthesised_null_default_allowed() {
+        // `(null)` is still a null default. The method rule used to match the
+        // bare `null` name syntactically and so reported this, while the
+        // function rule — folding the constant — did not.
+        let src = "<?php class C { public function f(int $x = (null)): void {} }";
+        assert!(codes(src, run_incompatible_default_param).is_empty());
+    }
+
+    #[test]
+    fn non_constant_default_is_skipped() {
+        // Nothing constant-foldable to compare against; the old `mixed`
+        // fallback relied on `value_mismatch` staying lenient.
+        let src = "<?php class C { public function f(int $x = SOME_UNKNOWN_CONST): void {} }";
         assert!(codes(src, run_incompatible_default_param).is_empty());
     }
 }

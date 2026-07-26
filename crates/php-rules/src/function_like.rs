@@ -10,6 +10,39 @@ pub(crate) fn collect_returns<'a>(body: &'a [Stmt], mut f: impl FnMut(Option<&'a
     decls::collect_returns_in_body(body, &mut f);
 }
 
+/// The type of a parameter's **constant** default expression, or `None` when it
+/// isn't constant-foldable (a `new` expression, a non-constant call, …) and so
+/// says nothing about compatibility.
+///
+/// `true`/`false` fold to the *literal* `True`/`False` rather than `Bool`, and
+/// parentheses are peeled — `(null)` is still a null default, which the
+/// implicit-nullable rule must not report. Shared so the function and method
+/// `parameter.defaultValue` rules cannot answer this differently.
+pub(crate) fn const_default_type(e: &Expr) -> Option<Type> {
+    if let php_ast::ExprKind::Array { .. } = &e.kind {
+        return Some(Type::Array(None));
+    }
+    if let php_ast::ExprKind::Paren(inner) = &e.kind {
+        return const_default_type(inner);
+    }
+    match php_infer::eval_const(e)? {
+        php_infer::ConstVal::Int(_) => Some(Type::Int),
+        php_infer::ConstVal::Float(_) => Some(Type::Float),
+        php_infer::ConstVal::Bool(b) => Some(if b { Type::True } else { Type::False }),
+        php_infer::ConstVal::Str(_) => Some(Type::String),
+        php_infer::ConstVal::Null => Some(Type::Null),
+    }
+}
+
+/// Whether `t` accepts an array-literal default (`[]`, `[…]`).
+pub(crate) fn is_array_or_iterable(t: &Type) -> bool {
+    match t {
+        Type::Array(_) | Type::Iterable(_) | Type::List(_) | Type::Shape { .. } => true,
+        Type::Nullable(inner) => is_array_or_iterable(inner),
+        _ => false,
+    }
+}
+
 pub(crate) fn lenient_return_value(actual: &Type, check_nullables: bool) -> Type {
     if check_nullables {
         actual.clone()
