@@ -194,15 +194,26 @@ impl AnalysisInputs {
         h.write_opt_bool(*check_implicit_mixed);
         h.write_bool(*check_uninitialized_properties);
         h.write_bool(*check_too_wide_return_public);
+        // Each collection is length-prefixed. Individual strings are already
+        // delimited by `write_bytes`, but without a *count* per section the
+        // sections run together and distinct configs collide: a lone
+        // `earlyTerminatingFunctionCalls: [bail]` hashed identically to a lone
+        // `earlyTerminatingMethodCalls: {bail: []}`, so editing one into the
+        // other served the pre-edit report from the cache and re-analyzed
+        // nothing in watch.
+        h.write_u64(early_terminating_function_calls.len() as u64);
         for f in early_terminating_function_calls {
             h.write_str(f);
         }
+        h.write_u64(early_terminating_method_calls.len() as u64);
         for (class, methods) in early_terminating_method_calls {
             h.write_str(class);
+            h.write_u64(methods.len() as u64);
             for m in methods {
                 h.write_str(m);
             }
         }
+        h.write_u64(type_aliases.len() as u64);
         for (name, body) in type_aliases {
             h.write_str(name);
             h.write_str(body);
@@ -211,10 +222,12 @@ impl AnalysisInputs {
         // file set, so nothing else would notice them changing.
         h.write_bool(laravel.is_some());
         if let Some(l) = laravel {
+            h.write_u64(l.aliases.len() as u64);
             for (alias, target) in &l.aliases {
                 h.write_str(alias);
                 h.write_str(target);
             }
+            h.write_u64(l.sources.len() as u64);
             for (path, contents) in &l.sources {
                 h.write_str(path);
                 h.write_bytes(contents.as_bytes());
@@ -232,5 +245,54 @@ impl AnalysisInputs {
         h.write_str("analysis-inputs-v1");
         self.hash_into(&mut h);
         h.finish_hex()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Distinct configs must not share a fingerprint.
+    ///
+    /// The cache key and the incremental fingerprint both derive from
+    /// `hash_into`, so a collision serves a stale report and re-analyzes
+    /// nothing. Individual strings are length-prefixed, but the *sections* used
+    /// not to be — these pairs were verified to collide before section counts
+    /// were added.
+    #[test]
+    fn distinct_configs_hash_distinctly() {
+        let root = std::path::Path::new("/proj");
+        let fp = |c: &Config| AnalysisInputs::resolve(c, root).fingerprint();
+
+        let a = Config {
+            early_terminating_function_calls: vec!["bail".into()],
+            ..Config::default()
+        };
+        let mut b = Config::default();
+        b.early_terminating_method_calls
+            .insert("bail".into(), vec![]);
+        assert_ne!(fp(&a), fp(&b), "terminating function vs method call");
+
+        let mut c = Config::default();
+        c.early_terminating_method_calls
+            .insert("A".into(), vec!["b".into()]);
+        let mut d = Config::default();
+        d.type_aliases.insert("A".into(), "b".into());
+        assert_ne!(fp(&c), fp(&d), "terminating method call vs type alias");
+
+        // Splitting the same names across entries must also differ.
+        let e = Config {
+            early_terminating_function_calls: vec!["x".into(), "y".into()],
+            ..Config::default()
+        };
+        let mut f = Config {
+            early_terminating_function_calls: vec!["x".into()],
+            ..Config::default()
+        };
+        f.type_aliases.insert("y".into(), String::new());
+        assert_ne!(fp(&e), fp(&f), "same names, different sections");
+
+        // And an unchanged config still hashes stably.
+        assert_eq!(fp(&a), fp(&a.clone()));
     }
 }
