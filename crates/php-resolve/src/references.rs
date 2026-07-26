@@ -110,6 +110,21 @@ impl Collector {
         }
     }
 
+    /// A member name in `->name` / `::name` position.
+    ///
+    /// Only the computed form carries anything to resolve, but it carries a
+    /// whole expression: every function, constant and class named inside
+    /// `$o->{helper()}` or `Foo::{other(SOME_CONST)}` was invisible to
+    /// unknown-symbol checking and unused-import accounting until this walked it.
+    /// The identifier and simple-variable forms name a *member*, which is
+    /// resolved against a receiver type elsewhere, not through the namespace.
+    fn member_name(&mut self, scope: &Scope, name: &MemberName) {
+        match name {
+            MemberName::Expr(e) => self.expr(scope, e),
+            MemberName::Ident(_) | MemberName::Var(_) => {}
+        }
+    }
+
     // --- types ----------------------------------------------------------
 
     fn ty(&mut self, scope: &Scope, t: &Type) {
@@ -211,12 +226,23 @@ impl Collector {
                 }
                 self.args(scope, args);
             }
-            ExprKind::MethodCall { recv, args, .. } => {
+            ExprKind::MethodCall {
+                recv,
+                method,
+                args,
+                nullsafe: _,
+            } => {
                 self.expr(scope, recv);
+                self.member_name(scope, method);
                 self.args(scope, args);
             }
-            ExprKind::StaticCall { class, args, .. } => {
+            ExprKind::StaticCall {
+                class,
+                method,
+                args,
+            } => {
                 self.class_or_expr(scope, class);
+                self.member_name(scope, method);
                 self.args(scope, args);
             }
             ExprKind::New { class, args } => {
@@ -233,9 +259,17 @@ impl Collector {
                     self.expr(scope, i);
                 }
             }
-            ExprKind::Prop { base, .. } => self.expr(scope, base),
-            ExprKind::StaticProp { class, .. } | ExprKind::ClassConst { class, .. } => {
+            ExprKind::Prop {
+                base,
+                name,
+                nullsafe: _,
+            } => {
+                self.expr(scope, base);
+                self.member_name(scope, name);
+            }
+            ExprKind::StaticProp { class, name } | ExprKind::ClassConst { class, name } => {
                 self.class_or_expr(scope, class);
+                self.member_name(scope, name);
             }
             ExprKind::Instanceof { expr, class } => {
                 self.expr(scope, expr);
@@ -614,6 +648,28 @@ mod tests {
         assert!(got.contains(&(RefKind::Class, "App\\Widget".into())));
         assert!(got.contains(&(RefKind::Class, "App\\Gadget".into())));
         assert!(got.contains(&(RefKind::Class, "App\\Deep".into())));
+    }
+
+    #[test]
+    fn computed_member_names_are_walked() {
+        // `->{expr}` / `::{expr}` hold a whole expression. Everything named
+        // inside used to be invisible: no unknown-symbol checking, and any
+        // import used only there looked unused.
+        let got = refs(
+            r#"<?php
+            namespace App;
+            $o->{helper()};
+            $o->{MY_CONST}();
+            Foo::{other(OTHER_CONST)}();
+            $o::${dynamic()};
+            "#,
+        );
+        for want in ["App\\helper", "App\\MY_CONST", "App\\other", "App\\OTHER_CONST", "App\\dynamic"] {
+            assert!(
+                got.iter().any(|(_, fqn)| fqn == want),
+                "missing {want} in {got:?}"
+            );
+        }
     }
 
     #[test]
