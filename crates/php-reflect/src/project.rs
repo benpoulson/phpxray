@@ -464,48 +464,21 @@ impl ReflectionIndex {
         // Owned set of real class keys so the guard closure doesn't borrow `self`
         // while its maps are mutated.
         let real: std::collections::HashSet<String> = self.classes.keys().cloned().collect();
-        let ex = |t: &mut php_types::Type| *t = expand_global_alias_guarded(t, &map, &real);
+        let mut ex = |t: &mut php_types::Type| *t = expand_global_alias_guarded(t, &map, &real);
         for cls_arc in self.classes.values_mut() {
             let cls = Arc::make_mut(cls_arc);
             for m in &mut cls.methods {
-                ex(&mut m.return_type);
-                ex(&mut m.native_return);
-                for p in &mut m.params {
-                    ex(&mut p.ty);
-                    ex(&mut p.native_ty);
-                    if let Some(o) = &mut p.out_ty {
-                        ex(o);
-                    }
-                }
-                for a in &mut m.asserts {
-                    ex(&mut a.ty);
-                }
-                if let Some(s) = &mut m.self_out {
-                    ex(s);
-                }
+                m.map_types(&mut ex);
             }
             for p in &mut cls.properties {
-                ex(&mut p.ty);
-                ex(&mut p.native_ty);
+                p.map_types(&mut ex);
             }
             for k in &mut cls.constants {
-                ex(&mut k.ty);
+                k.map_types(&mut ex);
             }
         }
         for fn_arc in self.functions.values_mut() {
-            let f = Arc::make_mut(fn_arc);
-            ex(&mut f.return_type);
-            ex(&mut f.native_return);
-            for p in &mut f.params {
-                ex(&mut p.ty);
-                ex(&mut p.native_ty);
-                if let Some(o) = &mut p.out_ty {
-                    ex(o);
-                }
-            }
-            for a in &mut f.asserts {
-                ex(&mut a.ty);
-            }
+            Arc::make_mut(fn_arc).map_types(&mut ex);
         }
     }
 
@@ -1262,12 +1235,7 @@ fn subst_method<'a>(m: &'a MethodReflection, subst: &Subst) -> Cow<'a, MethodRef
         return Cow::Borrowed(m);
     }
     let mut out = m.clone();
-    for p in &mut out.params {
-        p.ty = subst_type(&p.ty, subst);
-        p.native_ty = subst_type(&p.native_ty, subst);
-    }
-    out.return_type = subst_type(&out.return_type, subst);
-    out.native_return = subst_type(&out.native_return, subst);
+    out.map_types(&mut |t| *t = subst_type(t, subst));
     Cow::Owned(out)
 }
 
@@ -1277,10 +1245,9 @@ fn subst_property<'a>(p: &'a PropertyReflection, subst: &Subst) -> Cow<'a, Prope
     if subst.is_empty() {
         return Cow::Borrowed(p);
     }
-    Cow::Owned(PropertyReflection {
-        ty: subst_type(&p.ty, subst),
-        ..p.clone()
-    })
+    let mut out = p.clone();
+    out.map_types(&mut |t| *t = subst_type(t, subst));
+    Cow::Owned(out)
 }
 
 /// Apply a template substitution to a constant's type, borrowing when nothing
@@ -1289,10 +1256,9 @@ fn subst_constant<'a>(c: &'a ConstReflection, subst: &Subst) -> Cow<'a, ConstRef
     if subst.is_empty() {
         return Cow::Borrowed(c);
     }
-    Cow::Owned(ConstReflection {
-        ty: subst_type(&c.ty, subst),
-        ..c.clone()
-    })
+    let mut out = c.clone();
+    out.map_types(&mut |t| *t = subst_type(t, subst));
+    Cow::Owned(out)
 }
 
 /// Recursively replace [`Type::TemplateVar`] occurrences using `subst`.
@@ -2086,6 +2052,41 @@ mod tests {
             .classes
             .iter()
             .any(|c| c.reflection.fqn == "MethodClass"));
+    }
+
+    #[test]
+    fn substitution_rewrites_every_type_a_member_carries() {
+        // `out_ty` (`@param-out`) and `self_out` (`@phpstan-self-out`) used to
+        // survive substitution untouched, leaking a raw `TemplateVar` into by-ref
+        // argument types and retyping the receiver to an *unbound* `T`.
+        let idx = index(
+            "<?php
+            class User {}
+            /** @template T */
+            class Collection {
+                /**
+                 * @param-out T $out
+                 * @phpstan-self-out Collection<T>
+                 * @return T
+                 */
+                public function take(&$out) {}
+            }
+            /** @extends Collection<User> */
+            class Users extends Collection {}",
+        );
+        let found = idx.find_method("Users", "take").expect("method");
+        let m = found.member.as_ref();
+        assert_eq!(m.return_type.to_string(), "User", "return");
+        assert_eq!(
+            m.params[0].out_ty.as_ref().map(|t| t.to_string()),
+            Some("User".to_string()),
+            "@param-out must be substituted"
+        );
+        assert_eq!(
+            m.self_out.as_ref().map(|t| t.to_string()),
+            Some("Collection<User>".to_string()),
+            "@phpstan-self-out must be substituted"
+        );
     }
 
     #[test]

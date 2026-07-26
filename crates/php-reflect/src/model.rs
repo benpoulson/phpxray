@@ -68,6 +68,124 @@ impl ParamReflection {
             self.ty.clone()
         }
     }
+
+    /// Apply `f` to every type this parameter carries.
+    ///
+    /// Deliberately written as an **exhaustive destructure**: adding a field to
+    /// the struct breaks this one site, forcing whoever adds it to say whether
+    /// it holds a type. Rewriting used to be open-coded at four call sites that
+    /// each covered a *different* subset of the fields, which is exactly how
+    /// `@param-out` came to survive template substitution unsubstituted — a raw
+    /// `TemplateVar` then leaked into by-ref argument types.
+    pub fn map_types(&mut self, f: &mut impl FnMut(&mut Type)) {
+        let Self {
+            name: _,
+            ty,
+            by_ref: _,
+            variadic: _,
+            optional: _,
+            promoted: _,
+            explicit: _,
+            native_ty,
+            out_ty,
+            inferred: _,
+        } = self;
+        f(ty);
+        f(native_ty);
+        if let Some(out) = out_ty {
+            f(out);
+        }
+    }
+}
+
+impl MethodReflection {
+    /// Apply `f` to every type this method carries — parameters, both return
+    /// facets, `@phpstan-assert` targets and `@phpstan-self-out`.
+    ///
+    /// See [`ParamReflection::map_types`] for why this is an exhaustive
+    /// destructure. `self_out` and `asserts` are the fields the old open-coded
+    /// substitution missed: a `self_out` left holding `Collection<T>` retypes the
+    /// receiver to an *unbound* `T` after a call, discarding the binding the call
+    /// site had already established.
+    pub fn map_types(&mut self, f: &mut impl FnMut(&mut Type)) {
+        let Self {
+            name: _,
+            visibility: _,
+            is_static: _,
+            is_abstract: _,
+            is_final: _,
+            params,
+            return_type,
+            explicit_return: _,
+            inferred_return: _,
+            native_return,
+            templates: _,
+            deprecated: _,
+            pure: _,
+            impure: _,
+            asserts,
+            self_out,
+            must_use_return_value: _,
+            magic: _,
+        } = self;
+        for p in params {
+            p.map_types(f);
+        }
+        f(return_type);
+        f(native_return);
+        for a in asserts {
+            let AssertReflection {
+                param: _,
+                ty,
+                negated: _,
+                when: _,
+            } = a;
+            f(ty);
+        }
+        if let Some(out) = self_out {
+            f(out);
+        }
+    }
+}
+
+impl PropertyReflection {
+    /// Apply `f` to both type facets. See [`ParamReflection::map_types`].
+    pub fn map_types(&mut self, f: &mut impl FnMut(&mut Type)) {
+        let Self {
+            name: _,
+            visibility: _,
+            is_static: _,
+            is_readonly: _,
+            ty,
+            native_ty,
+            has_default: _,
+            access: _,
+            magic: _,
+        } = self;
+        f(ty);
+        f(native_ty);
+    }
+}
+
+impl ConstReflection {
+    /// Apply `f` to every type this constant carries. See
+    /// [`ParamReflection::map_types`]. `case_backing` is a type too — it was
+    /// never rewritten by the open-coded substitution.
+    pub fn map_types(&mut self, f: &mut impl FnMut(&mut Type)) {
+        let Self {
+            name: _,
+            visibility: _,
+            ty,
+            declared: _,
+            is_final: _,
+            int_value: _,
+            case_backing,
+        } = self;
+        f(ty);
+        if let Some(backing) = case_backing {
+            f(backing);
+        }
+    }
 }
 
 /// A reflected free function.
@@ -108,6 +226,43 @@ pub struct FunctionReflection {
     /// defaults on some optional params and over-/under-counts variadics), so the
     /// arguments-count rule skips these; their *types* still drive inference.
     pub builtin: bool,
+}
+
+impl FunctionReflection {
+    /// Apply `f` to every type this function carries. See
+    /// [`ParamReflection::map_types`].
+    pub fn map_types(&mut self, f: &mut impl FnMut(&mut Type)) {
+        let Self {
+            fqn: _,
+            params,
+            return_type,
+            explicit_return: _,
+            inferred_return: _,
+            native_return,
+            by_ref: _,
+            templates: _,
+            deprecated: _,
+            pure: _,
+            impure: _,
+            asserts,
+            must_use_return_value: _,
+            builtin: _,
+        } = self;
+        for p in params {
+            p.map_types(f);
+        }
+        f(return_type);
+        f(native_return);
+        for a in asserts {
+            let AssertReflection {
+                param: _,
+                ty,
+                negated: _,
+                when: _,
+            } = a;
+            f(ty);
+        }
+    }
 }
 
 /// A reflected method (real or magic `@method`).
@@ -1212,27 +1367,15 @@ pub(crate) fn expand_member_aliases(
     constants: &mut [ConstReflection],
     aliases: &HashMap<String, Type>,
 ) {
-    let ex = |t: &mut Type| *t = expand_aliases(t, aliases);
+    let mut ex = |t: &mut Type| *t = expand_aliases(t, aliases);
     for m in methods.iter_mut() {
-        ex(&mut m.return_type);
-        ex(&mut m.native_return);
-        for p in &mut m.params {
-            ex(&mut p.ty);
-            ex(&mut p.native_ty);
-            if let Some(o) = &mut p.out_ty {
-                ex(o);
-            }
-        }
-        for a in &mut m.asserts {
-            ex(&mut a.ty);
-        }
+        m.map_types(&mut ex);
     }
     for p in properties.iter_mut() {
-        ex(&mut p.ty);
-        ex(&mut p.native_ty);
+        p.map_types(&mut ex);
     }
     for k in constants.iter_mut() {
-        ex(&mut k.ty);
+        k.map_types(&mut ex);
     }
 }
 
