@@ -56,8 +56,8 @@ use crate::{
     return_type_errors, FileAnalysis, RuleEntry,
 };
 use php_ast::{
-    BinOp, CastKind, ClassDecl, ClosureExpr, Expr, ExprKind, HookBody, Member, Param, Stmt,
-    StmtKind,
+    BinOp, CastKind, ClassDecl, ClosureExpr, Expr, ExprKind, HookBody, Member, MemberName, Param,
+    Stmt, StmtKind,
 };
 use php_diagnostics::Diagnostic;
 use php_intern::{Interner, Symbol};
@@ -612,27 +612,58 @@ fn run_unused_closure_uses(fa: &FileAnalysis) -> Vec<Diagnostic> {
 
 /// Every variable name referenced inside a closure's body (and nested closures'
 /// own `use` lists / bodies, since a captured var can be passed down).
+/// The variable a **dynamic member name** reads, if any.
+///
+/// `$row->$field` stores `$field` as [`MemberName::Var`] — a bare `Symbol` in the
+/// member slot, with no `Expr` node for a walker to reach. So the read is
+/// invisible to any expression walk, however thorough: `php_ast::walk` visits
+/// `MemberName::Expr` (the `->{expr}` form) but there is simply nothing to visit
+/// here.
+///
+/// Missing it made `use ($field)` look unused when the body did
+/// `$row->$field`, and `--fix` then deleted the capture — producing code that
+/// dies at runtime with an undefined variable. Any rule that decides whether a
+/// variable is *used* has to consult this.
+fn dynamic_member_var(e: &Expr) -> Option<Symbol> {
+    let member = match &e.kind {
+        ExprKind::Prop { name, .. }
+        | ExprKind::StaticProp { name, .. }
+        | ExprKind::ClassConst { name, .. } => name,
+        ExprKind::MethodCall { method, .. } | ExprKind::StaticCall { method, .. } => method,
+        _ => return None,
+    };
+    match member {
+        MemberName::Var(sym) => Some(*sym),
+        MemberName::Ident(_) | MemberName::Expr(_) => None,
+    }
+}
+
 fn collect_used_variables(c: &ClosureExpr, interner: &Interner) -> HashSet<String> {
     let mut names: HashSet<String> = HashSet::new();
     for st in &c.body {
-        crate::walk::for_each_expr_in_scope(st, &mut |e| match &e.kind {
-            ExprKind::Variable(sym) => {
-                names.insert(interner.resolve(*sym).to_string());
+        crate::walk::for_each_expr_in_scope(st, &mut |e| {
+            if let Some(sym) = dynamic_member_var(e) {
+                names.insert(interner.resolve(sym).to_string());
             }
-            // Nested closures forward captures via their own `use` list, but a
-            // bare variable reference inside the nested body belongs to that
-            // nested scope and must not make the outer `use` look used.
-            ExprKind::Closure(inner) => {
-                for u in &inner.uses {
-                    names.insert(interner.resolve(u.name).to_string());
+            match &e.kind {
+                ExprKind::Variable(sym) => {
+                    names.insert(interner.resolve(*sym).to_string());
                 }
+                // Nested closures forward captures via their own `use` list, but a
+                // bare variable reference inside the nested body belongs to that
+                // nested scope and must not make the outer `use` look used.
+                ExprKind::Closure(inner) => {
+                    for u in &inner.uses {
+                        names.insert(interner.resolve(u.name).to_string());
+                    }
+                }
+                // Arrow fns auto-capture: every variable referenced in their body
+                // (transitively through further arrow fns) is a use of this scope.
+                ExprKind::ArrowFn(inner) => {
+                    collect_arrow_captured(&inner.body, interner, &mut names);
+                }
+                _ => {}
             }
-            // Arrow fns auto-capture: every variable referenced in their body
-            // (transitively through further arrow fns) is a use of this scope.
-            ExprKind::ArrowFn(inner) => {
-                collect_arrow_captured(&inner.body, interner, &mut names);
-            }
-            _ => {}
         });
     }
     names
@@ -643,17 +674,22 @@ fn collect_used_variables(c: &ClosureExpr, interner: &Interner) -> HashSet<Strin
 /// bodies recursively. Over-approximates (the arrow's own params count too),
 /// which only makes an outer `use` look used — the safe direction.
 fn collect_arrow_captured(body: &Expr, interner: &Interner, names: &mut HashSet<String>) {
-    crate::walk::for_each_subexpr(body, &mut |e| match &e.kind {
-        ExprKind::Variable(sym) => {
-            names.insert(interner.resolve(*sym).to_string());
+    crate::walk::for_each_subexpr(body, &mut |e| {
+        if let Some(sym) = dynamic_member_var(e) {
+            names.insert(interner.resolve(sym).to_string());
         }
-        ExprKind::Closure(inner) => {
-            for u in &inner.uses {
-                names.insert(interner.resolve(u.name).to_string());
+        match &e.kind {
+            ExprKind::Variable(sym) => {
+                names.insert(interner.resolve(*sym).to_string());
             }
+            ExprKind::Closure(inner) => {
+                for u in &inner.uses {
+                    names.insert(interner.resolve(u.name).to_string());
+                }
+            }
+            ExprKind::ArrowFn(inner) => collect_arrow_captured(&inner.body, interner, names),
+            _ => {}
         }
-        ExprKind::ArrowFn(inner) => collect_arrow_captured(&inner.body, interner, names),
-        _ => {}
     });
 }
 
@@ -3164,7 +3200,9 @@ fn run_incompatible_default_parameter(fa: &FileAnalysis) -> Vec<Diagnostic> {
             // An array-literal default (`[]`, `[…]`) is compatible with any
             // array/iterable parameter — an empty array fits any `array<K,V>`, and
             // we don't type literal elements here (under-report, never false-flag).
-            if matches!(dty, php_types::Type::Array(_)) && crate::function_like::is_array_or_iterable(&param.ty) {
+            if matches!(dty, php_types::Type::Array(_))
+                && crate::function_like::is_array_or_iterable(&param.ty)
+            {
                 continue;
             }
             if compat::value_mismatch(fa, &dty, Some(&dty), &param.ty, &param.native_ty) {
@@ -4030,6 +4068,40 @@ mod tests {
             };
         "#;
         assert!(codes(src, run_unused_closure_uses).is_empty());
+    }
+
+    /// A capture used only as a **dynamic member name** is still used.
+    ///
+    /// `$row->$field` stores `$field` in the member slot as a bare `Symbol`, not
+    /// as an expression, so no walker reaches it. Reporting the capture unused
+    /// was bad enough; `--fix` then *deleted* it, turning working code into an
+    /// undefined-variable fatal at runtime. Found on a real project
+    /// (`PCAStatsRepositoryMySQL.php`, five closures).
+    #[test]
+    fn capture_used_as_a_dynamic_member_name_is_not_unused() {
+        for src in [
+            // Property fetch.
+            r#"<?php $f = function ($row) use ($field) { return $row->$field; };"#,
+            // Method call.
+            r#"<?php $f = function ($row) use ($m) { return $row->$m(); };"#,
+            // Static property and class constant.
+            r#"<?php $f = function () use ($p) { return Foo::$$p; };"#,
+            r#"<?php $f = function () use ($m) { return Foo::$m(); };"#,
+            // Assignment target, and nested inside an arrow fn.
+            r#"<?php $f = function ($row) use ($field) { $row->$field = 1; };"#,
+            r#"<?php $f = function ($row) use ($field) { return fn () => $row->$field; };"#,
+        ] {
+            assert!(
+                codes(src, run_unused_closure_uses).is_empty(),
+                "reported a used capture: {src}"
+            );
+        }
+        // The genuine case still reports.
+        let unused = r#"<?php $f = function ($row) use ($field) { return $row->other; };"#;
+        assert_eq!(
+            codes(unused, run_unused_closure_uses),
+            ["closure.unusedUse"]
+        );
     }
 
     // --- call to non-existent function -----------------------------------
