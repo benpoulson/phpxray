@@ -72,8 +72,16 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// The doc-comment immediately preceding `offset` (only whitespace between),
-    /// if any.
+    /// The doc-comment preceding `offset`, if any: only whitespace and plain
+    /// comments may sit between the two.
+    ///
+    /// Tolerating comments matters because the "docblock, `// TODO`,
+    /// declaration" shape is everywhere, and requiring a whitespace-only gap
+    /// silently drops the `@param`/`@return`/`@var` types for every one of them.
+    /// Zend is stickier still (its `CG(doc_comment)` survives even an
+    /// intervening statement); we follow PHP-Parser and stop at anything that
+    /// isn't trivia, since a docblock separated from its declaration by real
+    /// code is not documenting it.
     ///
     /// `docs` is sorted by end offset (the lexer emits in source order), so the
     /// candidate is found by binary search. The previous reverse linear scan
@@ -83,10 +91,7 @@ impl<'a> Parser<'a> {
     fn doc_before(&self, offset: u32) -> Option<std::sync::Arc<str>> {
         let idx = self.docs.partition_point(|(end, _)| *end <= offset);
         let (end, text) = self.docs.get(idx.checked_sub(1)?)?;
-        let gap = &self.src[*end as usize..offset as usize];
-        gap.bytes()
-            .all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
-            .then(|| text.clone())
+        gap_is_trivia(&self.src[*end as usize..offset as usize]).then(|| text.clone())
     }
 
     /// Parse the token stream into a program + diagnostics. The interner is the
@@ -3142,6 +3147,46 @@ fn cast_kind(k: T) -> Option<CastKind> {
 
 fn stmt_allows_raw_doc(kind: &StmtKind) -> bool {
     !matches!(kind, StmtKind::Function(_) | StmtKind::Class(_))
+}
+
+/// Whether `gap` holds nothing but whitespace and plain comments — what PHP
+/// allows between a doc-comment and the declaration it documents.
+///
+/// Anything else (including `#[`, a close tag, or an unterminated block
+/// comment) means real content intervened, so the docblock is not attached.
+fn gap_is_trivia(gap: &str) -> bool {
+    let b = gap.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b' ' | b'\t' | b'\r' | b'\n' => i += 1,
+            // `#[` opens an attribute — code, not a comment.
+            b'#' if b.get(i + 1) != Some(&b'[') => i = line_comment_end(b, i + 1),
+            b'/' if b.get(i + 1) == Some(&b'/') => i = line_comment_end(b, i + 2),
+            b'/' if b.get(i + 1) == Some(&b'*') => match gap[i + 2..].find("*/") {
+                Some(rel) => i += 2 + rel + 2,
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// One past the end of a line comment whose body starts at `from`.
+///
+/// A line comment stops at the newline, or before a `?>` close tag — which the
+/// caller then rejects, since leaving PHP is not trivia.
+fn line_comment_end(b: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while i < b.len() {
+        match b[i] {
+            b'\n' => return i + 1,
+            b'?' if b.get(i + 1) == Some(&b'>') => return i,
+            _ => i += 1,
+        }
+    }
+    i
 }
 
 fn parse_int(text: &str) -> i64 {
