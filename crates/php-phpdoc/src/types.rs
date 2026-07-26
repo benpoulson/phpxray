@@ -114,6 +114,8 @@ enum Tk {
     Comma,
     Colon,
     Ellipsis,
+    /// `=` — marks a callable parameter optional (`callable(int=): void`).
+    Equals,
     Eof,
 }
 
@@ -185,6 +187,10 @@ fn lex(s: &str) -> Vec<Tok> {
             }
             b':' => {
                 push(Tk::Colon, i + 1, &mut out);
+                i += 1;
+            }
+            b'=' => {
+                push(Tk::Equals, i + 1, &mut out);
                 i += 1;
             }
             b'.' if b[i..].starts_with(b"...") => {
@@ -510,12 +516,19 @@ impl Parser {
             // we keep only the type.
             self.eat(Tk::Ellipsis);
             params.push(self.union()?);
-            // Skip an optional `$name`/`=` decoration on the parameter.
+            // Decorations phpstan allows after the type, in any combination:
+            // `callable(int...)`, `callable(int=)`, `callable(int $x)`,
+            // `callable(int $x=)`. We model neither variadicity nor optionality
+            // on `DocType::Callable` yet, so they are accepted and dropped —
+            // failing to consume them made the *whole* tag decay to `mixed`,
+            // and the `=` in particular aborted the tokenizer outright.
+            self.eat(Tk::Ellipsis);
             if let Tk::Ident(n) = self.peek() {
                 if n.starts_with('$') {
                     self.bump();
                 }
             }
+            self.eat(Tk::Equals);
             if !self.eat(Tk::Comma) {
                 break;
             }
@@ -853,5 +866,29 @@ mod tests {
         assert_eq!(parse_type("|int"), None); // leading pipe
         assert_eq!(parse_type(""), None);
         assert_eq!(parse_type("array{id:"), None);
+    }
+
+    #[test]
+    fn callable_parameter_decorations_are_accepted() {
+        // phpstan allows a variadic marker, a parameter name and an optional
+        // marker after the type, in any combination. We do not model
+        // variadicity/optionality yet, but failing to *parse* them decayed the
+        // whole tag to `mixed` — and the `=` used to abort the tokenizer.
+        for src in [
+            "callable(int): void",
+            "callable(int...): void",
+            "callable(int=): bool",
+            "callable(int $x): bool",
+            "callable(int $x=): bool",
+            "callable(int $x, string ...$rest): bool",
+            "Closure(int=, string=): void",
+        ] {
+            let t = parse_type(src);
+            assert!(t.is_some(), "failed to parse: {src}");
+            assert!(
+                matches!(t, Some(DocType::Callable { .. })),
+                "not a callable: {src}"
+            );
+        }
     }
 }
