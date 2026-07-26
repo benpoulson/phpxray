@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The static Linux (musl) builds are roughly 9x faster. musl's allocator is a
+  poor fit for allocation-dense parsing — measured on a 21k-file project, the
+  released musl binary took 56s where the same analysis takes ~6s, spending 6x
+  more time in the kernel than on the wall and gaining nothing from extra
+  threads. Those builds now use mimalloc. macOS and glibc builds are unchanged.
+
 ### Added
 
 - A real installer at `install.sh`, attached to each release: it verifies the

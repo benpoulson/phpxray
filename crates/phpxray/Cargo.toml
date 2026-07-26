@@ -43,3 +43,12 @@ notify-debouncer-full.workspace = true
 [target.'cfg(unix)'.dependencies]
 # Local-time rendering for the watch header (localtime_r) without a date/time crate.
 libc.workspace = true
+
+[target.'cfg(target_env = "musl")'.dependencies]
+# musl's allocator is the bottleneck in the static Linux builds we ship: parsing
+# is allocation-dense, and mallocng serialises on a global lock and returns pages
+# to the kernel aggressively. Measured on a 21k-file project, the released musl
+# binary took 54s where the same analysis takes ~6s on a system allocator, with
+# system time 6x wall time and *no* speedup from extra threads. Only the musl
+# targets pay for this dependency; macOS and glibc allocators are fine as they are.
+mimalloc = { version = "0.1", default-features = false }

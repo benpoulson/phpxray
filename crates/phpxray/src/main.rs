@@ -1,6 +1,12 @@
 //! The `phpxray` command-line entry point.
 
 use clap::Parser;
+
+// See the dependency comment in Cargo.toml: musl's mallocng makes the static
+// Linux builds roughly 9x slower than they need to be on allocation-dense work.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use php_config::Config;
 use phpxray::{baseline, report, run_with_options, RunOptions};
 use std::path::{Path, PathBuf};
