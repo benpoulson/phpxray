@@ -380,6 +380,10 @@ fn run_missing_implementation(fa: &FileAnalysis) -> Vec<Diagnostic> {
         if matches!(c.kind, ClassKind::Interface | ClassKind::Trait) || c.modifiers.is_abstract {
             return;
         }
+        // An unseen trait or parent may carry the implementation.
+        if !fa.class_fully_known(fqn) {
+            return;
+        }
         for (mname, declaring) in collect_unimplemented_abstracts(fa.reflection, fqn) {
             let lead = if c.kind == ClassKind::Enum {
                 "Enum"
@@ -485,6 +489,10 @@ fn run_serializable_methods(fa: &FileAnalysis) -> Vec<Diagnostic> {
                 .unwrap_or(false)
         }) || fa.reflection.is_subclass_of(fqn, "Serializable");
         if !implements_serializable {
+            return;
+        }
+        // An unseen ancestor may already provide the two methods.
+        if !fa.class_fully_known(fqn) {
             return;
         }
         let missing = |name: &str| fa.reflection.find_method(fqn, name).is_none();
@@ -596,11 +604,9 @@ fn run_overriding_method(fa: &FileAnalysis) -> Vec<Diagnostic> {
                     .with_code("method.static"),
                 );
             }
-            // Visibility must not be narrowed (private parent methods aren't
-            // really overridden, so skip them).
-            if pm.visibility != Visibility::Private
-                && vis_rank(pm.visibility) > vis_rank(m.visibility)
-            {
+            // Visibility must not be narrowed. (A private prototype never gets
+            // here — `find_parent_method` rejects those outright.)
+            if vis_rank(pm.visibility) > vis_rank(m.visibility) {
                 let (lead, want) = match (pm.visibility, m.visibility) {
                     (Visibility::Public, Visibility::Private) => ("Private", "be public"),
                     (Visibility::Public, _) => ("Protected", "also be public"),
@@ -736,7 +742,7 @@ fn find_parent_method<'a>(
     for parent in class.parents.iter().chain(&class.interfaces) {
         if let Type::Named { fqn: pf, .. } = parent {
             if let Some(found) = refl.find_method(pf, name) {
-                if !found.member.magic {
+                if !found.member.magic && found.member.visibility != Visibility::Private {
                     return Some(found);
                 }
             }
@@ -1092,8 +1098,9 @@ fn check_member_call(
     is_static: bool,
     out: &mut Vec<Diagnostic>,
 ) {
-    // The class must be known, else we can't judge.
-    if fa.reflection.class(class_fqn).is_none() {
+    // The whole hierarchy must be known, else the method may simply be
+    // inherited from an ancestor we cannot see (registry.rs `class_fully_known`).
+    if !fa.class_fully_known(class_fqn) {
         return;
     }
     let Some(found) = fa.reflection.find_method(class_fqn, method) else {
@@ -3845,6 +3852,48 @@ mod tests {
     }
 
     #[test]
+    fn missing_implementation_with_an_unknown_trait_is_not_flagged() {
+        // The unseen trait may supply `f()`.
+        let src = "<?php
+            abstract class Base { abstract public function f(): void; }
+            class C extends Base { use UnknownVendorTrait; }";
+        assert!(codes(src, run_missing_implementation).is_empty());
+    }
+
+    #[test]
+    fn private_parent_method_is_not_a_prototype() {
+        // A private parent method gets its own slot, so the child may redeclare
+        // it with any signature, staticness or visibility (phpstan:
+        // MethodPrototypeFinder returns null for private prototypes).
+        let src = "<?php
+            class P {
+                private function f(): int { return 1; }
+                private static function s(): int { return 1; }
+                private function v(): int { return 1; }
+            }
+            class C extends P {
+                private function f(): string { return 'a'; }
+                private function s(): string { return 'b'; }
+                protected function v(): string { return 'c'; }
+            }";
+        assert!(
+            codes(src, run_overriding_method).is_empty(),
+            "private prototypes must not be checked: {:?}",
+            codes(src, run_overriding_method)
+        );
+    }
+
+    #[test]
+    fn protected_parent_method_is_still_a_prototype() {
+        // The guard is about *private* only — narrowing a protected parent
+        // method to private is still an error.
+        let src = "<?php
+            class P { protected function f(): void {} }
+            class C extends P { private function f(): void {} }";
+        assert!(codes(src, run_overriding_method).contains(&"method.visibility"));
+    }
+
+    #[test]
     fn override_final_method_flagged() {
         let src = "<?php
             class Base { final public function f(): void {} }
@@ -4000,6 +4049,16 @@ mod tests {
     #[test]
     fn call_to_existing_this_method_clean() {
         let src = "<?php class C { public function a() { $this->b(); } public function b() {} }";
+        assert!(codes(src, run_call_existence).is_empty());
+    }
+
+    #[test]
+    fn call_through_an_unknown_ancestor_is_not_flagged() {
+        // The base is outside the analyzed set, so `inherited()` may well exist
+        // on it — judging the call would be a false positive.
+        let src = "<?php class C extends UnknownVendorBase {
+            public function a() { $this->inherited(); self::inheritedStatic(); }
+        }";
         assert!(codes(src, run_call_existence).is_empty());
     }
 

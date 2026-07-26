@@ -1187,10 +1187,23 @@ fn run_overriding_property(fa: &FileAnalysis) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for_each_property_elem(fa, &mut |class_fqn, class, pd, elem| {
         let prop = fa.interner.resolve(elem.name).to_string();
-        let proto = class.extends.iter().find_map(|p| {
-            fa.reflection
-                .find_property(p.text.trim_start_matches('\\'), &prop)
-        });
+        // Ascend from the parents' *resolved* FQNs. `class.extends` holds the
+        // name as written (`P`, or a use-alias), which is not a reflection key:
+        // in a namespace it would miss `App\P` entirely, and in the worst case
+        // match a same-named class from another namespace.
+        //
+        // A private prototype does not count as overridden — the child gets its
+        // own slot — matching phpstan's `OverridingPropertyRule::findPrototype`.
+        let proto = fa
+            .reflection
+            .class(class_fqn)
+            .into_iter()
+            .flat_map(|c| c.parents.iter())
+            .find_map(|p| match p {
+                Type::Named { fqn, .. } => fa.reflection.find_property(fqn, &prop),
+                _ => None,
+            })
+            .filter(|found| found.member.visibility != Visibility::Private);
         let has_override = has_override_attr(&pd.attrs);
         let span = span_of(elem);
 
@@ -4784,6 +4797,45 @@ mod tests {
     fn non_overriding_property_is_clean() {
         let src = "<?php class C { public int $x = 0; }";
         assert!(codes(src, run_overriding_property).is_empty());
+    }
+
+    #[test]
+    fn namespaced_parent_property_is_found() {
+        // The parent is named unqualified inside a namespace, so the prototype
+        // is only reachable by resolving `P` to `App\P` — looking it up by the
+        // written name silently disabled this whole family for namespaced code.
+        let src = "<?php namespace App;
+            class P { public static int $s = 1; }
+            class C extends P { public int $s = 2; }";
+        assert!(codes(src, run_overriding_property).contains(&"property.nonStatic"));
+    }
+
+    #[test]
+    fn same_named_class_in_another_namespace_is_not_the_prototype() {
+        // A global `P` must not stand in for `App\P`.
+        let src = "<?php
+            namespace { class P { public string $z = 'a'; } }
+            namespace App {
+                class P { public bool $z = false; }
+                class C extends P { public bool $z = false; }
+            }";
+        let got = codes(src, run_overriding_property);
+        assert!(
+            !got.contains(&"property.nativeType"),
+            "compared against the wrong class: {got:?}"
+        );
+    }
+
+    #[test]
+    fn private_parent_property_is_not_a_prototype() {
+        // A private parent property is a separate slot, so the child may
+        // redeclare it freely (phpstan: OverridingPropertyRule::findPrototype
+        // skips private).
+        let src = "<?php
+            class P { private string $x = 'a'; private static int $y = 1; }
+            class C extends P { private int $x = 1; private string $y = 'b'; }";
+        let got = codes(src, run_overriding_property);
+        assert!(got.is_empty(), "private prototypes must be skipped: {got:?}");
     }
 
     #[test]
